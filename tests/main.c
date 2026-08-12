@@ -67,6 +67,14 @@ volatile uint32_t debug_log_idx = 0;
 // no disk and run regardless.
 volatile uint32_t load_guest_flag = 0;
 
+/* Video self-test. The host writes a pattern into cga_test_vram, raises the
+   flag, and reads cga_test_out back to check the expansion independently. */
+volatile uint32_t run_video_flag = 0;
+volatile uint32_t video_blit_cycles = 0;
+uint8_t cga_test_vram[X86_VRAM_BYTES];
+uint8_t cga_test_out[320 * 240];
+uint16_t cga_test_palette[4];
+
 // Latched fault state, for the host to read over the debug backend.
 volatile uint32_t fault_active = 0;   // 0 = none, else VECTACTIVE
 volatile uint32_t fault_cfsr = 0;
@@ -351,6 +359,19 @@ void Reset_Handler(void) {
             run_benchmark_flag = 0;
         }
         
+        if (run_video_flag == 1) {
+            x86_video_init(cga_test_vram, cga_test_palette);
+            /* init clears VRAM; the host's pattern is written after the flag
+               is armed, so re-arm ordering matters -- see tests/test_video.py */
+            run_video_flag = 2;
+        }
+        if (run_video_flag == 3) {
+            uint32_t t0 = DWT_CYCCNT;
+            x86_video_render(cga_test_out, 320);
+            video_blit_cycles = DWT_CYCCNT - t0;
+            run_video_flag = 0;
+        }
+
         if (run_benchmark_flag == 1) {
             // Setup benchmark state
             memset(&cpu_state_dtcm, 0, sizeof(cpu_state_dtcm));

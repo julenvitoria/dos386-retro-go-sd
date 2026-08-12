@@ -852,8 +852,8 @@
    "insns": 3
   },
   ".save_state_and_exit": {
-   "bytes": 22,
-   "insns": 6
+   "bytes": 20,
+   "insns": 5
   },
   ".str_exit": {
    "bytes": 52,
@@ -2263,6 +2263,10 @@
    "bytes": 8,
    "insns": 2
   },
+  "cga_mode4_blit": {
+   "bytes": 1508,
+   "insns": 388
+  },
   "decode_modrm_addr16": {
    "bytes": 44,
    "insns": 14
@@ -2309,8 +2313,8 @@
   }
  },
  "totals": {
-  "bytes": 28398,
-  "insns": 7865,
-  "symbols": 576
+  "bytes": 29904,
+  "insns": 8252,
+  "symbols": 577
  }
 }

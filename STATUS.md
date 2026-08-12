@@ -7,11 +7,11 @@ Roadmap and phase definitions: [`PLAN.md`](PLAN.md).
 
 | Tier | State |
 |---|---|
-| 1. gwemu bare-metal | 159/159 `tests/test_opcodes.py` |
+| 1. gwemu bare-metal | 162/162 `tests/test_opcodes.py`, plus `test_video.py` |
 | 2. gwemu + retro-go | `core_dtcm_ok=1`, bonus pool 153,600 B, 1,000,001 insns — matches tier 1 |
 | 3. Hardware | 50.50 cyc/insn, 5.54 MIPS |
 
-`tests/asm_baseline.json`: 580 symbols, 7880 insns, 28412 bytes.
+`tests/asm_baseline.json`: 577 symbols, 8252 insns, 29904 bytes.
 Dispatch-table symbols are data; `objdump` counts them as instructions.
 
 Cycles/insn: 57.50 pre-fold → 50.00 fold + absolute dispatch → 50.50 segmentation
@@ -90,7 +90,23 @@ path. The fold and dispatch were measured together and are not separable.
 - [x] `0F 0B imm8` hypercall, gated on `hle_enabled`, real `#UD` when off;
       sets `exit_reason=X86_EXIT_HLE_INT`, `exit_info=selector`
 - [ ] FreeDOS bring-up; INT 13h → FatFs; INT 10h/16h/1Ah
-- [ ] Video (CGA/EGA → LCD), input, PIT timing, PC speaker
+- [x] PC speaker: PIT ch2 + port 0x61 driven by real guest OUT; square-wave
+      renderer with phase carried across buffers
+- [x] Port I/O rebuilt on a C dispatch — it had indexed function-pointer tables
+      at hardcoded, never-initialised AXI addresses and read the port number
+      from ESP instead of DX
+- [x] Guest page pool + fold mapping (`x86_mem.c`). NOT a pager: no faults, no
+      eviction, no COW — 640 KB conventional + 32 KB VRAM fits the pool, so
+      every guest page is resident
+- [x] CGA mode 4 → LUT8 blitter in Thumb-2, pixel-exact against an independent
+      Python expansion (`tests/test_video.py`). 0.59 instructions/pixel: a DTCM
+      expansion table turns 2bpp→8bpp into one load, source arrives by LDM,
+      output leaves by 4-register STM, row body fully unrolled so the only
+      branch is one backward hop per 640 pixels
+- [ ] Wire the core loop: LCD framebuffer + audio buffer + input, VRAM
+      allocated below the framebuffer in AXI (it is a static array in the
+      bare-metal harness today)
+- [ ] Input mapping, PIT tick timing
 - [ ] DWT per-opcode-class profile over a real Alley Cat frame
 - [ ] Gate: measure NOR code-vs-data clean fraction before any NOR backing
 

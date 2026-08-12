@@ -94,9 +94,11 @@ standby. Called automatically by `make retrogo_media`.
 ## Harnesses (`tests/`)
 
 ```bash
-python3 tests/test_opcodes.py            # 113 cases, incl. EFLAGS + segmentation
+python3 tests/test_opcodes.py            # 162 cases: EFLAGS, segmentation,
+                                         # 16-bit, 66/67, interrupts, speaker
 python3 tests/test_benchmark.py
 python3 tests/test_game.py
+python3 tests/test_video.py              # CGA mode 4 blitter, pixel-exact
 python3 tests/test_core_retrogo.py       # tier 2
 ```
 

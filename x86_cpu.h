@@ -128,6 +128,15 @@ extern X86IOState x86_io;
    repointed at runtime by the core, which allocates DTCM through mem_ctl. */
 extern uint32_t *guest_page_table_ptr;
 
+/* Dedicated CGA VRAM. Sized for the full 32 KB aperture at 0xB8000 even though
+   mode 4 uses 16 KB, so text and the other CGA modes fit without remapping. */
+#define X86_VRAM_BYTES 32768u
+
+void x86_video_init(void *vram, void *lut8_palette);
+int x86_video_map(void);
+uint8_t *x86_video_vram(void);
+void x86_video_render(uint8_t *dst, uint32_t stride);
+
 void x86_mem_pool_init(void *base, uint32_t bytes);
 uint32_t x86_mem_pool_free(void);
 int x86_map_range(uint32_t guest, uint32_t bytes);
