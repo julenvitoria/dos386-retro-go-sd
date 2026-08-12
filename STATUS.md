@@ -1,18 +1,15 @@
 # Status
 
-Last verified 2026-08-12. Run instructions: [`TOOLING.md`](TOOLING.md).
+Last verified 2026-08-13. Run instructions: [`TOOLING.md`](TOOLING.md).
 Roadmap and phase definitions: [`PLAN.md`](PLAN.md).
 
 ## Verification state
 
 | Tier | State |
 |---|---|
-| 1. gwemu bare-metal | 188/188 `test_opcodes.py`, plus `test_video`/`test_dos`/`test_screen` |
+| 1. gwemu bare-metal | 209/209 `test_opcodes.py`, plus `test_video`/`test_dos`/`test_screen` |
 | 2. gwemu + retro-go | `core_dtcm_ok=1`, bonus pool 153,600 B, 1,000,001 insns — matches tier 1 |
 | 3. Hardware | 50.50 cyc/insn, 5.54 MIPS |
-
-`tests/asm_baseline.json`: 596 symbols, 8751 insns, 31840 bytes.
-Dispatch-table symbols are data; `objdump` counts them as instructions.
 
 Cycles/insn: 57.50 pre-fold → 50.00 fold + absolute dispatch → 50.50 segmentation
 → 50.50 unchanged through 16-bit, the 66/67 axes, segment loads, far transfers
@@ -39,35 +36,15 @@ Details are in the git history; `git log --oneline` is the index.
 21 opcode slots still reach `.exit_loop`: x87 (`D8`-`DF`), BCD
 (`27`/`2F`/`37`/`3F`), `BOUND`/`ARPL`, `INS`/`OUTS`, `XLAT`, `WAIT`, `INT1`.
 
-- [x] Real-mode interrupt dispatch: 4-byte IVT, FLAGS/CS/IP frame, IF/TF
-      cleared, CS installed; `IRET` inverts it. `CR0.PE` traps out
-- [x] `0F 0B imm8` hypercall, gated on `hle_enabled`, real `#UD` when off;
-      sets `exit_reason=X86_EXIT_HLE_INT`, `exit_info=selector`
-- [x] HLE dispatch: `0F 0B` stubs planted per vector, host-side service table
-- [x] BIOS: INT 10h / 16h / 1Ah over a real BIOS Data Area
-- [x] CGA text mode 3 (8x8 font, 16-colour attributes, 40 visible columns)
-- [x] DOS: real MCB arena (alloc/free/resize/coalesce, largest-block reporting),
-      PSP, MZ loader with relocations, INT 21h core + file handles on FatFs
-- [x] Hardware keyboard: 8042-style queue on ports 0x60/0x64, IRQ 1 delivered
-      in-guest at the instruction boundary (gated by IF, no per-instruction
-      cost), INT 09h filling the BIOS ring for INT 16h. Port-level on purpose:
-      identical in protected mode, and a game with its own INT 09h needs none
-      of the BIOS layer
-- [ ] Stream the `.dsk` from SD through the firmware's FatFs
-- [ ] Load ALLEYCAT.EXE through `x86_dos_exec` instead of the built-in demo
-- [x] PC speaker: PIT ch2 + port 0x61 driven by real guest OUT; square-wave
-      renderer with phase carried across buffers
-- [x] Port I/O on a C dispatch
-- [x] Guest page pool + fold mapping (`x86_mem.c`). Not a pager: no faults, no
-      eviction, no COW — every guest page stays resident
-- [x] CGA mode 4 → LUT8 blitter in Thumb-2 at 0.59 instructions/pixel,
-      pixel-exact against an independent Python expansion (`test_video.py`)
-- [x] CGA registers: 0x3D8 mode, 0x3D9 background/palette/intensity, 0x3DA
-      retrace status (both bits must move or a polling guest spins forever)
-- [x] Core emulator loop: 640 KB RAM + 32 KB VRAM from AXI, frame-paced CPU
-      slices, CGA blit to the LCD, speaker to the audio buffer, gamepad polled.
-      A built-in real-mode guest drives all three, and `test_screen.py`
-      confirms the image the display controller is scanning
+Done: real-mode interrupt dispatch and `IRET`; the `0F 0B` hypercall and its
+HLE service table with stubs planted per vector; BIOS INT 10h/16h/1Ah over a
+real BDA; CGA text mode 3 and a mode 4 LUT8 blitter at 0.59 insns/pixel, both
+checked pixel-exact; CGA registers including a moving retrace bit; a port-level
+8042 keyboard with IRQ 1 delivered at the instruction boundary; PC speaker on
+PIT ch2; port I/O on a C dispatch; the guest page pool and fold mapping; the
+frame-paced emulator loop; and the DOS layer -- MCB arena, PSP, MZ loader with
+relocations, INT 21h on FatFs -- fed by the guest `.dsk` streamed from SD.
+
 - [ ] Input into a BIOS keyboard buffer (state captured; INT 16h will consume it)
 - [ ] Real 18.2 Hz PIT tick driving INT 08h
 - [ ] DWT per-opcode-class profile over a real Alley Cat frame
@@ -79,6 +56,26 @@ Details are in the git history; `git log --oneline` is the index.
 - [ ] Gate: measure DOS FAT/sector overhead → decide the INT 21h fast path
 - [ ] Protected mode: descriptor validation, far transfers, IRET privilege change, paging walk
 - [ ] Profile-directed tuning against a Wolf3D DWT profile
+
+## TOPBENCH (the current 16-bit correctness driver)
+
+The .dsk streams, AUTOEXEC.BAT names the program, the MZ loader places it and
+its Borland relocator runs. Four bug classes found and fixed against it so far
+(see `git log`): the v-width shift group was pass-agnostic; `INC`/`DEC r/m8` and
+`INC`/`DEC Ev` set no flags; thirteen stack handlers ignored `SS.base` and used a
+4-byte slot; the shift operand FETCH and `XCHG` were 32-bit in 16-bit mode.
+
+It now runs ~1.34 M instructions and dies inside the self-unpacker.
+`scripts/ref_trace.py` says a real 8086 takes 1,553,044 to reach INT 21h, so
+roughly one bug remains between here and the first DOS call. The failure is that
+our machine leaves the relocation copy loop sooner than the reference does; the
+copy itself, its direction, large counts, granule crossing and the 16-bit index
+wrap are all covered by passing tier-1 cases, so the cause is elsewhere. No
+screenshot yet: `hle_calls_seen` is still 0, meaning nothing has been printed.
+
+Known-broken and untested, from a read of the handler table -- any of them could
+be next: `TEST` 0x84/0xA8/0xA9 set no flags at all, and 0x98/0x99 are
+dual-emitted with fixed bodies so 16-bit `CBW`/`CWD` execute `CWDE`/`CDQ`.
 
 ## Open defects
 
