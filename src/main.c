@@ -86,6 +86,7 @@ volatile uint32_t guest_ram_bytes = 0;
 volatile uint32_t guest_vram_ok = 0;
 volatile uint32_t frames_rendered = 0;
 volatile uint32_t guest_exit_reason = 0;
+volatile uint32_t guest_halted = 0;
 volatile uint32_t fb_addr = 0;        /* the buffer the blit was handed */
 volatile uint32_t fb_sample = 0;      /* first 4 pixels of the picture area */
 volatile uint32_t clut_sample = 0;    /* colour 1, to prove the CLUT took */
@@ -543,6 +544,7 @@ static void poll_input(const gw_firmware_abi_t *abi)
 static void emulator_loop(const gw_firmware_abi_t *abi)
 {
     guest_reset();
+    guest_halted = 0;
 
     abi->audio_ctl(GW_AUDIO_INIT, SAMPLE_RATE);
     uint32_t audio_frames = (uint32_t)abi->audio_ctl(GW_AUDIO_GET_LENGTH, 0);
@@ -569,7 +571,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
          * stops the guest rather than looping on the same instruction forever,
          * which would look exactly like a hang.
          */
-        for (;;) {
+        while (!guest_halted) {
             x86_cpu_interp_asm();
             uint32_t reason = cpu_state_ptr->exit_reason;
             guest_exit_reason = reason;
@@ -582,7 +584,11 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                 x86_hle_service();
                 continue;
             }
-            break;   /* fault, HLT or unimplemented: stop stepping */
+            /* Fault, HLT or unimplemented: latch it. Re-entering re-executes
+               the same faulting instruction forever, spinning the frame loop
+               thousands of times a second and telling us nothing new. */
+            guest_halted = 1;
+            break;
         }
 
         /* Video. The beam fraction drives the CGA status register, so a guest
@@ -614,6 +620,10 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         if (abuf && audio_frames)
             x86_speaker_render(abuf, audio_frames, SAMPLE_RATE, 6000);
 
+        /* Pace to the panel; otherwise the loop renders and swaps as fast as
+           the guest returns, which with a halted guest is thousands of times a
+           second and shows as flicker. */
+        abi->lcd_ctl(GW_LCD_WAIT_VBLANK, 0, 0, 0);
         abi->lcd_ctl(GW_LCD_SWAP, 0, 0, 0);
         frames_rendered++;
         abi->wdog_refresh();

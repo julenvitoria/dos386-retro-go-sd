@@ -161,7 +161,15 @@ uint8_t *x86_video_vram(void)
  */
 void x86_video_render(uint8_t *dst, uint32_t stride)
 {
-    uint8_t *top = dst + ((240u - CGA_HEIGHT) / 2u) * stride;
+    /* Clear the letterbox. 320x200 into a 240-row panel leaves 20 rows top
+       and bottom; leaving them alone means they keep whatever the firmware or
+       the other buffer had, reinterpreted through the CGA palette -- which is
+       what turns an otherwise black screen into colour flashes. */
+    unsigned band = (240u - CGA_HEIGHT) / 2u;
+    memset(dst, 0, band * stride);
+    memset(dst + (band + CGA_HEIGHT) * stride, 0, band * stride);
+
+    uint8_t *top = dst + band * stride;
     if (x86_video_is_text())
         text_render(top, stride);
     else

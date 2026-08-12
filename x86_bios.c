@@ -100,6 +100,11 @@ void x86_bios_init(void)
     bda_w16(BDA_KB_TAIL, BDA_KB_BUF - BDA);
     bda_w8(BDA_MODE, 0x03);
     bda_w16(BDA_COLS, 80);
+    /* Keep the renderer and the BDA agreeing. They did not: the BDA said mode
+       3 (text, what a PC boots into) while the renderer stayed on mode 4, so a
+       guest that never calls INT 10h AH=00 had its text cells drawn as 2bpp
+       graphics. */
+    x86_video_set_mode(0x03);
     bda_w32(BDA_TICKS, 0);
 }
 
