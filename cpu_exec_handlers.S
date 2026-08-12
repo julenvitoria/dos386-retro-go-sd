@@ -210,6 +210,37 @@
         ADD.W \out, \out, \tmp
     .endm
 
+/* moffs (A0-A3): a bare offset immediate, no ModRM.
+ *
+ * Two things the old handlers got wrong. The immediate is an ADDRESS-size
+ * value -- 2 bytes with 16-bit addressing, 4 with 32-bit -- and they always
+ * fetched 4, so a 16-bit guest ran two bytes of the NEXT instruction into the
+ * offset and then jumped past it. And the offset is an OFFSET: it goes through
+ * the active segment, DS unless an override prefix put something else in R6.
+ * They used it raw as a linear address, so every moffs access in a segmented
+ * guest landed a segment base away from the data.
+ *
+ * Returns the linear address in \out; clobbers \tmp and advances R10.
+ */
+    .macro MOFFS_EA out, tmp
+        UBFX \tmp, R10, #12, #12
+        LDR.W \tmp, [R9, \tmp, LSL #2]
+        ADDS \tmp, \tmp, R10
+        BMI .mem_fault
+        TST.W R2, #ADDRSIZE_XOR
+        BEQ 1f
+        LDR \out, [\tmp, #0]           @ 32-bit addressing: 4-byte offset
+        ADD.W R10, R10, #4
+        B 2f
+1:      LDRH \out, [\tmp, #0]          @ 16-bit addressing: 2-byte offset
+        ADD.W R10, R10, #2
+2:      SUBS \tmp, R6, R8              @ segment override in play?
+        IT EQ
+        ADDEQ R6, R8, #SEG_DS_SEL
+        LDR.W \tmp, [R6, #4]           @ descriptor base (SEL 0, FLAGS 2, BASE 4)
+        ADD.W \out, \out, \tmp
+    .endm
+
     .macro STR_DST out, tmp
         LDR.W \out, [R8, #REG_EDI]
         TST.W R2, #ADDRSIZE_XOR
@@ -1061,12 +1092,7 @@ OP .op_popfd_9D
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_mov_al_moffs8_A0
-    UBFX R4, R10, #12, #12
-    LDR.W R4, [R9, R4, LSL #2]
-    ADDS R4, R4, R10
-    BMI .mem_fault
-    LDR R4, [R4, #0]
-    ADD.W R10, R10, #4
+    MOFFS_EA R4, R3
     UBFX R3, R4, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R4
@@ -1076,28 +1102,22 @@ OP_AGNOSTIC .op_mov_al_moffs8_A0
     B.W .fetch_decode_loop
 
 OP .op_mov_eax_moffs32_A1
-    UBFX R4, R10, #12, #12
-    LDR.W R4, [R9, R4, LSL #2]
-    ADDS R4, R4, R10
-    BMI .mem_fault
-    LD_V R4, R4
-    EIP_ADV_V
+    MOFFS_EA R4, R3
     UBFX R3, R4, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R4
     BMI .mem_fault
     LD_V R3, R3
-    STR.W R3, [R8, #8]
+#if NSH
+    STRH.W R3, [R8, #REG_EAX]      @ 16-bit: EAX[31:16] is untouched
+#else
+    STR.W R3, [R8, #REG_EAX]
+#endif
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_mov_moffs8_al_A2
-    UBFX R4, R10, #12, #12
-    LDR.W R4, [R9, R4, LSL #2]
-    ADDS R4, R4, R10
-    BMI .mem_fault
-    LDR R4, [R4, #0]
-    ADD.W R10, R10, #4
-    LDRB.W R3, [R8, #8]
+    MOFFS_EA R4, R3
+    LDRB.W R3, [R8, #REG_EAX]
     UBFX R12, R4, #12, #12
     LDR.W R12, [R9, R12, LSL #2]
     ADDS R12, R12, R4
@@ -1106,13 +1126,8 @@ OP_AGNOSTIC .op_mov_moffs8_al_A2
     B.W .fetch_decode_loop
 
 OP .op_mov_moffs32_eax_A3
-    UBFX R4, R10, #12, #12
-    LDR.W R4, [R9, R4, LSL #2]
-    ADDS R4, R4, R10
-    BMI .mem_fault
-    LD_V R4, R4
-    EIP_ADV_V
-    LDR.W R3, [R8, #8]
+    MOFFS_EA R4, R3
+    LDR.W R3, [R8, #REG_EAX]
     UBFX R12, R4, #12, #12
     LDR.W R12, [R9, R12, LSL #2]
     ADDS R12, R12, R4

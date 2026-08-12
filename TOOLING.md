@@ -46,7 +46,9 @@ python3 scripts/asm_metrics.py --cycles --target hardware
 `--dump SYM:N[xG]` reads a symbol's OWN storage as N words grouped G per line,
 which is what an array needs — `--deref` would treat the first word as a
 pointer. A literal `0xADDR` works in place of a symbol, for memory with no name
-(guest RAM, a stack frame, a peripheral register). Dumped words that land
+(a stack frame, a peripheral register), and `*SYM+OFF` reads THROUGH a pointer,
+which is the only way to reach guest RAM — `guest_ram` is handed to the core at
+startup, so its address is not in the ELF. Dumped words that land
 inside a known function are annotated with it, so a saved LR reads as
 `HANDLE_INTERRUPT_16+0xd9` rather than a bare address. Dumps happen AFTER
 sampling: read at t=0 and you see the state before the target has done
@@ -57,6 +59,7 @@ python3 scripts/probe.py --retrogo --wait-magic \
     --watch core_ready,core_dtcm_ok,benchmark_insns --deref cpu_state_ptr+8=EAX
 python3 scripts/probe.py --dump x86_cs_log:16x4=CSLOG  # array contents
 python3 scripts/probe.py --dump 0x2408bf48:16x4=STACK  # or a raw address
+python3 scripts/probe.py --retrogo --dump '*guest_ram+0x8DC0:32x4=CODE'  # guest memory
 python3 scripts/probe.py --target hardware --watch run_flag,benchmark_cycles
 python3 scripts/probe.py --retrogo --set run_benchmark_flag=1 --watch benchmark_insns
 ```

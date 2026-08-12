@@ -114,12 +114,43 @@ def parse_dump(spec):
     return sym, int(cnt or 8, 0), group, (label or sym)
 
 
-def _dump_base(sym, syms):
-    """A symbol name, or a literal address for memory with no symbol -- guest
-    RAM, a peripheral register, a stack frame."""
+def dump_symbol_name(sym):
+    """The ELF symbol a dump spec depends on, or None for a literal address."""
+    sym = sym.lstrip("*")
+    sym = sym.split("+", 1)[0].strip()
     if sym.startswith("0x") or sym.startswith("0X"):
-        return int(sym, 16)
-    return syms.get(sym)
+        return None
+    return sym
+
+
+def _dump_base(sym, syms, backend=None):
+    """Resolve a dump target to an address.
+
+    Three forms, because the interesting memory comes in three shapes:
+      `name`          the symbol's own storage (an array)
+      `0xADDR`        memory with no symbol (a peripheral, a stack frame)
+      `*name+OFF`     through a runtime pointer, which is the only way to
+                      reach guest RAM: `guest_ram` is a pointer the core is
+                      handed at startup, so its value is not in the ELF.
+    """
+    deref = sym.startswith("*")
+    sym = sym.lstrip("*")
+    off = 0
+    if "+" in sym:
+        sym, off_s = sym.split("+", 1)
+        off = int(off_s, 0)
+    sym = sym.strip()
+    if sym.startswith("0x") or sym.startswith("0X"):
+        base = int(sym, 16)
+    else:
+        base = syms.get(sym)
+        if base is None:
+            return None
+    if deref:
+        if backend is None:
+            return None
+        base = backend.read_uint32(base)
+    return base + off
 
 
 def dump_arrays(target, syms, dumps, out=print, symbol_maps=()):
@@ -131,7 +162,7 @@ def dump_arrays(target, syms, dumps, out=print, symbol_maps=()):
     """
     maps = symbol_maps or [syms]
     for sym, count, group, label in dumps:
-        base = _dump_base(sym, syms)
+        base = _dump_base(sym, syms, target.backend)
         if base is None:
             out(f"  {label}: symbol not found")
             continue

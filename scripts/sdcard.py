@@ -32,7 +32,7 @@ from scripts.common.sdcard import (                                        # noq
 )
 
 DEFAULT_CONTENT = "references/game-and-watch-retro-go-sd/sd_content"
-DEFAULT_ROM = "references/game-and-watch-retro-go-sd/roms/dos/TOPBENCH.dsk"
+DEFAULT_ROM = "references/game-and-watch-retro-go-sd/roms/dos/ALLEYCAT.dsk"
 
 
 def main():

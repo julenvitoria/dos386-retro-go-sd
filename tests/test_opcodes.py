@@ -1405,6 +1405,82 @@ def run_test(args):
                 "expected_eip": 7,
             },
 
+            # --- moffs (A0-A3) ------------------------------------------------
+            # The offset is an ADDRESS-size immediate and the access goes
+            # through the active segment. Both were wrong: the byte forms read
+            # a 4-byte offset unconditionally, and all four used the raw offset
+            # as a linear address with no segment base at all.
+            {
+                "name": "A0: MOV AL,[moffs] is 2 bytes wide and uses DS.base",
+                "code": bytes([0xA0, 0x34, 0x02, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000},
+                "ram_setup": [(0x1234, bytes([0x5A]))],
+                "regs_initial": {0: 0x1111FF00},
+                "regs_expected": {0: 0x1111FF5A},
+                "expected_eip": 4,
+            },
+            {
+                "name": "A1: MOV AX,[moffs] is 2 bytes wide and uses DS.base",
+                "code": bytes([0xA1, 0x34, 0x02, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000},
+                "ram_setup": [(0x1234, bytes([0xEF, 0xBE]))],
+                "regs_initial": {0: 0x11110000},
+                "regs_expected": {0: 0x1111BEEF},
+                "expected_eip": 4,
+            },
+            {
+                "name": "A2: MOV [moffs],AL is 2 bytes wide and uses DS.base",
+                "code": bytes([0xA2, 0x44, 0x02, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000},
+                "regs_initial": {0: 0x1111FF5A},
+                "regs_expected": {},
+                "mem_expected": [(0x1244, bytes([0x5A]))],
+                "expected_eip": 4,
+            },
+            {
+                "name": "A3: MOV [moffs],AX is 2 bytes wide and uses DS.base",
+                "code": bytes([0xA3, 0x54, 0x02, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000},
+                "regs_initial": {0: 0x1111BEEF},
+                "regs_expected": {},
+                "mem_expected": [(0x1254, bytes([0xEF, 0xBE]))],
+                "expected_eip": 4,
+            },
+            {
+                "name": "A0 with ES: -- the override segment wins",
+                # 26 A0 fe 0f -> MOV AL, ES:[0x0FFE]; this is the exact form
+                # Alley Cat uses to read the BIOS model byte.
+                "code": bytes([0x26, 0xA0, 0xFE, 0x0F, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"ES": 0x1000, "DS": 0x8000},
+                "ram_setup": [(0x1FFE, bytes([0xFC]))],
+                "regs_initial": {0: 0x00000000},
+                "regs_expected": {0: 0x000000FC},
+                "expected_eip": 5,
+            },
+            {
+                "name": "A1: 32-bit addressing takes a 4-byte offset",
+                "code": bytes([0xA1, 0x00, 0x12, 0x00, 0x00, 0xF4]),
+                "segs_initial": {"DS": 0x1000},
+                "ram_setup": [(0x2200, (0xCAFEBABE).to_bytes(4, "little"))],
+                "regs_initial": {0: 0},
+                "regs_expected": {0: 0xCAFEBABE},
+                "expected_eip": 6,
+            },
+            {
+                "name": "A2: 32-bit addressing takes a 4-byte offset",
+                "code": bytes([0xA2, 0x10, 0x12, 0x00, 0x00, 0xF4]),
+                "segs_initial": {"DS": 0x1000},
+                "regs_initial": {0: 0x0000005A},
+                "regs_expected": {},
+                "mem_expected": [(0x2210, bytes([0x5A]))],
+                "expected_eip": 6,
+            },
+
             # --- 16-bit control flow ------------------------------------------
             {
                 "name": "O16: JMP rel16 displacement is 2 bytes",

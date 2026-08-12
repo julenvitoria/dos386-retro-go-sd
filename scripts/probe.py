@@ -26,7 +26,8 @@ import sys
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from scripts.common.probe import (                       # noqa: E402
-    dump_arrays, load_symbol_maps, parse_deref, parse_dump, parse_watch,
+    dump_arrays, dump_symbol_name, load_symbol_maps, parse_deref, parse_dump,
+    parse_watch,
     sample, wait_for_value,
 )
 from scripts.common.target import Image, add_target_args, open_target  # noqa: E402
@@ -90,8 +91,8 @@ def main():
 
     missing = [w for w in watches if w not in syms]
     missing += [s for s, _, _ in derefs if s not in syms]
-    missing += [s for s, _, _, _ in dumps
-                if not s.startswith("0x") and s not in syms]
+    missing += [n for n in (dump_symbol_name(s) for s, _, _, _ in dumps)
+                if n is not None and n not in syms]
     if missing:
         sys.exit(f"symbols not found in {elf}: {missing}")
 
