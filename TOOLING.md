@@ -42,10 +42,21 @@ python3 scripts/asm_metrics.py --cycles --target hardware
 
 ### `probe.py` — see what a running target is doing
 
+`--watch` reads globals. `--deref SYM+OFF` follows a pointer into a struct.
+`--dump SYM:N[xG]` reads a symbol's OWN storage as N words grouped G per line,
+which is what an array needs — `--deref` would treat the first word as a
+pointer. A literal `0xADDR` works in place of a symbol, for memory with no name
+(guest RAM, a stack frame, a peripheral register). Dumped words that land
+inside a known function are annotated with it, so a saved LR reads as
+`HANDLE_INTERRUPT_16+0xd9` rather than a bare address. Dumps happen AFTER
+sampling: read at t=0 and you see the state before the target has done
+anything, which is how a full log reads as empty.
+
 ```bash
 python3 scripts/probe.py --retrogo --wait-magic \
     --watch core_ready,core_dtcm_ok,benchmark_insns --deref cpu_state_ptr+8=EAX
-python3 scripts/probe.py --dump x86_cs_log:8x2=CSLOG   # array contents
+python3 scripts/probe.py --dump x86_cs_log:16x4=CSLOG  # array contents
+python3 scripts/probe.py --dump 0x2408bf48:16x4=STACK  # or a raw address
 python3 scripts/probe.py --target hardware --watch run_flag,benchmark_cycles
 python3 scripts/probe.py --retrogo --set run_benchmark_flag=1 --watch benchmark_insns
 ```
@@ -160,7 +171,7 @@ Importable support only — no CLIs.
 | `rglog.py` | Read retro-go's in-memory log ring |
 | `faults.py` | Decode latched CPU faults |
 | `asm_metrics.py` | Instruction counts, DWT capture |
-| `probe.py` | Sample PC, globals and pointer derefs on a running target; `read_faults` decodes CFSR/HFSR/BFAR |
+| `probe.py` | Sample PC, globals, pointer derefs and array dumps on a running target; `read_faults` decodes CFSR/HFSR/BFAR |
 | `verify.py` | Symbol-region checks and ELF-vs-target section comparison |
 | `builder.py`, `runner.py` | Tier-1 build convenience |
 
