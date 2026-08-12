@@ -1345,7 +1345,7 @@ OP_AGNOSTIC .op_mov_eb_imm8_C6
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
     CMP R3, #192
-    BNE.W .exit_loop
+    BNE.W L(MOV_EB_IMM8_MEM)
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -1361,6 +1361,26 @@ OP_AGNOSTIC .op_mov_eb_imm8_C6
     STRB.W R5, [R8, R2]
     B.W .fetch_decode_loop
 
+/* The memory form, which used to bail to .exit_loop -- so `MOV BYTE PTR
+   [addr], imm8`, one of the most common instructions a compiler emits, was
+   unimplemented. The immediate follows the displacement, so it can only be
+   fetched AFTER the decode has walked R10 past it. */
+L(MOV_EB_IMM8_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRB R5, [R5, #0]
+    ADD.W R10, R10, #1
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    BMI .mem_fault
+    STRB.W R5, [R2]
+    B.W .fetch_decode_loop
+
 OP .op_mov_ev_imm32_C7
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
@@ -1370,7 +1390,7 @@ OP .op_mov_ev_imm32_C7
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
     CMP R3, #192
-    BNE.W .exit_loop
+    BNE.W L(MOV_EV_IMM_MEM)
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -1381,6 +1401,24 @@ OP .op_mov_ev_imm32_C7
     MOV.W R2, R2, LSL #2
     ADD.W R2, R2, #8
     STREG_V R5, R2
+    B.W .fetch_decode_loop
+
+/* Same gap as C6: only the register form existed. The immediate is at the
+   operand size and follows the displacement, so it is fetched after the walk. */
+L(MOV_EV_IMM_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LD_V R5, R5
+    EIP_ADV_V
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    BMI .mem_fault
+    ST_V R5, R2
     B.W .fetch_decode_loop
 
 /* C1 / D1 / D3 shift a v-width operand, so they are NOT pass-agnostic: they

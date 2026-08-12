@@ -1481,6 +1481,62 @@ def run_test(args):
                 "expected_eip": 6,
             },
 
+            # --- C6/C7 memory forms -------------------------------------------
+            # MOV r/m, imm implemented only the register form; every memory
+            # form bailed to .exit_loop. Alley Cat's third instruction is
+            # `MOV BYTE PTR ds:0x690,4`.
+            {
+                "name": "C6 /0: MOV BYTE [disp16],imm8",
+                "code": bytes([0xC6, 0x06, 0x60, 0x02, 0x5A, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000},
+                "regs_initial": {},
+                "regs_expected": {},
+                "mem_expected": [(0x1260, bytes([0x5A]))],
+                "expected_eip": 6,
+            },
+            {
+                "name": "C7 /0: MOV WORD [disp16],imm16",
+                "code": bytes([0xC7, 0x06, 0x70, 0x02, 0xEF, 0xBE, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000},
+                "regs_initial": {},
+                "regs_expected": {},
+                "mem_expected": [(0x1270, bytes([0xEF, 0xBE]))],
+                "expected_eip": 7,
+            },
+            {
+                "name": "C6 /0: MOV BYTE [BX+disp8],imm8",
+                "code": bytes([0xC6, 0x47, 0x10, 0x77, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000},
+                "regs_initial": {3: 0x0280},
+                "regs_expected": {},
+                "mem_expected": [(0x1290, bytes([0x77]))],
+                "expected_eip": 5,
+            },
+            {
+                "name": "C6 /0: MOV BYTE [disp32],imm8 at 32 bits",
+                "code": bytes([0xC6, 0x05, 0x00, 0x13, 0x00, 0x00, 0x5B,
+                               0xF4]),
+                "segs_initial": {"DS": 0x1000},
+                "regs_initial": {},
+                "regs_expected": {},
+                "mem_expected": [(0x2300, bytes([0x5B]))],
+                "expected_eip": 8,
+            },
+            {
+                "name": "C7 /0: MOV DWORD [disp32],imm32 at 32 bits",
+                "code": bytes([0xC7, 0x05, 0x10, 0x13, 0x00, 0x00,
+                               0xBE, 0xBA, 0xFE, 0xCA, 0xF4]),
+                "segs_initial": {"DS": 0x1000},
+                "regs_initial": {},
+                "regs_expected": {},
+                "mem_expected": [(0x2310,
+                                  (0xCAFEBABE).to_bytes(4, "little"))],
+                "expected_eip": 11,
+            },
+
             # --- 16-bit control flow ------------------------------------------
             {
                 "name": "O16: JMP rel16 displacement is 2 bytes",
