@@ -45,6 +45,7 @@ python3 scripts/asm_metrics.py --cycles --target hardware
 ```bash
 python3 scripts/probe.py --retrogo --wait-magic \
     --watch core_ready,core_dtcm_ok,benchmark_insns --deref cpu_state_ptr+8=EAX
+python3 scripts/probe.py --dump x86_cs_log:8x2=CSLOG   # array contents
 python3 scripts/probe.py --target hardware --watch run_flag,benchmark_cycles
 python3 scripts/probe.py --retrogo --set run_benchmark_flag=1 --watch benchmark_insns
 ```

@@ -26,7 +26,8 @@ import sys
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from scripts.common.probe import (                       # noqa: E402
-    load_symbol_maps, parse_deref, parse_watch, sample, wait_for_value,
+    dump_arrays, load_symbol_maps, parse_deref, parse_dump, parse_watch,
+    sample, wait_for_value,
 )
 from scripts.common.target import Image, add_target_args, open_target  # noqa: E402
 
@@ -47,6 +48,10 @@ def main():
                    help="ELF for symbols (default depends on --retrogo)")
     p.add_argument("--watch", default="",
                    help="comma-separated globals to read as uint32")
+    p.add_argument("--dump", action="append", default=[],
+                   metavar="SYM[:N][xG][=LABEL]",
+                   help="hexdump N words of a symbol's own storage, grouped "
+                        "G per line (arrays; --deref follows a pointer instead)")
     p.add_argument("--deref", action="append", default=[],
                    metavar="SYM[+OFF][=LABEL]",
                    help="read uint32 at (*SYM)+OFF; repeatable")
@@ -81,9 +86,11 @@ def main():
     syms, maps = load_symbol_maps(fw_elf, elf)
     watches = parse_watch(args.watch)
     derefs = [parse_deref(d) for d in args.deref]
+    dumps = [parse_dump(d) for d in args.dump]
 
     missing = [w for w in watches if w not in syms]
     missing += [s for s, _, _ in derefs if s not in syms]
+    missing += [s for s, _, _, _ in dumps if s not in syms]
     if missing:
         sys.exit(f"symbols not found in {elf}: {missing}")
 
@@ -107,6 +114,14 @@ def main():
 
         sample(target, syms, watches=watches, derefs=derefs,
                count=args.samples, interval=args.interval, symbol_maps=maps)
+
+        # After sampling, not before: an array read at t=0 shows the state
+        # before the target has done anything, which is how a full log reads
+        # as empty.
+        if dumps:
+            target.backend.halt()
+            dump_arrays(target, syms, dumps)
+            target.backend.resume()
         if args.faults:
             from scripts.common.probe import read_faults
             print("fault state:")

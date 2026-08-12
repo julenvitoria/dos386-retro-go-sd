@@ -89,6 +89,40 @@ def parse_deref(spec):
     return sym, off, (label or f"*{sym}+{off:#x}")
 
 
+def parse_dump(spec):
+    """'x86_cs_log:8x2=CSLOG' -> ('x86_cs_log', 8, 2, 'CSLOG')
+
+    count:stride reads the symbol's OWN storage, which is what an array needs.
+    --deref cannot: it follows the first word as a pointer. `x2` groups the
+    words into pairs so a log of (a, b) records prints as pairs.
+    """
+    label = None
+    if "=" in spec:
+        spec, label = spec.split("=", 1)
+    group = 1
+    if "x" in spec.split(":")[-1]:
+        head, g = spec.rsplit("x", 1)
+        spec, group = head, int(g, 0)
+    sym, _, cnt = spec.partition(":")
+    sym = sym.strip()
+    return sym, int(cnt or 8, 0), group, (label or sym)
+
+
+def dump_arrays(target, syms, dumps, out=print):
+    """Print each requested array as words, grouped."""
+    for sym, count, group, label in dumps:
+        if sym not in syms:
+            out(f"  {label}: symbol not found")
+            continue
+        base = syms[sym]
+        words = [target.backend.read_uint32(base + 4 * i) for i in range(count)]
+        out(f"  {label} @0x{base:08x}:")
+        for i in range(0, count, group):
+            chunk = words[i:i + group]
+            cells = "  ".join(f"0x{w:08x} ({w})" for w in chunk)
+            out(f"    [{i // group}] {cells}")
+
+
 def sample(target, syms, watches=(), derefs=(), count=10, interval=1.0,
            symbol_maps=(), out=print):
     """Halt/read/resume `count` times. Returns the rows it printed.
