@@ -2307,6 +2307,31 @@ def run_test(args):
                 "regs_expected": {1: 0xAAAA2222, 3: 0xBBBB1111},
                 "expected_eip": 3,
             },
+            {
+                "name": "STD + REP MOVSW walks SI/DI through the 16-bit wrap",
+                # The relocator's second pass starts at SI=DI=0xFFFE and copies
+                # DOWN through offset 0, so the index registers wrap from 0x0000
+                # back to 0xFFFE mid-run. Existing coverage never crossed that
+                # point. STD ; REP MOVSW ; HLT with the segments based at
+                # 0x10000/0x30000 and six words to move from offset 4.
+                "code": bytes([0xFD, 0xF3, 0xA5, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x10000, "ES": 0x30000},
+                "ram_setup": [(0x30000, bytes(8)), (0x3FFF8, bytes(8)),
+                              (0x10000, bytes([0x11, 0x11, 0x22, 0x22,
+                                               0x33, 0x33])),
+                              (0x1FFFA, bytes([0x44, 0x44, 0x55, 0x55,
+                                               0x66, 0x66]))],
+                "regs_initial": {1: 6, 6: 0x0004, 7: 0x0004},
+                # six words from offset 4 downward: 4, 2, 0, then 0xFFFE,
+                # 0xFFFC, 0xFFFA. The run must not stop at the wrap.
+                "regs_expected": {1: 0, 6: 0xFFF8, 7: 0xFFF8},
+                "mem_expected": [(0x30000, bytes([0x11, 0x11, 0x22, 0x22,
+                                                  0x33, 0x33])),
+                                 (0x3FFFA, bytes([0x44, 0x44, 0x55, 0x55,
+                                                  0x66, 0x66]))],
+                "expected_eip": 4,
+            },
         ])
 
         all_passed = True

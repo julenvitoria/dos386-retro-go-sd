@@ -65,6 +65,51 @@ Samples PC (labelled ITCM / firmware symbol / region), watched globals, and
 pointer dereferences. Reach for this when a harness reports a value that makes
 no sense — it is faster than lengthening a timeline, which is capped at 60s.
 
+### `watch_memory.py` — catch whatever is writing to an address
+
+```bash
+# who is scribbling on the relocated stub at guest linear 0x2E920?
+python3 scripts/watch_memory.py --retrogo --wait-magic \
+    --addr '*guest_ram+0x2E920' --length 4
+python3 scripts/watch_memory.py --retrogo --wait-magic --addr core_ready --hits 3 \
+    --peek '*guest_ram+0x810:224'
+```
+
+`probe.py` samples; this catches. A corrupting write is one instruction among
+millions and polling never sees it, so this sets a real data watchpoint and
+reports the ARM PC at the stop resolved against the ELF — inside the
+interpreter that PC is the handler, which names the guest instruction class.
+`--addr` takes a raw `0x…`, a symbol, or `*SYM+OFF` to dereference a pointer
+(guest RAM needs the last form). `--peek` hexdumps on every hit, which turns a
+watchpoint on a completion flag into a clean snapshot of what a load produced.
+
+Caveat: a stop can repeat on the same access without advancing. Treat repeated
+identical hits as one event, not as several.
+
+### `ref_trace.py` — run the same guest under a reference x86
+
+```bash
+python3 scripts/ref_trace.py --dsk references/.../TOPBENCH.dsk --args=-l --summary
+python3 scripts/ref_trace.py --dsk ... --args=-l --every 16384 --count 64
+python3 scripts/ref_trace.py --dsk ... --args=-l --skip 43520 --every 1 --count 64
+```
+
+When a guest walks off into memory it does not own, the question is always
+"which instruction first behaved differently from a real 8086". This runs the
+identical image under Unicorn (`pip install unicorn`) and prints a trace in the
+same shape, so the two can be diffed. The image is built by
+`scripts/common/dosimage.py`, which mirrors `x86_dos_exec` — same PSP, same
+load segment, same relocations, same entry registers; starting anywhere else
+would make the comparison meaningless. It stops at the first software
+interrupt, which for a self-unpacking program is the finish line.
+
+**Aligning the two traces takes care.** Our interpreter re-enters its fetch loop
+once per `REP` element, and so does Unicorn's hook, but instructions executed in
+the HLE stub page are ours alone and desynchronise the counters. A long `REP`
+also makes thousands of consecutive samples identical, so a naive index-by-index
+diff reports a match where there is only coincidence — confirm a suspected
+divergence by comparing a register (CX, DX) over the same window, not just EIP.
+
 ### `sdcard.py` — compose the SD card
 
 ```bash
@@ -172,6 +217,8 @@ Importable support only — no CLIs.
 | `faults.py` | Decode latched CPU faults |
 | `asm_metrics.py` | Instruction counts, DWT capture |
 | `probe.py` | Sample PC, globals, pointer derefs and array dumps on a running target; `read_faults` decodes CFSR/HFSR/BFAR |
+| `watchpoint.py` | Z2/Z3 data watchpoints over the GDB remote protocol, and the unsolicited stop reply that follows a resume |
+| `dosimage.py` | FAT12 reader + MZ loader that mirrors `x86_dos_exec`, so a reference emulator starts from OUR entry state |
 | `verify.py` | Symbol-region checks and ELF-vs-target section comparison |
 | `builder.py`, `runner.py` | Tier-1 build convenience |
 
