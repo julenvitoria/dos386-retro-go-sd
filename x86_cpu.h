@@ -120,6 +120,11 @@ typedef struct {
     uint8_t  pit2_latched;    /* half-way through a lo/hi pair */
     uint8_t  port61;          /* bit0 = ch2 gate, bit1 = speaker data */
     uint32_t spk_phase;       /* 16.16 square-wave phase, carried across buffers */
+    uint8_t  cga_mode;        /* 0x3D8 mode control */
+    uint8_t  cga_color_select;/* 0x3D9 background + palette + intensity */
+    uint16_t cga_beam;        /* 0..0xFFFF through the frame, set by the core */
+    uint32_t cga_status_reads;/* advances per 0x3DA read so poll loops progress */
+    uint32_t input_keys;      /* host buttons, consumed by the BIOS layer */
 } X86IOState;
 
 extern X86IOState x86_io;
@@ -133,6 +138,9 @@ extern uint32_t *guest_page_table_ptr;
 #define X86_VRAM_BYTES 32768u
 
 void x86_video_init(void *vram, void *lut8_palette);
+void x86_video_refresh_palette(void);
+extern uint32_t cga_clut_dirty;   /* frame loop re-pushes the CLUT when set */
+void x86_video_set_beam(uint32_t frac);
 int x86_video_map(void);
 uint8_t *x86_video_vram(void);
 void x86_video_render(uint8_t *dst, uint32_t stride);

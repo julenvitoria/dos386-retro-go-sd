@@ -73,7 +73,9 @@ volatile uint32_t run_video_flag = 0;
 volatile uint32_t video_blit_cycles = 0;
 uint8_t cga_test_vram[X86_VRAM_BYTES];
 uint8_t cga_test_out[320 * 240];
-uint16_t cga_test_palette[4];
+/* 32-bit ARGB entries, matching lcd_set_clut(). Sized 16 so a palette
+   change can never write past it. */
+uint32_t cga_test_palette[16];
 
 // Latched fault state, for the host to read over the debug backend.
 volatile uint32_t fault_active = 0;   // 0 = none, else VECTACTIVE

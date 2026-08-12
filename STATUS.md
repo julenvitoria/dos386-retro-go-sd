@@ -80,10 +80,13 @@ path. The fold and dispatch were measured together and are not separable.
       eviction, no COW — every guest page stays resident
 - [x] CGA mode 4 → LUT8 blitter in Thumb-2 at 0.59 instructions/pixel,
       pixel-exact against an independent Python expansion (`test_video.py`)
-- [ ] Wire the core loop: LCD framebuffer + audio buffer + input, VRAM
-      allocated below the framebuffer in AXI (it is a static array in the
-      bare-metal harness today)
-- [ ] Input mapping, PIT tick timing
+- [x] CGA registers: 0x3D8 mode, 0x3D9 background/palette/intensity, 0x3DA
+      retrace status (both bits must move or a polling guest spins forever)
+- [x] Core emulator loop: 640 KB RAM + 32 KB VRAM from AXI, frame-paced CPU
+      slices, CGA blit to the LCD, speaker to the audio buffer, gamepad polled.
+      A built-in real-mode guest drives all three
+- [ ] Input into a BIOS keyboard buffer (state captured; INT 16h will consume it)
+- [ ] Real 18.2 Hz PIT tick driving INT 08h
 - [ ] DWT per-opcode-class profile over a real Alley Cat frame
 - [ ] Gate: measure NOR code-vs-data clean fraction before any NOR backing
 
@@ -108,3 +111,8 @@ path. The fold and dispatch were measured together and are not separable.
 - Tier 2 harness had two faults, now fixed: it polled for 150 s against a 35 s
   timeline (so every run ended in a GDB traceback), and it never armed
   `run_benchmark_flag`, so it read a figure the core had stopped producing.
+- **Headless gwemu renders nothing** — even Retro-Go's own menu screenshots come
+  back fully black, so the picture cannot be confirmed there. Tier 2 asserts the
+  framebuffer contents and the CLUT instead. Visual confirmation needs hardware.
+- The hardware probe was not detected during this session, so `50.50 cyc/insn`
+  is the last measured figure and predates the interrupt, speaker and video work.

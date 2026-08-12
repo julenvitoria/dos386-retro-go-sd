@@ -16,10 +16,14 @@ CORE_ENTRY := app_main
 
 CORE_C_SOURCES := \
 src/main.c \
-x86_cpu.c
+x86_cpu.c \
+x86_io.c \
+x86_mem.c \
+x86_video.c
 
 CORE_ASM_SOURCES := \
 cpu_exec.S \
+cga_blit.S \
 hw_accel.S
 
 # Two-segment layout: RAM_EMU + ITCM (the interpreter hot loop).

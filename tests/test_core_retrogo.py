@@ -100,7 +100,8 @@ def main():
     syms = get_symbols(args.elf)
     for name in ("core_ready", "core_dtcm_ok", "benchmark_cycles",
                  "benchmark_insns", "bonus_pool_size", "core_magic",
-                 "run_benchmark_flag"):
+                 "run_benchmark_flag", "frames_rendered", "fb_sample",
+                 "clut_sample", "guest_ram_bytes", "guest_vram_ok"):
         if name not in syms:
             sys.exit(f"symbol {name} not in {args.elf}")
 
@@ -133,6 +134,46 @@ def main():
             dump_log(runner.backend, args.firmware_elf, tail=40)
             return 1
 
+        # The emulator loop, checked through state rather than through a
+        # screenshot: headless gwemu renders nothing at all -- even Retro-Go's
+        # own menu comes back black -- so the picture cannot be verified here.
+        # What CAN be verified is that the guest ran, the blitter produced the
+        # right palette indices, and the CLUT reached the firmware.
+        frames_a = runner.backend.read_uint32(syms["frames_rendered"])
+        time.sleep(1.0)
+        frames_b = runner.backend.read_uint32(syms["frames_rendered"])
+        fb_sample = runner.backend.read_uint32(syms["fb_sample"])
+        clut_sample = runner.backend.read_uint32(syms["clut_sample"])
+        guest_ram = runner.backend.read_uint32(syms["guest_ram_bytes"])
+        vram_ok = runner.backend.read_uint32(syms["guest_vram_ok"])
+
+        print("\n--- emulator loop ---")
+        print(f"frames           {frames_a} -> {frames_b}")
+        print(f"guest RAM        {guest_ram} bytes")
+        print(f"VRAM allocated   {vram_ok}")
+        print(f"fb first 4 px    0x{fb_sample:08x}")
+        print(f"clut[1]          0x{clut_sample:08x}")
+
+        loop_ok = True
+        if frames_b <= frames_a:
+            print("FAIL: frame counter is not advancing")
+            loop_ok = False
+        if guest_ram != 640 * 1024:
+            print(f"FAIL: expected 640 KB of guest RAM, got {guest_ram}")
+            loop_ok = False
+        if not vram_ok:
+            print("FAIL: VRAM was not allocated")
+            loop_ok = False
+        # The demo guest fills VRAM with 0x6C1B, whose low byte 0x1B is
+        # 00 01 10 11 -> palette indices 0,1,2,3 left to right.
+        if fb_sample != 0x03020100:
+            print(f"FAIL: blitter wrote 0x{fb_sample:08x}, expected 0x03020100")
+            loop_ok = False
+        # Palette 1 high intensity, colour 1 = light cyan.
+        if clut_sample != 0xFF55FFFF:
+            print(f"FAIL: clut[1] was 0x{clut_sample:08x}, expected 0xff55ffff")
+            loop_ok = False
+
         dtcm_ok = runner.backend.read_uint32(syms["core_dtcm_ok"])
         bonus = runner.backend.read_uint32(syms["bonus_pool_size"])
         # The core does NOT self-start the benchmark: auto-running it at boot
@@ -152,7 +193,7 @@ def main():
         if insns:
             print(f"cyc/insn         {cycles / insns:.2f}")
 
-        ok = True
+        ok = loop_ok
         if not dtcm_ok:
             print("FAIL: DTCM allocation failed"); ok = False
         if insns != 1000001:

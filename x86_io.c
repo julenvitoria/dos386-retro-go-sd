@@ -98,6 +98,32 @@ uint32_t x86_port_read(uint32_t port, uint32_t size)
         return x86_io.pit2_reload & 0xFF;
     case 0x61:
         return x86_io.port61;
+
+    /*
+     * CGA status (0x3DA). Games poll this to sync to the display: the usual
+     * idiom waits for vertical retrace to END and then to BEGIN, so both bits
+     * must actually change or the guest spins forever. Bit 3 is vertical
+     * retrace, bit 0 is "display disabled", which is true during either
+     * retrace.
+     *
+     * The vertical position comes from cga_beam, which the frame loop advances,
+     * so a wait for vsync lasts about the right length of time. The horizontal
+     * bit is driven off the read counter instead: a tight poll loop makes no
+     * forward progress in emulated time otherwise, and would hang on a beam
+     * value that never moves between two reads.
+     */
+    case 0x3DA: {
+        unsigned v = 0;
+        if (x86_io.cga_beam >= 0xD000u)
+            v |= 0x08u | 0x01u;                 /* vertical retrace */
+        else if (++x86_io.cga_status_reads & 8u)
+            v |= 0x01u;                         /* horizontal retrace */
+        return v;
+    }
+    case 0x3D8:
+        return x86_io.cga_mode;
+    case 0x3D9:
+        return x86_io.cga_color_select;
     }
     /* An unassigned port floats high, which is what a real bus does and what
        DOS code probing for hardware expects to see. */
@@ -116,6 +142,15 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
         break;
     case 0x61:
         x86_io.port61 = (uint8_t)value;
+        break;
+
+    case 0x3D8:
+        x86_io.cga_mode = (uint8_t)value;
+        x86_video_refresh_palette();
+        break;
+    case 0x3D9:
+        x86_io.cga_color_select = (uint8_t)value;
+        x86_video_refresh_palette();
         break;
     default:
         break;
