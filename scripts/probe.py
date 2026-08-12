@@ -90,7 +90,8 @@ def main():
 
     missing = [w for w in watches if w not in syms]
     missing += [s for s, _, _ in derefs if s not in syms]
-    missing += [s for s, _, _, _ in dumps if s not in syms]
+    missing += [s for s, _, _, _ in dumps
+                if not s.startswith("0x") and s not in syms]
     if missing:
         sys.exit(f"symbols not found in {elf}: {missing}")
 
@@ -120,7 +121,7 @@ def main():
         # as empty.
         if dumps:
             target.backend.halt()
-            dump_arrays(target, syms, dumps)
+            dump_arrays(target, syms, dumps, symbol_maps=maps)
             target.backend.resume()
         if args.faults:
             from scripts.common.probe import read_faults

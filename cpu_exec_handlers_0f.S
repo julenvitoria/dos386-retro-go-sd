@@ -141,10 +141,23 @@ L(HANDLE_INTERRUPT):
 OP .op_iret_CF
     /* Pops IP, CS, FLAGS -- the exact inverse of the frame above. The old
        version popped 32-bit values, skipped a word, and never installed CS. */
+    MOVW R3, #:lower16:x86_iret_log
+    MOVT R3, #:upper16:x86_iret_log
+    LDR.W R12, [R8, #CPU_ESP]
+    STR R12, [R3, #12]             @ SP before the pops
     POP_V R0, R3, R12              @ IP
+    MOVW R3, #:lower16:x86_iret_log
+    MOVT R3, #:upper16:x86_iret_log
+    STR R0, [R3]
     POP_V R5, R3, R12              @ CS
     UXTH R5, R5
+    MOVW R3, #:lower16:x86_iret_log
+    MOVT R3, #:upper16:x86_iret_log
+    STR R5, [R3, #4]
     POP_V R11, R3, R12             @ FLAGS
+    MOVW R3, #:lower16:x86_iret_log
+    MOVT R3, #:upper16:x86_iret_log
+    STR R11, [R3, #8]
     PUSH {R0, LR}
     MOV.W R4, #1
     BL L(SET_SREG)

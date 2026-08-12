@@ -39,14 +39,20 @@ def region_of(addr):
 
 
 def describe_pc(pc, symbol_maps):
-    """'ITCM' for our interpreter, else 'REGION sym+0xoff'."""
+    """'REGION sym+0xoff'.
+
+    ITCM used to be reported as a bare "(interpreter)" because it held only the
+    fetch loop. It now holds several hundred named handlers, and which one is
+    running is the whole question when a guest misbehaves -- so resolve it like
+    anywhere else.
+    """
     region = region_of(pc)
-    if region == "ITCM":
-        return "ITCM (interpreter)"
     merged = {}
     for m in symbol_maps:
         merged.update(m)
-    return f"{region} {nearest_symbol(merged, pc)}" if merged else region
+    if not merged:
+        return region
+    return f"{region} {nearest_symbol(merged, pc)}"
 
 
 # ARMv7-M fault status registers. Reading these is how you stop guessing why
@@ -108,19 +114,39 @@ def parse_dump(spec):
     return sym, int(cnt or 8, 0), group, (label or sym)
 
 
-def dump_arrays(target, syms, dumps, out=print):
-    """Print each requested array as words, grouped."""
+def _dump_base(sym, syms):
+    """A symbol name, or a literal address for memory with no symbol -- guest
+    RAM, a peripheral register, a stack frame."""
+    if sym.startswith("0x") or sym.startswith("0X"):
+        return int(sym, 16)
+    return syms.get(sym)
+
+
+def dump_arrays(target, syms, dumps, out=print, symbol_maps=()):
+    """Print each requested array as words, grouped.
+
+    Words that land inside a known function are annotated with it. Half of what
+    these logs hold is code addresses -- a saved LR, a handler entry -- and
+    resolving them by hand against nm output is slow and easy to get wrong.
+    """
+    maps = symbol_maps or [syms]
     for sym, count, group, label in dumps:
-        if sym not in syms:
+        base = _dump_base(sym, syms)
+        if base is None:
             out(f"  {label}: symbol not found")
             continue
-        base = syms[sym]
         words = [target.backend.read_uint32(base + 4 * i) for i in range(count)]
         out(f"  {label} @0x{base:08x}:")
         for i in range(0, count, group):
             chunk = words[i:i + group]
-            cells = "  ".join(f"0x{w:08x} ({w})" for w in chunk)
-            out(f"    [{i // group}] {cells}")
+            cells = []
+            for w in chunk:
+                note = describe_pc(w, maps) if w > 0x100 else ""
+                # Only keep it when it actually resolved to a name.
+                if note and "+" not in note and not note.endswith(")"):
+                    note = ""
+                cells.append(f"0x{w:08x}" + (f" <{note}>" if note else f" ({w})"))
+            out(f"    [{i // group}] " + "  ".join(cells))
 
 
 def sample(target, syms, watches=(), derefs=(), count=10, interval=1.0,

@@ -3388,8 +3388,10 @@ L(SET_SREG):
        by shifting, so an unmasked register produced a base above the 1 MB real
        mode limit while the stored selector still looked correct. */
     UXTH R5, R5
-    /* Trace CS loads. Every far transfer and every interrupt installs CS here,
-       so this one place names them all. */
+    /* Trace CS loads. Every far transfer and every interrupt installs CS
+       here, so this one place names them all. LR is logged too: it is the
+       return address into whichever handler called us, which identifies the
+       instruction type without a tag at each call site. */
     CMP R4, #1
     BNE.N L(SET_SREG_NOLOG)
     MOVW R3, #:lower16:x86_cs_log_idx
@@ -3397,12 +3399,15 @@ L(SET_SREG):
     LDR R0, [R3]
     ADD.W R12, R0, #1
     STR R12, [R3]
-    AND.W R0, R0, #7
+    AND.W R0, R0, #3               @ 4 entries of 4 words
     MOVW R3, #:lower16:x86_cs_log
     MOVT R3, #:upper16:x86_cs_log
-    ADD.W R3, R3, R0, LSL #3
+    ADD.W R3, R3, R0, LSL #4
     STR R10, [R3]                  @ linear EIP at the transfer
     STR R5, [R3, #4]               @ the CS being installed
+    STR LR, [R3, #8]               @ who called us
+    LDR.W R12, [R8, #CPU_ESP]
+    STR R12, [R3, #12]             @ SP, to tell a stack pop from an immediate
 L(SET_SREG_NOLOG):
     MOV.W R3, #SEG_STRIDE
     MLA R3, R4, R3, R8

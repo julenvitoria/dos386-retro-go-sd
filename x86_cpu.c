@@ -266,3 +266,7 @@ uint32_t x86_mode_table(int op32, int addr32)
  * since all of them install CS through the same path. */
 uint32_t x86_cs_log[16];
 uint32_t x86_cs_log_idx;
+
+/* Diagnostic: what the last IRET popped, and the SP it popped from.
+ * [0]=IP [1]=CS [2]=FLAGS [3]=SP before the pops. */
+uint32_t x86_iret_log[4];
