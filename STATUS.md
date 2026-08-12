@@ -7,7 +7,7 @@ Roadmap and phase definitions: [`PLAN.md`](PLAN.md).
 
 | Tier | State |
 |---|---|
-| 1. gwemu bare-metal | 209/209 `test_opcodes.py`, plus `test_video`/`test_dos`/`test_screen` |
+| 1. gwemu bare-metal | 215/215 `test_opcodes.py`, plus `test_video`/`test_dos`/`test_screen` |
 | 2. gwemu + retro-go | `core_dtcm_ok=1`, bonus pool 153,600 B, 1,000,001 insns — matches tier 1 |
 | 3. Hardware | 50.50 cyc/insn, 5.54 MIPS |
 
@@ -60,10 +60,11 @@ relocations, INT 21h on FatFs -- fed by the guest `.dsk` streamed from SD.
 ## TOPBENCH (the current 16-bit correctness driver)
 
 The .dsk streams, AUTOEXEC.BAT names the program, the MZ loader places it and
-its Borland relocator runs. Four bug classes found and fixed against it so far
+its Borland relocator runs. Five bug classes found and fixed against it so far
 (see `git log`): the v-width shift group was pass-agnostic; `INC`/`DEC r/m8` and
 `INC`/`DEC Ev` set no flags; thirteen stack handlers ignored `SS.base` and used a
-4-byte slot; the shift operand FETCH and `XCHG` were 32-bit in 16-bit mode.
+4-byte slot; the shift operand FETCH and `XCHG` were 32-bit in 16-bit mode; and
+all three `TEST` forms set no flags while 16-bit `CBW`/`CWD` ran `CWDE`/`CDQ`.
 
 It now runs ~1.34 M instructions and dies inside the self-unpacker.
 `scripts/ref_trace.py` says a real 8086 takes 1,553,044 to reach INT 21h, so
@@ -73,9 +74,10 @@ copy itself, its direction, large counts, granule crossing and the 16-bit index
 wrap are all covered by passing tier-1 cases, so the cause is elsewhere. No
 screenshot yet: `hle_calls_seen` is still 0, meaning nothing has been printed.
 
-Known-broken and untested, from a read of the handler table -- any of them could
-be next: `TEST` 0x84/0xA8/0xA9 set no flags at all, and 0x98/0x99 are
-dual-emitted with fixed bodies so 16-bit `CBW`/`CWD` execute `CWDE`/`CDQ`.
+Next step is `scripts/ref_trace.py` against a fresh trace: the divergence is
+between the relocation copy and the first INT 21h, and the alignment traps in
+TOOLING have to be respected or the diff points at the wrong instruction --
+they cost most of a session here.
 
 ## Open defects
 
