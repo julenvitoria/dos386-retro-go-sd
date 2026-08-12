@@ -111,6 +111,7 @@ python3 tests/test_opcodes.py            # 162 cases: EFLAGS, segmentation,
                                          # 16-bit, 66/67, interrupts, speaker
 python3 tests/test_benchmark.py
 python3 tests/test_game.py
+python3 tests/test_dos.py                # MCB arena, walked from the host
 python3 tests/test_video.py              # CGA mode 4 blitter, pixel-exact
 python3 tests/test_screen.py             # what the LTDC actually scans out,
                                          # reconstructed to build/artifacts/screen.png

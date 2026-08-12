@@ -69,6 +69,11 @@ volatile uint32_t load_guest_flag = 0;
 
 /* Video self-test. The host writes a pattern into cga_test_vram, raises the
    flag, and reads cga_test_out back to check the expansion independently. */
+/* DOS arena self-test. The host arms it and reads the results back; the MCB
+   chain lives in guest memory so the host can also walk it independently. */
+volatile uint32_t run_dos_flag = 0;
+volatile uint32_t dos_r[16];
+
 volatile uint32_t run_video_flag = 0;
 volatile uint32_t video_blit_cycles = 0;
 uint8_t cga_test_vram[X86_VRAM_BYTES];
@@ -361,6 +366,29 @@ void Reset_Handler(void) {
             run_benchmark_flag = 0;
         }
         
+        if (run_dos_flag == 1) {
+            /* Exercise the arena the way a program does: allocate, allocate,
+               free the first, allocate something that only fits if the freed
+               block was really reclaimed, then resize. */
+            x86_dos_arena_init();
+            uint16_t largest0 = 0;
+            uint16_t a = dos_test_alloc(0x100, &largest0);
+            uint16_t b = dos_test_alloc(0x100, &largest0);
+            dos_r[0] = a;
+            dos_r[1] = b;
+            dos_r[2] = (b > a) ? (b - a) : 0;      /* spacing: 0x101 paras */
+            dos_r[3] = dos_test_free(a);
+            uint16_t c = dos_test_alloc(0x80, &largest0);
+            dos_r[4] = c;
+            dos_r[5] = (c == a) ? 1 : 0;           /* reused the hole */
+            uint16_t largest = 0;
+            dos_r[6] = dos_test_resize(b, 0x40, &largest);
+            dos_r[7] = dos_test_alloc(0xFFFF, &largest);
+            dos_r[8] = largest;                    /* must report a real size */
+            dos_r[9] = dos_test_walk();            /* chain still consistent */
+            run_dos_flag = 0;
+        }
+
         if (run_video_flag == 1) {
             x86_video_init(cga_test_vram, cga_test_palette);
             /* init clears VRAM; the host's pattern is written after the flag

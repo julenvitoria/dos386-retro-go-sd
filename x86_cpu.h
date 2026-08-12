@@ -186,6 +186,14 @@ int x86_bios_keyboard(uint8_t func);
 int x86_bios_time(uint8_t func);
 int x86_dos_int21(uint8_t func);
 int x86_dos_terminate(void);
+void x86_dos_arena_init(void);
+int x86_dos_exec(const char *path, const char *cmdline);
+uint16_t x86_dos_psp(void);
+extern uint32_t x86_dos_last_error;
+uint16_t dos_test_alloc(uint16_t paras, uint16_t *largest);
+uint16_t dos_test_free(uint16_t seg);
+uint16_t dos_test_resize(uint16_t seg, uint16_t paras, uint16_t *largest);
+uint16_t dos_test_walk(void);
 extern uint32_t x86_hle_unhandled_vector, x86_hle_unhandled_func;
 
 uint32_t x86_port_read(uint32_t port, uint32_t size);

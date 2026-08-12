@@ -72,7 +72,14 @@ path. The fold and dispatch were measured together and are not separable.
       cleared, CS installed; `IRET` inverts it. `CR0.PE` traps out
 - [x] `0F 0B imm8` hypercall, gated on `hle_enabled`, real `#UD` when off;
       sets `exit_reason=X86_EXIT_HLE_INT`, `exit_info=selector`
-- [ ] FreeDOS bring-up; INT 13h → FatFs; INT 10h/16h/1Ah
+- [x] HLE dispatch: `0F 0B` stubs planted per vector, host-side service table
+- [x] BIOS: INT 10h / 16h / 1Ah over a real BIOS Data Area
+- [x] CGA text mode 3 (8x8 font, 16-colour attributes, 40 visible columns)
+- [x] DOS: real MCB arena (alloc/free/resize/coalesce, largest-block reporting),
+      PSP, MZ loader with relocations, INT 21h core + file handles on FatFs
+- [ ] Hardware keyboard: port 0x60, IRQ 1, INT 09h feeding the BIOS ring
+- [ ] Stream the `.dsk` from SD through the firmware's FatFs
+- [ ] Load ALLEYCAT.EXE through `x86_dos_exec` instead of the built-in demo
 - [x] PC speaker: PIT ch2 + port 0x61 driven by real guest OUT; square-wave
       renderer with phase carried across buffers
 - [x] Port I/O on a C dispatch
