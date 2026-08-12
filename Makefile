@@ -1,134 +1,112 @@
-#
-# TinyEMU
-# 
-# Copyright (c) 2016-2018 Fabrice Bellard
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
-# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-# THE SOFTWARE.
-#
+CC = arm-none-eabi-gcc
+AS = arm-none-eabi-as
+LD = arm-none-eabi-gcc
+OBJCOPY = arm-none-eabi-objcopy
+SIZE = arm-none-eabi-size
 
-# if set, network filesystem is enabled. libcurl and libcrypto
-# (openssl) must be installed.
-CONFIG_FS_NET=y
-# SDL support (optional)
-CONFIG_SDL=y
-# if set, compile the 128 bit emulator. Note: the 128 bit target does
-# not compile if gcc does not support the int128 type (32 bit hosts).
-CONFIG_INT128=y
-# build x86 emulator
-CONFIG_X86EMU=y
-# win32 build (not usable yet)
-#CONFIG_WIN32=y
-# user space network redirector
-CONFIG_SLIRP=y
+CFLAGS = -mcpu=cortex-m7 -mthumb -O2 -Wall -g -ffunction-sections -fdata-sections
+CFLAGS += -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -D_GNU_SOURCE
+CFLAGS += -DCONFIG_X86EMU -DCONFIG_VERSION=\"1.0\"
 
-ifdef CONFIG_WIN32
-CROSS_PREFIX=i686-w64-mingw32-
-EXE=.exe
-else
-CROSS_PREFIX=
-EXE=
-endif
-CC=$(CROSS_PREFIX)gcc
-STRIP=$(CROSS_PREFIX)strip
-CFLAGS=-O2 -Wall -g -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -MMD
-CFLAGS+=-D_GNU_SOURCE -DCONFIG_VERSION=\"$(shell cat VERSION)\"
-LDFLAGS=
+# The Retro-Go SD external-core SDK is VENDORED into this repo at sdk/, per the
+# template's own model ("headers, bridge trampolines, linker scripts and packers
+# are vendored under sdk/; you do not need a firmware checkout to compile").
+#
+# NOTHING may link against references/ -- that tree is temporary and strictly
+# for reading. To pick up upstream retro-go changes, re-vendor:
+#     scripts/sync_from_firmware.sh <path-to-game-and-watch-retro-go-sd>
+# and update SDK_VERSION. Staying current is a core owner's responsibility.
+SDK = sdk
+SDK_INC = $(SDK)/include
 
-bindir=/usr/local/bin
-INSTALL=install
+# Tier-2 flags. Deliberately free of any retro-go/SDK include path: the
+# bare-metal CPU harness (test_core.elf) depends only on lib/FatFs (our own
+# submodule) and our own headers, which is what keeps it a clean, isolated
+# measurement tier.
+CFLAGS += -DIS_LITTLE_ENDIAN -Ilib/FatFs
 
-PROGS+= temu$(EXE)
-ifndef CONFIG_WIN32
-ifdef CONFIG_FS_NET
-PROGS+=build_filelist splitimg
-endif
-endif
+LDFLAGS = -mcpu=cortex-m7 -mthumb -T STM32H7B0VBTx_SDCARD.ld -Wl,--gc-sections --specs=nosys.specs
+
+PROGS = test_core.elf
+
+TEST_OBJS = x86_cpu.o x86_io.o cpu_exec.o tests/main.o hw_accel.o tests/vdisk.o lib/FatFs/ff.o lib/FatFs/ffunicode.o
 
 all: $(PROGS)
 
-EMU_OBJS:=virtio.o pci.o fs.o cutils.o iomem.o simplefb.o \
-    json.o machine.o temu.o
+test_core.elf: $(TEST_OBJS) TEST.ld
+	$(CC) -mcpu=cortex-m7 -mthumb -T TEST.ld -Wl,--gc-sections --specs=nosys.specs -o $@ $(TEST_OBJS)
+	$(SIZE) $@
 
-ifdef CONFIG_SLIRP
-CFLAGS+=-DCONFIG_SLIRP
-EMU_OBJS+=$(addprefix slirp/, bootp.o ip_icmp.o mbuf.o slirp.o tcp_output.o cksum.o ip_input.o misc.o socket.o tcp_subr.o udp.o if.o ip_output.o sbuf.o tcp_input.o tcp_timer.o)
-endif
+# X86CPUState field offsets, generated on the host so the Thumb-2 core and the
+# C struct cannot drift apart. Built with the host compiler, not $(CC).
+x86_offsets.inc: offset.c x86_cpu.h cutils.h
+	cc -I. -o offset_gen offset.c
+	./offset_gen > $@
+	rm -f offset_gen
 
-ifndef CONFIG_WIN32
-EMU_OBJS+=fs_disk.o
-EMU_LIBS=-lrt
-endif
-ifdef CONFIG_FS_NET
-CFLAGS+=-DCONFIG_FS_NET
-EMU_OBJS+=fs_net.o fs_wget.o fs_utils.o block_net.o
-EMU_LIBS+=-lcurl -lcrypto
-ifdef CONFIG_WIN32
-EMU_LIBS+=-lwsock32
-endif # CONFIG_WIN32
-endif # CONFIG_FS_NET
-ifdef CONFIG_SDL
-EMU_LIBS+=-lSDL
-EMU_OBJS+=sdl.o
-CFLAGS+=-DCONFIG_SDL
-ifdef CONFIG_WIN32
-LDFLAGS+=-mwindows
-endif
-endif
-
-EMU_OBJS+=riscv_machine.o softfp.o riscv_cpu32.o riscv_cpu64.o
-ifdef CONFIG_INT128
-CFLAGS+=-DCONFIG_RISCV_MAX_XLEN=128
-EMU_OBJS+=riscv_cpu128.o
-else
-CFLAGS+=-DCONFIG_RISCV_MAX_XLEN=64
-endif
-ifdef CONFIG_X86EMU
-EMU_OBJS+=x86_cpu.o x86_machine.o ide.o ps2.o vmmouse.o pckbd.o vga.o
-endif
-
-temu$(EXE): $(EMU_OBJS)
-	$(CC) $(LDFLAGS) -o $@ $^ $(EMU_LIBS)
-
-riscv_cpu32.o: riscv_cpu.c
-	$(CC) $(CFLAGS) -DMAX_XLEN=32 -c -o $@ $<
-
-riscv_cpu64.o: riscv_cpu.c
-	$(CC) $(CFLAGS) -DMAX_XLEN=64 -c -o $@ $<
-
-riscv_cpu128.o: riscv_cpu.c
-	$(CC) $(CFLAGS) -DMAX_XLEN=128 -c -o $@ $<
-
-build_filelist: build_filelist.o fs_utils.o cutils.o
-	$(CC) $(LDFLAGS) -o $@ $^ -lm
-
-splitimg: splitimg.o
-	$(CC) $(LDFLAGS) -o $@ $^
-
-install: $(PROGS)
-	$(STRIP) $(PROGS)
-	$(INSTALL) -m755 $(PROGS) "$(DESTDIR)$(bindir)"
+cpu_exec.o: x86_offsets.inc cpu_exec_handlers.S cpu_exec_handlers_0f.S \
+            opcode_table.S opcode_0f_table.S
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-clean:
-	rm -f *.o *.d *~ $(PROGS) slirp/*.o slirp/*.d slirp/*~
+%.o: %.S
+	$(CC) $(CFLAGS) -c -o $@ $<
 
--include $(wildcard *.d)
--include $(wildcard slirp/*.d)
+qemu_bank1.bin: test_core.elf
+	$(OBJCOPY) -O binary $< test_core_intflash.bin
+	dd if=test_core_intflash.bin of=qemu_bank1.bin bs=256k count=1 conv=sync 2>/dev/null
+
+qemu_bank2.bin: qemu_bank1.bin
+	dd if=/dev/zero of=qemu_bank2.bin bs=256k count=1 2>/dev/null
+
+# The guest DISK IMAGE. DOS titles ship as .dsk floppy images, not bare
+# executables -- a .dsk is a FAT12 filesystem, which is exactly what vdisk.c
+# already mounts, and it carries the game's own files rather than one .EXE
+# lifted out of context. The sibling .cfg/.dosmeta describe it to the launcher.
+GUEST_DSK ?= references/game-and-watch-retro-go-sd/roms/dos/ALLEYCAT.dsk
+GUEST_DSK_NAME := $(notdir $(GUEST_DSK))
+
+# Tier-2 extflash: the .dsk IS a FAT12 image, so it is used directly as the
+# backing store that vdisk_init() maps -- no repackaging.
+extflash.bin: $(GUEST_DSK)
+	dd if=/dev/zero of=extflash.bin bs=1M count=64 2>/dev/null
+	dd if=$(GUEST_DSK) of=extflash.bin conv=notrunc 2>/dev/null
+# Bare 1 MB unformatted card, enough for the tier-2 bare-metal harness which
+# never touches it.
+sdcard.img:
+	dd if=/dev/zero of=sdcard.img bs=1M count=1 2>/dev/null
+
+# ---------------------------------------------------------------------------
+# SD card content is NOT built here.
+#
+# make compiles; Python composes and deploys. The card has to reach three
+# destinations -- a gwemu image, a mounted card, and the device over the probe
+# -- and that is one recipe with three backends, not an mtools pipeline.
+#
+#   python3 scripts/sdcard.py --image sdcard_retrogo.img
+#   python3 scripts/sdcard.py --mount /media/.../RETROGO
+#   python3 scripts/sdcard.py --probe
+#
+# dos.bin is built by Makefile.core. It is declared PHONY-ish here so the SD
+# image can never be assembled around a stale core -- the previous split let
+# `make retrogo_media` happily package a core you had not rebuilt.
+# ---------------------------------------------------------------------------
+RETROGO_SD ?= sdcard_retrogo.img
+
+# Ordered steps, not a dependency graph. `dos.bin: core` looked right but was
+# a trap: the dos.bin target had no recipe of its own, so make ran `core`
+# (which rewrites dos.bin) yet never re-stat'd it -- and happily packaged a
+# stale core into the SD image. sdcard.py rebuilds the image unconditionally,
+# so there is nothing for timestamps to save here anyway.
+.PHONY: core sdcard
+core:
+	$(MAKE) -f Makefile.core pack
+
+sdcard: core
+	python3 scripts/sdcard.py --image $(RETROGO_SD)
+
+gwemu_media: qemu_bank1.bin qemu_bank2.bin extflash.bin sdcard.img
+
+clean:
+	rm -f *.o *.d *~ tests/*.o $(PROGS) *.bin *.img

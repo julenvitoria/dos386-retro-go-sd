@@ -1,0 +1,78 @@
+# Retro-Go SD external core — TinyEMU x86 DOS.
+#
+#   make -f Makefile.core          build + pack -> dos.bin
+#   make -f Makefile.core clean
+#
+# Mirrors the structure of the SDK template's root Makefile (identity here,
+# rules in sdk/Makefile). The bare-metal CPU harness is a SEPARATE build:
+# see the default Makefile / test_core.elf. Keeping them apart is deliberate --
+# the harness must stay free of firmware ABI surface so it remains a clean
+# measurement tier.
+
+PROJECT_KIND ?= core
+
+CORE_NAME  := dos
+CORE_ENTRY := app_main
+
+CORE_C_SOURCES := \
+src/main.c \
+x86_cpu.c
+
+CORE_ASM_SOURCES := \
+cpu_exec.S \
+hw_accel.S
+
+# Two-segment layout: RAM_EMU + ITCM (the interpreter hot loop).
+CORE_LDSCRIPT := dos_core.ld
+
+CORE_C_INCLUDES := -I. -Ilib/FatFs
+
+# Match the template's release-firmware layout. COVERFLOW fields sit BEFORE
+# cheat_* in retro_emulator_file_t, so CHEAT_CODES with COVERFLOW=0 misaligns
+# pointers -- our old Makefile had exactly that combination.
+CORE_C_DEFS := \
+-DPROJECT_KIND_CORE=1 \
+-DCOVERFLOW=1 \
+-DCHEAT_CODES=1 \
+-DMAX_CHEAT_CODES=13 \
+-DIS_LITTLE_ENDIAN
+
+GNW_CORE_SDK ?= sdk
+BUILD_DIR ?= build/$(PROJECT_KIND)
+
+PACKED_BIN  := $(CORE_NAME).bin
+PAD_LOGO    := src/assets/pad.png
+HEADER_LOGO := src/assets/header.png
+
+include $(GNW_CORE_SDK)/Makefile
+
+# Must come AFTER the include: the first target in a makefile becomes the
+# default goal, so putting these above it made `make -f Makefile.core` build
+# one object file and stop.
+.DEFAULT_GOAL := all
+
+# Generated X86CPUState offsets, shared with the bare-metal build.
+$(BUILD_DIR)/cpu_exec.o: x86_offsets.inc
+
+x86_offsets.inc: offset.c x86_cpu.h cutils.h
+	cc -I. -o offset_gen offset.c
+	./offset_gen > $@
+	rm -f offset_gen
+
+#######################################
+# Pack -> /cores/dos.bin, ROMs under /roms/dos/
+#######################################
+PACK_CORE := $(GNW_CORE_SDK)/tools/pack_core.py
+
+.PHONY: pack
+pack: $(TARGET_BIN) $(PAD_LOGO) $(HEADER_LOGO)
+	$(V)$(ECHO) [ PACK CORE ] $(PACKED_BIN)
+	$(V)python3 $(PACK_CORE) \
+		--elf $(TARGET_ELF) --bin $(TARGET_BIN) \
+		--system-name "DOS PC" --dirname dos \
+		--extensions "dsk" \
+		--core-name "TinyEMU x86" \
+		--version 0.1.0 \
+		--pad-logo $(PAD_LOGO) \
+		--header-logo $(HEADER_LOGO) \
+		--out $(PACKED_BIN)

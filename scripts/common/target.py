@@ -1,0 +1,385 @@
+"""
+One target abstraction for every tier.
+
+This replaces what used to be four modules -- runner.py, qemu_runner.py,
+hardware_runner.py and retrogo_runner.py -- which duplicated launch, symbol and
+SD handling three times over and left the retro-go path unable to run on
+hardware at all.
+
+Two ideas make one module enough:
+
+  * WHAT boots is an Image: bank1/bank2/extflash/sdcard. The bare-metal CPU
+    harness and the retro-go firmware differ only in which bytes those are.
+  * WHERE it boots is a Target: GwemuTarget (GDBBackend) or HardwareTarget
+    (OpenOCDBackend). Past `.open()` they behave identically, which is exactly
+    why one test script can drive both.
+
+SD card access goes through scripts/common/sdcard.py, which already models the
+three real paths: mcopy into an image (gwemu), sd_write_file over the probe
+(device, incremental), and a plain copy to a mounted block device (device, bulk
+-- repackaging DOS ROMs).
+"""
+
+import atexit
+import json
+import os
+import shutil
+import socket
+import subprocess
+import time
+from dataclasses import dataclass
+
+from gnwmanager.gnw import GnW
+from gnwmanager.ocdbackend.gdb_backend import GDBBackend
+from gnwmanager.ocdbackend.openocd_backend import OpenOCDBackend
+
+from .sdcard import (HardwarePhysicalSDCardManager, HardwareProbeSDCardManager,
+                     QemuSDCardManager)
+
+# gwemu key map (gnw-input.ini), per the firmware's docs/gwemu.md.
+KEYS = {
+    "A": "x", "B": "z", "GAME": "g", "TIME": "t",
+    "PAUSE": "esc", "POWER": "p", "START": "ret", "SELECT": "shift_r",
+    "UP": "up", "DOWN": "down", "LEFT": "left", "RIGHT": "right",
+}
+HOLD_MS = 600   # 200 is too short for the launcher to register; do not lower
+
+BANK_SIZE = 256 * 1024   # gwemu refuses anything else
+
+# Run scratch lives in the PROJECT, never /tmp. Each gwemu run copies the SD
+# image and extflash (100s of MB) into its own directory; on a tmpfs box that
+# is RAM, and leaking a few dozen runs fills it. Always deleted -- pass
+# keep_temp / --keep-temp only when you need the artifacts to look at.
+RUN_ROOT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "build", "run")
+
+
+def _make_run_dir():
+    os.makedirs(RUN_ROOT, exist_ok=True)
+    d = os.path.join(os.path.abspath(RUN_ROOT), f"gwemu-{os.getpid()}-{id(object())}")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+@dataclass
+class Image:
+    """The bytes to boot. bank1/bank2 are internal flash; the rest optional."""
+    bank1: str
+    bank2: str = ""
+    extflash: str = ""
+    sdcard: str = ""
+    elf: str = ""            # for symbol lookup
+    intflash_bank: int = 1   # which bank the firmware was LINKED for
+
+    @property
+    def primary(self):
+        """The bank image that actually carries the firmware."""
+        return self.bank2 if self.intflash_bank == 2 else self.bank1
+
+
+def bare_metal_image(elf="test_core.elf", bin_="test_core_intflash.bin"):
+    """Tier 1: our own bare-metal harness, no SD, no extflash needed."""
+    return Image(bank1=bin_, elf=elf, intflash_bank=1)
+
+
+def timeline_quit_time(path):
+    """Seconds until a timeline's `quit` event, or None if it has none.
+
+    A test that polls the target for longer than this outlives gwemu: the
+    process exits on `quit` and the next backend read fails with "Connection
+    closed by remote", which reads as a target fault rather than a harness
+    bug. Callers clamp their waits with this instead of hardcoding a duration
+    that silently goes stale when the timeline changes.
+    """
+    try:
+        with open(path) as fh:
+            lines = fh.readlines()
+    except OSError:
+        return None
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "quit":
+            try:
+                return float(parts[0])
+            except ValueError:
+                return None
+    return None
+
+
+class QMP:
+    """Minimal QMP client. Used for screendump; input goes via timelines."""
+
+
+    def __init__(self, port, timeout=20.0):
+        deadline = time.time() + timeout
+        last = None
+        while time.time() < deadline:
+            try:
+                self.sock = socket.create_connection(("localhost", port), 2.0)
+                break
+            except OSError as exc:
+                last = exc
+                time.sleep(0.2)
+        else:
+            raise RuntimeError(f"could not reach QMP on {port}: {last}")
+        self.f = self.sock.makefile("rw", encoding="utf-8", newline="\n")
+        self._read()
+        self._cmd("qmp_capabilities")
+
+    def _read(self):
+        while True:
+            line = self.f.readline()
+            if not line:
+                raise RuntimeError("QMP closed")
+            msg = json.loads(line)
+            if "event" in msg:
+                continue
+            return msg
+
+    def _cmd(self, execute, **args):
+        payload = {"execute": execute}
+        if args:
+            payload["arguments"] = args
+        self.f.write(json.dumps(payload) + "\n")
+        self.f.flush()
+        return self._read()
+
+    def send_key(self, name, hold_ms=HOLD_MS):
+        return self._cmd("send-key",
+                         keys=[{"type": "qcode", "data": KEYS[name.upper()]}],
+                         **{"hold-time": hold_ms})
+
+    def screendump(self, path):
+        return self._cmd("screendump", filename=os.path.abspath(path))
+
+    def close(self):
+        try:
+            self.f.close()
+            self.sock.close()
+        except Exception:
+            pass
+
+
+class Target:
+    """Common surface: .backend, .sdcard, start(), stop()."""
+
+    def __init__(self, image):
+        self.image = image
+        self.backend = None
+        self.sdcard = None
+
+    def start(self):
+        raise NotImplementedError
+
+    def stop(self):
+        raise NotImplementedError
+
+    def collect_artifacts(self, dest="build/artifacts"):
+        return []
+
+
+class GwemuTarget(Target):
+    """Boot an Image under gwemu."""
+
+    def __init__(self, image, display=False, audio=False, icount=None,
+                 timeline=None, port=None, qmp_port=None, keep_temp=False):
+        super().__init__(image)
+        self.display = display
+        self.audio = audio
+        self.icount = icount
+        self.timeline = timeline
+        self.port = port or _free_port()
+        self.qmp_port = qmp_port or _free_port()
+        self.proc = None
+        self.qmp = None
+        self.keep_temp = keep_temp
+        # Isolate: gwemu hardcodes relative image names, and concurrent runs out
+        # of one directory corrupt each other (docs/04 §3).
+        self.tmpdir = _make_run_dir()
+        # Belt and braces: if a harness dies before stop(), still clean up.
+        atexit.register(self._cleanup)
+
+    def _pad_bank(self, src, name):
+        dst = os.path.join(self.tmpdir, name)
+        data = b""
+        if src and os.path.exists(src):
+            with open(src, "rb") as fh:
+                data = fh.read()
+        if len(data) > BANK_SIZE:
+            raise RuntimeError(f"{src} is {len(data)}B, larger than a bank")
+        with open(dst, "wb") as fh:
+            fh.write(data.ljust(BANK_SIZE, b"\x00"))
+        return dst
+
+    def start(self):
+        try:
+            self._start()
+        except Exception:
+            self.stop()          # never leave a populated run dir behind
+            raise
+
+    def _start(self):
+        img = self.image
+        self._pad_bank(img.bank1, "qemu_bank1.bin")
+        self._pad_bank(img.bank2, "qemu_bank2.bin")
+        for src, name in ((img.extflash, "extflash.bin"),
+                          (img.sdcard, "sdcard.img")):
+            if src and os.path.exists(src):
+                shutil.copy(src, os.path.join(self.tmpdir, name))
+
+        cmd = ["gwemu", "-machine", "gnw-h7b0",
+               "-global", "gnw-h7b0-soc.bank1-image=qemu_bank1.bin",
+               "-global", "gnw-h7b0-soc.bank2-image=qemu_bank2.bin"]
+        if os.path.exists(os.path.join(self.tmpdir, "extflash.bin")):
+            cmd += ["-global", "gnw-h7b0-soc.extflash-image=extflash.bin"]
+        # Silent by default: these run in the background repeatedly.
+        cmd += ["-audiodev", ("sdl,id=snd0" if self.audio else "none,id=snd0"),
+                "-global", "gnw-h7b0-sai1.audiodev=snd0"]
+        if os.path.exists(os.path.join(self.tmpdir, "sdcard.img")):
+            cmd += ["-drive", "if=sd,format=raw,file=sdcard.img"]
+        cmd += ["-display", "gwemu" if self.display else "none",
+                "-qmp", f"tcp:localhost:{self.qmp_port},server=on,wait=off",
+                "-gdb", f"tcp::{self.port}", "-S"]
+        if self.icount is not None:
+            # Without -icount, virtual time follows host wall-clock and DWT
+            # counts vary ~14% run to run. See docs/06.
+            cmd += ["-icount", f"shift={self.icount},align=off,sleep=off"]
+
+        env = dict(os.environ)
+        if self.timeline:
+            tl = os.path.abspath(self.timeline)
+            if not os.path.exists(tl):
+                raise RuntimeError(f"timeline not found: {tl}")
+            env["GNW_TIMELINE"] = tl
+
+        self.proc = subprocess.Popen(cmd, cwd=self.tmpdir, env=env)
+        time.sleep(1.0)
+        self.qmp = QMP(self.qmp_port)
+        self.backend = GDBBackend(host="localhost", port=self.port)
+        self.backend.open()
+        self.sdcard = QemuSDCardManager(os.path.join(self.tmpdir, "sdcard.img"))
+        self.backend.resume()
+
+    def press(self, *names, delay=0.5):
+        for n in names:
+            self.qmp.send_key(n)
+            time.sleep(delay)
+
+    def collect_artifacts(self, dest="build/artifacts"):
+        os.makedirs(dest, exist_ok=True)
+        out = []
+        for name in sorted(os.listdir(self.tmpdir)):
+            if name.endswith((".png", ".ppm")):
+                shutil.copy(os.path.join(self.tmpdir, name),
+                            os.path.join(dest, name))
+                out.append(os.path.join(dest, name))
+        if out:
+            print(f"artifacts -> {dest}/ ({len(out)} files)")
+        return out
+
+    def _cleanup(self):
+        if self.keep_temp or not self.tmpdir:
+            return
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        self.tmpdir = None
+
+    def stop(self):
+        try:
+            if self.qmp:
+                self.qmp.close()
+            if self.proc:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+        finally:
+            if self.keep_temp:
+                print(f"kept run dir: {self.tmpdir}")
+            self._cleanup()
+
+    # Context-manager form so cleanup is structural, not remembered.
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop()
+        return False
+
+
+class HardwareTarget(Target):
+    """Boot an Image on the real device over a debug probe."""
+
+    def __init__(self, image, physical_sdcard=None):
+        super().__init__(image)
+        self.physical_sdcard = physical_sdcard
+        self.gnw = None
+
+    def start(self):
+        print("Attaching to hardware via OpenOCD...")
+        self.backend = OpenOCDBackend()
+        self.backend.open()
+        self.gnw = GnW(self.backend)
+        self.gnw.start_gnwmanager()
+
+        # Flash the bank the image was LINKED for. A bank-2 firmware written to
+        # bank 1 boots nothing, and this used to be hardcoded to bank 1.
+        bank = self.image.intflash_bank
+        src = self.image.primary
+        print(f"Flashing {src} to internal flash bank {bank}...")
+        with open(src, "rb") as fh:
+            self.gnw.flash(bank, 0, fh.read())
+
+        self.sdcard = (HardwarePhysicalSDCardManager(self.physical_sdcard)
+                       if self.physical_sdcard
+                       else HardwareProbeSDCardManager(self.gnw))
+
+        self.gnw.reset_and_halt()
+        self.backend.resume()
+
+    def stop(self):
+        proc = getattr(self.backend, "_openocd_process", None)
+        if proc:
+            proc.terminate()
+            proc.wait()
+
+
+def add_target_args(parser):
+    """Shared CLI surface. Every harness gets the same switches."""
+    # "qemu" is accepted as an alias for "gwemu": existing harnesses and docs
+    # use it, and the emulator is a QEMU fork.
+    parser.add_argument("--target", choices=["gwemu", "qemu", "hardware"],
+                        default="gwemu", help="where to run")
+    parser.add_argument("--gui", action="store_true",
+                        help="show the gwemu window")
+    parser.add_argument("--audio", action="store_true",
+                        help="enable host audio (silent by default)")
+    parser.add_argument("--icount", default=None,
+                        help="gwemu -icount shift; makes DWT counts "
+                             "reproducible (see docs/06)")
+    parser.add_argument("--timeline", default=None,
+                        help="input timeline to replay under gwemu")
+    parser.add_argument("--physical-sdcard", default=None,
+                        help="mounted SD path for bulk hardware copies")
+    parser.add_argument("--keep-temp", action="store_true",
+                        help="keep the run directory under build/run/ for "
+                             "analysis (deleted by default -- each run copies "
+                             "the SD image and extflash)")
+
+
+def open_target(args, image):
+    """Build the Target an argparse namespace asks for."""
+    if getattr(args, "target", "gwemu") == "hardware":
+        return HardwareTarget(image, physical_sdcard=args.physical_sdcard)
+    return GwemuTarget(image, display=getattr(args, "gui", False),
+                       audio=getattr(args, "audio", False),
+                       icount=getattr(args, "icount", None),
+                       timeline=getattr(args, "timeline", None),
+                       keep_temp=getattr(args, "keep_temp", False))

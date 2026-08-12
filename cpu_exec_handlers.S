@@ -1,0 +1,3327 @@
+
+#ifndef MACROS_DEFINED
+#define MACROS_DEFINED
+
+/* ------------------------------------------------------------------------
+ * x86 arithmetic flags.
+ *
+ * R11 holds a materialized x86 EFLAGS word: CF=0 PF=2 AF=4 ZF=6 SF=7 OF=11.
+ * Every consumer already reads that format (EVAL_COND, SETcc, PUSHF/POPF,
+ * SAHF/LAHF, the string ops' DF check), so keeping it means the flag layer
+ * lands without touching any of them.
+ *
+ * Flags come out of the host PSR: after an S-form ARM op, N/Z/C/V are exactly
+ * the x86 SF/ZF/CF/OF provided the operands were normalized to the TOP of the
+ * word (LSL #NSH: 24 for byte ops, 0 for dword). That is the same trick the
+ * ALU-core collapse will use to serve 8/16/32 from one core.
+ *
+ * Note on cost: PF and AF are computed eagerly here. That is deliberate for a
+ * first correct implementation -- it keeps every consumer unchanged and is
+ * verifiable by the FLAGS cases in tests/test_opcodes.py. It is also the
+ * expensive choice (~9 of the ~16 instructions below), which is why the plan
+ * converts PF/AF to lazy evaluation during the ALU-core collapse. Doing that
+ * conversion is a change to these macros, not to their ~30 call sites.
+ * ------------------------------------------------------------------------ */
+
+/* PF = even parity of the low 8 bits of the result. Bits above 7 fold out of
+   bit 0 on their own, so no masking is needed. */
+.macro X86_PF res, t
+    EOR  \t, \res, \res, LSR #4
+    EOR  \t, \t, \t, LSR #2
+    EOR  \t, \t, \t, LSR #1
+    MVN  \t, \t
+    BFI  R11, \t, #2, #1
+.endm
+
+/* SF/ZF from N/Z. LSR #30 puts Z at bit0 and N at bit1, which BFI drops
+   straight into EFLAGS[7:6]. */
+.macro X86_SF_ZF t0, t1
+    LSR  \t1, \t0, #30
+    BFI  R11, \t1, #6, #2
+.endm
+
+/* AF = carry out of bit 3 = (a ^ b ^ result) bit 4. \afaux must already hold
+   that XOR; the caller computes a^b before the op and XORs the result after. */
+.macro X86_AF afaux, t, sh=0
+    /* The aux word is a^b^result. AF is the carry out of bit 3, i.e. bit 4 of
+       the OPERAND -- which sits at bit 4+sh once operands are normalized to the
+       top of the word. Reading bit 4 unconditionally made AF wrong for every
+       8-bit op. */
+    LSR  \t, \afaux, #(4 + \sh)
+    BFI  R11, \t, #4, #1
+.endm
+
+/* ADD/SUB/CMP/ADC/SBB/NEG. cf_inv=1 for subtract-like ops, because ARM's C is
+   "no borrow" where x86's CF is "borrow". */
+.macro X86_FLAGS_ARITH res, afaux, t0, t1, cf_inv, sh=0
+    MRS  \t0, APSR
+    X86_SF_ZF \t0, \t1
+    LSR  \t1, \t0, #29
+.if \cf_inv
+    EOR  \t1, \t1, #1
+.endif
+    BFI  R11, \t1, #0, #1          @ CF
+    LSR  \t1, \t0, #28
+    BFI  R11, \t1, #11, #1         @ OF
+    X86_AF \afaux, \t1, \sh
+    X86_PF \res, \t1
+.endm
+
+/* Narrow ADC/SBB.
+ *
+ * The normalize-to-the-top trick cannot carry: ADCS injects the host carry at
+ * bit 0, but a normalized operand's LSB is at bit `sh`, so the carry-in landed
+ * in dead bits and was discarded by the shift back down. 8-bit ADC/SBB
+ * therefore ignored CF entirely, and nothing tested it.
+ *
+ * Compute the sum at full width instead -- a and b are below 2^W, so a+b+c
+ * cannot truncate -- then normalize the RESULT with one LSLS, which lands
+ * N=SF, Z=ZF and C=carry-out-of-bit-W together. For subtract, C is the borrow
+ * directly (a negative s leaves bits W..31 set), so unlike the SUBS path this
+ * needs no CF inversion. Only OF is built by hand.
+ *
+ * a: R3 (becomes result), b: R5 (dead after), scratch R0/R1/R4.
+ * R2 is the destination pointer and must stay live.
+ */
+    .macro X86_ADC_NARROW sh, sub
+    UBFX R0, R11, #0, #1           @ CF in
+    EOR.W R4, R3, R5               @ a ^ b
+.if \sub
+    SUB.W R1, R3, R5
+    SUB.W R1, R1, R0               @ s = a - b - c
+    EOR.W R0, R3, R1               @ a ^ s
+    AND.W R0, R0, R4               @ OF(sub) = (a^b) & (a^s)
+.else
+    ADD.W R1, R3, R5
+    ADD.W R1, R1, R0               @ s = a + b + c
+    EOR.W R0, R3, R1               @ a ^ s
+    EOR.W R3, R5, R1               @ b ^ s
+    AND.W R0, R0, R3               @ OF(add) = (a^s) & (b^s)
+.endif
+    EOR.W R4, R4, R1               @ a ^ b ^ s; AF at bit 4, operands unshifted
+    LSLS R3, R1, #\sh              @ N=SF, Z=ZF, C=carry/borrow out of bit W
+    MRS  R5, APSR
+    X86_SF_ZF R5, R1
+    LSR  R1, R5, #29
+    BFI  R11, R1, #0, #1           @ CF
+    LSR  R0, R0, #(31 - \sh)
+    BFI  R11, R0, #11, #1          @ OF
+    X86_AF R4, R1, 0
+    LSR  R3, R3, #\sh              @ result back down
+    X86_PF R3, R1
+    .endm
+
+/* AND/OR/XOR/TEST: x86 defines CF=0 and OF=0; AF is undefined and left alone. */
+.macro X86_FLAGS_LOGIC res, t0, t1
+    MRS  \t0, APSR
+    X86_SF_ZF \t0, \t1
+    BIC  R11, R11, #1              @ CF = 0
+    BIC  R11, R11, #(1 << 11)      @ OF = 0
+    X86_PF \res, \t1
+.endm
+
+/* Shifts. ARM's S-form shifts set C to the last bit shifted out, which is
+   exactly x86's CF. OF is architecturally defined only for a count of 1 and is
+   NOT implemented here -- see the shift entry in STATUS.md. */
+.macro X86_FLAGS_SHIFT res, t0, t1
+    MRS  \t0, APSR
+    X86_SF_ZF \t0, \t1
+    LSR  \t1, \t0, #29
+    BFI  R11, \t1, #0, #1          @ CF = last bit shifted out
+    X86_PF \res, \t1
+.endm
+
+/* INC/DEC are ADD/SUB that must leave CF untouched. */
+.macro X86_FLAGS_INCDEC res, afaux, t0, t1
+    MRS  \t0, APSR
+    X86_SF_ZF \t0, \t1
+    LSR  \t1, \t0, #28
+    BFI  R11, \t1, #11, #1         @ OF
+    X86_AF \afaux, \t1
+    X86_PF \res, \t1
+.endm
+
+.macro ALU_TABLE_32 name dispatch target_suffix
+\name:
+    .short (ALU\target_suffix\()_ADD_32 - (\dispatch + 4)) / 2
+    .short (ALU\target_suffix\()_OR_32 - (\dispatch + 4)) / 2
+    .short (ALU\target_suffix\()_ADC_32 - (\dispatch + 4)) / 2
+    .short (ALU\target_suffix\()_SBB_32 - (\dispatch + 4)) / 2
+    .short (ALU\target_suffix\()_AND_32 - (\dispatch + 4)) / 2
+    .short (ALU\target_suffix\()_SUB_32 - (\dispatch + 4)) / 2
+    .short (ALU\target_suffix\()_XOR_32 - (\dispatch + 4)) / 2
+    .short (ALU\target_suffix\()_CMP_32 - (\dispatch + 4)) / 2
+.endm
+
+.macro ALU_TABLE_16 name dispatch target_suffix
+\name:
+    .short (ALU\target_suffix\()_ADD_16 - (\dispatch + 4)) / 2
+    .short (ALU\target_suffix\()_OR_16 - (\dispatch + 4)) / 2
+    .short (ALU\target_suffix\()_ADC_16 - (\dispatch + 4)) / 2
+    .short (ALU\target_suffix\()_SBB_16 - (\dispatch + 4)) / 2
+    .short (ALU\target_suffix\()_AND_16 - (\dispatch + 4)) / 2
+    .short (ALU\target_suffix\()_SUB_16 - (\dispatch + 4)) / 2
+    .short (ALU\target_suffix\()_XOR_16 - (\dispatch + 4)) / 2
+    .short (ALU\target_suffix\()_CMP_16 - (\dispatch + 4)) / 2
+.endm
+
+.macro SHIFT_TABLE_32 name dispatch target_suffix
+\name:
+    .short (SHIFT\target_suffix\()_ROL_32 - (\dispatch + 4)) / 2
+    .short (SHIFT\target_suffix\()_ROR_32 - (\dispatch + 4)) / 2
+    .short (SHIFT\target_suffix\()_RCL_32 - (\dispatch + 4)) / 2
+    .short (SHIFT\target_suffix\()_RCR_32 - (\dispatch + 4)) / 2
+    .short (SHIFT\target_suffix\()_SHL_32 - (\dispatch + 4)) / 2
+    .short (SHIFT\target_suffix\()_SHR_32 - (\dispatch + 4)) / 2
+    .short (SHIFT\target_suffix\()_SHL_32 - (\dispatch + 4)) / 2
+    .short (SHIFT\target_suffix\()_SAR_32 - (\dispatch + 4)) / 2
+.endm
+
+.macro SHIFT_TABLE_16 name dispatch target_suffix
+\name:
+    .short (SHIFT\target_suffix\()_ROL_16 - (\dispatch + 4)) / 2
+    .short (SHIFT\target_suffix\()_ROR_16 - (\dispatch + 4)) / 2
+    .short (SHIFT\target_suffix\()_RCL_16 - (\dispatch + 4)) / 2
+    .short (SHIFT\target_suffix\()_RCR_16 - (\dispatch + 4)) / 2
+    .short (SHIFT\target_suffix\()_SHL_16 - (\dispatch + 4)) / 2
+    .short (SHIFT\target_suffix\()_SHR_16 - (\dispatch + 4)) / 2
+    .short (SHIFT\target_suffix\()_SHL_16 - (\dispatch + 4)) / 2
+    .short (SHIFT\target_suffix\()_SAR_16 - (\dispatch + 4)) / 2
+.endm
+
+/* String-operation primitives.
+ *
+ * The source is DS:(E)SI and may be overridden; the destination is ES:(E)DI
+ * and may NOT be. Index registers are used at the ADDRESS size, which is a
+ * separate axis from the operand size -- R2 still points at the mode record
+ * here (string ops take no ModRM), so bit ADDRSIZE_XOR of it is the live
+ * address size. The old handlers used raw ESI/EDI as linear addresses with no
+ * base and no wrap, which is only correct in a flat 32-bit model.
+ */
+    .macro STR_SRC out, tmp
+        LDR.W \out, [R8, #REG_ESI]
+        TST.W R2, #ADDRSIZE_XOR
+        IT EQ
+        UXTHEQ \out, \out
+        SUBS \tmp, R6, R8             @ segment override in play?
+        IT EQ
+        ADDEQ R6, R8, #SEG_DS_SEL
+        LDR.W \tmp, [R6, #4]
+        ADD.W \out, \out, \tmp
+    .endm
+
+    .macro STR_DST out, tmp
+        LDR.W \out, [R8, #REG_EDI]
+        TST.W R2, #ADDRSIZE_XOR
+        IT EQ
+        UXTHEQ \out, \out
+        LDR.W \tmp, [R8, #SEG_ES_BASE]
+        ADD.W \out, \out, \tmp
+    .endm
+
+    .macro STR_ADV off, delta, tmp
+        LDR.W \tmp, [R8, #\off]
+        ADD.W \tmp, \tmp, \delta
+        TST.W R2, #ADDRSIZE_XOR
+        IT EQ
+        UXTHEQ \tmp, \tmp            @ SI/DI wrap at the address size
+        STR.W \tmp, [R8, #\off]
+    .endm
+
+    /* +w or -w according to DF, in two instructions plus the scale. */
+    .macro STR_DELTA out, w
+        SBFX \out, R11, #10, #1
+        ORR.W \out, \out, #1
+    .if \w == 2
+        LSL.W \out, \out, #1
+    .endif
+    .if \w == 4
+        LSL.W \out, \out, #2
+    .endif
+    .endm
+
+/* Stack primitives. Both widths, both passes.
+   PUSH_V: val is stored; tsp/tptr are scratch and are clobbered.
+   The linear address is SS.base + SP, with SP wrapped to the stack width
+   BEFORE the base is added -- a 16-bit stack cannot walk out of its segment. */
+    .macro PUSH_V val, tsp, tptr
+        LDR.W \tsp, [R8, #CPU_ESP]
+        SP_DEC \tsp
+        SP_WRAP \tsp
+        STR.W \tsp, [R8, #CPU_ESP]
+        LDR.W \tptr, [R8, #SEG_SS_BASE]
+        ADD.W \tptr, \tptr, \tsp
+        UBFX \tsp, \tptr, #12, #12
+        LDR.W \tsp, [R9, \tsp, LSL #2]
+        ADDS \tsp, \tsp, \tptr
+        BMI .mem_fault
+        ST_V \val, \tsp
+    .endm
+
+    .macro POP_V dest, tsp, tptr
+        LDR.W \tsp, [R8, #CPU_ESP]
+        LDR.W \tptr, [R8, #SEG_SS_BASE]
+        ADD.W \tptr, \tptr, \tsp
+        UBFX \dest, \tptr, #12, #12
+        LDR.W \dest, [R9, \dest, LSL #2]
+        ADDS \dest, \dest, \tptr
+        BMI .mem_fault
+        LD_V \dest, \dest
+        SP_INC \tsp
+        SP_WRAP \tsp
+        STR.W \tsp, [R8, #CPU_ESP]
+    .endm
+
+#endif
+
+/* Width normalization. These MUST live outside the MACROS_DEFINED guard: that
+   guard is processed once, so a definition inside it would freeze the first
+   pass's (32-bit, empty) form and silently make every 16-bit ALU flag wrong. */
+#undef VNORM
+#undef VDENORM
+#if NSH
+#define VNORM(r)   LSL.W r, r, #NSH
+#define VDENORM(r) LSR.W r, r, #NSH
+#else
+#define VNORM(r)
+#define VDENORM(r)
+#endif
+
+#define ALU_TABLE_M CONCAT(ALU_TABLE, OP_SUFFIX)
+#define SHIFT_TABLE_M CONCAT(SHIFT_TABLE, OP_SUFFIX)
+
+OP_AGNOSTIC .op_nop
+    B.W .fetch_decode_loop
+
+OP .op_inc_r32
+    AND.W R2, R0, #7
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    LDREG_V R3, R2
+    MVN.W R4, R3                   @ AF aux: a ^ b with b == 1
+    ADDS R3, R3, #1
+    EOR.W R4, R4, R3
+    X86_FLAGS_INCDEC R3, R4, R0, R1    @ INC must not disturb CF
+    B.N L(WRITE_REG)
+
+OP .op_dec_r32
+    AND.W R2, R0, #7
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    LDREG_V R3, R2
+    MVN.W R4, R3
+    SUBS R3, R3, #1
+    EOR.W R4, R4, R3
+    X86_FLAGS_INCDEC R3, R4, R0, R1    @ DEC must not disturb CF
+L(WRITE_REG):
+    STREG_V R3, R2
+    B.W .fetch_decode_loop
+
+OP .op_push_r32
+    AND.W R2, R0, #7
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    LDREG_V R3, R2
+    PUSH_V R3, R4, R12
+    B.W .fetch_decode_loop
+
+OP .op_pop_r32
+    AND.W R2, R0, #7
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    POP_V R3, R4, R12
+    STREG_V R3, R2
+    B.W .fetch_decode_loop
+
+OP .op_mov_r32_imm32
+    AND.W R2, R0, #7
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    UBFX R3, R10, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R10
+    BMI .mem_fault
+    LD_V R3, R3
+    EIP_ADV_V
+    STREG_V R3, R2
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_alu_eb_gb
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.N L(ALU_EB_GB_MEM)
+    UBFX R4, R1, #3, #3
+    AND.W R5, R4, #3
+    MOV.W R5, R5, LSL #2
+    MOV.W R4, R4, LSR #2
+    ADD R4, R5
+    ADD.W R4, R4, #8
+    LDRB.W R5, [R8, R4]
+    AND.W R2, R1, #7
+    AND.W R3, R2, #3
+    MOV.W R3, R3, LSL #2
+    MOV.W R2, R2, LSR #2
+    ADD R2, R3
+    ADD.W R2, R2, #8
+    ADD R2, R8
+    LDRB R3, [R2, #0]
+    B.N L(ALU_DISPATCH_8_SUBOP)
+L(ALU_EB_GB_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    UBFX R4, R1, #3, #3
+    AND.W R5, R4, #3
+    MOV.W R5, R5, LSL #2
+    MOV.W R4, R4, LSR #2
+    ADD R4, R5
+    ADD.W R4, R4, #8
+    LDRB.W R5, [R8, R4]
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    BMI .mem_fault
+    LDRB R3, [R2, #0]
+L(ALU_DISPATCH_8_SUBOP):
+    UBFX R12, R0, #3, #3
+L(ALU_DISPATCH_8):
+    TBH [PC, R12, LSL #1]
+L(ALU_TABLE_EB_GB):
+    ALU_TABLE_M L(ALU_TABLE_EB_GB), L(ALU_DISPATCH_8), 8
+
+OP .op_alu_ev_gv
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.N L(ALU_EV_GV_MEM)
+    UBFX R4, R1, #3, #3
+    MOV.W R4, R4, LSL #2
+    ADD.W R4, R4, #8
+    LDREG_V R5, R4
+    AND.W R2, R1, #7
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    ADD R2, R8
+    LD_V R3, R2
+    B.N L(ALU_DISPATCH_32_SUBOP)
+L(ALU_EV_GV_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    UBFX R4, R1, #3, #3
+    MOV.W R4, R4, LSL #2
+    ADD.W R4, R4, #8
+    LDREG_V R5, R4
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    BMI .mem_fault
+    LD_V R3, R2
+L(ALU_DISPATCH_32_SUBOP):
+    UBFX R12, R0, #3, #3
+L(ALU_DISPATCH_32):
+    TBH [PC, R12, LSL #1]
+L(ALU_TABLE_EV_GV):
+    ALU_TABLE_M L(ALU_TABLE_EV_GV), L(ALU_DISPATCH_32), 
+
+OP_AGNOSTIC .op_alu_gb_eb
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.N L(ALU_GB_EB_MEM)
+    AND.W R2, R1, #7
+    AND.W R3, R2, #3
+    MOV.W R3, R3, LSL #2
+    MOV.W R2, R2, LSR #2
+    ADD R2, R3
+    ADD.W R2, R2, #8
+    LDRB.W R5, [R8, R2]
+    UBFX R4, R1, #3, #3
+    AND.W R3, R4, #3
+    MOV.W R3, R3, LSL #2
+    MOV.W R4, R4, LSR #2
+    ADD R4, R3
+    ADD.W R4, R4, #8
+    ADD.W R2, R8, R4
+    LDRB R3, [R2, #0]
+    B.N L(ALU_DISPATCH_8_GB_EB_SUBOP)
+L(ALU_GB_EB_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    BMI .mem_fault
+    LDRB R5, [R2, #0]
+    UBFX R4, R1, #3, #3
+    AND.W R3, R4, #3
+    MOV.W R3, R3, LSL #2
+    MOV.W R4, R4, LSR #2
+    ADD R4, R3
+    ADD.W R4, R4, #8
+    ADD.W R2, R8, R4
+    LDRB R3, [R2, #0]
+L(ALU_DISPATCH_8_GB_EB_SUBOP):
+    UBFX R12, R0, #3, #3
+L(ALU_DISPATCH_8_GB_EB):
+    TBH [PC, R12, LSL #1]
+L(ALU_TABLE_GB_EB):
+    ALU_TABLE_M L(ALU_TABLE_GB_EB), L(ALU_DISPATCH_8_GB_EB), 8
+
+OP .op_alu_gv_ev
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.N L(ALU_GV_EV_MEM)
+    AND.W R2, R1, #7
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    LDREG_V R5, R2
+    UBFX R4, R1, #3, #3
+    MOV.W R4, R4, LSL #2
+    ADD.W R4, R4, #8
+    ADD.W R2, R8, R4
+    LD_V R3, R2
+    B.N L(ALU_DISPATCH_32_GV_EV_SUBOP)
+L(ALU_GV_EV_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    BMI .mem_fault
+    LD_V R5, R2
+    UBFX R4, R1, #3, #3
+    MOV.W R4, R4, LSL #2
+    ADD.W R4, R4, #8
+    ADD.W R2, R8, R4
+    LD_V R3, R2
+L(ALU_DISPATCH_32_GV_EV_SUBOP):
+    UBFX R12, R0, #3, #3
+L(ALU_DISPATCH_32_GV_EV):
+    TBH [PC, R12, LSL #1]
+L(ALU_TABLE_GV_EV):
+    ALU_TABLE_M L(ALU_TABLE_GV_EV), L(ALU_DISPATCH_32_GV_EV), 
+
+OP_AGNOSTIC .op_alu_al_imm8
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRB R5, [R5, #0]
+    ADD.W R10, R10, #1
+    ADD.W R2, R8, #8
+    LDRB R3, [R2, #0]
+L(ALU_DISPATCH_8_AL_SUBOP):
+    UBFX R12, R0, #3, #3
+L(ALU_DISPATCH_8_AL):
+    TBH [PC, R12, LSL #1]
+L(ALU_TABLE_AL):
+    ALU_TABLE_M L(ALU_TABLE_AL), L(ALU_DISPATCH_8_AL), 8
+
+OP .op_alu_eax_imm32
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LD_V R5, R5
+    EIP_ADV_V
+    ADD.W R2, R8, #8
+    LD_V R3, R2
+L(ALU_DISPATCH_32_EAX_SUBOP):
+    UBFX R12, R0, #3, #3
+L(ALU_DISPATCH_32_EAX):
+    TBH [PC, R12, LSL #1]
+L(ALU_TABLE_EAX):
+    ALU_TABLE_M L(ALU_TABLE_EAX), L(ALU_DISPATCH_32_EAX), 
+
+OP_AGNOSTIC .op_alu_eb_imm8_80
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    UBFX R12, R1, #3, #3
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.N L(ALU_EB_IMM8_80_MEM)
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRB R5, [R5, #0]
+    ADD.W R10, R10, #1
+    AND.W R2, R1, #7
+    AND.W R3, R2, #3
+    MOV.W R3, R3, LSL #2
+    MOV.W R2, R2, LSR #2
+    ADD R2, R3
+    ADD.W R2, R2, #8
+    ADD R2, R8
+    LDRB R3, [R2, #0]
+    B.N L(ALU_DISPATCH_EB_IMM8_80_SUBOP)
+L(ALU_EB_IMM8_80_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRB R5, [R5, #0]
+    ADD.W R10, R10, #1
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    BMI .mem_fault
+    LDRB R3, [R2, #0]
+L(ALU_DISPATCH_EB_IMM8_80_SUBOP):
+    UBFX R12, R1, #3, #3
+L(ALU_DISPATCH_EB_IMM8_80):
+    TBH [PC, R12, LSL #1]
+L(ALU_TABLE_EB_IMM8_80):
+    ALU_TABLE_M L(ALU_TABLE_EB_IMM8_80), L(ALU_DISPATCH_EB_IMM8_80), 8
+
+OP .op_alu_ev_imm32_81
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    UBFX R12, R1, #3, #3
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.N L(ALU_EV_IMM32_81_MEM)
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LD_V R5, R5
+    EIP_ADV_V
+    AND.W R2, R1, #7
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    ADD R2, R8
+    LD_V R3, R2
+    B.N L(ALU_DISPATCH_EV_IMM32_81_SUBOP)
+L(ALU_EV_IMM32_81_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LD_V R5, R5
+    EIP_ADV_V
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    BMI .mem_fault
+    LD_V R3, R2
+L(ALU_DISPATCH_EV_IMM32_81_SUBOP):
+    UBFX R12, R1, #3, #3
+L(ALU_DISPATCH_EV_IMM32_81):
+    TBH [PC, R12, LSL #1]
+L(ALU_TABLE_EV_IMM32_81):
+    ALU_TABLE_M L(ALU_TABLE_EV_IMM32_81), L(ALU_DISPATCH_EV_IMM32_81), 
+
+OP .op_alu_ev_imm8_83
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    UBFX R12, R1, #3, #3
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.N L(ALU_EV_IMM8_83_MEM)
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRSB.W R5, [R5]
+    ADD.W R10, R10, #1
+    AND.W R2, R1, #7
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    ADD R2, R8
+    LD_V R3, R2
+    B.N L(ALU_DISPATCH_EV_IMM8_83_SUBOP)
+L(ALU_EV_IMM8_83_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRSB.W R5, [R5]
+    ADD.W R10, R10, #1
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    BMI .mem_fault
+    LD_V R3, R2
+L(ALU_DISPATCH_EV_IMM8_83_SUBOP):
+    UBFX R12, R1, #3, #3
+L(ALU_DISPATCH_EV_IMM8_83):
+    TBH [PC, R12, LSL #1]
+L(ALU_TABLE_EV_IMM8_83):
+    ALU_TABLE_M L(ALU_TABLE_EV_IMM8_83), L(ALU_DISPATCH_EV_IMM8_83), 
+
+OP_AGNOSTIC .op_test_eb_gb_84
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.W .exit_loop
+    B.W .fetch_decode_loop
+
+OP .op_test_ev_gv_85
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.W .exit_loop
+    UBFX R4, R1, #3, #3            @ reg operand
+    MOV.W R4, R4, LSL #2
+    ADD.W R4, R4, #8
+    LDREG_V R5, R4
+    AND.W R2, R1, #7               @ r/m operand (register form)
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    LDREG_V R3, R2
+    ANDS.W R3, R3, R5              @ TEST sets flags and discards the result
+    X86_FLAGS_LOGIC R3, R0, R1
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_xchg_eb_gb_86
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.W .exit_loop
+    UBFX R4, R1, #3, #3
+    AND.W R5, R4, #3
+    MOV.W R5, R5, LSL #2
+    MOV.W R4, R4, LSR #2
+    ADD R4, R5
+    ADD.W R4, R4, #8
+    LDRB.W R5, [R8, R4]
+    AND.W R2, R1, #7
+    AND.W R3, R2, #3
+    MOV.W R3, R3, LSL #2
+    MOV.W R2, R2, LSR #2
+    ADD R2, R3
+    ADD.W R2, R2, #8
+    LDRB.W R3, [R8, R2]
+    STRB.W R5, [R8, R2]
+    STRB.W R3, [R8, R4]
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_xchg_ev_gv_87
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.W .exit_loop
+    UBFX R4, R1, #3, #3
+    MOV.W R4, R4, LSL #2
+    ADD.W R4, R4, #8
+    LDR.W R5, [R8, R4]
+    AND.W R2, R1, #7
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    LDR.W R3, [R8, R2]
+    STR.W R5, [R8, R2]
+    STR.W R3, [R8, R4]
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_mov_eb_gb_88
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.W L(MOV_EB_GB_MEM)
+    UBFX R4, R1, #3, #3
+    AND.W R5, R4, #3
+    MOV.W R5, R5, LSL #2
+    MOV.W R4, R4, LSR #2
+    ADD R4, R5
+    ADD.W R4, R4, #8
+    LDRB.W R5, [R8, R4]
+    AND.W R2, R1, #7
+    AND.W R3, R2, #3
+    MOV.W R3, R3, LSL #2
+    MOV.W R2, R2, LSR #2
+    ADD R2, R3
+    ADD.W R2, R2, #8
+    STRB.W R5, [R8, R2]
+    B.W .fetch_decode_loop
+
+/* MOV Eb, Gb -- memory form. The whole 88/89/8A/8B family had none: the
+   non-register ModRM went straight to .exit_loop, and no test used a memory
+   operand with MOV, so the suite was green over a hole. */
+L(MOV_EB_GB_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    UBFX R4, R1, #3, #3
+    AND.W R5, R4, #3
+    MOV.W R5, R5, LSL #2
+    MOV.W R4, R4, LSR #2
+    ADD R4, R5
+    ADD.W R4, R4, #8
+    LDRB.W R5, [R8, R4]
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    BMI .mem_fault
+    STRB R5, [R2, #0]
+    B.W .fetch_decode_loop
+
+OP .op_mov_ev_gv_89
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.W L(MOV_EV_GV_MEM)
+    UBFX R4, R1, #3, #3
+    MOV.W R4, R4, LSL #2
+    ADD.W R4, R4, #8
+    LDREG_V R5, R4
+    AND.W R2, R1, #7
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    STREG_V R5, R2
+    B.W .fetch_decode_loop
+
+L(MOV_EV_GV_MEM):
+    /* MOV Ev, Gv -- memory form. The source register is read AFTER the decode:
+       DECODE_MODRM uses R5 as scratch, so hoisting the load above the call to
+       fill the walk's shadow silently corrupts the stored value. R1 survives
+       the call, so the reg field is still available here. */
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    UBFX R4, R1, #3, #3
+    MOV.W R4, R4, LSL #2
+    ADD.W R4, R4, #8
+    LDREG_V R5, R4
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    BMI .mem_fault
+    ST_V R5, R2
+    B.W .fetch_decode_loop
+
+OP .op_lea_8D
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BEQ.W .exit_loop
+    UBFX R4, R1, #3, #3
+    MOV.W R4, R4, LSL #2
+    ADD.W R4, R4, #8
+    ADD R4, R8
+    PUSH {R4}
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    POP {R4}
+    STR R7, [R4, #0]
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_mov_gb_eb_8A
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.W L(MOV_GB_EB_MEM)
+    AND.W R4, R1, #7
+    AND.W R5, R4, #3
+    MOV.W R5, R5, LSL #2
+    MOV.W R4, R4, LSR #2
+    ADD R4, R5
+    ADD.W R4, R4, #8
+    LDRB.W R5, [R8, R4]
+    UBFX R2, R1, #3, #3
+    AND.W R3, R2, #3
+    MOV.W R3, R3, LSL #2
+    MOV.W R2, R2, LSR #2
+    ADD R2, R3
+    ADD.W R2, R2, #8
+    STRB.W R5, [R8, R2]
+    B.W .fetch_decode_loop
+
+L(MOV_GB_EB_MEM):
+    /* MOV Gb, Eb -- memory form. */
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    BMI .mem_fault
+    LDRB R5, [R2, #0]
+    UBFX R2, R1, #3, #3
+    AND.W R3, R2, #3
+    MOV.W R3, R3, LSL #2
+    MOV.W R2, R2, LSR #2
+    ADD R2, R3
+    ADD.W R2, R2, #8
+    STRB.W R5, [R8, R2]
+    B.W .fetch_decode_loop
+
+OP .op_mov_gv_ev_8B
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.W L(MOV_GV_EV_MEM)
+    AND.W R4, R1, #7
+    MOV.W R4, R4, LSL #2
+    ADD.W R4, R4, #8
+    LDREG_V R5, R4
+    UBFX R2, R1, #3, #3
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    STREG_V R5, R2
+    B.W .fetch_decode_loop
+
+L(MOV_GV_EV_MEM):
+    /* MOV Gv, Ev -- memory form. */
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    BMI .mem_fault
+    LD_V R5, R2
+    UBFX R2, R1, #3, #3
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    STREG_V R5, R2
+    B.W .fetch_decode_loop
+
+OP .op_pop_ev_8F
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.W .exit_loop
+    AND.W R2, R1, #7
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    LDR.W R4, [R8, #24]
+    UBFX R3, R4, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R4
+    BMI .mem_fault
+    LD_V R3, R3
+    ADD.W R4, R4, #4
+    STR.W R4, [R8, #24]
+    STREG_V R3, R2
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_xchg_eax_r32
+    AND.W R2, R0, #7
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    LDR.W R4, [R8, #8]
+    LDR.W R3, [R8, R2]
+    STR.W R4, [R8, R2]
+    STR.W R3, [R8, #8]
+    B.W .fetch_decode_loop
+
+OP .op_cwde_98
+    LDR.W R3, [R8, #8]
+    SXTH R3, R3
+    STR.W R3, [R8, #8]
+    B.W .fetch_decode_loop
+
+OP .op_cdq_99
+    LDR.W R3, [R8, #8]
+    MOV.W R4, R3, ASR #31
+    STR.W R4, [R8, #16]
+    B.W .fetch_decode_loop
+
+OP .op_pushfd_9C
+    LDR.W R4, [R8, #24]
+    SUB.W R4, R4, #4
+    STR.W R4, [R8, #24]
+    UBFX R12, R4, #12, #12
+    LDR.W R12, [R9, R12, LSL #2]
+    ADDS R12, R12, R4
+    BMI .mem_fault
+    ST_V R11, R12
+    B.W .fetch_decode_loop
+
+OP .op_popfd_9D
+    LDR.W R4, [R8, #24]
+    UBFX R3, R4, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R4
+    BMI .mem_fault
+    LDR.W R11, [R3]
+    ADD.W R4, R4, #4
+    STR.W R4, [R8, #24]
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_mov_al_moffs8_A0
+    UBFX R4, R10, #12, #12
+    LDR.W R4, [R9, R4, LSL #2]
+    ADDS R4, R4, R10
+    BMI .mem_fault
+    LDR R4, [R4, #0]
+    ADD.W R10, R10, #4
+    UBFX R3, R4, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R4
+    BMI .mem_fault
+    LDRB R3, [R3, #0]
+    STRB.W R3, [R8, #8]
+    B.W .fetch_decode_loop
+
+OP .op_mov_eax_moffs32_A1
+    UBFX R4, R10, #12, #12
+    LDR.W R4, [R9, R4, LSL #2]
+    ADDS R4, R4, R10
+    BMI .mem_fault
+    LD_V R4, R4
+    EIP_ADV_V
+    UBFX R3, R4, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R4
+    BMI .mem_fault
+    LD_V R3, R3
+    STR.W R3, [R8, #8]
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_mov_moffs8_al_A2
+    UBFX R4, R10, #12, #12
+    LDR.W R4, [R9, R4, LSL #2]
+    ADDS R4, R4, R10
+    BMI .mem_fault
+    LDR R4, [R4, #0]
+    ADD.W R10, R10, #4
+    LDRB.W R3, [R8, #8]
+    UBFX R12, R4, #12, #12
+    LDR.W R12, [R9, R12, LSL #2]
+    ADDS R12, R12, R4
+    BMI .mem_fault
+    STRB.W R3, [R12]
+    B.W .fetch_decode_loop
+
+OP .op_mov_moffs32_eax_A3
+    UBFX R4, R10, #12, #12
+    LDR.W R4, [R9, R4, LSL #2]
+    ADDS R4, R4, R10
+    BMI .mem_fault
+    LD_V R4, R4
+    EIP_ADV_V
+    LDR.W R3, [R8, #8]
+    UBFX R12, R4, #12, #12
+    LDR.W R12, [R9, R12, LSL #2]
+    ADDS R12, R12, R4
+    BMI .mem_fault
+    ST_V R3, R12
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_test_al_imm8_A8
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRB R5, [R5, #0]
+    ADD.W R10, R10, #1
+    LDRB.W R3, [R8, #8]
+    AND.W R3, R3, R5
+    B.W .fetch_decode_loop
+
+OP .op_test_eax_imm32_A9
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LD_V R5, R5
+    EIP_ADV_V
+    LDR.W R3, [R8, #8]
+    AND.W R3, R3, R5
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_movsb_A4
+    STR_SRC R4, R3
+    MEM_GET_PTR R3, R4
+    LDRB R3, [R3]
+    STR_DST R5, R12
+    MEM_GET_PTR R12, R5
+    STRB R3, [R12]
+    STR_DELTA R7, 1
+    STR_ADV REG_ESI, R7, R4
+    STR_ADV REG_EDI, R7, R5
+    B.W .str_exit
+
+OP .op_movsd_A5
+    STR_SRC R4, R3
+    MEM_GET_PTR R3, R4
+    LD_V R3, R3
+    STR_DST R5, R12
+    MEM_GET_PTR R12, R5
+    ST_V R3, R12
+    STR_DELTA R7, OPSZ
+    STR_ADV REG_ESI, R7, R4
+    STR_ADV REG_EDI, R7, R5
+    B.W .str_exit
+
+OP_AGNOSTIC .op_cmpsb_A6
+    STR_SRC R4, R3
+    MEM_GET_PTR R3, R4
+    LDRB R3, [R3]
+    STR_DST R5, R12
+    MEM_GET_PTR R12, R5
+    LDRB R5, [R12]
+    LSL.W R3, R3, #24
+    LSL.W R5, R5, #24
+    EOR.W R4, R3, R5
+    SUBS R3, R3, R5
+    EOR.W R4, R4, R3
+    LSR.W R3, R3, #24
+    X86_FLAGS_ARITH R3, R4, R0, R1, 1, 24
+    STR_DELTA R7, 1
+    STR_ADV REG_ESI, R7, R4
+    STR_ADV REG_EDI, R7, R5
+    B.W .str_exit
+
+OP .op_cmpsd_A7
+    STR_SRC R4, R3
+    MEM_GET_PTR R3, R4
+    LD_V R3, R3
+    STR_DST R5, R12
+    MEM_GET_PTR R12, R5
+    LD_V R5, R12
+    VNORM(R3)
+    VNORM(R5)
+    EOR.W R4, R3, R5
+    SUBS R3, R3, R5
+    EOR.W R4, R4, R3
+    VDENORM(R3)
+    X86_FLAGS_ARITH R3, R4, R0, R1, 1, NSH
+    STR_DELTA R7, OPSZ
+    STR_ADV REG_ESI, R7, R4
+    STR_ADV REG_EDI, R7, R5
+    B.W .str_exit
+
+OP_AGNOSTIC .op_stosb_AA
+    STR_DST R5, R12
+    MEM_GET_PTR R12, R5
+    LDRB.W R3, [R8, #REG_EAX]
+    STRB R3, [R12]
+    STR_DELTA R7, 1
+    STR_ADV REG_EDI, R7, R5
+    B.W .str_exit
+
+OP .op_stosd_AB
+    STR_DST R5, R12
+    MEM_GET_PTR R12, R5
+    LDREG_V R3, #REG_EAX
+    ST_V R3, R12
+    STR_DELTA R7, OPSZ
+    STR_ADV REG_EDI, R7, R5
+    B.W .str_exit
+
+OP_AGNOSTIC .op_lodsb_AC
+    STR_SRC R4, R3
+    MEM_GET_PTR R3, R4
+    LDRB R3, [R3]
+    STRB.W R3, [R8, #REG_EAX]
+    STR_DELTA R7, 1
+    STR_ADV REG_ESI, R7, R4
+    B.W .str_exit
+
+OP .op_lodsd_AD
+    STR_SRC R4, R3
+    MEM_GET_PTR R3, R4
+    LD_V R3, R3
+    STREG_V R3, #REG_EAX
+    STR_DELTA R7, OPSZ
+    STR_ADV REG_ESI, R7, R4
+    B.W .str_exit
+
+OP_AGNOSTIC .op_scasb_AE
+    STR_DST R5, R12
+    MEM_GET_PTR R12, R5
+    LDRB R5, [R12]
+    LDRB.W R3, [R8, #REG_EAX]
+    LSL.W R3, R3, #24
+    LSL.W R5, R5, #24
+    EOR.W R4, R3, R5
+    SUBS R3, R3, R5
+    EOR.W R4, R4, R3
+    LSR.W R3, R3, #24
+    X86_FLAGS_ARITH R3, R4, R0, R1, 1, 24
+    STR_DELTA R7, 1
+    STR_ADV REG_EDI, R7, R5
+    B.W .str_exit
+
+OP .op_scasd_AF
+    STR_DST R5, R12
+    MEM_GET_PTR R12, R5
+    LD_V R5, R12
+    LDREG_V R3, #REG_EAX
+    VNORM(R3)
+    VNORM(R5)
+    EOR.W R4, R3, R5
+    SUBS R3, R3, R5
+    EOR.W R4, R4, R3
+    VDENORM(R3)
+    X86_FLAGS_ARITH R3, R4, R0, R1, 1, NSH
+    STR_DELTA R7, OPSZ
+    STR_ADV REG_EDI, R7, R5
+    B.W .str_exit
+
+OP_AGNOSTIC .op_mov_r8_imm8
+    AND.W R2, R0, #7
+    AND.W R3, R2, #3
+    MOV.W R3, R3, LSL #2
+    MOV.W R2, R2, LSR #2
+    ADD R2, R3
+    ADD.W R2, R2, #8
+    UBFX R3, R10, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R10
+    BMI .mem_fault
+    LDRB R3, [R3, #0]
+    ADD.W R10, R10, #1
+    STRB.W R3, [R8, R2]
+    B.W .fetch_decode_loop
+
+OP .op_ret_C3
+    POP_V R4, R0, R12
+    LDR.W R3, [R8, #SEG_CS_BASE]
+    ADD.W R10, R4, R3
+    B.W .fetch_decode_loop
+
+OP .op_ret_imm16_C2
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRH R5, [R5, #0]
+    LDR.W R4, [R8, #24]
+    UBFX R10, R4, #12, #12
+    LDR.W R10, [R9, R10, LSL #2]
+    ADDS R10, R10, R4
+    BMI .mem_fault
+    LDR.W R10, [R10]
+    ADD.W R4, R4, #4
+    ADD R4, R5
+    STR.W R4, [R8, #24]
+    B.W .fetch_decode_loop
+
+OP .op_leave_C9
+    LDR.W R3, [R8, #28]
+    STR.W R3, [R8, #24]
+    LDR.W R4, [R8, #24]
+    UBFX R3, R4, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R4
+    BMI .mem_fault
+    LD_V R3, R3
+    ADD.W R4, R4, #4
+    STR.W R4, [R8, #24]
+    STR.W R3, [R8, #28]
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_mov_eb_imm8_C6
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.W .exit_loop
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRB R5, [R5, #0]
+    ADD.W R10, R10, #1
+    AND.W R2, R1, #7
+    AND.W R3, R2, #3
+    MOV.W R3, R3, LSL #2
+    MOV.W R2, R2, LSR #2
+    ADD R2, R3
+    ADD.W R2, R2, #8
+    STRB.W R5, [R8, R2]
+    B.W .fetch_decode_loop
+
+OP .op_mov_ev_imm32_C7
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.W .exit_loop
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LD_V R5, R5
+    EIP_ADV_V
+    AND.W R2, R1, #7
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    STREG_V R5, R2
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_shift_ev_imm8_C1
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.N L(SHIFT_EV_IMM8_C1_MEM)
+    AND.W R2, R1, #7
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    ADD R2, R8
+    LDR R3, [R2, #0]
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRB R5, [R5, #0]
+    ADD.W R10, R10, #1
+    AND.W R5, R5, #31
+    B.N L(SHIFT_DISPATCH_32)
+L(SHIFT_EV_IMM8_C1_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    BMI .mem_fault
+    LDR R3, [R2, #0]
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRB R5, [R5, #0]
+    ADD.W R10, R10, #1
+    AND.W R5, R5, #31
+    B.N L(SHIFT_DISPATCH_32)
+
+OP_AGNOSTIC .op_shift_ev_1_D1
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    MOV.W R5, #1
+    B.N L(SHIFT_EV_DECODE)
+
+OP_AGNOSTIC .op_shift_ev_cl_D3
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    LDRB.W R5, [R8, #12]
+    AND.W R5, R5, #31
+L(SHIFT_EV_DECODE):
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.N L(SHIFT_EV_MEM)
+    AND.W R2, R1, #7
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    ADD R2, R8
+    LDR R3, [R2, #0]
+    B.N L(SHIFT_DISPATCH_32)
+L(SHIFT_EV_MEM):
+    PUSH {R5}
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    POP {R5}
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    BMI .mem_fault
+    LDR R3, [R2, #0]
+L(SHIFT_DISPATCH_32):
+    UBFX R12, R1, #3, #3
+    /* The table offsets are relative to the TBH's own PC, so the label the
+       table is computed against must sit HERE, not on the UBFX above. */
+L(SHIFT_TBH_32):
+    TBH [PC, R12, LSL #1]
+L(SHIFT_TABLE):
+    SHIFT_TABLE_M L(SHIFT_TABLE), L(SHIFT_TBH_32), 
+L(SHIFT_ROL):
+    CMP R5, #0
+    BEQ.N L(SHIFT_DONE)
+    RSB R12, R5, #32
+    ROR.W R3, R3, R12
+    B.N L(SHIFT_DONE)
+L(SHIFT_ROR):
+    CMP R5, #0
+    BEQ.N L(SHIFT_DONE)
+    ROR.W R3, R3, R5
+    B.N L(SHIFT_DONE)
+L(SHIFT_RCL):
+    B.N L(SHIFT_DONE)
+L(SHIFT_RCR):
+    B.N L(SHIFT_DONE)
+    /* A zero count leaves every flag untouched, which falls out of the
+       existing early branch straight to SHIFT_DONE. */
+L(SHIFT_SHL):
+    CMP R5, #0
+    BEQ.N L(SHIFT_DONE)
+    LSLS.W R3, R3, R5
+    X86_FLAGS_SHIFT R3, R0, R1
+    B.N L(SHIFT_DONE)
+L(SHIFT_SHR):
+    CMP R5, #0
+    BEQ.N L(SHIFT_DONE)
+    LSRS.W R3, R3, R5
+    X86_FLAGS_SHIFT R3, R0, R1
+    B.N L(SHIFT_DONE)
+L(SHIFT_SAR):
+    CMP R5, #0
+    BEQ.N L(SHIFT_DONE)
+    ASRS.W R3, R3, R5
+    X86_FLAGS_SHIFT R3, R0, R1
+L(SHIFT_DONE):
+    STR R3, [R2, #0]
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_shift_eb_imm8_C0
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.N L(SHIFT_EB_IMM8_C0_MEM)
+    AND.W R2, R1, #7
+    AND.W R3, R2, #3
+    MOV.W R3, R3, LSL #2
+    MOV.W R2, R2, LSR #2
+    ADD R2, R3
+    ADD.W R2, R2, #8
+    ADD R2, R8
+    LDRB R3, [R2, #0]
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRB R5, [R5, #0]
+    ADD.W R10, R10, #1
+    AND.W R5, R5, #31
+    B.N L(SHIFT_DISPATCH_8)
+L(SHIFT_EB_IMM8_C0_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    BMI .mem_fault
+    LDRB R3, [R2, #0]
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRB R5, [R5, #0]
+    ADD.W R10, R10, #1
+    AND.W R5, R5, #31
+    B.N L(SHIFT_DISPATCH_8)
+
+OP_AGNOSTIC .op_shift_eb_1_D0
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    MOV.W R5, #1
+    B.N L(SHIFT_EB_DECODE)
+
+OP_AGNOSTIC .op_shift_eb_cl_D2
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    LDRB.W R5, [R8, #12]
+    AND.W R5, R5, #31
+L(SHIFT_EB_DECODE):
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.N L(SHIFT_EB_MEM)
+    AND.W R2, R1, #7
+    AND.W R3, R2, #3
+    MOV.W R3, R3, LSL #2
+    MOV.W R2, R2, LSR #2
+    ADD R2, R3
+    ADD.W R2, R2, #8
+    ADD R2, R8
+    LDRB R3, [R2, #0]
+    B.N L(SHIFT_DISPATCH_8)
+L(SHIFT_EB_MEM):
+    PUSH {R5}
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    POP {R5}
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    BMI .mem_fault
+    LDRB R3, [R2, #0]
+L(SHIFT_DISPATCH_8):
+    UBFX R12, R1, #3, #3
+L(SHIFT_TBH_8):
+    TBH [PC, R12, LSL #1]
+L(SHIFT8_TABLE):
+    SHIFT_TABLE_M L(SHIFT8_TABLE), L(SHIFT_TBH_8), 8
+L(SHIFT8_ROL):
+    CMP R5, #0
+    BEQ.N L(SHIFT8_DONE)
+    AND.W R5, R5, #7
+    RSB R12, R5, #8
+    LSL.W R4, R3, R5
+    LSR.W R3, R3, R12
+    ORR.W R3, R3, R4
+    UXTB R3, R3
+    B.N L(SHIFT8_DONE)
+L(SHIFT8_ROR):
+    CMP R5, #0
+    BEQ.N L(SHIFT8_DONE)
+    AND.W R5, R5, #7
+    RSB R12, R5, #8
+    LSR.W R4, R3, R5
+    LSL.W R3, R3, R12
+    ORR.W R3, R3, R4
+    UXTB R3, R3
+    B.N L(SHIFT8_DONE)
+L(SHIFT8_RCL):
+    B.N L(SHIFT8_DONE)
+L(SHIFT8_RCR):
+    B.N L(SHIFT8_DONE)
+L(SHIFT8_SHL):
+    CMP R5, #0
+    BEQ.N L(SHIFT8_DONE)
+    LSL.W R3, R3, R5
+    UXTB R3, R3
+    B.N L(SHIFT8_DONE)
+L(SHIFT8_SHR):
+    CMP R5, #0
+    BEQ.N L(SHIFT8_DONE)
+    LSR.W R3, R3, R5
+    UXTB R3, R3
+    B.N L(SHIFT8_DONE)
+L(SHIFT8_SAR):
+    CMP R5, #0
+    BEQ.N L(SHIFT8_DONE)
+    SXTB R3, R3
+    ASR.W R3, R3, R5
+    UXTB R3, R3
+L(SHIFT8_DONE):
+    STRB R3, [R2, #0]
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_cld_FC
+    BIC.W R11, R11, #1024
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_std_FD
+    ORR.W R11, R11, #1024
+    B.W .fetch_decode_loop
+    /* R3 = dest value / result, R5 = src, R2 = dest pointer.
+       R0/R1/R4 are dead here and used as scratch. */
+/* v-width ALU cores. One source, two passes: NSH is 0 for the 32-bit pass and
+   16 for the 16-bit pass. Operands are normalized to the TOP of the word, so
+   the host N/Z/C/V ARE the x86 SF/ZF/CF/OF for this width with no extra work
+   -- that is the whole reason the collapse is worth doing. At NSH=0 the shifts
+   vanish and the 32-bit code is byte-identical to what it was. */
+L(ALU_ADD):
+    VNORM(R3)
+    VNORM(R5)
+    EOR.W R4, R3, R5               @ AF aux: a ^ b
+    ADDS R3, R3, R5
+    EOR.W R4, R4, R3               @ a ^ b ^ result
+    VDENORM(R3)
+    X86_FLAGS_ARITH R3, R4, R0, R1, 0, NSH
+    B.N L(WRITEBACK_REG)
+L(ALU_OR):
+    VNORM(R3)
+    VNORM(R5)
+    ORRS.W R3, R3, R5
+    VDENORM(R3)
+    X86_FLAGS_LOGIC R3, R0, R1
+    B.N L(WRITEBACK_REG)
+L(ALU_ADC):
+#if NSH
+    X86_ADC_NARROW NSH, 0
+#else
+    EOR.W R4, R3, R5
+    LSRS R0, R11, #1               @ EFLAGS bit0 (CF) -> host carry
+    ADCS R3, R3, R5
+    EOR.W R4, R4, R3
+    X86_FLAGS_ARITH R3, R4, R0, R1, 0, 0
+#endif
+    B.N L(WRITEBACK_REG)
+L(ALU_SBB):
+#if NSH
+    X86_ADC_NARROW NSH, 1
+#else
+    EOR.W R4, R3, R5
+    EOR.W R0, R11, #1              @ ARM SBC subtracts NOT(C), so feed it !CF
+    LSRS R0, R0, #1                @ ...shifted into the host carry
+    SBCS R3, R3, R5
+    EOR.W R4, R4, R3
+    X86_FLAGS_ARITH R3, R4, R0, R1, 1, 0
+#endif
+    B.N L(WRITEBACK_REG)
+L(ALU_AND):
+    VNORM(R3)
+    VNORM(R5)
+    ANDS.W R3, R3, R5
+    VDENORM(R3)
+    X86_FLAGS_LOGIC R3, R0, R1
+    B.N L(WRITEBACK_REG)
+L(ALU_SUB):
+    VNORM(R3)
+    VNORM(R5)
+    EOR.W R4, R3, R5
+    SUBS R3, R3, R5
+    EOR.W R4, R4, R3
+    VDENORM(R3)
+    X86_FLAGS_ARITH R3, R4, R0, R1, 1, NSH
+    B.N L(WRITEBACK_REG)
+L(ALU_XOR):
+    VNORM(R3)
+    VNORM(R5)
+    EORS.W R3, R3, R5
+    VDENORM(R3)
+    X86_FLAGS_LOGIC R3, R0, R1
+    B.N L(WRITEBACK_REG)
+L(ALU_CMP):
+    VNORM(R3)
+    VNORM(R5)
+    EOR.W R4, R3, R5
+    SUBS R3, R3, R5
+    EOR.W R4, R4, R3
+    VDENORM(R3)
+    X86_FLAGS_ARITH R3, R4, R0, R1, 1, NSH
+    B.W .fetch_decode_loop         @ CMP discards the result
+L(WRITEBACK_REG):
+    ST_V R3, R2
+    B.W .fetch_decode_loop
+    /* 8-bit cores. Same normalization with sh=24. */
+L(ALU8_ADD):
+    LSL.W R3, R3, #24
+    LSL.W R5, R5, #24
+    EOR.W R4, R3, R5
+    ADDS R3, R3, R5
+    EOR.W R4, R4, R3
+    LSR.W R3, R3, #24
+    X86_FLAGS_ARITH R3, R4, R0, R1, 0, 24
+    B.N L(WRITEBACK_REG8)
+L(ALU8_OR):
+    ORR.W R3, R3, R5
+    LSLS.W R0, R3, #24             @ set N/Z for the byte width
+    X86_FLAGS_LOGIC R3, R0, R1
+    B.N L(WRITEBACK_REG8)
+L(ALU8_ADC):
+    X86_ADC_NARROW 24, 0
+    B.N L(WRITEBACK_REG8)
+L(ALU8_SBB):
+    X86_ADC_NARROW 24, 1
+    B.N L(WRITEBACK_REG8)
+L(ALU8_AND):
+    AND.W R3, R3, R5
+    LSLS.W R0, R3, #24
+    X86_FLAGS_LOGIC R3, R0, R1
+    B.N L(WRITEBACK_REG8)
+L(ALU8_SUB):
+    LSL.W R3, R3, #24
+    LSL.W R5, R5, #24
+    EOR.W R4, R3, R5
+    SUBS R3, R3, R5
+    EOR.W R4, R4, R3
+    LSR.W R3, R3, #24
+    X86_FLAGS_ARITH R3, R4, R0, R1, 1, 24
+    B.N L(WRITEBACK_REG8)
+L(ALU8_XOR):
+    EOR.W R3, R3, R5
+    LSLS.W R0, R3, #24
+    X86_FLAGS_LOGIC R3, R0, R1
+    B.N L(WRITEBACK_REG8)
+L(ALU8_CMP):
+    LSL.W R3, R3, #24
+    LSL.W R5, R5, #24
+    EOR.W R4, R3, R5
+    SUBS R3, R3, R5
+    EOR.W R4, R4, R3
+    LSR.W R3, R3, #24
+    X86_FLAGS_ARITH R3, R4, R0, R1, 1, 24
+    B.W .fetch_decode_loop         @ CMP discards the result
+L(WRITEBACK_REG8):
+    STRB R3, [R2, #0]
+    B.W .fetch_decode_loop
+#ifndef USE_16_BIT
+    .global decode_modrm_addr32
+decode_modrm_addr32:
+L(DECODE_MODRM_32):
+    /* R12 = offset of the DEFAULT segment descriptor for this addressing form.
+       DS unless the base register is (E)BP or (E)SP, which default to SS. An
+       explicit override prefix has already put its own descriptor in R6 and
+       wins over both -- see L(MODRM_SEG). */
+    MOV.W R12, #SEG_DS_SEL
+    AND.W R2, R1, #192
+    AND.W R4, R1, #7
+    CMP R4, #4
+    BEQ.N L(MODRM_SIB)
+    MOV.W R4, R4, LSL #2
+    ADD.W R4, R4, #8
+    LDR.W R7, [R8, R4]
+    CMP R2, #0
+    BEQ.N L(MODRM_MOD0)
+    CMP R2, #64
+    BEQ.N L(MODRM_MOD1)
+    CMP R4, #28                    @ rm==5 -> [(E)BP+disp], default SS
+    IT EQ
+    MOVEQ R12, #SEG_SS_SEL
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDR R5, [R5, #0]
+    ADD.W R10, R10, #4
+    ADD R7, R5
+    B.N L(MODRM_SEG)
+L(MODRM_MOD1):
+    CMP R4, #28                    @ rm==5 -> [(E)BP+disp], default SS
+    IT EQ
+    MOVEQ R12, #SEG_SS_SEL
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRSB.W R5, [R5]
+    ADD.W R10, R10, #1
+    ADD R7, R5
+    B.N L(MODRM_SEG)
+L(MODRM_MOD0):
+    AND.W R4, R1, #7
+    CMP R4, #5
+    BNE.N L(MODRM_DONE_MOD0)
+    UBFX R7, R10, #12, #12
+    LDR.W R7, [R9, R7, LSL #2]
+    ADDS R7, R7, R10
+    BMI .mem_fault
+    LDR R7, [R7, #0]
+    ADD.W R10, R10, #4
+    B.N L(MODRM_SEG)
+L(MODRM_DONE_MOD0):
+    B.N L(MODRM_SEG)
+L(MODRM_SIB):
+    UBFX R3, R10, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R10
+    BMI .mem_fault
+    LDRB R3, [R3, #0]
+    ADD.W R10, R10, #1
+    AND.W R4, R3, #7
+    CMP R4, #5
+    BNE.N L(SIB_HAS_BASE)
+    CMP R2, #0
+    BEQ.N L(SIB_BASE_DISP32)
+L(SIB_HAS_BASE):
+    SUB R5, R4, #4                 @ 0 for ESP, 1 for EBP
+    CMP R5, #2
+    IT LO
+    MOVLO R12, #SEG_SS_SEL         @ stack-relative base -> default SS
+    MOV.W R4, R4, LSL #2
+    ADD.W R4, R4, #8
+    LDR.W R7, [R8, R4]
+    B.N L(SIB_DO_INDEX)
+L(SIB_BASE_DISP32):
+    UBFX R7, R10, #12, #12
+    LDR.W R7, [R9, R7, LSL #2]
+    ADDS R7, R7, R10
+    BMI .mem_fault
+    LDR R7, [R7, #0]
+    ADD.W R10, R10, #4
+L(SIB_DO_INDEX):
+    UBFX R5, R3, #3, #3
+    CMP R5, #4
+    BEQ.N L(SIB_ADD_DISP)
+    MOV.W R5, R5, LSL #2
+    ADD.W R5, R5, #8
+    LDR.W R5, [R8, R5]
+    UBFX R4, R3, #6, #2
+    LSL.W R5, R5, R4
+    ADD R7, R5
+L(SIB_ADD_DISP):
+    CMP R2, #64
+    BEQ.N L(SIB_DISP8)
+    CMP R2, #128
+    BEQ.N L(SIB_DISP32)
+    B.N L(MODRM_SEG)
+L(SIB_DISP8):
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRSB.W R5, [R5]
+    ADD.W R10, R10, #1
+    ADD R7, R5
+    B.N L(MODRM_SEG)
+L(SIB_DISP32):
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDR R5, [R5, #0]
+    ADD.W R10, R10, #4
+    ADD R7, R5
+    B.N L(MODRM_SEG)
+
+
+#else
+/* ---------------------------------------------------------------------------
+ * 16-bit ModRM. A DIFFERENT GRAMMAR, not a narrower one -- this is why the old
+ * MEM_READ_SZ/STACK_INC scheme could never have worked even if it had been
+ * wired up. There is no SIB byte, disp is 8 or 16 bits, and rm selects one of
+ * eight fixed base+index pairs:
+ *
+ *   0 [BX+SI]  1 [BX+DI]  2 [BP+SI]  3 [BP+DI]  4 [SI]  5 [DI]  6 [BP]  7 [BX]
+ *
+ * mod=00 rm=6 is the disp16 special case (no BP). Any form whose base is BP
+ * defaults to SS -- rm 2, 3 and 6 -- which is the same rule as 32-bit, applied
+ * to a different encoding. The computed offset wraps at 16 bits BEFORE the
+ * segment base is added; a real 8086 cannot address past 0xFFFF within a
+ * segment and DOS code relies on that wrap.
+ * ------------------------------------------------------------------------ */
+    .global decode_modrm_addr16
+decode_modrm_addr16:
+L(DECODE_MODRM_32):
+    MOV.W R12, #SEG_DS_SEL
+    AND.W R2, R1, #192             @ mod
+    AND.W R4, R1, #7               @ rm
+
+    CMP R4, #6
+    BNE.N L(M16_NOT_RM6)
+    CMP R2, #0
+    BNE.N L(M16_RM6_BP)
+    /* mod=00 rm=110: disp16, no base register at all, segment stays DS. */
+    UBFX R7, R10, #12, #12
+    LDR.W R7, [R9, R7, LSL #2]
+    ADDS R7, R7, R10
+    BMI .mem_fault
+    LDRH R7, [R7, #0]
+    ADD.W R10, R10, #2
+    B.N L(MODRM_SEG)
+L(M16_RM6_BP):
+    LDRH.W R7, [R8, #REG_EBP]      @ [BP+disp]
+    MOV.W R12, #SEG_SS_SEL
+    B.N L(M16_DISP)
+
+L(M16_NOT_RM6):
+    /* rm 0..5,7. Base: BX for 0,1,7; BP for 2,3 (-> SS); none for 4,5.
+       Index: SI for 0,2,4; DI for 1,3,5; none for 6,7. */
+    MOV.W R7, #0
+    CMP R4, #4
+    BLO.N L(M16_PAIR)              @ 0..3 have both a base and an index
+    CMP R4, #7
+    BEQ.N L(M16_BX_ONLY)
+    /* rm 4 = [SI], rm 5 = [DI] */
+    SUB.W R5, R4, #4
+    LSLS R5, R5, #2
+    ADD.W R5, R5, #REG_ESI
+    LDRH.W R7, [R8, R5]
+    B.N L(M16_DISP)
+L(M16_BX_ONLY):
+    LDRH.W R7, [R8, #REG_EBX]
+    B.N L(M16_DISP)
+L(M16_PAIR):
+    TST R4, #2                     @ rm 2,3 are BP-based -> SS
+    BEQ.N L(M16_BASE_BX)
+    LDRH.W R7, [R8, #REG_EBP]
+    MOV.W R12, #SEG_SS_SEL
+    B.N L(M16_INDEX)
+L(M16_BASE_BX):
+    LDRH.W R7, [R8, #REG_EBX]
+L(M16_INDEX):
+    TST R4, #1                     @ odd rm uses DI, even uses SI
+    ITE EQ
+    LDRHEQ.W R5, [R8, #REG_ESI]
+    LDRHNE.W R5, [R8, #REG_EDI]
+    ADD R7, R7, R5
+
+L(M16_DISP):
+    CMP R2, #0
+    BEQ.N L(M16_WRAP)
+    CMP R2, #64
+    BNE.N L(M16_DISP16)
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRSB.W R5, [R5]
+    ADD.W R10, R10, #1
+    ADD R7, R7, R5
+    B.N L(M16_WRAP)
+L(M16_DISP16):
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRH R5, [R5, #0]
+    ADD.W R10, R10, #2
+    ADD R7, R7, R5
+L(M16_WRAP):
+    UXTH R7, R7                    @ offset wraps inside the segment
+    B.N L(MODRM_SEG)
+#endif
+/* Effective address -> linear address. Two instructions in the common case;
+   the descriptor pointer was chosen over a base value precisely so this stays
+   a single load. */
+L(MODRM_SEG):
+    SUBS R5, R6, R8                @ 0 iff no override prefix
+    IT EQ
+    ADDEQ R6, R8, R12              @ take this form's default (DS, or SS for BP/SP)
+    LDR.W R5, [R6, #4]             @ descriptor base (SEL 0, FLAGS 2, BASE 4)
+    ADD R7, R7, R5
+    BX LR
+
+OP .op_call_rel32_E8
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDS_V R5, R5                   @ displacement is SIGNED
+    EIP_ADV_V
+    /* Push IP, not the linear EIP: R10 carries CS.base folded in, and the
+       stack must hold the segment-relative offset or the matching RET lands
+       CS.base too far along. */
+    LDR.W R3, [R8, #SEG_CS_BASE]
+    SUB.W R4, R10, R3
+    PUSH_V R4, R0, R12
+    ADD R10, R10, R5
+    EIP_WRAP
+    B.W .fetch_decode_loop
+
+OP .op_jmp_rel32_E9
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDS_V R5, R5                   @ displacement is SIGNED
+    EIP_ADV_V
+    ADD R10, R10, R5
+    EIP_WRAP
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_jmp_rel8_EB
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRSB.W R5, [R5]
+    ADD.W R10, R10, #1
+    ADD R10, R5
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_grp4_FE
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.N L(GRP4_MEM)
+    AND.W R2, R1, #7
+    AND.W R3, R2, #3
+    MOV.W R3, R3, LSL #2
+    MOV.W R2, R2, LSR #2
+    ADD R2, R3
+    ADD.W R2, R2, #8
+    ADD R2, R8
+    LDRB R3, [R2, #0]
+    B.N L(GRP4_DISPATCH)
+L(GRP4_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    BMI .mem_fault
+    LDRB R3, [R2, #0]
+L(GRP4_DISPATCH):
+    UBFX R12, R1, #3, #3
+    CMP R12, #0
+    BEQ.N L(GRP4_INC)
+    CMP R12, #1
+    BEQ.N L(GRP4_DEC)
+    B.W .exit_loop
+L(GRP4_INC):
+    ADD.W R3, R3, #1
+    STRB R3, [R2, #0]
+    B.W .fetch_decode_loop
+L(GRP4_DEC):
+    SUB.W R3, R3, #1
+    STRB R3, [R2, #0]
+    B.W .fetch_decode_loop
+
+OP .op_grp5_FF
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.N L(GRP5_MEM)
+    AND.W R2, R1, #7
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    ADD R2, R8
+    LD_V R3, R2
+    B.N L(GRP5_DISPATCH)
+L(GRP5_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    BMI .mem_fault
+    LD_V R3, R2
+L(GRP5_DISPATCH):
+    UBFX R12, R1, #3, #3
+    CMP R12, #0
+    BEQ.N L(GRP5_INC)
+    CMP R12, #1
+    BEQ.N L(GRP5_DEC)
+    CMP R12, #2
+    BEQ.N L(GRP5_CALL)
+    CMP R12, #4
+    BEQ.N L(GRP5_JMP)
+    CMP R12, #6
+    BEQ.N L(GRP5_PUSH)
+    B.W .exit_loop
+L(GRP5_INC):
+    ADD.W R3, R3, #1
+    ST_V R3, R2
+    B.W .fetch_decode_loop
+L(GRP5_DEC):
+    SUB.W R3, R3, #1
+    ST_V R3, R2
+    B.W .fetch_decode_loop
+L(GRP5_CALL):
+    LDR.W R4, [R8, #24]
+    SUB.W R4, R4, #4
+    STR.W R4, [R8, #24]
+    UBFX R12, R4, #12, #12
+    LDR.W R12, [R9, R12, LSL #2]
+    ADDS R12, R12, R4
+    BMI .mem_fault
+    ST_V R10, R12
+    MOV R10, R3
+    B.W .fetch_decode_loop
+L(GRP5_JMP):
+    MOV R10, R3
+    B.W .fetch_decode_loop
+L(GRP5_PUSH):
+    LDR.W R4, [R8, #24]
+    SUB.W R4, R4, #4
+    STR.W R4, [R8, #24]
+    UBFX R12, R4, #12, #12
+    LDR.W R12, [R9, R12, LSL #2]
+    ADDS R12, R12, R4
+    BMI .mem_fault
+    ST_V R3, R12
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_jcc_rel8_7X
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRSB.W R5, [R5]
+    ADD.W R10, R10, #1
+    AND.W R2, R0, #15
+    BL L(EVAL_COND)
+    CMP R3, #1
+    BNE.W .fetch_decode_loop
+    ADD R10, R5
+    B.W .fetch_decode_loop
+L(EVAL_COND):
+    MOV.W R3, #0
+    CMP R2, #0
+    BNE.N L(COND_1)
+    UBFX R0, R11, #11, #1
+    MOV R3, R0
+    BX LR
+L(COND_1):
+    CMP R2, #1
+    BNE.N L(COND_2)
+    UBFX R0, R11, #11, #1
+    EOR.W R3, R0, #1
+    BX LR
+L(COND_2):
+    CMP R2, #2
+    BNE.N L(COND_3)
+    UBFX R3, R11, #0, #1
+    BX LR
+L(COND_3):
+    CMP R2, #3
+    BNE.N L(COND_4)
+    UBFX R0, R11, #0, #1
+    EOR.W R3, R0, #1
+    BX LR
+L(COND_4):
+    CMP R2, #4
+    BNE.N L(COND_5)
+    UBFX R3, R11, #6, #1
+    BX LR
+L(COND_5):
+    CMP R2, #5
+    BNE.N L(COND_6)
+    UBFX R0, R11, #6, #1
+    EOR.W R3, R0, #1
+    BX LR
+L(COND_6):
+    CMP R2, #6
+    BNE.N L(COND_7)
+    UBFX R3, R11, #0, #1
+    UBFX R0, R11, #6, #1
+    ORR.W R3, R3, R0
+    BX LR
+L(COND_7):
+    CMP R2, #7
+    BNE.N L(COND_8)
+    UBFX R3, R11, #0, #1
+    UBFX R0, R11, #6, #1
+    ORR.W R3, R3, R0
+    EOR.W R3, R3, #1
+    BX LR
+L(COND_8):
+    CMP R2, #8
+    BNE.N L(COND_9)
+    UBFX R3, R11, #7, #1
+    BX LR
+L(COND_9):
+    CMP R2, #9
+    BNE.N L(COND_A)
+    UBFX R0, R11, #7, #1
+    EOR.W R3, R0, #1
+    BX LR
+L(COND_A):
+    CMP R2, #10
+    BNE.N L(COND_B)
+    UBFX R3, R11, #2, #1
+    BX LR
+L(COND_B):
+    CMP R2, #11
+    BNE.N L(COND_C)
+    UBFX R0, R11, #2, #1
+    EOR.W R3, R0, #1
+    BX LR
+L(COND_C):
+    CMP R2, #12
+    BNE.N L(COND_D)
+    UBFX R3, R11, #7, #1
+    UBFX R0, R11, #11, #1
+    EOR.W R3, R3, R0
+    BX LR
+L(COND_D):
+    CMP R2, #13
+    BNE.N L(COND_E)
+    UBFX R3, R11, #7, #1
+    UBFX R0, R11, #11, #1
+    EOR.W R3, R3, R0
+    EOR.W R3, R3, #1
+    BX LR
+L(COND_E):
+    CMP R2, #14
+    BNE.N L(COND_F)
+    UBFX R3, R11, #7, #1
+    UBFX R0, R11, #11, #1
+    EOR.W R3, R3, R0
+    UBFX R0, R11, #6, #1
+    ORR.W R3, R3, R0
+    BX LR
+L(COND_F):
+    UBFX R3, R11, #7, #1
+    UBFX R0, R11, #11, #1
+    EOR.W R3, R3, R0
+    UBFX R0, R11, #6, #1
+    ORR.W R3, R3, R0
+    EOR.W R3, R3, #1
+    BX LR
+
+OP .op_pusha_60
+    LDR.W R4, [R8, #24]
+    MOV R5, R4
+    LDR.W R3, [R8, #8]
+    SUB.W R4, R4, #4
+    UBFX R12, R4, #12, #12
+    LDR.W R12, [R9, R12, LSL #2]
+    ADDS R12, R12, R4
+    BMI .mem_fault
+    ST_V R3, R12
+    LDR.W R3, [R8, #12]
+    SUB.W R4, R4, #4
+    UBFX R12, R4, #12, #12
+    LDR.W R12, [R9, R12, LSL #2]
+    ADDS R12, R12, R4
+    BMI .mem_fault
+    ST_V R3, R12
+    LDR.W R3, [R8, #16]
+    SUB.W R4, R4, #4
+    UBFX R12, R4, #12, #12
+    LDR.W R12, [R9, R12, LSL #2]
+    ADDS R12, R12, R4
+    BMI .mem_fault
+    ST_V R3, R12
+    LDR.W R3, [R8, #20]
+    SUB.W R4, R4, #4
+    UBFX R12, R4, #12, #12
+    LDR.W R12, [R9, R12, LSL #2]
+    ADDS R12, R12, R4
+    BMI .mem_fault
+    ST_V R3, R12
+    SUB.W R4, R4, #4
+    UBFX R12, R4, #12, #12
+    LDR.W R12, [R9, R12, LSL #2]
+    ADDS R12, R12, R4
+    BMI .mem_fault
+    ST_V R5, R12
+    LDR.W R3, [R8, #28]
+    SUB.W R4, R4, #4
+    UBFX R12, R4, #12, #12
+    LDR.W R12, [R9, R12, LSL #2]
+    ADDS R12, R12, R4
+    BMI .mem_fault
+    ST_V R3, R12
+    LDR.W R3, [R8, #32]
+    SUB.W R4, R4, #4
+    UBFX R12, R4, #12, #12
+    LDR.W R12, [R9, R12, LSL #2]
+    ADDS R12, R12, R4
+    BMI .mem_fault
+    ST_V R3, R12
+    LDR.W R3, [R8, #36]
+    SUB.W R4, R4, #4
+    UBFX R12, R4, #12, #12
+    LDR.W R12, [R9, R12, LSL #2]
+    ADDS R12, R12, R4
+    BMI .mem_fault
+    ST_V R3, R12
+    STR.W R4, [R8, #24]
+    B.W .fetch_decode_loop
+
+OP .op_popa_61
+    LDR.W R4, [R8, #24]
+    UBFX R3, R4, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R4
+    BMI .mem_fault
+    LD_V R3, R3
+    ADD.W R4, R4, #4
+    STR.W R3, [R8, #36]
+    UBFX R3, R4, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R4
+    BMI .mem_fault
+    LD_V R3, R3
+    ADD.W R4, R4, #4
+    STR.W R3, [R8, #32]
+    UBFX R3, R4, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R4
+    BMI .mem_fault
+    LD_V R3, R3
+    ADD.W R4, R4, #4
+    STR.W R3, [R8, #28]
+    ADD.W R4, R4, #4
+    UBFX R3, R4, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R4
+    BMI .mem_fault
+    LD_V R3, R3
+    ADD.W R4, R4, #4
+    STR.W R3, [R8, #20]
+    UBFX R3, R4, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R4
+    BMI .mem_fault
+    LD_V R3, R3
+    ADD.W R4, R4, #4
+    STR.W R3, [R8, #16]
+    UBFX R3, R4, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R4
+    BMI .mem_fault
+    LD_V R3, R3
+    ADD.W R4, R4, #4
+    STR.W R3, [R8, #12]
+    UBFX R3, R4, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R4
+    BMI .mem_fault
+    LD_V R3, R3
+    ADD.W R4, R4, #4
+    STR.W R3, [R8, #8]
+    STR.W R4, [R8, #24]
+    B.W .fetch_decode_loop
+
+OP .op_push_imm32_68
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LD_V R5, R5
+    EIP_ADV_V
+    LDR.W R4, [R8, #24]
+    SUB.W R4, R4, #4
+    STR.W R4, [R8, #24]
+    UBFX R12, R4, #12, #12
+    LDR.W R12, [R9, R12, LSL #2]
+    ADDS R12, R12, R4
+    BMI .mem_fault
+    ST_V R5, R12
+    B.W .fetch_decode_loop
+
+OP .op_imul_imm32_69
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.N L(IMUL69_MEM)
+    AND.W R2, R1, #7
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    ADD R2, R8
+    LD_V R3, R2
+    B.N L(IMUL69_DO)
+L(IMUL69_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    BMI .mem_fault
+    LD_V R3, R2
+L(IMUL69_DO):
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LD_V R5, R5
+    EIP_ADV_V
+    MUL.W R3, R3, R5
+    UBFX R4, R1, #3, #3
+    MOV.W R4, R4, LSL #2
+    ADD.W R4, R4, #8
+    STREG_V R3, R4
+    B.W .fetch_decode_loop
+
+OP .op_push_imm8_6A
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRSB.W R5, [R5]
+    ADD.W R10, R10, #1
+    LDR.W R4, [R8, #24]
+    SUB.W R4, R4, #4
+    STR.W R4, [R8, #24]
+    UBFX R12, R4, #12, #12
+    LDR.W R12, [R9, R12, LSL #2]
+    ADDS R12, R12, R4
+    BMI .mem_fault
+    ST_V R5, R12
+    B.W .fetch_decode_loop
+
+OP .op_imul_imm8_6B
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.N L(IMUL6B_MEM)
+    AND.W R2, R1, #7
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    ADD R2, R8
+    LD_V R3, R2
+    B.N L(IMUL6B_DO)
+L(IMUL6B_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    BMI .mem_fault
+    LD_V R3, R2
+L(IMUL6B_DO):
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRSB.W R5, [R5]
+    ADD.W R10, R10, #1
+    MUL.W R3, R3, R5
+    UBFX R4, R1, #3, #3
+    MOV.W R4, R4, LSL #2
+    ADD.W R4, R4, #8
+    STREG_V R3, R4
+    B.W .fetch_decode_loop
+
+OP .op_enter_C8
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRH R5, [R5, #0]
+    ADD.W R10, R10, #2
+    /* ENTER's nesting-level byte. The value is discarded (level nesting is not
+       implemented), but the fetch stays: it advances EIP and it faults on an
+       unmapped page, which is what the real instruction does. */
+    UBFX R12, R10, #12, #12
+    LDR.W R12, [R9, R12, LSL #2]
+    ADDS R12, R12, R10
+    BMI .mem_fault
+    LDRB R12, [R12, #0]
+    ADD.W R10, R10, #1
+    LDR.W R4, [R8, #24]
+    LDR.W R3, [R8, #28]
+    SUB.W R4, R4, #4
+    UBFX R12, R4, #12, #12
+    LDR.W R12, [R9, R12, LSL #2]
+    ADDS R12, R12, R4
+    BMI .mem_fault
+    ST_V R3, R12
+    MOV R3, R4
+    STR.W R3, [R8, #28]
+    SUB.W R4, R4, R5
+    STR.W R4, [R8, #24]
+    B.W .fetch_decode_loop
+
+OP .op_retf_CB
+    /* RETF popped CS and threw it away, so a far return kept executing in the
+       caller's segment. Pop IP then CS, install CS properly (which recomputes
+       the base), and rebuild the linear EIP from it. */
+    POP_V R4, R3, R12              @ IP
+    POP_V R5, R3, R12              @ CS selector
+    UXTH R5, R5
+    PUSH {R4, LR}
+    MOV.W R4, #1                   @ CS
+    BL L(SET_SREG)
+    POP {R4, LR}
+    LDR.W R3, [R8, #SEG_CS_BASE]
+    ADD.W R10, R4, R3
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_retf_imm16_CA
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRH R5, [R5, #0]
+    ADD.W R10, R10, #2
+    LDR.W R4, [R8, #24]
+    UBFX R10, R4, #12, #12
+    LDR.W R10, [R9, R10, LSL #2]
+    ADDS R10, R10, R4
+    BMI .mem_fault
+    LDR.W R10, [R10]
+    ADD.W R4, R4, #4
+    UBFX R3, R4, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R4
+    BMI .mem_fault
+    LDR R3, [R3, #0]
+    ADD.W R4, R4, #4
+    ADD R4, R5
+    STR.W R4, [R8, #24]
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_aam_D4
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRB R5, [R5, #0]
+    ADD.W R10, R10, #1
+    CMP R5, #0
+    BEQ.W .exit_loop
+    LDRB.W R3, [R8, #8]
+    UDIV R4, R3, R5
+    MLS R3, R4, R5, R3
+    STRB.W R3, [R8, #8]
+    STRB.W R4, [R8, #9]
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_aad_D5
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRB R5, [R5, #0]
+    ADD.W R10, R10, #1
+    LDRB.W R3, [R8, #8]
+    LDRB.W R4, [R8, #9]
+    MUL.W R4, R4, R5
+    ADD R3, R4
+    AND.W R3, R3, #255
+    STRB.W R3, [R8, #8]
+    MOV.W R4, #0
+    STRB.W R4, [R8, #9]
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_salc_D6
+    UBFX R3, R11, #0, #1
+    CMP R3, #1
+    ITE EQ
+    MOVEQ R4, #255
+    MOVNE R4, #0
+    STRB.W R4, [R8, #8]
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_xlat_D7
+    LDR.W R3, [R8, #20]
+    LDRB.W R4, [R8, #8]
+    ADD R3, R4
+    UBFX R4, R3, #12, #12
+    LDR.W R4, [R9, R4, LSL #2]
+    ADDS R4, R4, R3
+    BMI .mem_fault
+    LDRB R4, [R4, #0]
+    STRB.W R4, [R8, #8]
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_loopnz_E0
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRSB.W R5, [R5]
+    ADD.W R10, R10, #1
+    LDR.W R3, [R8, #12]
+    SUB.W R3, R3, #1
+    STR.W R3, [R8, #12]
+    CMP R3, #0
+    BEQ.W .fetch_decode_loop
+    UBFX R4, R11, #6, #1
+    CMP R4, #0
+    BEQ.N L(LOOP_TAKEN)
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_loopz_E1
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRSB.W R5, [R5]
+    ADD.W R10, R10, #1
+    LDR.W R3, [R8, #12]
+    SUB.W R3, R3, #1
+    STR.W R3, [R8, #12]
+    CMP R3, #0
+    BEQ.W .fetch_decode_loop
+    UBFX R4, R11, #6, #1
+    CMP R4, #1
+    BEQ.N L(LOOP_TAKEN)
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_loop_E2
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRSB.W R5, [R5]
+    ADD.W R10, R10, #1
+    LDR.W R3, [R8, #12]
+    SUB.W R3, R3, #1
+    STR.W R3, [R8, #12]
+    CMP R3, #0
+    BNE.N L(LOOP_TAKEN)
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_jcxz_E3
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRSB.W R5, [R5]
+    ADD.W R10, R10, #1
+    LDR.W R3, [R8, #12]
+    CMP R3, #0
+    BEQ.N L(LOOP_TAKEN)
+    B.W .fetch_decode_loop
+L(LOOP_TAKEN):
+    ADD R10, R5
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_lock_F0
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_hlt_F4
+    LDR.W R2, [R8, #CPU_CR0]        // CR0
+    TST.W R2, #1                // Check PE bit
+    BEQ.W .exit_loop            // Real mode: HLT allowed
+    LDRH.W R2, [R8, #SEG_CS_SEL]  // CS.sel
+    AND.W R2, R2, #3            // CPL = CS.sel[1:0]
+    CMP R2, #0
+    BNE.W .raise_gp_fault       // #GP if not ring 0
+    B.W .exit_loop
+
+OP_AGNOSTIC .op_cmc_F5
+    EOR.W R11, R11, #1
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_clc_F8
+    BIC.W R11, R11, #1
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_stc_F9
+    ORR.W R11, R11, #1
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_cli_FA
+    LDR.W R2, [R8, #CPU_CR0]
+    TST.W R2, #1
+    BEQ.N L(OP_CLI_FA_OK)
+    LDRH.W R2, [R8, #SEG_CS_SEL]  // CS.sel
+    AND.W R2, R2, #3
+    UBFX R3, R11, #12, #2
+    CMP R2, R3
+    BHI.W .raise_gp_fault
+L(OP_CLI_FA_OK):
+    BIC.W R11, R11, #512
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_sti_FB
+    LDR.W R2, [R8, #CPU_CR0]
+    TST.W R2, #1
+    BEQ.N L(OP_STI_FB_OK)
+    LDRH.W R2, [R8, #SEG_CS_SEL]  // CS.sel
+    AND.W R2, R2, #3
+    UBFX R3, R11, #12, #2
+    CMP R2, R3
+    BHI.W .raise_gp_fault
+L(OP_STI_FB_OK):
+    ORR.W R11, R11, #512
+    B.W .fetch_decode_loop
+
+/* ===========================================================================
+ * Port I/O.
+ *
+ * DX is regs[2] at REG_EDX. Every one of these handlers used to read
+ * [R8, #24], which is regs[4] -- ESP. So `OUT DX, AL` sent the byte to
+ * whatever port number the stack pointer happened to look like.
+ *
+ * Dispatch is a direct call into C. AAPCS makes R4-R11 callee-saved, so the
+ * interpreter's R6/R8/R9/R10/R11 survive it; R2 (the mode record) does not,
+ * but no port instruction takes a ModRM so it is already dead.
+ * =========================================================================== */
+OP_AGNOSTIC .op_in_al_dx_EC
+    LDRH.W R0, [R8, #REG_EDX]
+    B.N L(DO_IN_B)
+
+OP_AGNOSTIC .op_in_al_imm8_E4
+    UBFX R0, R10, #12, #12
+    LDR.W R0, [R9, R0, LSL #2]
+    ADDS R0, R0, R10
+    BMI .mem_fault
+    LDRB R0, [R0, #0]
+    ADD.W R10, R10, #1
+L(DO_IN_B):
+    CHECK_IOPL R2, R3
+    MOV.W R1, #1
+    BL x86_port_read
+    STRB.W R0, [R8, #REG_EAX]
+    B.W .fetch_decode_loop
+
+OP .op_in_eax_dx_ED
+    LDRH.W R0, [R8, #REG_EDX]
+    B.N L(DO_IN_V)
+
+OP .op_in_eax_imm8_E5
+    UBFX R0, R10, #12, #12
+    LDR.W R0, [R9, R0, LSL #2]
+    ADDS R0, R0, R10
+    BMI .mem_fault
+    LDRB R0, [R0, #0]
+    ADD.W R10, R10, #1
+L(DO_IN_V):
+    CHECK_IOPL R2, R3
+    MOV.W R1, #OPSZ
+    BL x86_port_read
+    STREG_V R0, #REG_EAX
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_out_dx_al_EE
+    LDRH.W R0, [R8, #REG_EDX]
+    B.N L(DO_OUT_B)
+
+OP_AGNOSTIC .op_out_imm8_al_E6
+    UBFX R0, R10, #12, #12
+    LDR.W R0, [R9, R0, LSL #2]
+    ADDS R0, R0, R10
+    BMI .mem_fault
+    LDRB R0, [R0, #0]
+    ADD.W R10, R10, #1
+L(DO_OUT_B):
+    CHECK_IOPL R2, R3
+    LDRB.W R1, [R8, #REG_EAX]
+    MOV.W R2, #1
+    BL x86_port_write
+    B.W .fetch_decode_loop
+
+OP .op_out_dx_eax_EF
+    LDRH.W R0, [R8, #REG_EDX]
+    B.N L(DO_OUT_V)
+
+OP .op_out_imm8_eax_E7
+    UBFX R0, R10, #12, #12
+    LDR.W R0, [R9, R0, LSL #2]
+    ADDS R0, R0, R10
+    BMI .mem_fault
+    LDRB R0, [R0, #0]
+    ADD.W R10, R10, #1
+L(DO_OUT_V):
+    CHECK_IOPL R2, R3
+    LDREG_V R1, #REG_EAX
+    MOV.W R2, #OPSZ
+    BL x86_port_write
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_sahf_9E
+    LDRB.W R3, [R8, #9]
+    BFI R11, R3, #0, #8
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_lahf_9F
+    UBFX R3, R11, #0, #8
+    STRB.W R3, [R8, #9]
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_grp3_eb_F6
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.N L(GRP3_F6_MEM)
+    AND.W R2, R1, #7
+    AND.W R3, R2, #3
+    MOV.W R3, R3, LSL #2
+    MOV.W R2, R2, LSR #2
+    ADD R2, R3
+    ADD.W R2, R2, #8
+    ADD R2, R8
+    LDRB R3, [R2, #0]
+    B.N L(GRP3_F6_DISPATCH)
+L(GRP3_F6_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    BMI .mem_fault
+    LDRB R3, [R2, #0]
+L(GRP3_F6_DISPATCH):
+    UBFX R12, R1, #3, #3
+    CMP R12, #0
+    BEQ.N L(GRP3_F6_TEST)
+    CMP R12, #2
+    BEQ.N L(GRP3_F6_NOT)
+    CMP R12, #3
+    BEQ.N L(GRP3_F6_NEG)
+    CMP R12, #4
+    BEQ.N L(GRP3_F6_MUL)
+    CMP R12, #6
+    BEQ.N L(GRP3_F6_DIV)
+    B.W .exit_loop
+L(GRP3_F6_TEST):
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRB R5, [R5, #0]
+    ADD.W R10, R10, #1
+    B.W .fetch_decode_loop
+L(GRP3_F6_NOT):
+    MVN.W R3, R3
+    STRB R3, [R2, #0]
+    B.W .fetch_decode_loop
+L(GRP3_F6_NEG):
+    RSB R3, R3, #0
+    STRB R3, [R2, #0]
+    B.W .fetch_decode_loop
+L(GRP3_F6_MUL):
+    LDRB.W R4, [R8, #8]
+    MUL.W R3, R3, R4
+    STRH.W R3, [R8, #8]
+    B.W .fetch_decode_loop
+L(GRP3_F6_DIV):
+    LDRH.W R4, [R8, #8]
+    CMP R3, #0
+    BEQ.W .exit_loop
+    UDIV R5, R4, R3
+    MLS R12, R5, R3, R4
+    STRB.W R5, [R8, #8]
+    STRB.W R12, [R8, #9]
+    B.W .fetch_decode_loop
+
+OP .op_grp3_ev_F7
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
+    CMP R3, #192
+    BNE.N L(GRP3_F7_MEM)
+    AND.W R2, R1, #7
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    ADD R2, R8
+    LD_V R3, R2
+    B.N L(GRP3_F7_DISPATCH)
+L(GRP3_F7_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    BMI .mem_fault
+    LD_V R3, R2
+L(GRP3_F7_DISPATCH):
+    UBFX R12, R1, #3, #3
+    CMP R12, #0
+    BEQ.N L(GRP3_F7_TEST)
+    CMP R12, #2
+    BEQ.N L(GRP3_F7_NOT)
+    CMP R12, #3
+    BEQ.N L(GRP3_F7_NEG)
+    CMP R12, #4
+    BEQ.N L(GRP3_F7_MUL)
+    CMP R12, #6
+    BEQ.N L(GRP3_F7_DIV)
+    B.W .exit_loop
+L(GRP3_F7_TEST):
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LD_V R5, R5
+    EIP_ADV_V
+    ANDS.W R3, R3, R5              @ TEST sets flags and discards the result
+    X86_FLAGS_LOGIC R3, R0, R1
+    B.W .fetch_decode_loop
+L(GRP3_F7_NOT):
+    MVN.W R3, R3
+    ST_V R3, R2
+    B.W .fetch_decode_loop
+L(GRP3_F7_NEG):
+    MOV.W R4, R3                   @ AF aux: (0 ^ operand)
+    RSBS R3, R3, #0
+    EOR.W R4, R4, R3
+    X86_FLAGS_ARITH R3, R4, R0, R1, 1   @ CF = (operand != 0)
+    ST_V R3, R2
+    B.W .fetch_decode_loop
+L(GRP3_F7_MUL):
+    LDR.W R4, [R8, #8]
+    UMULL R3, R5, R4, R3
+    STR.W R3, [R8, #8]
+    STR.W R5, [R8, #16]
+    B.W .fetch_decode_loop
+L(GRP3_F7_DIV):
+    LDR.W R5, [R8, #16]
+    CMP R5, #0
+    BNE.W .exit_loop
+    LDR.W R4, [R8, #8]
+    CMP R3, #0
+    BEQ.W .exit_loop
+    UDIV R5, R4, R3
+    MLS R12, R5, R3, R4
+    STR.W R5, [R8, #8]
+    STR.W R12, [R8, #16]
+    B.W .fetch_decode_loop
+
+#include "cpu_exec_handlers_0f.S"
+
+/* ---------------------------------------------------------------
+ * Segment override prefixes (26 ES, 2E CS, 36 SS, 3E DS, 64 FS, 65 GS)
+ *
+ * Two instructions, no store and no conditional branch: point R6 at the
+ * descriptor and re-enter the fetch BELOW the R6 reset, so the override
+ * survives into its own instruction and dies at the next boundary. Re-entry
+ * also skips the PIT decrement, which is correct -- a prefixed instruction is
+ * one instruction, not two.
+ * --------------------------------------------------------------- */
+OP_AGNOSTIC .op_seg_es_26
+    ADD.W R6, R8, #SEG_ES_SEL
+    B.W .fetch_next_byte_no_reset
+
+OP_AGNOSTIC .op_seg_cs_2E
+    ADD.W R6, R8, #SEG_CS_SEL
+    B.W .fetch_next_byte_no_reset
+
+OP_AGNOSTIC .op_seg_ss_36
+    ADD.W R6, R8, #SEG_SS_SEL
+    B.W .fetch_next_byte_no_reset
+
+OP_AGNOSTIC .op_seg_ds_3E
+    ADD.W R6, R8, #SEG_DS_SEL
+    B.W .fetch_next_byte_no_reset
+
+OP_AGNOSTIC .op_seg_fs_64
+    ADD.W R6, R8, #SEG_FS_SEL
+    B.W .fetch_next_byte_no_reset
+
+OP_AGNOSTIC .op_seg_gs_65
+    ADD.W R6, R8, #SEG_GS_SEL
+    B.W .fetch_next_byte_no_reset
+
+/* ---------------------------------------------------------------
+ * Operand-size (66) and address-size (67) prefixes.
+ *
+ * Two instructions, no store, no branch beyond the re-entry, and NO
+ * per-instruction cost to pay for them: R2 already holds the active mode
+ * record when the prefix handler is entered -- it is what dispatched to it --
+ * and .fetch_decode_loop reloads the default on the next instruction boundary,
+ * so the override cannot leak. The records are 2 KB apart precisely so each
+ * axis is a single EOR.
+ *
+ * The two axes are independent, which is the point: 66 in a 16-bit segment
+ * gives a 32-bit operand with 16-bit addressing, and 67 in a 32-bit segment
+ * gives the reverse. Applying a prefix twice cancels, as on real hardware.
+ * --------------------------------------------------------------- */
+OP_AGNOSTIC .op_pfx_66
+    EOR.W R2, R2, #OPSIZE_XOR
+    B.W .fetch_next_byte_no_reset
+
+OP_AGNOSTIC .op_pfx_67
+    EOR.W R2, R2, #ADDRSIZE_XOR
+    B.W .fetch_next_byte_no_reset
+
+/* ===========================================================================
+ * Segment register loads.
+ *
+ * Real mode only: base = sel<<4, limit = 0xFFFF. A protected-mode load has to
+ * walk the GDT/LDT and validate the descriptor, which does not exist yet, so
+ * CR0.PE traps out loudly instead of quietly installing a real-mode base --
+ * that would look like it worked and fail much later.
+ *
+ * R4 = segment index (0=ES 1=CS 2=SS 3=DS 4=FS 5=GS), R5 = selector.
+ * Clobbers R3, R12.
+ * =========================================================================== */
+L(SET_SREG):
+    LDR.W R12, [R8, #CPU_CR0]
+    TST.W R12, #1
+    BNE.W .exit_loop
+    MOV.W R3, #SEG_STRIDE
+    MLA R3, R4, R3, R8
+    STRH.W R5, [R3, #SEG_ES_SEL]
+    LSL.W R12, R5, #4
+    STR.W R12, [R3, #(SEG_ES_SEL + 4)]     @ base
+    MOV.W R12, #0xFFFF
+    STR.W R12, [R3, #(SEG_ES_SEL + 8)]     @ limit
+    BX LR
+
+/* MOV Sreg, Ew (8E). The source is always 16 bits regardless of operand size. */
+OP_AGNOSTIC .op_mov_seg_Ew_8E
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192
+    CMP R3, #192
+    BNE.N L(MOV_SREG_MEM)
+    AND.W R5, R1, #7
+    MOV.W R5, R5, LSL #2
+    ADD.W R5, R5, #8
+    LDRH.W R5, [R8, R5]
+    B.N L(MOV_SREG_SET)
+L(MOV_SREG_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN]
+    BLX R12
+    UBFX R3, R7, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R7
+    BMI .mem_fault
+    LDRH R5, [R3, #0]
+L(MOV_SREG_SET):
+    UBFX R4, R1, #3, #3
+    PUSH {LR}
+    BL L(SET_SREG)
+    POP {LR}
+    B.W .fetch_decode_loop
+
+/* MOV Ew, Sreg (8C). Always a 16-bit store. */
+OP_AGNOSTIC .op_mov_Ew_seg_8C
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    UBFX R4, R1, #3, #3
+    MOV.W R3, #SEG_STRIDE
+    MLA R3, R4, R3, R8
+    LDRH.W R5, [R3, #SEG_ES_SEL]
+    AND.W R3, R1, #192
+    CMP R3, #192
+    BNE.N L(MOV_EW_SREG_MEM)
+    AND.W R4, R1, #7
+    MOV.W R4, R4, LSL #2
+    ADD.W R4, R4, #8
+    STRH.W R5, [R8, R4]
+    B.W .fetch_decode_loop
+L(MOV_EW_SREG_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN]
+    BLX R12
+    UBFX R3, R7, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R7
+    BMI .mem_fault
+    STRH R5, [R3, #0]
+    B.W .fetch_decode_loop
+
+/* LES (C4) / LDS (C5): Gv <- [mem], then Sreg <- [mem + operand size].
+   The selector is always 16 bits; the offset follows the operand size. */
+OP .op_les_C4
+    MOV.W R0, #0                   @ ES
+    B.N L(LOAD_FAR_PTR)
+OP .op_lds_C5
+    MOV.W R0, #3                   @ DS
+L(LOAD_FAR_PTR):
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R1, #192
+    CMP R3, #192
+    BEQ.W .exit_loop               @ a register source is #UD for these
+    LDR.W R12, [R2, #REC_MODRM_FN]
+    BLX R12
+    PUSH {R0, R1}
+    UBFX R3, R7, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R7
+    BMI .mem_fault
+    LD_V R4, R3                    @ offset, operand-size wide
+    ADD.W R7, R7, #OPSZ
+    UBFX R3, R7, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R7
+    BMI .mem_fault
+    LDRH R5, [R3, #0]              @ selector, always 16 bits
+    POP {R0, R1}
+    UBFX R3, R1, #3, #3
+    MOV.W R3, R3, LSL #2
+    ADD.W R3, R3, #8
+    STREG_V R4, R3                 @ Gv <- offset
+    MOV R4, R0
+    PUSH {LR}
+    BL L(SET_SREG)
+    POP {LR}
+    B.W .fetch_decode_loop
+
+/* PUSH/POP Sreg. The stack slot is operand-size wide, but a segment register
+   is only ever 16 bits, so the pushed value is zero-extended and the popped
+   one truncated. */
+OP .op_push_es_06
+    MOV.W R4, #0
+    B.N L(PUSH_SREG)
+OP .op_push_cs_0E
+    MOV.W R4, #1
+    B.N L(PUSH_SREG)
+OP .op_push_ss_16
+    MOV.W R4, #2
+    B.N L(PUSH_SREG)
+OP .op_push_ds_1E
+    MOV.W R4, #3
+L(PUSH_SREG):
+    MOV.W R3, #SEG_STRIDE
+    MLA R3, R4, R3, R8
+    LDRH.W R3, [R3, #SEG_ES_SEL]
+    PUSH_V R3, R0, R12
+    B.W .fetch_decode_loop
+
+OP .op_pop_es_07
+    MOV.W R0, #0
+    B.N L(POP_SREG)
+OP .op_pop_ss_17
+    MOV.W R0, #2
+    B.N L(POP_SREG)
+OP .op_pop_ds_1F
+    MOV.W R0, #3
+L(POP_SREG):
+    POP_V R5, R3, R12
+    UXTH R5, R5
+    MOV R4, R0
+    PUSH {LR}
+    BL L(SET_SREG)
+    POP {LR}
+    B.W .fetch_decode_loop
+
+/* Far JMP (EA) and far CALL (9A): an immediate ptr16:v -- offset first at the
+   operand size, then the selector. Both reload CS, so EIP is rebuilt from the
+   new base rather than adjusted. */
+OP .op_jmp_far_EA
+    MOV.W R0, #0
+    B.N L(FAR_IMM)
+OP .op_call_far_9A
+    MOV.W R0, #1
+L(FAR_IMM):
+    UBFX R3, R10, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R10
+    BMI .mem_fault
+    LD_V R4, R3                    @ new offset
+    EIP_ADV_V
+    UBFX R3, R10, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R10
+    BMI .mem_fault
+    LDRH R5, [R3, #0]              @ new selector
+    ADD.W R10, R10, #2
+    CMP R0, #0
+    BEQ.N L(FAR_SET)
+    /* CALL: push the RETURN CS:IP, which is the state before the transfer. */
+    LDRH.W R3, [R8, #SEG_CS_SEL]
+    PUSH_V R3, R0, R12
+    LDR.W R3, [R8, #SEG_CS_BASE]
+    SUB.W R3, R10, R3
+    PUSH_V R3, R0, R12
+L(FAR_SET):
+    PUSH {R4}
+    MOV.W R4, #1                   @ CS
+    PUSH {LR}
+    BL L(SET_SREG)
+    POP {LR}
+    POP {R4}
+    LDR.W R3, [R8, #SEG_CS_BASE]
+    ADD.W R10, R4, R3
+    B.W .fetch_decode_loop
+
+/* ===========================================================================
+ * REP (F3) / REPNE (F2).
+ *
+ * One element runs per pass through the main fetch loop; if the run is not
+ * finished the string op re-points EIP at the prefix and the pair executes
+ * again. That keeps interrupts serviceable in the middle of a long REP MOVS --
+ * an inner loop would stall the PIT for its whole duration, which is precisely
+ * how a DOS game's timing comes apart -- and it means each string op has ONE
+ * implementation rather than a plain and a repeating variant.
+ *
+ * The continuation test lives on the string ops' shared exit, so it costs
+ * nothing anywhere else in the interpreter.
+ *
+ * The counter is CX or ECX by ADDRESS size, which is live in R2.
+ * =========================================================================== */
+#ifndef USE_16_BIT
+.str_exit:
+    LDR.W R3, [R8, #CPU_REP_ACTIVE]
+    CBZ R3, 1f
+    MOV.W R3, #0
+    STR.W R3, [R8, #CPU_REP_ACTIVE]    @ self-clearing: one run, one arming
+    LDR.W R5, [R8, #REG_ECX]
+    TST.W R2, #ADDRSIZE_XOR
+    IT EQ
+    UXTHEQ R5, R5
+    CBZ R5, 1f                         @ count exhausted -> done
+    LDR.W R4, [R8, #CPU_REP_ZF_SENSE]
+    CMP R4, #2
+    BEQ.N 2f                           @ MOVS/STOS/LODS ignore ZF
+    UBFX R3, R11, #6, #1               @ ZF
+    CMP R3, R4
+    BNE.N 1f                           @ REPE saw ZF=0, or REPNE saw ZF=1
+2:  LDR.W R10, [R8, #CPU_REP_RESUME]   @ rewind to the prefix
+1:  B.W .fetch_decode_loop
+#endif
+
+OP_AGNOSTIC .op_repne_F2
+    MOV.W R4, #0                   @ REPNE: stop once ZF becomes 1
+    B.N L(REP_ENTER)
+OP_AGNOSTIC .op_rep_F3
+    MOV.W R4, #1                   @ REP/REPE: stop once ZF becomes 0
+L(REP_ENTER):
+    /* Peek at the string opcode without consuming it. */
+    UBFX R3, R10, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R10
+    BMI .mem_fault
+    LDRB R0, [R3, #0]
+
+    /* Only string opcodes repeat; on anything else the prefix is ignored,
+       which is what the hardware does. A4..A7 are MOVS/CMPS, AA..AF are
+       STOS/LODS/SCAS. Only the comparing forms consult ZF -- sense 2 means
+       "no ZF test". */
+    SUB.W R3, R0, #0xA4
+    CMP R3, #4
+    BLO.N L(REP_STRING)
+    SUB.W R3, R0, #0xAA
+    CMP R3, #6
+    BHS.W .fetch_next_byte_no_reset
+    CMP R0, #0xAE
+    IT LO
+    MOVLO R4, #2                   @ AA..AD: STOS/LODS, no ZF test
+    B.N L(REP_COUNT)
+L(REP_STRING):
+    CMP R0, #0xA6
+    IT LO
+    MOVLO R4, #2                   @ A4/A5: MOVS, no ZF test
+L(REP_COUNT):
+    LDR.W R5, [R8, #REG_ECX]
+    TST.W R2, #ADDRSIZE_XOR
+    IT EQ
+    UXTHEQ R5, R5
+    CBNZ R5, L(REP_ONE)
+    ADD.W R10, R10, #1             @ count 0: skip the string opcode entirely
+    B.W .fetch_decode_loop
+
+L(REP_ONE):
+    SUB.W R5, R5, #1
+    TST.W R2, #ADDRSIZE_XOR
+    IT EQ
+    UXTHEQ R5, R5
+    STR.W R5, [R8, #REG_ECX]
+    STR.W R4, [R8, #CPU_REP_ZF_SENSE]
+    SUB.W R3, R10, #1              @ this prefix, for the rewind
+    STR.W R3, [R8, #CPU_REP_RESUME]
+    MOV.W R3, #1
+    STR.W R3, [R8, #CPU_REP_ACTIVE]
+    B.W .fetch_next_byte_no_reset
+
+/* ===========================================================================
+ * 0F 0B imm8 -- the HLE hypercall.
+ *
+ * UD2 is architecturally #UD on every x86 since the 286, in BOTH modes, and it
+ * is not a vector, so no mode switch and no guest IVT edit can alias it. That
+ * is why the escape is an opcode rather than a software interrupt: a guest is
+ * free to hook INT 21h, and it should keep working. The loader plants a
+ * three-byte stub (0F 0B nn / CF) at each vector we serve, so a guest that
+ * chains one still reaches us, and a guest that replaces one takes over
+ * cleanly.
+ *
+ * The imm8 selects the service. Control leaves the interpreter entirely --
+ * the host reads exit_info, does the work against FatFs or the LCD, writes
+ * registers back and re-enters. EIP is already past the imm8, so the IRET in
+ * the stub runs on re-entry and unwinds the guest's INT frame.
+ * =========================================================================== */
+OP_AGNOSTIC .op_hypercall_0F0B
+    UBFX R3, R10, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R10
+    BMI .mem_fault
+    LDRB R3, [R3, #0]              @ service selector
+    ADD.W R10, R10, #1
+    LDR.W R4, [R8, #CPU_HLE_ENABLED]   @ CBZ needs a low register
+    CBZ R4, L(HYPERCALL_UD)
+    STR.W R3, [R8, #CPU_EXIT_INFO]
+    MOV.W R3, #X86_EXIT_HLE_INT
+    STR.W R3, [R8, #CPU_EXIT_REASON]
+    B.W .save_state_and_exit
+L(HYPERCALL_UD):
+    /* HLE off: behave like the real instruction. Rewind past the imm8 so the
+       #UD frame points at the 0F 0B itself, as hardware would. */
+    SUB.W R10, R10, #3
+    MOV.W R4, #6                   @ #UD
+    B.W L(HANDLE_INTERRUPT)

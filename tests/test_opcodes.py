@@ -1,0 +1,1840 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import subprocess
+import time
+import socket
+import argparse
+import struct
+
+# Add the project root to sys.path to allow importing scripts.common
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from scripts.common.runner import build_and_create_runner
+from scripts.common.elf import get_symbols
+from scripts.common.faults import check_fault
+
+# x86 EFLAGS bit positions, for the flags_expected field on a test case.
+# Offset of each segment's cached base within the CPU struct. Segments start at
+# 48 with a 12-byte stride (sel 0, flags 2, base 4, limit 8) in x86 encoding
+# order. Mirrors x86_offsets.inc, which is generated from the C struct.
+SEG_BASE_OFFSETS = {
+    "ES": 48 + 4, "CS": 60 + 4, "SS": 72 + 4,
+    "DS": 84 + 4, "FS": 96 + 4, "GS": 108 + 4,
+}
+
+# CS.flags lives at segs[1]+2. The interpreter does a 32-bit load at SEG_CS_SEL
+# (60) and tests bit 22, which is bit 6 of that halfword: DESC_D_MASK.
+SEG_ORDER = ("ES", "CS", "SS", "DS", "FS", "GS")
+CS_FLAGS_OFFSET = 60 + 2
+# CR0 was never reset between cases either; bit 0 (PE) changes what a segment
+# load means, so a case that sets it would silently alter every later one.
+CR0_OFFSET = 120
+# Generated offsets, mirrored from x86_offsets.inc.
+EXIT_INFO_OFFSET = 2200
+EXIT_REASON_OFFSET = 2196
+HLE_ENABLED_OFFSET = 2220
+CS_FLAG_D = 1 << 6
+
+FLAG_BITS = {
+    "CF": 0, "PF": 2, "AF": 4, "ZF": 6, "SF": 7,
+    "TF": 8, "IF": 9, "DF": 10, "OF": 11,
+}
+
+
+PIT_HZ = 1193182
+
+
+def read_io_state(backend, addr):
+    """Mirror of X86IOState. Field order is fixed by the struct in x86_cpu.h."""
+    raw = bytes(backend.read_memory(addr, 12))
+    reload_ = int.from_bytes(raw[0:2], "little")
+    port61 = raw[4]
+    if (port61 & 3) != 3:
+        hz = 0
+    else:
+        hz = PIT_HZ // (reload_ if reload_ else 65536)
+    return {
+        "pit2_reload": reload_,
+        "pit2_access": raw[2],
+        "port61": port61,
+        "port61_low2": port61 & 3,
+        "speaker_hz": hz,
+    }
+
+
+def get_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        return s.getsockname()[1]
+
+def run_test(args):
+    runner = build_and_create_runner(args)
+    runner.start()
+    
+    backend = runner.backend
+    
+    syms = get_symbols("test_core.elf")
+    dtcm_addr = syms.get("cpu_state_dtcm")
+    ram_addr = syms.get("test_ram")
+    run_flag_addr = syms.get("run_flag")
+    page_table_addr = syms.get("guest_page_table")
+    io_addr = syms.get("x86_io")
+    
+    if not all([dtcm_addr, ram_addr, run_flag_addr, page_table_addr, io_addr]):
+        print("Failed to find necessary symbols in ELF!")
+        return False
+        
+    print(f"Symbols -> cpu_state_dtcm: 0x{dtcm_addr:08x}, test_ram: 0x{ram_addr:08x}, run_flag: 0x{run_flag_addr:08x}")
+    
+    # Wait for C firmware init to complete (guest_page_table[0] will be set to test_ram)
+    deadline = 50  # 50 * 0.1s = 5 seconds max
+    while deadline > 0:
+        pt0 = backend.read_uint32(page_table_addr)
+        if pt0 == ram_addr:
+            break
+        time.sleep(0.1)
+        deadline -= 1
+    if deadline == 0:
+        print(f"WARNING: guest_page_table[0]={pt0:#010x}, expected {ram_addr:#010x} -- firmware may not have initialized!")
+
+    
+    try:
+        
+        test_cases = [
+            {
+                "name": "NOP + INC EAX",
+                "code": bytes([0x90, 0x40, 0xF4]),
+                "regs_initial": {0: 5},
+                "regs_expected": {0: 6},
+                "expected_eip": 3,
+            },
+            {
+                "name": "INC ECX (0x41)",
+                "code": bytes([0x41, 0xF4]),
+                "regs_initial": {1: 10},
+                "regs_expected": {1: 11},
+                "expected_eip": 2,
+            },
+            {
+                "name": "DEC EBX (0x4B)",
+                "code": bytes([0x4B, 0xF4]),
+                "regs_initial": {3: 42},
+                "regs_expected": {3: 41},
+                "expected_eip": 2,
+            },
+            {
+                "name": "INC EDI (0x47) x 3",
+                "code": bytes([0x47, 0x47, 0x47, 0xF4]),
+                "regs_initial": {7: 0},
+                "regs_expected": {7: 3},
+                "expected_eip": 4,
+            },
+            {
+                "name": "MOV EDX, 0x11223344",
+                "code": bytes([0xBA, 0x44, 0x33, 0x22, 0x11, 0xF4]), # 0xBA = MOV EDX
+                "regs_initial": {2: 0},
+                "regs_expected": {2: 0x11223344},
+                "expected_eip": 6,
+            },
+            {
+                "name": "PUSH EAX",
+                "code": bytes([0x50, 0x5B, 0xF4]),
+                "regs_initial": {0: 0xDEADBEEF, 3: 0, 4: 1000}, # ESP=1000
+                "regs_expected": {0: 0xDEADBEEF, 3: 0xDEADBEEF, 4: 1000},
+                "expected_eip": 3,
+            },
+            {
+                "name": "ADD ECX, EDX (0x01)",
+                "code": bytes([0x01, 0xD1, 0xF4]),
+                "regs_initial": {1: 10, 2: 25}, # ECX=10, EDX=25
+                "regs_expected": {1: 35, 2: 25}, # ECX=35, EDX=25
+                "expected_eip": 3,
+            },
+            {
+                "name": "ADD EAX, EBX (0x03)",
+                "code": bytes([0x03, 0xC3, 0xF4]),
+                "regs_initial": {0: 100, 3: 50}, # EAX=100, EBX=50
+                "regs_expected": {0: 150, 3: 50}, # EAX=150, EBX=50
+                "expected_eip": 3,
+            },
+            {
+                "name": "OR ESI, EDI (0x09)",
+                "code": bytes([0x09, 0xFE, 0xF4]), # ModR/M=11 111 110 = 0xFE (Dest=ESI, Src=EDI)
+                "regs_initial": {6: 0x1010, 7: 0x0101},
+                "regs_expected": {6: 0x1111, 7: 0x0101},
+                "expected_eip": 3,
+            },
+            {
+                "name": "AND EBP, EAX (0x23)",
+                "code": bytes([0x23, 0xE8, 0xF4]), # ModR/M=11 101 000 = 0xE8 (Dest=EBP, Src=EAX)
+                "regs_initial": {5: 0xF4FF0000, 0: 0xF400FF00},
+                "regs_expected": {5: 0xF4000000, 0: 0xF400FF00},
+                "expected_eip": 3,
+            },
+            {
+                "name": "SUB EBX, ECX (0x2B)",
+                "code": bytes([0x2B, 0xD9, 0xF4]), # ModR/M=11 011 001 = 0xD9 (Dest=EBX, Src=ECX)
+                "regs_initial": {3: 100, 1: 30},
+                "regs_expected": {3: 70, 1: 30},
+                "expected_eip": 3,
+            },
+            {
+                "name": "XOR EDX, EDX (0x33)",
+                "code": bytes([0x33, 0xD2, 0xF4]), # ModR/M=11 010 010 = 0xD2 (Dest=EDX, Src=EDX)
+                "regs_initial": {2: 0xBEEF},
+                "regs_expected": {2: 0},
+                "expected_eip": 3,
+            },
+            {
+                "name": "ADD EAX, 0x1000 (0x05)",
+                "code": bytes([0x05, 0x00, 0x10, 0x00, 0x00, 0xF4]),
+                "regs_initial": {0: 0x500},
+                "regs_expected": {0: 0x1500},
+                "expected_eip": 6,
+            },
+            {
+                "name": "ADD EAX, 0x1000 (0x05)",
+                "code": bytes([0x05, 0x00, 0x10, 0x00, 0x00, 0xF4]),
+                "regs_initial": {0: 0x500},
+                "regs_expected": {0: 0x1500},
+                "expected_eip": 6,
+            },
+            {
+                "name": "SUB EAX, 0x100 (0x2D)",
+                "code": bytes([0x2D, 0x00, 0x01, 0x00, 0x00, 0xF4]),
+                "regs_initial": {0: 0x500},
+                "regs_expected": {0: 0x400},
+                "expected_eip": 6,
+            },
+            {
+                "name": "ADD AL, 0x15 (0x04)",
+                "code": bytes([0x04, 0x15, 0xF4]),
+                "regs_initial": {0: 0x11223344},
+                "regs_expected": {0: 0x11223359}, # 44 + 15 = 59
+                "expected_eip": 3,
+            },
+            {
+                "name": "ADD AL, BL (0x00 ModR/M=11 011 000 = 0xD8)",
+                "code": bytes([0x00, 0xD8, 0xF4]),
+                "regs_initial": {0: 0x100, 3: 0x55}, # AL=00, BL=55
+                "regs_expected": {0: 0x155, 3: 0x55}, # AL=55
+                "expected_eip": 3,
+            },
+            {
+                "name": "OR CH, DH (0x0A ModR/M=11 101 110 = 0xEE)",
+                "code": bytes([0x0A, 0xEE, 0xF4]), # Dest=CH (Reg=5), Src=DH (R/M=6). Mod=11.
+                "regs_initial": {1: 0x1100, 2: 0x2200}, # CH=11, DH=22
+                "regs_expected": {1: 0x3300, 2: 0x2200}, # CH=33
+                "expected_eip": 3,
+            },
+            {
+                "name": "ADD EBX, 0x1000 (0x81)",
+                "code": bytes([0x81, 0xC3, 0x00, 0x10, 0x00, 0x00, 0xF4]), # ModR/M = 0xC3
+                "regs_initial": {3: 0x500},
+                "regs_expected": {3: 0x1500},
+                "expected_eip": 7,
+            },
+            {
+                "name": "AND EDX, 0xFFFFFFF4 (0x83 sign-extended)",
+                "code": bytes([0x83, 0xE2, 0xF4, 0xF4]), # ModR/M = 0xE2, imm8 = 0xF4 (-12)
+                "regs_initial": {2: 0x12345678},
+                "regs_expected": {2: 0x12345670},
+                "expected_eip": 4,
+            },
+            {
+                "name": "SUB AL, 0x11 (0x80)",
+                "code": bytes([0x80, 0xE8, 0x11, 0xF4]), # ModR/M = 0xE8, imm8 = 0x11
+                "regs_initial": {0: 0x55},
+                "regs_expected": {0: 0x44},
+                "expected_eip": 4,
+            },
+            {
+                "name": "TEST EAX, EBX (0x85)",
+                "code": bytes([0x85, 0xD8, 0xF4]), # ModR/M = 11 011 000 (0xD8) -> EBX, EAX
+                "regs_initial": {0: 0x5555, 3: 0xAAAA},
+                "regs_expected": {0: 0x5555, 3: 0xAAAA}, # No writeback!
+                "expected_eip": 3,
+            },
+            {
+                "name": "XCHG ECX, EDX (0x87)",
+                "code": bytes([0x87, 0xCA, 0xF4]), # ModR/M = 11 001 010 (0xCA) -> ECX, EDX
+                "regs_initial": {1: 0x111, 2: 0x222},
+                "regs_expected": {1: 0x222, 2: 0x111},
+                "expected_eip": 3,
+            },
+            {
+                "name": "MOV ESI, EDI (0x8B)",
+                "code": bytes([0x8B, 0xF7, 0xF4]), # ModR/M = 11 110 111 (0xF7) -> ESI, EDI
+                "regs_initial": {6: 0x111, 7: 0x999},
+                "regs_expected": {6: 0x999, 7: 0x999}, # ESI = EDI
+                "expected_eip": 3,
+            },
+            {
+                "name": "MOV BL, BH (0x8A)",
+                "code": bytes([0x8A, 0xDF, 0xF4]), # ModR/M = 11 011 111 (0xDF) -> BL(3), BH(7)
+                "regs_initial": {3: 0x1234}, # BL=34, BH=12
+                "regs_expected": {3: 0x1212}, # BL=12, BH=12
+                "expected_eip": 3,
+            },
+            {
+                "name": "XCHG EAX, EBX (0x93)",
+                "code": bytes([0x93, 0xF4]),
+                "regs_initial": {0: 0x111, 3: 0x333},
+                "regs_expected": {0: 0x333, 3: 0x111},
+                "expected_eip": 2,
+            },
+            {
+                "name": "CWDE (0x98) - Positive",
+                "code": bytes([0x98, 0xF4]),
+                "regs_initial": {0: 0xDEAD0100}, # AX = 0x0100 -> Sign extend to 0x00000100
+                "regs_expected": {0: 0x00000100},
+                "expected_eip": 2,
+            },
+            {
+                "name": "CWDE (0x98) - Negative",
+                "code": bytes([0x98, 0xF4]),
+                "regs_initial": {0: 0x00008000}, # AX = 0x8000 -> Sign extend to 0xFFFF8000
+                "regs_expected": {0: 0xFFFF8000},
+                "expected_eip": 2,
+            },
+            {
+                "name": "CDQ (0x99) - Negative",
+                "code": bytes([0x99, 0xF4]),
+                "regs_initial": {0: 0x80000000, 2: 0}, # EAX is negative
+                "regs_expected": {0: 0x80000000, 2: 0xFFFFFFFF}, # EDX becomes 0xFFFFFFFF
+                "expected_eip": 2,
+            },
+            {
+                "name": "POP EBX (0x8F)",
+                "code": bytes([0x8F, 0xC3, 0xF4]), # ModR/M = 11 000 011 -> EBX
+                "regs_initial": {3: 0},
+                # We need to simulate memory since POP reads from memory. 
+                # Let's set ESP to 0x1000 and write a value there in the test script, OR we can push first.
+                # Let's just do PUSH EAX, POP EBX
+            }
+        ]
+        
+        # We need to fix the POP EBX test
+        test_cases[-1]["code"] = bytes([0x50, 0x8F, 0xC3, 0xF4]) # PUSH EAX (0x50), POP EBX (0x8F 0xC3)
+        test_cases[-1]["regs_initial"] = {0: 0x99887766, 3: 0, 4: 0x2000} # EAX=value, EBX=0, ESP=0x2000
+        test_cases[-1]["regs_expected"] = {0: 0x99887766, 3: 0x99887766, 4: 0x2000} # ESP goes down then up
+        test_cases[-1]["expected_eip"] = 4
+        
+        # PUSHFD and POPFD
+        test_cases.append({
+            "name": "PUSHFD / POPFD",
+            # PUSHFD (0x9C), POPFD (0x9D)
+            "code": bytes([0x9C, 0x9D, 0xF4]),
+            "regs_initial": {4: 0x2000},
+            "regs_expected": {4: 0x2000},
+            "expected_eip": 3,
+        })
+        
+        test_cases.extend([
+            {
+                "name": "MOV EAX, moffs32 (0xA1)",
+                "code": bytes([0xA1, 0x00, 0x00, 0x00, 0x00, 0xF4]), # Read from guest addr 0x0
+                "regs_initial": {0: 0},
+                "regs_expected": {0: 0x000000A1}, # It reads the instruction bytes themselves! [A1 00 00 00]
+                "expected_eip": 6,
+            },
+            {
+                "name": "TEST EAX, imm32 (0xA9)",
+                "code": bytes([0xA9, 0x11, 0x22, 0x33, 0x44, 0xF4]),
+                "regs_initial": {0: 0x55555555},
+                "regs_expected": {0: 0x55555555},
+                "expected_eip": 6,
+            },
+            {
+                "name": "MOV BL, imm8 (0xB3)",
+                "code": bytes([0xB3, 0x99, 0xF4]),
+                "regs_initial": {3: 0x11111111},
+                "regs_expected": {3: 0x11111199},
+                "expected_eip": 3,
+            },
+            {
+                "name": "MOV CL, imm8 (0xC6)",
+                "code": bytes([0xC6, 0xC1, 0x77, 0xF4]), # ModR/M = 11 000 001 -> CL
+                "regs_initial": {1: 0x22222222},
+                "regs_expected": {1: 0x22222277},
+                "expected_eip": 4,
+            },
+            {
+                "name": "MOV EDX, imm32 (0xC7)",
+                "code": bytes([0xC7, 0xC2, 0xAA, 0xBB, 0xCC, 0xDD, 0xF4]), # ModR/M = 11 000 010 -> EDX
+                "regs_initial": {2: 0},
+                "regs_expected": {2: 0xDDCCBBAA},
+                "expected_eip": 7,
+            },
+            {
+                "name": "LEAVE (0xC9)",
+                "code": bytes([0xC9, 0xF4]),
+                # EBP is 0x100, ESP is 0x80. Stack at 0x100 has 0.
+                "regs_initial": {4: 0x80, 5: 0x100},
+                # ESP becomes EBP (0x100), then pops (reads 0 from memory) -> EBP=0
+                # ESP becomes 0x104.
+                "regs_expected": {4: 0x104, 5: 0},
+                "expected_eip": 2,
+            },
+            {
+                "name": "RET (0xC3)",
+                "code": bytes([0xB8, 0x07, 0x00, 0x00, 0x00, 0x50, 0xC3, 0xF4]), # MOV EAX, 7; PUSH EAX; RET -> Jumps to 7
+                "regs_initial": {0: 0xFFFFFFFF, 4: 0x104},
+                "regs_expected": {0: 7, 4: 0x104},
+                "expected_eip": 8,
+            },
+            {
+                "name": "RET imm16 (0xC2)",
+                "code": bytes([0xB8, 0x09, 0x00, 0x00, 0x00, 0x50, 0xC2, 0x10, 0x00, 0xF4]), # MOV EAX, 9; PUSH EAX; RET 0x10
+                "regs_initial": {0: 0xFFFFFFFF, 4: 0x104},
+                "regs_expected": {0: 9, 4: 0x114}, # ESP goes to 0x100, pops 9, adds 0x10 -> 0x114
+                "expected_eip": 10,
+            },
+            {
+                "name": "LEA EAX, [EBX + 0x12] (disp8)",
+                "code": bytes([0x8D, 0x43, 0x12, 0xF4]), # 0x8D, Mod=01, Reg=000, R/M=011 -> 0x43
+                "regs_initial": {0: 0, 3: 0x1000},
+                "regs_expected": {0: 0x1012, 3: 0x1000},
+                "expected_eip": 4,
+            },
+            {
+                "name": "LEA ECX, [EDI + ESI*4 + 0x11223344] (SIB + disp32)",
+                # 0x8D
+                # ModR/M = 10 001 100 (0x8C) -> Reg=ECX, R/M=SIB, Mod=disp32
+                # SIB = 10 110 111 (0xB7) -> Scale=4, Index=ESI(6), Base=EDI(7)
+                # Disp32 = 0x11223344
+                "code": bytes([0x8D, 0x8C, 0xB7, 0x44, 0x33, 0x22, 0x11, 0xF4]),
+                "regs_initial": {1: 0, 6: 0x10, 7: 0x100},
+                # EA = EDI + ESI*4 + Disp32 = 0x100 + 0x40 + 0x11223344 = 0x11223484
+                "regs_expected": {1: 0x11223484},
+                "expected_eip": 8,
+            },
+            {
+                "name": "LEA EDX, [disp32] (Mod=00, R/M=5)",
+                # 0x8D
+                # ModR/M = 00 010 101 (0x15) -> Reg=EDX, R/M=5
+                # Disp32 = 0x55555555
+                "code": bytes([0x8D, 0x15, 0x55, 0x55, 0x55, 0x55, 0xF4]),
+                "regs_initial": {2: 0},
+                "regs_expected": {2: 0x55555555},
+                "expected_eip": 7,
+            },
+            {
+                "name": "ADD [EBX + 4], ECX (Memory Ev, Gv)",
+                # 0x01
+                # ModR/M = 01 001 011 (0x4B) -> Reg=ECX, R/M=EBX, Mod=disp8
+                # disp8 = 4
+                "code": bytes([0x01, 0x4B, 0x04, 0xF4]),
+                "regs_initial": {1: 0x11223344, 3: 0},
+                "regs_expected": {1: 0x11223344, 3: 0},
+                # It should write to [4]! We can't easily check memory without modifying test script, but EIP=4 means it didn't crash.
+                "expected_eip": 4,
+            },
+            {
+                "name": "CLD, STOSD",
+                "code": bytes([0xFC, 0xAB, 0xF4]), # CLD (0xFC), STOSD (0xAB)
+                "regs_initial": {0: 0xDEADBEEF, 7: 0x100}, # EDI = 0x100
+                "regs_expected": {0: 0xDEADBEEF, 7: 0x104}, # EDI should increment by 4
+                "expected_eip": 3,
+            },
+            {
+                "name": "STD, LODSD",
+                "code": bytes([0xFD, 0xAD, 0xF4]), # STD (0xFD), LODSD (0xAD)
+                "regs_initial": {6: 0x100}, # ESI = 0x100
+                "regs_expected": {6: 0x0FC}, # ESI should decrement by 4
+                "expected_eip": 3,
+            },
+            {
+                "name": "CLD, MOVSB",
+                "code": bytes([0xFC, 0xA4, 0xF4]), # CLD (0xFC), MOVSB (0xA4)
+                "regs_initial": {6: 0x100, 7: 0x200}, # ESI = 0x100, EDI = 0x200
+                "regs_expected": {6: 0x101, 7: 0x201}, # Both should increment by 1
+                "expected_eip": 3,
+            },
+            {
+                "name": "SHL EAX, 1 (0xD1)",
+                # 0xD1, Mod=11, Reg=4 (SHL), R/M=0 (EAX) -> 0xE0
+                "code": bytes([0xD1, 0xE0, 0xF4]),
+                "regs_initial": {0: 1},
+                "regs_expected": {0: 2},
+                "expected_eip": 3,
+            },
+            {
+                "name": "SHR EBX, 4 (0xC1)",
+                # 0xC1, Mod=11, Reg=5 (SHR), R/M=3 (EBX) -> 0xEB
+                # imm8 = 4
+                "code": bytes([0xC1, 0xEB, 0x04, 0xF4]),
+                "regs_initial": {3: 0x40},
+                "regs_expected": {3: 4},
+                "expected_eip": 4,
+            },
+            {
+                "name": "SAR ECX, CL (0xD3)",
+                # 0xD3, Mod=11, Reg=7 (SAR), R/M=1 (ECX) -> 0xF9
+                "code": bytes([0xD3, 0xF9, 0xF4]),
+                "regs_initial": {1: 0x80000002}, # Negative number, CL=2
+                "regs_expected": {1: 0xE0000000}, # Arithmetic shift right by 2 -> 0xE0000000
+                "expected_eip": 3,
+            },
+            {
+                "name": "SHR AL, 2 (0xC0)",
+                # 0xC0, Mod=11, Reg=5 (SHR), R/M=0 (AL) -> 0xE8, imm8=2
+                "code": bytes([0xC0, 0xE8, 0x02, 0xF4]),
+                "regs_initial": {0: 0xFF}, # AL = 0xFF
+                "regs_expected": {0: 0x3F}, # 0xFF >> 2 = 0x3F
+                "expected_eip": 4,
+            },
+            {
+                "name": "ROL BL, 1 (0xD0)",
+                # 0xD0, Mod=11, Reg=0 (ROL), R/M=3 (BL) -> 0xC3
+                "code": bytes([0xD0, 0xC3, 0xF4]),
+                "regs_initial": {3: 0x81}, # 1000 0001
+                "regs_expected": {3: 0x03}, # 0000 0011
+                "expected_eip": 3,
+            },
+            {
+                "name": "JMP rel8 (0xEB)",
+                "code": bytes([0xEB, 0x05, 0xF4, 0xF4, 0xF4, 0xF4, 0xF4, 0x90, 0xF4]),
+                "regs_initial": {},
+                "regs_expected": {},
+                "expected_eip": 9, # 0 + 2 + 5 (rel8) + 1 (NOP) + 1 (term) = 9
+            },
+            {
+                "name": "CALL rel32 (0xE8)",
+                "code": bytes([0xE8, 0x04, 0x00, 0x00, 0x00, 0xF4, 0xF4, 0xF4, 0x90, 0xF4]),
+                "regs_initial": {4: 0x104},
+                "regs_expected": {4: 0x100},
+                "expected_eip": 10, # 0 + 5 + 4 + 1 = 10
+            },
+            {
+                "name": "INC [EBX] (0xFE Group 4)",
+                # 0xFE, Mod=00, Reg=0 (INC), R/M=3 (EBX) -> 0x03
+                "code": bytes([0xFE, 0x03, 0xF4]),
+                "regs_initial": {3: 0x1000},
+                "regs_expected": {3: 0x1000},
+                "expected_eip": 3,
+            },
+            {
+                "name": "DEC EAX (0xFF Group 5)",
+                # 0xFF, Mod=11, Reg=1 (DEC), R/M=0 (EAX) -> 0xC8
+                "code": bytes([0xFF, 0xC8, 0xF4]),
+                "regs_initial": {0: 0x500},
+                "regs_expected": {0: 0x4FF},
+                "expected_eip": 3,
+            },
+            {
+                "name": "JZ rel8 (0x74) - Not Taken (ZF=0)",
+                "code": bytes([0x74, 0x05, 0xF4, 0xF4, 0xF4, 0xF4, 0xF4, 0x90, 0xF4]),
+                "regs_initial": {},
+                "regs_expected": {},
+                "expected_eip": 3, # 0 + 2 (rel8) + 1 (term) = 3
+            },
+            {
+                "name": "JNZ rel8 (0x75) - Taken (ZF=0)",
+                "code": bytes([0x75, 0x05, 0xF4, 0xF4, 0xF4, 0xF4, 0xF4, 0x90, 0xF4]),
+                "regs_initial": {},
+                "regs_expected": {},
+                "expected_eip": 9, # 0 + 2 + 5 + 1 (NOP) + 1 (term) = 9
+            },
+            {
+                "name": "PUSHA / POPA (0x60 / 0x61)",
+                # 0x60 = PUSHA, 0x61 = POPA
+                # EAX=1, ECX=2, EDX=3, EBX=4, ESP=0x1000, EBP=6, ESI=7, EDI=8
+                # We can PUSHA, clear registers, then POPA to see if they come back!
+                "code": bytes([0x60, 0x33, 0xC0, 0x33, 0xC9, 0x61, 0xF4]), # PUSHA (1), XOR EAX, EAX (2), XOR ECX, ECX (2), POPA (1), HLT (1)
+                "regs_initial": {0: 1, 1: 2, 2: 3, 3: 4, 4: 0x1000, 5: 6, 6: 7, 7: 8},
+                "regs_expected": {0: 1, 1: 2, 2: 3, 3: 4, 4: 0x1000, 5: 6, 6: 7, 7: 8},
+                "expected_eip": 7,
+            },
+            {
+                "name": "PUSH imm32 (0x68)",
+                "code": bytes([0x68, 0x78, 0x56, 0x34, 0x12, 0x58, 0xF4]), # PUSH 0x12345678 (5), POP EAX (1), HLT (1)
+                "regs_initial": {0: 0, 4: 0x1000},
+                "regs_expected": {0: 0x12345678, 4: 0x1000},
+                "expected_eip": 7,
+            },
+            {
+                "name": "IMUL EAX, EBX, imm32 (0x69)",
+                # 0x69, Mod=11, Reg=0 (EAX), R/M=3 (EBX) -> 0xC3
+                "code": bytes([0x69, 0xC3, 0x03, 0x00, 0x00, 0x00, 0xF4]), # IMUL EAX, EBX, 3
+                "regs_initial": {0: 0, 3: 0x1000},
+                "regs_expected": {0: 0x3000, 3: 0x1000},
+                "expected_eip": 7,
+            },
+            {
+                "name": "ENTER 0x10, 0 (0xC8)",
+                "code": bytes([0xC8, 0x10, 0x00, 0x00, 0xF4]),
+                "regs_initial": {4: 0x1000, 5: 0x2000},
+                "regs_expected": {4: 0x0FEC, 5: 0x0FFC}, # ESP=0xFFC, pushes 0x2000, then ESP -= 0x10 = 0xFEC
+                "expected_eip": 5,
+            },
+            {
+                "name": "RETF (0xCB)",
+                # push CS=0, push IP=0x0B (the 0xF4), then RETF.
+                # CS was 0x0023 here originally, which only worked because RETF
+                # popped CS and discarded it. It now installs CS for real, so a
+                # non-zero selector moves CS.base and the linear EIP with it --
+                # see the next case.
+                "code": bytes([0x68, 0x00, 0x00, 0x00, 0x00, 0x68, 0x0B, 0x00, 0x00, 0x00, 0xCB, 0xF4]),
+                "regs_initial": {4: 0x1000},
+                "regs_expected": {4: 0x1000},
+                "expected_eip": 12, # Jump to 11, fetch 0xF4, EIP = 12
+            },
+            {
+                "name": "RETF installs CS, moving CS.base",
+                # The stack is planted directly: IP=0x0002 then CS=0x0020 above
+                # it. CS.base becomes 0x200, so execution resumes at linear
+                # 0x202 where a HLT sits. Before the fix RETF discarded CS and
+                # carried on in the caller's segment.
+                "code": bytes([0xCB]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x0000},
+                "ram_setup": [(0x1000, bytes([0x02, 0x00, 0x20, 0x00])),
+                              (0x202, bytes([0xF4]))],
+                "regs_initial": {4: 0x1000},
+                "regs_expected": {4: 0x1004},
+                "expected_eip": 3,   # IP 2 -> fetch HLT -> IP 3
+            },
+            {
+                "name": "AAM (0xD4)",
+                "code": bytes([0xD4, 0x0A, 0xF4]), # AL = AL % 10, AH = AL / 10
+                "regs_initial": {0: 0x17}, # AL = 23
+                "regs_expected": {0: 0x0203}, # AH = 2, AL = 3
+                "expected_eip": 3,
+            },
+            {
+                "name": "AAD (0xD5)",
+                "code": bytes([0xD5, 0x0A, 0xF4]), # AL = AH * 10 + AL, AH = 0
+                "regs_initial": {0: 0x0203}, # AH = 2, AL = 3
+                "regs_expected": {0: 0x17}, # AL = 23, AH = 0
+                "expected_eip": 3,
+            },
+            {
+                "name": "XLAT (0xD7)",
+                "code": bytes([0xD7, 0xF4]), # AL = [EBX + AL]
+                "regs_initial": {3: 0, 0: 0}, # EBX = 0, AL = 0
+                "regs_expected": {3: 0, 0: 0xD7}, # It reads the instruction byte at 0 (0xD7)
+                "expected_eip": 2,
+            },
+            {
+                "name": "LOOP (0xE2) - Taken",
+                "code": bytes([0xE2, 0x05, 0xF4, 0xF4, 0xF4, 0xF4, 0xF4, 0x90, 0xF4]),
+                "regs_initial": {1: 2}, # ECX = 2
+                "regs_expected": {1: 1}, # ECX = 1
+                "expected_eip": 9,
+            },
+            {
+                "name": "LOOP (0xE2) - Not Taken",
+                "code": bytes([0xE2, 0x05, 0xF4, 0xF4, 0xF4, 0xF4, 0xF4, 0x90, 0xF4]),
+                "regs_initial": {1: 1}, # ECX = 1
+                "regs_expected": {1: 0}, # ECX = 0
+                "expected_eip": 3,
+            },
+            {
+                "name": "JCXZ (0xE3) - Taken",
+                "code": bytes([0xE3, 0x05, 0xF4, 0xF4, 0xF4, 0xF4, 0xF4, 0x90, 0xF4]),
+                "regs_initial": {1: 0}, # ECX = 0
+                "regs_expected": {1: 0}, # ECX = 0
+                "expected_eip": 9,
+            },
+            {
+                "name": "STC / CLC / CMC (0xF9, 0xF8, 0xF5)",
+                # STC (F9) -> CF=1
+                # CMC (F5) -> CF=0
+                # CLC (F8) -> CF=0
+                "code": bytes([0xF9, 0xF5, 0xF8, 0xF4]),
+                "regs_initial": {},
+                "regs_expected": {},
+                "expected_eip": 4, # Just check if they execute without crashing since we don't mock EFLAGS directly
+            },
+            {
+                "name": "STI / CLI / LOCK (0xFB, 0xFA, 0xF0)",
+                "code": bytes([0xFB, 0xFA, 0xF0, 0x90, 0xF4]),
+                "regs_initial": {},
+                "regs_expected": {},
+                "expected_eip": 5,
+            },
+            {
+                "name": "SAHF / LAHF (0x9E, 0x9F)",
+                "code": bytes([0x9E, 0x9F, 0xF4]), # SAHF, LAHF
+                "regs_initial": {0: 0x5500}, # AH = 0x55
+                "regs_expected": {0: 0x5500}, # AH = 0x55
+                "expected_eip": 3,
+            },
+            {
+                "name": "Grp3 F6 NOT / NEG AL",
+                # F6 D0 -> NOT AL (Reg=2, R/M=0 -> Mod=11, Reg=010, R/M=000 -> 11 010 000 = 0xD0)
+                # F6 D8 -> NEG AL (Reg=3, R/M=0 -> Mod=11, Reg=011, R/M=000 -> 11 011 000 = 0xD8)
+                "code": bytes([0xF6, 0xD0, 0xF6, 0xD8, 0xF4]), 
+                "regs_initial": {0: 0x05}, # AL = 5
+                "regs_expected": {0: 0x06}, # NOT(5) = 0xFA, NEG(0xFA) = 6
+                "expected_eip": 5,
+            },
+            {
+                "name": "0x0F JZ rel32",
+                "code": bytes([0x0F, 0x84, 0x03, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90, 0xF4]),
+                "regs_initial": {2: 0},
+                "regs_expected": {},
+                "expected_eip": 10,
+                "eflags_initial": (1 << 6), # ZF=1
+            },
+            {
+                "name": "0x0F SETZ AL",
+                "code": bytes([0x0F, 0x94, 0xC0, 0xF4]), # SETZ AL
+                "regs_initial": {0: 0},
+                "regs_expected": {0: 1},
+                "expected_eip": 4,
+                "eflags_initial": (1 << 6), # ZF=1
+            },
+            {
+                "name": "0x0F MOVZX EAX, BL",
+                "code": bytes([0x0F, 0xB6, 0xC3, 0xF4]),
+                "regs_initial": {0: 0, 3: 0x88},
+                "regs_expected": {0: 0x88},
+                "expected_eip": 4,
+            },
+            {
+                "name": "0x0F MOVSX EAX, BL",
+                "code": bytes([0x0F, 0xBE, 0xC3, 0xF4]),
+                "regs_initial": {0: 0, 3: 0x88},
+                "regs_expected": {0: 0xFFFFFF88},
+                "expected_eip": 4,
+            },
+            {
+                "name": "0x0F MOVZX EAX, BX",
+                "code": bytes([0x0F, 0xB7, 0xC3, 0xF4]),
+                "regs_initial": {0: 0, 3: 0x8888},
+                "regs_expected": {0: 0x00008888},
+                "expected_eip": 4,
+            },
+            {
+                "name": "0x0F MOVSX EAX, BX",
+                "code": bytes([0x0F, 0xBF, 0xC3, 0xF4]),
+                "regs_initial": {0: 0, 3: 0x8888},
+                "regs_expected": {0: 0xFFFF8888},
+                "expected_eip": 4,
+            },
+            {
+                "name": "Grp3 F7 MUL EBX",
+                # F7 E3 -> MUL EBX (Reg=4, R/M=3 -> Mod=11, Reg=100, R/M=011 -> 11 100 011 = 0xE3)
+                "code": bytes([0xF7, 0xE3, 0xF4]), 
+                "regs_initial": {0: 0x10, 3: 0x03}, # EAX = 16, EBX = 3
+                "regs_expected": {0: 0x30, 2: 0x00, 3: 0x03}, # EAX = 48, EDX = 0
+                "expected_eip": 3,
+            },
+            {
+                "name": "LIDT test",
+                "code": bytes([
+                    0x0F, 0x01, 0x18, # LIDT [EAX]
+                    0xF4              # HLT
+                ]),
+                "regs_initial": {0: 0x1000},
+                "regs_expected": {0: 0x1000},
+                "expected_eip": 4,
+                "ram_setup": [
+                    (0x1000, bytes([0xFF, 0xFF, 0x00, 0x20, 0x00, 0x00]))
+                ]
+            },
+            {
+                "name": "INT 0x80 / IRET test",
+                "code": bytes([
+                    0xCD, 0x80,       # INT 0x80
+                    0xF4              # HLT (at EIP=3)
+                ]),
+                "regs_initial": {0: 0x1000, 4: 0x3000},
+                "regs_expected": {0: 0x1000, 4: 0x3000},
+                "expected_eip": 3,
+                "ram_setup": [
+                    # Real-mode IVT: 4-byte entries, offset then selector.
+                    # Vector 0x80 -> 0x80*4 = 0x200. This used to be written as
+                    # an 8-byte protected-mode gate at 0x400, which no real
+                    # machine would have read.
+                    (0x200, bytes([0x34, 0x12, 0x00, 0x00])),
+                    (0x1234, bytes([0xCF]))
+                ]
+            },
+            {
+                "name": "INT pushes FLAGS/CS/IP and clears IF",
+                # STI ; INT 0x80 ; HLT   handler stores nothing, just IRETs.
+                # Checked through the stack image: at SP-6 sits IP=4, then CS,
+                # then FLAGS with IF still set (the pushed copy predates the
+                # clear).
+                "code": bytes([0xFB, 0xCD, 0x80, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x0000},
+                "regs_initial": {4: 0x3000},
+                "regs_expected": {4: 0x3000},
+                "ram_setup": [
+                    (0x200, bytes([0x34, 0x12, 0x00, 0x00])),
+                    (0x1234, bytes([0xCF])),
+                ],
+                "mem_expected": [
+                    # STI is at 0 and INT 0x80 occupies 1-2, so the pushed IP
+                    # is 3. CS follows it as 0x0000.
+                    (0x2FFA, bytes([0x03, 0x00, 0x00, 0x00])),
+                ],
+                "expected_eip": 4,
+            },
+            {
+                "name": "INT clears IF for the handler",
+                # STI ; INT 0x80 ; HLT with a handler that HLTs instead of
+                # returning, so EFLAGS is observed INSIDE the handler.
+                "code": bytes([0xFB, 0xCD, 0x80, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x0000},
+                "regs_initial": {4: 0x3000},
+                "ram_setup": [
+                    (0x200, bytes([0x34, 0x12, 0x00, 0x00])),
+                    (0x1234, bytes([0xF4])),
+                ],
+                "flags_expected": {"IF": 0},
+                "regs_expected": {},
+                "expected_eip": 0x1235,
+            },
+            {
+                "name": "INT vector lookup uses a 4-byte stride",
+                # Vector 0x21 -> 0x84. An 8-byte stride would read 0x108.
+                "code": bytes([0xCD, 0x21, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x0000},
+                "regs_initial": {4: 0x3000},
+                "ram_setup": [
+                    (0x84, bytes([0x00, 0x30, 0x00, 0x00])),   # IP=0x3000 CS=0
+                    (0x108, bytes([0x00, 0x40, 0x00, 0x00])),  # decoy
+                    (0x3000, bytes([0xF4])),
+                ],
+                "regs_expected": {},
+                "expected_eip": 0x3001,
+            },
+            {
+                "name": "INT installs CS from the IVT, moving CS.base",
+                # Handler at CS=0x0100:IP=0x0010 -> linear 0x1010
+                "code": bytes([0xCD, 0x80, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x0000},
+                "regs_initial": {4: 0x3000},
+                "ram_setup": [
+                    (0x200, bytes([0x10, 0x00, 0x00, 0x01])),
+                    (0x1010, bytes([0xF4])),
+                ],
+                "regs_expected": {},
+                "expected_eip": 0x0011,
+            },
+            {
+                "name": "INTO does not fire when OF is clear",
+                "code": bytes([0xCE, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x0000},
+                "regs_initial": {4: 0x3000},
+                "eflags_initial": 0,
+                "ram_setup": [(0x10, bytes([0x00, 0x30, 0x00, 0x00])),
+                              (0x3000, bytes([0xF4]))],
+                "regs_expected": {},
+                "expected_eip": 2,
+            },
+            {
+                "name": "IN AL, imm8 (0xE4)",
+                "code": bytes([
+                    0xE4, 0x1F,       # IN AL, 0x1F
+                    0xF4              # HLT
+                ]),
+                "regs_initial": {0: 0},
+                "regs_expected": {0: 255}, # Since port 0x1F is unassigned, AL becomes 0xFF
+                "expected_eip": 3
+            }
+        ])
+
+        # ------------------------------------------------------------------
+        # Flag tests.
+        #
+        # Every case above checks only registers and EIP, which is why the
+        # entirely-missing arithmetic flag layer passed 82/82: CMP and TEST
+        # "pass" by correctly not touching registers, and the Jcc cases pass by
+        # reading an eflags_initial no instruction had to produce.
+        #
+        # These assert EFLAGS directly. Only the named flags are compared, so a
+        # case says exactly what it means to pin down.
+        # ------------------------------------------------------------------
+        test_cases.extend([
+            {
+                "name": "FLAGS: CMP equal (ZF=1, CF=0)",
+                "code": bytes([0x39, 0xD8, 0xF4]),          # CMP EAX, EBX
+                "regs_initial": {0: 100, 3: 100},
+                "regs_expected": {0: 100, 3: 100},           # CMP must not write
+                "flags_expected": {"ZF": 1, "CF": 0, "SF": 0, "OF": 0},
+                "expected_eip": 3,
+            },
+            {
+                "name": "FLAGS: CMP below (CF=1, ZF=0)",
+                "code": bytes([0x39, 0xD8, 0xF4]),          # CMP EAX, EBX
+                "regs_initial": {0: 5, 3: 9},
+                "regs_expected": {0: 5, 3: 9},
+                "flags_expected": {"ZF": 0, "CF": 1, "SF": 1, "OF": 0},
+                "expected_eip": 3,
+            },
+            {
+                "name": "FLAGS: CMP above (CF=0, ZF=0)",
+                # 0x100 - 1 = 0xFF: low byte has 8 bits set, so PF=1. Asserting a
+                # flag that must be *set* keeps this case from passing vacuously
+                # against an all-zero EFLAGS.
+                "code": bytes([0x39, 0xD8, 0xF4]),          # CMP EAX, EBX
+                "regs_initial": {0: 0x100, 3: 1},
+                "regs_expected": {0: 0x100, 3: 1},
+                "flags_expected": {"ZF": 0, "CF": 0, "SF": 0, "OF": 0, "PF": 1},
+                "expected_eip": 3,
+            },
+            {
+                "name": "FLAGS: SUB to zero (ZF=1)",
+                "code": bytes([0x29, 0xD8, 0xF4]),          # SUB EAX, EBX
+                "regs_initial": {0: 42, 3: 42},
+                "regs_expected": {0: 0, 3: 42},
+                "flags_expected": {"ZF": 1, "SF": 0, "CF": 0, "OF": 0},
+                "expected_eip": 3,
+            },
+            {
+                "name": "FLAGS: ADD unsigned carry out (CF=1)",
+                "code": bytes([0x01, 0xD8, 0xF4]),          # ADD EAX, EBX
+                "regs_initial": {0: 0xFFFFFFFF, 3: 1},
+                "regs_expected": {0: 0, 3: 1},
+                "flags_expected": {"CF": 1, "ZF": 1, "SF": 0, "OF": 0},
+                "expected_eip": 3,
+            },
+            {
+                "name": "FLAGS: ADD signed overflow (OF=1)",
+                "code": bytes([0x01, 0xD8, 0xF4]),          # ADD EAX, EBX
+                "regs_initial": {0: 0x7FFFFFFF, 3: 1},
+                "regs_expected": {0: 0x80000000, 3: 1},
+                "flags_expected": {"OF": 1, "SF": 1, "ZF": 0, "CF": 0},
+                "expected_eip": 3,
+            },
+            {
+                "name": "FLAGS: XOR self clears (ZF=1, CF=0, OF=0)",
+                "code": bytes([0x31, 0xC0, 0xF4]),          # XOR EAX, EAX
+                "regs_initial": {0: 0xDEADBEEF},
+                "regs_expected": {0: 0},
+                "flags_expected": {"ZF": 1, "SF": 0, "CF": 0, "OF": 0},
+                "expected_eip": 3,
+            },
+            {
+                "name": "FLAGS: AND negative result (SF=1)",
+                "code": bytes([0x21, 0xD8, 0xF4]),          # AND EAX, EBX
+                "regs_initial": {0: 0xF0000000, 3: 0x90000000},
+                "regs_expected": {0: 0x90000000, 3: 0x90000000},
+                "flags_expected": {"SF": 1, "ZF": 0, "CF": 0, "OF": 0},
+                "expected_eip": 3,
+            },
+            {
+                "name": "FLAGS: TEST Ev,Gv (0x85) sets ZF without writing",
+                "code": bytes([0x85, 0xD8, 0xF4]),          # TEST EAX, EBX
+                "regs_initial": {0: 0x0F0F0F0F, 3: 0xF0F0F0F0},
+                "regs_expected": {0: 0x0F0F0F0F, 3: 0xF0F0F0F0},
+                "flags_expected": {"ZF": 1, "SF": 0, "CF": 0, "OF": 0},
+                "expected_eip": 3,
+            },
+            {
+                "name": "FLAGS: TEST Ev,Iv (F7 /0) sets ZF without writing",
+                # Test a bit that is clear, so the AND is zero and ZF must be 1.
+                "code": bytes([0xF7, 0xC0, 0x02, 0x00, 0x00, 0x00, 0xF4]),  # TEST EAX, 2
+                "regs_initial": {0: 0x01000000},
+                "regs_expected": {0: 0x01000000},
+                "flags_expected": {"ZF": 1, "SF": 0, "CF": 0, "OF": 0},
+                "expected_eip": 7,
+            },
+            {
+                "name": "FLAGS: parity even (PF=1)",
+                "code": bytes([0x21, 0xD8, 0xF4]),          # AND EAX, EBX -> 0x03, two bits set
+                "regs_initial": {0: 0xFF, 3: 0x03},
+                "regs_expected": {0: 0x03, 3: 0x03},
+                "flags_expected": {"PF": 1, "ZF": 0, "SF": 0},
+                "expected_eip": 3,
+            },
+            {
+                "name": "FLAGS: parity odd (PF=0), negative result (SF=1)",
+                # Result 0x80000007: low byte has 3 bits set so PF=0, and bit 31
+                # is set so SF=1 -- the SF assertion is what stops this case from
+                # passing vacuously.
+                "code": bytes([0x21, 0xD8, 0xF4]),          # AND EAX, EBX
+                "regs_initial": {0: 0xFFFFFFFF, 3: 0x80000007},
+                "regs_expected": {0: 0x80000007, 3: 0x80000007},
+                "flags_expected": {"PF": 0, "ZF": 0, "SF": 1},
+                "expected_eip": 3,
+            },
+            {
+                "name": "FLAGS: INC does not touch CF",
+                "code": bytes([0x40, 0xF4]),                # INC EAX
+                "regs_initial": {0: 0xFFFFFFFF},
+                "regs_expected": {0: 0},
+                # INC sets ZF but must leave CF exactly as it was (1 here).
+                "eflags_initial": (1 << 0),
+                "flags_expected": {"ZF": 1, "CF": 1, "SF": 0, "OF": 0},
+                "expected_eip": 2,
+            },
+            {
+                "name": "FLAGS: SHL CF from last bit shifted out",
+                "code": bytes([0xC1, 0xE0, 0x01, 0xF4]),    # SHL EAX, 1
+                "regs_initial": {0: 0x80000000},
+                "regs_expected": {0: 0},
+                "flags_expected": {"CF": 1, "ZF": 1, "SF": 0},
+                "expected_eip": 4,
+            },
+            {
+                "name": "FLAGS: SHR CF from last bit shifted out",
+                "code": bytes([0xC1, 0xE8, 0x01, 0xF4]),    # SHR EAX, 1
+                "regs_initial": {0: 0x00000003},
+                "regs_expected": {0: 1},
+                "flags_expected": {"CF": 1, "ZF": 0, "SF": 0},
+                "expected_eip": 4,
+            },
+            {
+                "name": "FLAGS: SAR keeps sign, sets CF",
+                "code": bytes([0xC1, 0xF8, 0x01, 0xF4]),    # SAR EAX, 1
+                "regs_initial": {0: 0xFFFFFFFF},
+                "regs_expected": {0: 0xFFFFFFFF},
+                "flags_expected": {"CF": 1, "SF": 1, "ZF": 0},
+                "expected_eip": 4,
+            },
+            {
+                "name": "FLAGS: shift by zero leaves flags alone",
+                "code": bytes([0xC1, 0xE0, 0x00, 0xF4]),    # SHL EAX, 0
+                "regs_initial": {0: 0x00000001},
+                "regs_expected": {0: 1},
+                # CF starts set and must survive a zero-count shift untouched.
+                "eflags_initial": (1 << 0),
+                "flags_expected": {"CF": 1},
+                "expected_eip": 4,
+            },
+            {
+                "name": "FLAGS: NEG sets CF when operand nonzero",
+                "code": bytes([0xF7, 0xD8, 0xF4]),          # NEG EAX
+                "regs_initial": {0: 1},
+                "regs_expected": {0: 0xFFFFFFFF},
+                "flags_expected": {"CF": 1, "SF": 1, "ZF": 0},
+                "expected_eip": 3,
+            },
+            {
+                "name": "FLAGS: NEG of zero clears CF",
+                "code": bytes([0xF7, 0xD8, 0xF4]),          # NEG EAX
+                "regs_initial": {0: 0},
+                "regs_expected": {0: 0},
+                "flags_expected": {"CF": 0, "ZF": 1, "SF": 0},
+                "expected_eip": 3,
+            },
+            {
+                "name": "FLAGS: ADC consumes CF",
+                "code": bytes([0x11, 0xD8, 0xF4]),          # ADC EAX, EBX
+                "regs_initial": {0: 1, 3: 1},
+                "regs_expected": {0: 3, 3: 1},              # 1 + 1 + CF(1)
+                "eflags_initial": (1 << 0),
+                "flags_expected": {"CF": 0, "ZF": 0, "SF": 0},
+                "expected_eip": 3,
+            },
+            {
+                "name": "FLAGS: SBB consumes CF",
+                "code": bytes([0x19, 0xD8, 0xF4]),          # SBB EAX, EBX
+                "regs_initial": {0: 10, 3: 1},
+                "regs_expected": {0: 8, 3: 1},              # 10 - 1 - CF(1)
+                "eflags_initial": (1 << 0),
+                "flags_expected": {"CF": 0, "ZF": 0, "SF": 0},
+                "expected_eip": 3,
+            },
+            {
+                "name": "FLAGS: 8-bit CMP uses byte width for SF",
+                # CMP AL, BL with AL=0x00, BL=0x01 -> 0xFF: SF must come from
+                # bit 7, not bit 31, so this fails without the LSL #24 normalize.
+                "code": bytes([0x38, 0xD8, 0xF4]),          # CMP AL, BL
+                "regs_initial": {0: 0x00, 3: 0x01},
+                "regs_expected": {0: 0x00, 3: 0x01},
+                "flags_expected": {"SF": 1, "CF": 1, "ZF": 0},
+                "expected_eip": 3,
+            },
+            {
+                "name": "FLAGS: HLT alone preserves flags",
+                # Control: proves eflags_initial survives a run untouched, so a
+                # failure elsewhere is the handler and not the harness.
+                "code": bytes([0xF4]),
+                "regs_initial": {0: 1},
+                "regs_expected": {0: 1},
+                "eflags_initial": (1 << 0),
+                "flags_expected": {"CF": 1},
+                "expected_eip": 1,
+            },
+            {
+                "name": "FLAGS: CMP then JZ taken (end-to-end)",
+                # CMP EAX,EBX ; JZ +2 ; HLT ; HLT  -- equal, so the branch is taken
+                "code": bytes([0x39, 0xD8, 0x74, 0x01, 0xF4, 0xF4]),
+                "regs_initial": {0: 7, 3: 7},
+                "regs_expected": {0: 7, 3: 7},
+                "flags_expected": {"ZF": 1},
+                "expected_eip": 6,
+            },
+
+            # --- Segmentation -------------------------------------------------
+            # Every case here is built so it FAILS if the base is not applied:
+            # the value the instruction must load sits only at the segmented
+            # address, and a decoy sits at the unsegmented one.
+            {
+                "name": "SEG: DS.base is added to a disp32 operand",
+                # MOV EAX, [0x400] ; HLT   with DS.base = 0x200
+                # -> must read linear 0x600, not 0x400.
+                "code": bytes([0x8B, 0x05, 0x00, 0x04, 0x00, 0x00, 0xF4]),
+                "segs_initial": {"DS": 0x200},
+                "ram_setup": [(0x400, (0xDEADBEEF).to_bytes(4, "little")),
+                              (0x600, (0xCAFEF00D).to_bytes(4, "little"))],
+                "regs_initial": {},
+                "regs_expected": {0: 0xCAFEF00D},
+                "expected_eip": 7,
+            },
+            {
+                "name": "SEG: [EBP+disp8] defaults to SS, not DS",
+                # MOV EAX, [EBP+0x10] ; HLT   EBP=0x40, SS.base=0x200, DS.base=0x800
+                # -> must read 0x250 (SS), not 0x850 (DS).
+                "code": bytes([0x8B, 0x45, 0x10, 0xF4]),
+                "segs_initial": {"SS": 0x200, "DS": 0x800},
+                "ram_setup": [(0x250, (0x11112222).to_bytes(4, "little")),
+                              (0x850, (0x33334444).to_bytes(4, "little"))],
+                "regs_initial": {5: 0x40},
+                "regs_expected": {0: 0x11112222, 5: 0x40},
+                "expected_eip": 4,
+            },
+            {
+                "name": "SEG: 3E override beats the SS default on [EBP+disp8]",
+                # DS: MOV EAX, [EBP+0x10] ; HLT  -- same state as above, so this
+                # case and the previous one disagree only about the prefix. That
+                # is exactly the distinction a DS-pointer-as-default design
+                # cannot make, which is why R6's sentinel is R8.
+                "code": bytes([0x3E, 0x8B, 0x45, 0x10, 0xF4]),
+                "segs_initial": {"SS": 0x200, "DS": 0x800},
+                "ram_setup": [(0x250, (0x11112222).to_bytes(4, "little")),
+                              (0x850, (0x33334444).to_bytes(4, "little"))],
+                "regs_initial": {5: 0x40},
+                "regs_expected": {0: 0x33334444, 5: 0x40},
+                "expected_eip": 5,
+            },
+            {
+                "name": "SEG: 26 ES override on a disp32 operand",
+                # ES: MOV EAX, [0x400] ; HLT   ES.base=0x100, DS.base=0x200
+                "code": bytes([0x26, 0x8B, 0x05, 0x00, 0x04, 0x00, 0x00, 0xF4]),
+                "segs_initial": {"ES": 0x100, "DS": 0x200},
+                "ram_setup": [(0x500, (0x55556666).to_bytes(4, "little")),
+                              (0x600, (0x77778888).to_bytes(4, "little"))],
+                "regs_initial": {},
+                "regs_expected": {0: 0x55556666},
+                "expected_eip": 8,
+            },
+            {
+                "name": "SEG: an override does not leak into the next instruction",
+                # ES: NOP ; MOV EAX, [0x400] ; HLT  -- the prefix is consumed by
+                # an instruction with no memory operand, so the load that
+                # follows must still be DS. Catches a self-clearing scheme that
+                # only resets R6 where the override is actually used.
+                "code": bytes([0x26, 0x90, 0x8B, 0x05, 0x00, 0x04, 0x00, 0x00, 0xF4]),
+                "segs_initial": {"ES": 0x100, "DS": 0x200},
+                "ram_setup": [(0x500, (0x55556666).to_bytes(4, "little")),
+                              (0x600, (0x77778888).to_bytes(4, "little"))],
+                "regs_initial": {},
+                "regs_expected": {0: 0x77778888},
+                "expected_eip": 9,
+            },
+            {
+                "name": "SEG: a store applies DS.base too",
+                # MOV [0x400], EAX ; HLT   with DS.base = 0x200
+                "code": bytes([0x89, 0x05, 0x00, 0x04, 0x00, 0x00, 0xF4]),
+                "segs_initial": {"DS": 0x200},
+                "regs_initial": {0: 0x99990000},
+                "regs_expected": {0: 0x99990000},
+                "mem_expected": [(0x600, (0x99990000).to_bytes(4, "little")),
+                                 (0x400, bytes(4))],
+                "expected_eip": 7,
+            },
+            {
+                "name": "SEG: SIB with ESP base defaults to SS",
+                # MOV EAX, [ESP] ; HLT   ESP=0x40, SS.base=0x200, DS.base=0x800
+                "code": bytes([0x8B, 0x04, 0x24, 0xF4]),
+                "segs_initial": {"SS": 0x200, "DS": 0x800},
+                "ram_setup": [(0x240, (0xAAAA1111).to_bytes(4, "little")),
+                              (0x840, (0xBBBB2222).to_bytes(4, "little"))],
+                "regs_initial": {4: 0x40},
+                "regs_expected": {0: 0xAAAA1111, 4: 0x40},
+                "expected_eip": 4,
+            },
+
+            # --- 16-bit ------------------------------------------------------
+            # These run through opcode_table_16 with CS.D clear. Before this
+            # work that table was a byte-for-byte duplicate of the 32-bit
+            # handlers, so every one of these would have behaved as 32-bit.
+            {
+                "name": "O16: MOV AX,imm16 preserves the high half of EAX",
+                "code": bytes([0xB8, 0x34, 0x12, 0xF4]),   # MOV AX, 0x1234
+                "mode": 16,
+                "regs_initial": {0: 0xAAAA0000},
+                "regs_expected": {0: 0xAAAA1234},
+                "expected_eip": 4,
+            },
+            {
+                "name": "O16: immediate is 2 bytes, not 4",
+                # MOV AX,0x1234 ; MOV BX,0x5678 ; HLT -- if the first
+                # instruction ate a 4-byte immediate, the second is never
+                # decoded and EIP lands elsewhere.
+                "code": bytes([0xB8, 0x34, 0x12, 0xBB, 0x78, 0x56, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x1234, 3: 0x5678},
+                "expected_eip": 7,
+            },
+            {
+                "name": "O16: PUSH/POP move SP by 2 and go through SS.base",
+                # MOV AX,0x1234 ; PUSH AX ; POP BX ; HLT   SP=0x100, SS.base=0x2000
+                "code": bytes([0xB8, 0x34, 0x12, 0x50, 0x5B, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x2000},
+                "regs_initial": {4: 0x100},
+                "regs_expected": {0: 0x1234, 3: 0x1234, 4: 0x100},
+                # the word must actually land at SS.base + (SP-2)
+                # exactly two bytes: the word below must stay clear, or the
+                # push wrote 4.
+                "mem_expected": [(0x20FC, bytes([0x00, 0x00, 0x34, 0x12]))],
+                "expected_eip": 6,
+            },
+            {
+                "name": "A16: [BX] addressing",
+                # MOV AX,[BX] ; HLT   BX=0x300, DS.base=0x1000 -> linear 0x1300
+                "code": bytes([0x8B, 0x07, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000},
+                # 0xDEAD sits in the next word: a 32-bit read yields
+                # 0xDEADBEEF, and the dirty high half of EAX must survive.
+                "ram_setup": [(0x1300, (0xDEADBEEF).to_bytes(4, "little"))],
+                "regs_initial": {0: 0xAAAA0000, 3: 0x300},
+                "regs_expected": {0: 0xAAAABEEF, 3: 0x300},
+                "expected_eip": 3,
+            },
+            {
+                "name": "A16: [BX+SI+disp8] adds both index registers",
+                # MOV AX,[BX+SI+0x10] ; HLT  BX=0x300 SI=0x40 -> 0x350 + DS 0x1000
+                "code": bytes([0x8B, 0x40, 0x10, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000},
+                "ram_setup": [(0x1350, (0xDEADC0DE).to_bytes(4, "little"))],
+                "regs_initial": {0: 0xAAAA0000, 3: 0x300, 6: 0x40},
+                "regs_expected": {0: 0xAAAAC0DE, 3: 0x300, 6: 0x40},
+                "expected_eip": 4,
+            },
+            {
+                "name": "A16: [BP+disp8] defaults to SS",
+                # MOV AX,[BP+0x10] ; HLT  BP=0x40, SS.base=0x2000, DS.base=0x1000
+                "code": bytes([0x8B, 0x46, 0x10, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x2000, "DS": 0x1000},
+                "ram_setup": [(0x2050, (0xDEAD4444).to_bytes(4, "little")),
+                              (0x1050, (0x5555).to_bytes(2, "little"))],
+                "regs_initial": {0: 0xAAAA0000, 5: 0x40},
+                "regs_expected": {0: 0xAAAA4444, 5: 0x40},
+                "expected_eip": 4,
+            },
+            {
+                "name": "A16: mod=00 rm=110 is disp16, not [BP]",
+                # MOV AX,[0x0300] ; HLT   -- BP is set to a decoy value
+                "code": bytes([0x8B, 0x06, 0x00, 0x03, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000},
+                "ram_setup": [(0x1300, (0xDEAD7777).to_bytes(4, "little"))],
+                "regs_initial": {0: 0xAAAA0000, 5: 0xFFFF},
+                "regs_expected": {0: 0xAAAA7777},
+                "expected_eip": 5,
+            },
+            {
+                "name": "A16: effective address wraps at 16 bits",
+                # MOV AX,[BX+0x10] with BX=0xFFFF -> offset 0x0F, not 0x1000F
+                "code": bytes([0x8B, 0x47, 0x10, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000},
+                "ram_setup": [(0x100F, (0xDEAD8888).to_bytes(4, "little"))],
+                "regs_initial": {0: 0xAAAA0000, 3: 0xFFFF},
+                "regs_expected": {0: 0xAAAA8888, 3: 0xFFFF},
+                "expected_eip": 4,
+            },
+            {
+                "name": "O16: SF/OF come from bit 15",
+                # MOV AX,0x7FFF ; ADD AX,1 ; HLT -> 0x8000: SF=1 OF=1 CF=0
+                "code": bytes([0xB8, 0xFF, 0x7F, 0x83, 0xC0, 0x01, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x8000},
+                "flags_expected": {"SF": 1, "OF": 1, "CF": 0, "ZF": 0},
+                "expected_eip": 7,
+            },
+            {
+                "name": "O16: CF comes from bit 16",
+                # MOV AX,0xFFFF ; ADD AX,1 ; HLT -> 0x0000: CF=1 ZF=1 SF=0 OF=0
+                "code": bytes([0xB8, 0xFF, 0xFF, 0x83, 0xC0, 0x01, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0000},
+                "flags_expected": {"CF": 1, "ZF": 1, "SF": 0, "OF": 0},
+                "expected_eip": 7,
+            },
+            {
+                "name": "O16: ADC consumes CF at the 16-bit width",
+                # STC ; MOV AX,0x00FF ; ADC AX,0x0001 ; HLT -> 0x0101
+                # The normalized-carry bug made narrow ADC ignore CF entirely.
+                "code": bytes([0xF9, 0xB8, 0xFF, 0x00, 0x83, 0xD0, 0x01, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0101},
+                "expected_eip": 8,
+            },
+
+            # --- 66/67 prefixes: the two size axes, dynamically -----------------
+            # The point of these is that operand size and address size are
+            # INDEPENDENT and switch per instruction, in either default mode --
+            # not chosen once from CS.D.
+            {
+                "name": "66: 32-bit operand inside a 16-bit segment",
+                # 66 B8 imm32 -> MOV EAX, 0x11223344 ; HLT
+                "code": bytes([0x66, 0xB8, 0x44, 0x33, 0x22, 0x11, 0xF4]),
+                "mode": 16,
+                "regs_initial": {0: 0xAAAA0000},
+                "regs_expected": {0: 0x11223344},
+                "expected_eip": 7,
+            },
+            {
+                "name": "66: 16-bit operand inside a 32-bit segment",
+                # 66 B8 imm16 -> MOV AX, 0x1234 ; HLT, high half preserved
+                "code": bytes([0x66, 0xB8, 0x34, 0x12, 0xF4]),
+                "mode": 32,
+                "regs_initial": {0: 0xAAAA0000},
+                "regs_expected": {0: 0xAAAA1234},
+                "expected_eip": 5,
+            },
+            {
+                "name": "66: the override dies at the instruction boundary",
+                # 66 B8 imm32 (MOV EAX) ; B8 imm16 (MOV BX.. no: MOV AX) ; HLT
+                # The second MOV must be 16-bit again.
+                "code": bytes([0x66, 0xB8, 0x44, 0x33, 0x22, 0x11,
+                               0xBB, 0x78, 0x56, 0xF4]),
+                "mode": 16,
+                "regs_initial": {3: 0xBBBB0000},
+                "regs_expected": {0: 0x11223344, 3: 0xBBBB5678},
+                "expected_eip": 10,
+            },
+            {
+                "name": "66 twice cancels",
+                "code": bytes([0x66, 0x66, 0xB8, 0x34, 0x12, 0xF4]),
+                "mode": 16,
+                "regs_initial": {0: 0xAAAA0000},
+                "regs_expected": {0: 0xAAAA1234},
+                "expected_eip": 6,
+            },
+            {
+                "name": "67: 32-bit addressing inside a 16-bit segment",
+                # 67 8B 05 disp32 -> MOV AX, [disp32], 16-bit operand but a
+                # 32-bit address form. A 16-bit decoder would read the disp as
+                # 2 bytes and take rm=101 as [DI].
+                "code": bytes([0x67, 0x8B, 0x05, 0x00, 0x04, 0x00, 0x00, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000},
+                "ram_setup": [(0x1400, (0xDEAD9999).to_bytes(4, "little"))],
+                "regs_initial": {0: 0xAAAA0000, 7: 0xFFFF},
+                "regs_expected": {0: 0xAAAA9999},
+                "expected_eip": 8,
+            },
+            {
+                "name": "67: 16-bit addressing inside a 32-bit segment",
+                # 67 8B 07 -> MOV EAX, [BX] using the 16-bit grammar.
+                # Without 67 this ModRM means [EDI].
+                "code": bytes([0x67, 0x8B, 0x07, 0xF4]),
+                "mode": 32,
+                "segs_initial": {"DS": 0x1000},
+                "ram_setup": [(0x1300, (0x12345678).to_bytes(4, "little"))],
+                "regs_initial": {3: 0x300, 7: 0xFFFF},
+                "regs_expected": {0: 0x12345678, 3: 0x300},
+                "expected_eip": 4,
+            },
+            {
+                "name": "66+67: both axes overridden at once",
+                # 66 67 8B 07 in a 16-bit segment -> 32-bit operand, and 67
+                # flips addressing to 32-bit, so ModRM 07 means [EDI].
+                "code": bytes([0x66, 0x67, 0x8B, 0x07, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000},
+                "ram_setup": [(0x1300, (0xCAFEBABE).to_bytes(4, "little"))],
+                "regs_initial": {7: 0x300, 3: 0xFFFF},
+                "regs_expected": {0: 0xCAFEBABE, 7: 0x300},
+                "expected_eip": 5,
+            },
+            {
+                "name": "67 does not disturb operand size",
+                # 67 in a 16-bit segment: addressing becomes 32-bit, the
+                # operand must stay 16-bit and preserve the high half.
+                "code": bytes([0x67, 0x8B, 0x05, 0x00, 0x04, 0x00, 0x00, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000},
+                "ram_setup": [(0x1400, (0xDEAD9999).to_bytes(4, "little"))],
+                "regs_initial": {0: 0x5555FFFF},
+                "regs_expected": {0: 0x55559999},
+                "expected_eip": 8,
+            },
+            {
+                "name": "66 with a segment override, both prefixes live",
+                # 26 66 A1 disp -> ES: MOV EAX, [disp16] in a 16-bit segment
+                "code": bytes([0x26, 0x66, 0x8B, 0x06, 0x00, 0x03, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"ES": 0x1000, "DS": 0x8000},
+                "ram_setup": [(0x1300, (0x0BADF00D).to_bytes(4, "little"))],
+                "regs_initial": {},
+                "regs_expected": {0: 0x0BADF00D},
+                "expected_eip": 7,
+            },
+
+            # --- 16-bit control flow ------------------------------------------
+            {
+                "name": "O16: JMP rel16 displacement is 2 bytes",
+                # E9 rel16 -> jump over a MOV, land on the second
+                "code": bytes([0xE9, 0x03, 0x00,          # JMP +3
+                               0xB8, 0xFF, 0xFF,          # (skipped) MOV AX,0xFFFF
+                               0xB8, 0x11, 0x22,          # MOV AX,0x2211
+                               0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x2211},
+                "expected_eip": 10,
+            },
+            {
+                "name": "O16: CALL rel16 pushes a 2-byte return address",
+                # CALL +1 ; HLT ; POP BX ; HLT   SP=0x100, SS.base=0x2000
+                # The pushed IP is 3 (the instruction after the CALL).
+                "code": bytes([0xE8, 0x01, 0x00,   # CALL -> 4
+                               0xF4,               # (not reached)
+                               0x5B,               # POP BX
+                               0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x2000},
+                "regs_initial": {4: 0x100},
+                "regs_expected": {3: 0x0003, 4: 0x100},
+                "expected_eip": 6,
+            },
+            {
+                "name": "O16: CALL/RET round trip",
+                # CALL +2 ; JMP +3 (skipped path) ; RET target...
+                #  0: E8 02 00   CALL 5
+                #  3: EB 02      JMP 7
+                #  5: C3         RET  -> back to 3
+                #  6: F4
+                #  7: F4
+                "code": bytes([0xE8, 0x02, 0x00, 0xEB, 0x02, 0xC3, 0xF4, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x2000},
+                "regs_initial": {4: 0x100},
+                "regs_expected": {4: 0x100},
+                "expected_eip": 8,
+            },
+            {
+                "name": "O16: Jcc rel8 taken on a 16-bit compare",
+                # MOV AX,0x8000 ; CMP AX,0x8000 ; JZ +3 ; MOV AX,0xFFFF ; HLT
+                "code": bytes([0xB8, 0x00, 0x80,          # MOV AX,0x8000
+                               0x3D, 0x00, 0x80,          # CMP AX,0x8000
+                               0x74, 0x03,                # JZ +3
+                               0xB8, 0xFF, 0xFF,          # (skipped)
+                               0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x8000},
+                "flags_expected": {"ZF": 1},
+                "expected_eip": 12,
+            },
+            {
+                "name": "O16: rel16 displacement is sign-extended",
+                #  0: E9 03 00   JMP forward to 6
+                #  3: F4         HLT            <- backward target, ends the run
+                #  4: 90 90
+                #  6: B8 22 22   MOV AX,0x2222
+                #  9: E9 F7 FF   JMP -9 -> 3
+                # A zero-extended displacement lands at 3 + 0xFFF7 instead.
+                "code": bytes([0xE9, 0x03, 0x00,
+                               0xF4,
+                               0x90, 0x90,
+                               0xB8, 0x22, 0x22,
+                               0xE9, 0xF7, 0xFF]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x2222},
+                "expected_eip": 4,
+            },
+            {
+                "name": "O16: CALL pushes IP, not the linear EIP",
+                # Same CALL as before but with CS.base non-zero. Pushing R10
+                # directly would store base+3 and RET would then add the base a
+                # second time.
+                "code": bytes([0xE8, 0x01, 0x00, 0xF4, 0x5B, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x2000, "CS": 0x0000},
+                "regs_initial": {4: 0x100},
+                "regs_expected": {3: 0x0003, 4: 0x100},
+                "expected_eip": 6,
+            },
+
+            # --- string ops: segments and address size -------------------------
+            {
+                "name": "A16: MOVSB uses DS:SI -> ES:DI, not raw ESI/EDI",
+                # MOVSB ; HLT   DS.base=0x1000 SI=0x10, ES.base=0x2000 DI=0x20
+                "code": bytes([0xA4, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000, "ES": 0x2000},
+                "ram_setup": [(0x1010, bytes([0x5A]))],
+                "regs_initial": {6: 0x10, 7: 0x20},
+                "regs_expected": {6: 0x11, 7: 0x21},
+                "mem_expected": [(0x2020, bytes([0x5A]))],
+                "expected_eip": 2,
+            },
+            {
+                "name": "O16: STOSW writes 2 bytes and advances DI by 2",
+                "code": bytes([0xAB, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"ES": 0x2000},
+                "regs_initial": {0: 0xFFFF1234, 7: 0x30},
+                "regs_expected": {7: 0x32},
+                "mem_expected": [(0x2030, bytes([0x34, 0x12, 0x00, 0x00]))],
+                "expected_eip": 2,
+            },
+            {
+                "name": "A16: STD makes MOVSB decrement both indices",
+                # STD ; MOVSB ; HLT
+                "code": bytes([0xFD, 0xA4, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000, "ES": 0x2000},
+                "ram_setup": [(0x1010, bytes([0x77]))],
+                "regs_initial": {6: 0x10, 7: 0x20},
+                "regs_expected": {6: 0x0F, 7: 0x1F},
+                "mem_expected": [(0x2020, bytes([0x77]))],
+                "expected_eip": 3,
+            },
+            {
+                "name": "A16: SI wraps at 16 bits, it does not run into ESI",
+                # SI = 0xFFFF -> source is DS.base + 0xFFFF = 0x10FFF (the wrap
+                # is on the OFFSET, not on the linear sum). After the move SI
+                # must be 0x0000, not 0x10000.
+                "code": bytes([0xA4, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000, "ES": 0x2000},
+                "ram_setup": [(0x10FFF, bytes([0x33]))],
+                "regs_initial": {6: 0xFFFF, 7: 0x40},
+                "regs_expected": {6: 0x0000, 7: 0x41},
+                "mem_expected": [(0x2040, bytes([0x33]))],
+                "expected_eip": 2,
+            },
+            {
+                "name": "A16: a segment override redirects LODSB's source",
+                # ES: LODSB -- source becomes ES:SI instead of DS:SI
+                "code": bytes([0x26, 0xAC, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000, "ES": 0x2000},
+                "ram_setup": [(0x1050, bytes([0x11])), (0x2050, bytes([0x99]))],
+                "regs_initial": {0: 0xAAAAAA00, 6: 0x50},
+                "regs_expected": {0: 0xAAAAAA99, 6: 0x51},
+                "expected_eip": 3,
+            },
+            {
+                "name": "A16: SCASB compares against ES:DI and sets ZF",
+                "code": bytes([0xAE, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"ES": 0x2000},
+                "ram_setup": [(0x2060, bytes([0x42]))],
+                "regs_initial": {0: 0x42, 7: 0x60},
+                "regs_expected": {7: 0x61},
+                "flags_expected": {"ZF": 1},
+                "expected_eip": 2,
+            },
+
+            # --- REP ----------------------------------------------------------
+            {
+                "name": "REP MOVSB copies CX bytes and lands CX at 0",
+                # REP MOVSB ; HLT   CX=4, DS:SI=0x1000:0x10, ES:DI=0x2000:0x20
+                "code": bytes([0xF3, 0xA4, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000, "ES": 0x2000},
+                "ram_setup": [(0x1010, bytes([0xDE, 0xAD, 0xBE, 0xEF]))],
+                "regs_initial": {1: 4, 6: 0x10, 7: 0x20},
+                "regs_expected": {1: 0, 6: 0x14, 7: 0x24},
+                "mem_expected": [(0x2020, bytes([0xDE, 0xAD, 0xBE, 0xEF, 0x00]))],
+                "expected_eip": 3,
+            },
+            {
+                "name": "REP with CX=0 does nothing and skips the string op",
+                "code": bytes([0xF3, 0xA4, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000, "ES": 0x2000},
+                "ram_setup": [(0x1010, bytes([0xDE]))],
+                "regs_initial": {1: 0, 6: 0x10, 7: 0x20},
+                "regs_expected": {1: 0, 6: 0x10, 7: 0x20},
+                "mem_expected": [(0x2020, bytes([0x00]))],
+                "expected_eip": 3,
+            },
+            {
+                "name": "REP STOSW fills words, DI advances by 2 each",
+                "code": bytes([0xF3, 0xAB, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"ES": 0x2000},
+                "regs_initial": {0: 0x1234, 1: 3, 7: 0x40},
+                "regs_expected": {1: 0, 7: 0x46},
+                "mem_expected": [(0x2040, bytes([0x34, 0x12, 0x34, 0x12,
+                                                 0x34, 0x12, 0x00, 0x00]))],
+                "expected_eip": 3,
+            },
+            {
+                "name": "REPNE SCASB stops on a match, before CX runs out",
+                # Scan for 0x42 in 'A','B','C',0x42,... CX=8
+                "code": bytes([0xF2, 0xAE, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"ES": 0x2000},
+                "ram_setup": [(0x2050, bytes([0x41, 0x41, 0x41,
+                                              0x42, 0x41, 0x41]))],
+                "regs_initial": {0: 0x42, 1: 8, 7: 0x50},
+                # stops with DI just past the match at offset 0x53
+                "regs_expected": {1: 4, 7: 0x54},
+                "flags_expected": {"ZF": 1},
+                "expected_eip": 3,
+            },
+            {
+                "name": "REPE CMPSB stops at the first difference",
+                # "ABCX" vs "ABCY" -- equal for 3, differs at the 4th
+                "code": bytes([0xF3, 0xA6, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000, "ES": 0x2000},
+                "ram_setup": [(0x1010, b"ABCX"), (0x2020, b"ABCY")],
+                "regs_initial": {1: 4, 6: 0x10, 7: 0x20},
+                "regs_expected": {1: 0, 6: 0x14, 7: 0x24},
+                "flags_expected": {"ZF": 0},
+                "expected_eip": 3,
+            },
+            {
+                "name": "REP is ignored on a non-string opcode",
+                # F3 B8 imm16 -> just MOV AX,imm16
+                "code": bytes([0xF3, 0xB8, 0x34, 0x12, 0xF4]),
+                "mode": 16,
+                "regs_initial": {1: 5},
+                "regs_expected": {0: 0x1234, 1: 5},
+                "expected_eip": 5,
+            },
+
+            # --- hypercall ----------------------------------------------------
+            {
+                "name": "HLE: 0F 0B imm8 exits with reason and selector",
+                "code": bytes([0x0F, 0x0B, 0x2A, 0xF4]),
+                "mode": 16,
+                "hle_enabled": 1,
+                "regs_initial": {},
+                "regs_expected": {},
+                "expected_exit_reason": 2,   # X86_EXIT_HLE_INT
+                "expected_exit_info": 0x2A,
+                "expected_eip": 3,           # past the imm8: the stub's IRET runs on re-entry
+            },
+            {
+                "name": "HLE: disabled, 0F 0B raises a real #UD",
+                # Vector 6 -> 0x0000:0x5000, which halts. The pushed IP must
+                # point AT the 0F 0B, not past it.
+                "code": bytes([0x0F, 0x0B, 0x2A, 0xF4]),
+                "mode": 16,
+                "hle_enabled": 0,
+                "segs_initial": {"SS": 0x0000},
+                "regs_initial": {4: 0x3000},
+                "regs_expected": {},
+                "ram_setup": [(0x18, bytes([0x00, 0x50, 0x00, 0x00])),
+                              (0x5000, bytes([0xF4]))],
+                "mem_expected": [(0x2FFA, bytes([0x00, 0x00]))],
+                "expected_eip": 0x5001,
+            },
+
+            # --- PC speaker ---------------------------------------------------
+            # The classic sequence: program PIT channel 2, then enable the gate
+            # and data line on port 0x61. Checked through x86_io, which is what
+            # the audio renderer reads.
+            {
+                "name": "SPK: OUT programs PIT ch2 and the speaker gate",
+                # MOV AL,0xB6 ; OUT 0x43,AL      (ch2, lo/hi, square wave)
+                # MOV AL,0x97 ; OUT 0x42,AL      (divisor lo)
+                # MOV AL,0x04 ; OUT 0x42,AL      (divisor hi -> 0x0497 = 1175)
+                # IN AL,0x61  ; OR AL,3 ; OUT 0x61,AL
+                "code": bytes([0xB0, 0xB6, 0xE6, 0x43,
+                               0xB0, 0x97, 0xE6, 0x42,
+                               0xB0, 0x04, 0xE6, 0x42,
+                               0xE4, 0x61, 0x0C, 0x03, 0xE6, 0x61,
+                               0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {},
+                "io_expected": {"pit2_reload": 0x0497, "port61_low2": 3,
+                                "speaker_hz": 1193182 // 0x0497},
+                "expected_eip": 19,
+            },
+            {
+                "name": "SPK: clearing the gate silences it",
+                # Program a divisor but leave port 0x61 at 0 -> no tone.
+                "code": bytes([0xB0, 0xB6, 0xE6, 0x43,
+                               0xB0, 0x97, 0xE6, 0x42,
+                               0xB0, 0x04, 0xE6, 0x42,
+                               0xB0, 0x00, 0xE6, 0x61,
+                               0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {},
+                "io_expected": {"pit2_reload": 0x0497, "speaker_hz": 0},
+                "expected_eip": 17,
+            },
+            {
+                "name": "SPK: OUT DX,AL uses DX, not ESP",
+                # DX=0x61, ESP=0x43 -- reading the wrong register would send the
+                # byte to the PIT control port and leave the gate alone.
+                "code": bytes([0xEE, 0xF4]),
+                "mode": 16,
+                "regs_initial": {0: 0x03, 2: 0x61, 4: 0x43},
+                "regs_expected": {},
+                "io_expected": {"port61_low2": 3},
+                "expected_eip": 2,
+            },
+        ])
+
+        all_passed = True
+        
+        only = getattr(args, "only", None)
+        for test_num, tc in enumerate(test_cases, 1):
+            if only and test_num not in only:
+                continue
+            print(f"Running Test {test_num}: {tc['name']}")
+            
+            # Clear the data scratch region. Without this a value left by an
+            # earlier case can sit at the address a later case expects to be
+            # written, and the case passes without the CPU doing anything.
+            if "ram_setup" in tc or "mem_expected" in tc:
+                backend.write_memory(ram_addr + 0x200, bytes(0x2E00))
+
+            # Setup custom RAM if needed
+            if "ram_setup" in tc:
+                for addr, data in tc["ram_setup"]:
+                    backend.write_memory(ram_addr + addr, data)
+            
+            # Write program to test_ram
+            backend.write_memory(ram_addr, tc["code"])
+            
+            # Reset CPU state (EIP=0, clear all regs, then set initials)
+            backend.write_uint32(dtcm_addr + 0, 0)   # eip
+            backend.write_uint32(dtcm_addr + 4, tc.get("eflags_initial", 0))  # eflags
+            for i in range(8):
+                backend.write_uint32(dtcm_addr + 8 + i * 4, tc["regs_initial"].get(i, 0))
+            # Reset the whole segment cache, not just the bases. Selectors
+            # used to survive from case to case, which was invisible while
+            # nothing read them -- now that INT/RETF/MOV Sreg install a
+            # selector and derive base = sel<<4 from it, a leftover CS.sel
+            # silently relocates a later case's code.
+            for idx, seg in enumerate(SEG_ORDER):
+                off = SEG_BASE_OFFSETS[seg] - 4      # start of the descriptor
+                flags = CS_FLAG_D if (seg == "CS" and tc.get("mode", 32) == 32) else 0
+                backend.write_uint32(dtcm_addr + off, flags << 16)   # sel=0, flags
+                backend.write_uint32(dtcm_addr + off + 4, 0)         # base
+            for seg_name, base in tc.get("segs_initial", {}).items():
+                backend.write_uint32(dtcm_addr + SEG_BASE_OFFSETS[seg_name], base)
+
+            backend.write_uint32(dtcm_addr + CR0_OFFSET, 0)  # real mode
+            backend.write_uint32(dtcm_addr + HLE_ENABLED_OFFSET,
+                                 tc.get("hle_enabled", 0))
+            backend.write_uint32(dtcm_addr + 40, 0)   # idtr_base
+            backend.write_uint32(dtcm_addr + 2184, 0xFFFFFFFF)  # pit_counter
+            backend.write_uint32(dtcm_addr + 2196, 0)  # exit_reason
+            
+            # Trigger run
+            backend.write_uint32(run_flag_addr, 1)
+            
+            # Poll for completion
+            timeout = 10
+            while timeout > 0:
+                if backend.read_uint32(run_flag_addr) == 0:
+                    break
+                time.sleep(0.05)
+                timeout -= 1
+                
+            if timeout == 0:
+                print(f"  -> TIMEOUT: CPU loop did not finish!")
+                all_passed = False
+                continue
+                
+            # Check results
+            eip = backend.read_uint32(dtcm_addr + 0)
+            passed = eip == tc["expected_eip"]
+            
+            for reg, expected_val in tc["regs_expected"].items():
+                actual_val = backend.read_uint32(dtcm_addr + 8 + reg * 4)
+                if actual_val != expected_val:
+                    passed = False
+                    print(f"  -> FAIL: Reg {reg} was {actual_val}, expected {expected_val}")
+
+            # Only the flags a case names are compared, so each case pins down
+            # exactly what it means to and nothing more.
+            if "flags_expected" in tc:
+                eflags = backend.read_uint32(dtcm_addr + 4)
+                for flag_name, expected_bit in tc["flags_expected"].items():
+                    bit = FLAG_BITS[flag_name]
+                    actual_bit = (eflags >> bit) & 1
+                    if actual_bit != expected_bit:
+                        passed = False
+                        print(f"  -> FAIL: {flag_name} was {actual_bit}, expected "
+                              f"{expected_bit} (eflags=0x{eflags:08x})")
+
+            for addr, expected_bytes in tc.get("mem_expected", []):
+                actual = bytes(backend.read_memory(ram_addr + addr,
+                                                   len(expected_bytes)))
+                if actual != expected_bytes:
+                    passed = False
+                    print(f"  -> FAIL: mem[0x{addr:x}] was {actual.hex()}, "
+                          f"expected {expected_bytes.hex()}")
+
+            if "expected_exit_reason" in tc:
+                got = backend.read_uint32(dtcm_addr + EXIT_REASON_OFFSET)
+                if got != tc["expected_exit_reason"]:
+                    passed = False
+                    print(f"  -> FAIL: exit_reason was {got}, expected "
+                          f"{tc['expected_exit_reason']}")
+            if "expected_exit_info" in tc:
+                got = backend.read_uint32(dtcm_addr + EXIT_INFO_OFFSET)
+                if got != tc["expected_exit_info"]:
+                    passed = False
+                    print(f"  -> FAIL: exit_info was 0x{got:x}, expected "
+                          f"0x{tc['expected_exit_info']:x}")
+
+            if "io_expected" in tc:
+                io = read_io_state(backend, io_addr)
+                for key, want in tc["io_expected"].items():
+                    got = io[key]
+                    if got != want:
+                        passed = False
+                        print(f"  -> FAIL: io.{key} was {got}, expected {want}")
+
+            eflags_now = backend.read_uint32(dtcm_addr + 4)
+            exit_reason = backend.read_uint32(dtcm_addr + 2196)
+            print(f"  -> {'PASS' if passed else 'FAIL'}: EIP: {eip} "
+                  f"(Expected: {tc['expected_eip']}) eflags=0x{eflags_now:08x} "
+                  f"exit={exit_reason}")
+            
+            if not passed:
+                all_passed = False
+                
+        print("Halting...")
+        backend.halt()
+        
+        if all_passed:
+            print("All tests passed!")
+        return True
+        
+    finally:
+        runner.stop()
+
+if __name__ == "__main__":
+    import sys
+    import argparse
+    from scripts.common.runner import add_runner_args
+    parser = argparse.ArgumentParser(description="Run opcodes tests")
+    add_runner_args(parser)
+    parser.add_argument("--only", type=int, nargs="+", metavar="N",
+                        help="run only these test numbers (1-based)")
+    args = parser.parse_args()
+    success = run_test(args)
+    sys.exit(0 if success else 1)

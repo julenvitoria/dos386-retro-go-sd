@@ -23,7 +23,126 @@
  */
 #include "iomem.h"
 
+typedef struct {
+    uint16_t sel;
+    uint16_t flags;
+    uint32_t base;
+    uint32_t limit;
+} X86CPUSeg;
+
+/* CS.flags bit 6 is DESC_D_MASK: it is bit 22 of the 32-bit word the
+   interpreter loads at SEG_CS_SEL, and it selects the DEFAULT operand and
+   address size. Zeroing the CPU struct therefore selects 16-bit, which is
+   architecturally right for a real-mode reset but means any harness running
+   32-bit guest code must set it explicitly. */
+#define X86_DESC_D_FLAG  (1u << 6)
+
+struct X86CPUState {
+    uint32_t eip;
+    uint32_t eflags;
+    uint32_t regs[8];
+    uint32_t idtr_base;
+    uint16_t idtr_limit;
+    X86CPUSeg segs[6];
+    
+    // 386 System Registers
+    uint32_t cr0;
+    uint32_t cr2;
+    uint32_t cr3;
+    uint32_t cr4;
+    
+    // Virtual to Host Physical TLB. Direct-mapped, 128 read + 128 write entries.
+    // Each entry maps (Virtual Page Number) -> (Host Physical Base).
+    // Tag array: bits 31:12 = VPN, bit 0 = Valid.
+    //
+    // RESERVED, NOT YET USED -- 2 KB of DTCM currently doing nothing. Kept
+    // deliberately: this is the backing for the software TLB that will serve
+    // addresses above the direct fold window, which is what removes the current
+    // 8 MB aliasing bug (the 11-bit VPN in MEM_GET_PTR is untagged, so any
+    // access at or above 8 MB silently wraps into the low 8 MB). See PLAN.md
+    // Phase 1. Do not repurpose without reading that first.
+    uint32_t tlb_read_tag[128];
+    uint32_t tlb_read_host[128];
+
+    uint32_t tlb_write_tag[128];
+    uint32_t tlb_write_host[128];
+    
+    // Bare-metal PIT Channel 0 state
+    uint32_t pit_counter;
+    uint32_t pit_reload;
+    uint32_t hard_int_pending;
+    
+    // CPU Loop Exit State
+    uint32_t exit_reason;
+    uint32_t exit_info;
+
+    // Active opcode dispatch table (opcode_table_16 or opcode_table_32).
+    // Selected from CS.D at loop entry and reloaded from DTCM on every fetch.
+    // Kept here rather than in a reserved register so handlers may use R12
+    // freely as scratch (it is also the ARM intra-procedure scratch register).
+    uint32_t opcode_table_base;
+    /* REP state. Set by the F2/F3 prefix, consumed and cleared at the next
+       instruction boundary -- see .fetch_decode_loop. */
+    uint32_t rep_active;
+    uint32_t rep_resume;      /* linear address of the prefix byte */
+    uint32_t rep_zf_sense;    /* 1 = REP/REPE (stop on ZF==0), 0 = REPNE */
+    /* Non-zero enables the 0F 0B hypercall. When 0 it raises a real #UD, so a
+       guest can be run with HLE off and still behave like a plain 386. */
+    uint32_t hle_enabled;
+};
 typedef struct X86CPUState X86CPUState;
+
+/* Why x86_cpu_interp_asm returned. Emitted into x86_offsets.inc by offset.c so
+   the assembly and the C/Python consumers cannot disagree. */
+#define X86_EXIT_NONE          0
+#define X86_EXIT_TERMINATE     1  /* guest asked to exit (INT 21h AH=4Ch) */
+#define X86_EXIT_HLE_INT       2  /* interrupt the host should service */
+#define X86_EXIT_TIMER         3  /* PIT counter expired */
+#define X86_EXIT_UNIMPLEMENTED 4  /* HLT, or an opcode with no handler */
+#define X86_EXIT_MEM_FAULT     5  /* guest access to an unmapped page */
+#define X86_EXIT_GPF           13 /* EXCP0D_GPF */
+
+/* Address-translation fold.
+ *
+ * Each entry is an OFFSET k, not a base: host = guest_linear + k. A mapped
+ * page's k puts the result in RAM (0x20.. / 0x24..), so bit 31 is clear; an
+ * unmapped page stores FOLD_INVALID, which drives the result negative. One
+ * ADDS + BMI therefore validates every access at zero extra cost, replacing
+ * the old BFC/BFI pair that trusted the entry blindly -- and a zero entry used
+ * to alias address 0, which is ITCM, so a stray guest write corrupted the
+ * interpreter's own code. */
+/* Mode-record geometry. Mirrored by the .equ block in cpu_exec.S. */
+/* Guest I/O device state. Lives outside X86CPUState: the interpreter never
+   touches it, only the C port handlers do. */
+typedef struct {
+    uint16_t pit2_reload;     /* channel 2 divisor -> speaker frequency */
+    uint8_t  pit2_access;     /* latched access mode from port 0x43 */
+    uint8_t  pit2_latched;    /* half-way through a lo/hi pair */
+    uint8_t  port61;          /* bit0 = ch2 gate, bit1 = speaker data */
+    uint32_t spk_phase;       /* 16.16 square-wave phase, carried across buffers */
+} X86IOState;
+
+extern X86IOState x86_io;
+
+uint32_t x86_port_read(uint32_t port, uint32_t size);
+void x86_port_write(uint32_t port, uint32_t value, uint32_t size);
+uint32_t x86_speaker_hz(void);
+void x86_speaker_render(int16_t *dst, unsigned frames, unsigned sample_rate,
+                        int16_t amplitude);
+
+#define X86_MODE_REC_STRIDE     2048
+#define X86_MODE_REC_TABLE_OFF  1024
+#define X86_MODE_RECORDS_BYTES  (4 * X86_MODE_REC_STRIDE)
+#define X86_MODE_RECORDS_ALIGN  8192
+
+void x86_build_mode_records(void *dtcm_block);
+uint32_t x86_mode_table(int op32, int addr32);
+extern uint8_t *mode_records_ptr;
+
+#define FOLD_SHIFT       12                 /* 4 KB granules */
+#define FOLD_ENTRIES     4096               /* 16 MB direct window */
+#define FOLD_INVALID     0x80000000u        /* forces bit 31 of the result */
+#define FOLD_K(host, idx)  ((uint32_t)(host) - ((uint32_t)(idx) << FOLD_SHIFT))
 
 /* get_reg/set_reg additional constants */
 #define X86_CPU_REG_EIP 8
@@ -41,13 +160,6 @@ typedef struct X86CPUState X86CPUState;
 #define X86_CPU_SEG_GDT 8
 #define X86_CPU_SEG_IDT 9
 
-typedef struct {
-    uint16_t sel;
-    uint16_t flags;
-    uint32_t base;
-    uint32_t limit;
-} X86CPUSeg;
-
 X86CPUState *x86_cpu_init(PhysMemoryMap *mem_map);
 void x86_cpu_end(X86CPUState *s);
 void x86_cpu_interp(X86CPUState *s, int max_cycles1);
@@ -64,6 +176,7 @@ void x86_cpu_set_get_tsc(X86CPUState *s,
 void x86_cpu_set_port_io(X86CPUState *s, 
                          DeviceReadFunc *port_read, DeviceWriteFunc *port_write,
                          void *opaque);
+void x86_cpu_sync_port_map(X86CPUState *s, PhysMemoryMap *port_map);
 int64_t x86_cpu_get_cycles(X86CPUState *s);
 BOOL x86_cpu_get_power_down(X86CPUState *s);
 void x86_cpu_flush_tlb_write_range_ram(X86CPUState *s,
