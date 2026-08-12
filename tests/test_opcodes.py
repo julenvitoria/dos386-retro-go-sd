@@ -2254,6 +2254,59 @@ def run_test(args):
                 "regs_expected": {4: 0x0010},
                 "expected_eip": 9,
             },
+
+            # ---- 16-bit width on the operand FETCH, not just the core -------
+            {
+                "name": "SHR at 16 bits must not pull in the register's high half",
+                # MOV CL,1 ; SHR BP,CL ; HLT, with EBP dirty above bit 15.
+                # A 32-bit LDR of the operand shifts bit 16 down into bit 15,
+                # so the low half comes out wrong even though the shift core
+                # itself is width-aware. 0x00011234 >> 1 is 0x891A at 32 bits
+                # and 0x091A at 16.
+                "code": bytes([0xB1, 0x01, 0xD3, 0xED, 0xF4]),
+                "mode": 16,
+                "regs_initial": {5: 0x00011234},
+                "regs_expected": {5: 0x0001091A},
+                "expected_eip": 5,
+            },
+            {
+                "name": "SHR r/m16,1 (D1 /5) likewise, and CF is the bit lost",
+                "code": bytes([0xD1, 0xED, 0xF4]),
+                "mode": 16,
+                "regs_initial": {5: 0xFFFF8001},
+                "regs_expected": {5: 0xFFFF4000},
+                "flags_expected": {"CF": 1},
+                "expected_eip": 3,
+            },
+            {
+                "name": "SHR r/m16,imm8 (C1 /5) likewise",
+                "code": bytes([0xC1, 0xED, 0x04, 0xF4]),
+                "mode": 16,
+                "regs_initial": {5: 0x00011234},
+                "regs_expected": {5: 0x00010123},
+                "expected_eip": 4,
+            },
+            {
+                "name": "XCHG AX,r16 (0x95) swaps only the low halves",
+                # This is the decompressor's own idiom -- LODSW then XCHG BP,AX
+                # to refill a 16-bit bit buffer. Swapping 32 bits moves EAX's
+                # high half into EBP, and the SHR that reads the buffer then
+                # shifts that garbage down into BP.
+                "code": bytes([0x95, 0xF4]),
+                "mode": 16,
+                "regs_initial": {0: 0x11112222, 5: 0x33334444},
+                "regs_expected": {0: 0x11114444, 5: 0x33332222},
+                "expected_eip": 2,
+            },
+            {
+                "name": "XCHG Ev,Gv (0x87) swaps only the low halves",
+                # 87 D9 = XCHG CX,BX
+                "code": bytes([0x87, 0xD9, 0xF4]),
+                "mode": 16,
+                "regs_initial": {1: 0xAAAA1111, 3: 0xBBBB2222},
+                "regs_expected": {1: 0xAAAA2222, 3: 0xBBBB1111},
+                "expected_eip": 3,
+            },
         ])
 
         all_passed = True

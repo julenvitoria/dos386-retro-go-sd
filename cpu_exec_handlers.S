@@ -761,7 +761,7 @@ OP_AGNOSTIC .op_xchg_eb_gb_86
     STRB.W R3, [R8, R4]
     B.W .fetch_decode_loop
 
-OP_AGNOSTIC .op_xchg_ev_gv_87
+OP .op_xchg_ev_gv_87
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
@@ -774,13 +774,13 @@ OP_AGNOSTIC .op_xchg_ev_gv_87
     UBFX R4, R1, #3, #3
     MOV.W R4, R4, LSL #2
     ADD.W R4, R4, #8
-    LDR.W R5, [R8, R4]
+    LDREG_V R5, R4
     AND.W R2, R1, #7
     MOV.W R2, R2, LSL #2
     ADD.W R2, R2, #8
-    LDR.W R3, [R8, R2]
-    STR.W R5, [R8, R2]
-    STR.W R3, [R8, R4]
+    LDREG_V R3, R2
+    STREG_V R5, R2
+    STREG_V R3, R4
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_mov_eb_gb_88
@@ -984,14 +984,19 @@ OP .op_pop_ev_8F
     STREG_V R3, R2
     B.W .fetch_decode_loop
 
-OP_AGNOSTIC .op_xchg_eax_r32
+/* XCHG at the operand size. Both this and 0x87 swapped the full 32 bits in
+   16-bit mode: the low halves still ended up in the right places, so it looked
+   harmless, but the HIGH halves were swapped too. That is how EAX's high half
+   reaches BP in `LODSW ; XCHG BP,AX`, and a 16-bit SHR that reads the operand
+   at 32 bits then shifts it straight back down into BP. */
+OP .op_xchg_eax_r32
     AND.W R2, R0, #7
     MOV.W R2, R2, LSL #2
     ADD.W R2, R2, #8
-    LDR.W R4, [R8, #8]
-    LDR.W R3, [R8, R2]
-    STR.W R4, [R8, R2]
-    STR.W R3, [R8, #8]
+    LDREG_V R4, #REG_EAX
+    LDREG_V R3, R2
+    STREG_V R4, R2
+    STREG_V R3, #REG_EAX
     B.W .fetch_decode_loop
 
 OP .op_cwde_98
@@ -1343,7 +1348,7 @@ OP .op_shift_ev_imm8_C1
     MOV.W R2, R2, LSL #2
     ADD.W R2, R2, #8
     ADD R2, R8
-    LDR R3, [R2, #0]
+    LD_V R3, R2
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -1359,7 +1364,7 @@ L(SHIFT_EV_IMM8_C1_MEM):
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     BMI .mem_fault
-    LDR R3, [R2, #0]
+    LD_V R3, R2
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -1396,7 +1401,7 @@ L(SHIFT_EV_DECODE):
     MOV.W R2, R2, LSL #2
     ADD.W R2, R2, #8
     ADD R2, R8
-    LDR R3, [R2, #0]
+    LD_V R3, R2
     B.N L(SHIFT_DISPATCH_32)
 L(SHIFT_EV_MEM):
     PUSH {R5}
@@ -1407,7 +1412,7 @@ L(SHIFT_EV_MEM):
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     BMI .mem_fault
-    LDR R3, [R2, #0]
+    LD_V R3, R2
 L(SHIFT_DISPATCH_32):
     UBFX R12, R1, #3, #3
     /* The table offsets are relative to the TBH's own PC, so the label the

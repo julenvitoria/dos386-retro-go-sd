@@ -425,6 +425,8 @@ L(OP_0F_MOVSX_GV_EW_WRITE):
 .set .op_call_far_9A, .op_call_far_9A_32
 .set .op_retf_CB, .op_retf_CB_32
 .set .op_retf_imm16_CA, .op_retf_imm16_CA_32
+.set .op_xchg_eax_r32, .op_xchg_eax_r32_32
+.set .op_xchg_ev_gv_87, .op_xchg_ev_gv_87_32
 .set .op_stosd_AB, .op_stosd_AB_32
 .set .op_scasd_AF, .op_scasd_AF_32
 .set .op_in_eax_dx_ED, .op_in_eax_dx_ED_32
@@ -511,6 +513,8 @@ opcode_table_0f_32:
 .set .op_call_far_9A, .op_call_far_9A_16
 .set .op_retf_CB, .op_retf_CB_16
 .set .op_retf_imm16_CA, .op_retf_imm16_CA_16
+.set .op_xchg_eax_r32, .op_xchg_eax_r32_16
+.set .op_xchg_ev_gv_87, .op_xchg_ev_gv_87_16
 .set .op_stosd_AB, .op_stosd_AB_16
 .set .op_scasd_AF, .op_scasd_AF_16
 .set .op_in_eax_dx_ED, .op_in_eax_dx_ED_16
