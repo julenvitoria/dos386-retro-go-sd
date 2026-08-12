@@ -3384,6 +3384,10 @@ L(SET_SREG):
     LDR.W R12, [R8, #CPU_CR0]
     TST.W R12, #1
     BNE.W .exit_loop
+    /* A selector is 16 bits. The store below truncates, but the base is built
+       by shifting, so an unmasked register produced a base above the 1 MB real
+       mode limit while the stored selector still looked correct. */
+    UXTH R5, R5
     MOV.W R3, #SEG_STRIDE
     MLA R3, R4, R3, R8
     STRH.W R5, [R3, #SEG_ES_SEL]

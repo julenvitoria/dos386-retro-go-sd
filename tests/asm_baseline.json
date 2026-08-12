@@ -856,8 +856,8 @@
    "insns": 3
   },
   ".save_state_and_exit": {
-   "bytes": 20,
-   "insns": 5
+   "bytes": 22,
+   "insns": 6
   },
   ".str_exit": {
    "bytes": 52,
@@ -1185,7 +1185,7 @@
   },
   "ALU_TABLE_AL_16": {
    "bytes": 16,
-   "insns": 4
+   "insns": 5
   },
   "ALU_TABLE_AL_32": {
    "bytes": 16,
@@ -1193,7 +1193,7 @@
   },
   "ALU_TABLE_EAX_16": {
    "bytes": 100,
-   "insns": 29
+   "insns": 30
   },
   "ALU_TABLE_EAX_32": {
    "bytes": 16,
@@ -1201,7 +1201,7 @@
   },
   "ALU_TABLE_EB_GB_16": {
    "bytes": 16,
-   "insns": 4
+   "insns": 5
   },
   "ALU_TABLE_EB_GB_32": {
    "bytes": 16,
@@ -1209,7 +1209,7 @@
   },
   "ALU_TABLE_EB_IMM8_80_16": {
    "bytes": 16,
-   "insns": 4
+   "insns": 5
   },
   "ALU_TABLE_EB_IMM8_80_32": {
    "bytes": 16,
@@ -1217,7 +1217,7 @@
   },
   "ALU_TABLE_EV_GV_16": {
    "bytes": 102,
-   "insns": 30
+   "insns": 29
   },
   "ALU_TABLE_EV_GV_32": {
    "bytes": 16,
@@ -1225,7 +1225,7 @@
   },
   "ALU_TABLE_EV_IMM32_81_16": {
    "bytes": 16,
-   "insns": 5
+   "insns": 4
   },
   "ALU_TABLE_EV_IMM32_81_32": {
    "bytes": 16,
@@ -1233,7 +1233,7 @@
   },
   "ALU_TABLE_EV_IMM8_83_16": {
    "bytes": 52,
-   "insns": 14
+   "insns": 15
   },
   "ALU_TABLE_EV_IMM8_83_32": {
    "bytes": 16,
@@ -1241,7 +1241,7 @@
   },
   "ALU_TABLE_GB_EB_16": {
    "bytes": 16,
-   "insns": 5
+   "insns": 4
   },
   "ALU_TABLE_GB_EB_32": {
    "bytes": 16,
@@ -1249,7 +1249,7 @@
   },
   "ALU_TABLE_GV_EV_16": {
    "bytes": 44,
-   "insns": 12
+   "insns": 13
   },
   "ALU_TABLE_GV_EV_32": {
    "bytes": 16,
@@ -1884,8 +1884,8 @@
    "insns": 6
   },
   "OP_0F_MOVSX_GV_EW_WRITE_16": {
-   "bytes": 20,
-   "insns": 5
+   "bytes": 22,
+   "insns": 6
   },
   "OP_0F_MOVSX_GV_EW_WRITE_32": {
    "bytes": 20,
@@ -2020,12 +2020,12 @@
    "insns": 3
   },
   "SET_SREG_16": {
-   "bytes": 90,
-   "insns": 25
+   "bytes": 92,
+   "insns": 26
   },
   "SET_SREG_32": {
-   "bytes": 42,
-   "insns": 11
+   "bytes": 44,
+   "insns": 12
   },
   "SHIFT8_DONE_16": {
    "bytes": 22,
@@ -2109,7 +2109,7 @@
   },
   "SHIFT8_TABLE_16": {
    "bytes": 16,
-   "insns": 4
+   "insns": 5
   },
   "SHIFT8_TABLE_32": {
    "bytes": 16,
@@ -2261,7 +2261,7 @@
   },
   "SHIFT_TABLE_16": {
    "bytes": 16,
-   "insns": 5
+   "insns": 4
   },
   "SHIFT_TABLE_32": {
    "bytes": 16,
@@ -2389,8 +2389,8 @@
   }
  },
  "totals": {
-  "bytes": 31840,
-  "insns": 8751,
+  "bytes": 31848,
+  "insns": 8758,
   "symbols": 596
  }
 }

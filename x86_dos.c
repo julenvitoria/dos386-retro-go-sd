@@ -392,13 +392,15 @@ int x86_dos_exec(const char *path, const char *cmdline)
     psp_build(psp, (uint16_t)(psp + need), cmdline);
 
     /* Entry state, exactly as the header specifies. */
+    /* Segment arithmetic wraps at 16 bits; the base must be built from the
+       wrapped value or it can land above 1 MB. */
     cpu_state_ptr->segs[1].sel  = (uint16_t)(load_seg + h.cs);
-    cpu_state_ptr->segs[1].base = SEG(load_seg + h.cs);
+    cpu_state_ptr->segs[1].base = SEG((uint16_t)(load_seg + h.cs));
     cpu_state_ptr->segs[1].limit = 0xFFFF;
     cpu_state_ptr->eip = h.ip;
 
     cpu_state_ptr->segs[2].sel  = (uint16_t)(load_seg + h.ss);
-    cpu_state_ptr->segs[2].base = SEG(load_seg + h.ss);
+    cpu_state_ptr->segs[2].base = SEG((uint16_t)(load_seg + h.ss));
     cpu_state_ptr->segs[2].limit = 0xFFFF;
     cpu_state_ptr->regs[4] = h.sp;
 
