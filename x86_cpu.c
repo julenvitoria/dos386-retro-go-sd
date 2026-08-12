@@ -259,3 +259,10 @@ uint32_t x86_mode_table(int op32, int addr32)
                       + (op32 + 2 * addr32) * X86_MODE_REC_STRIDE
                       + X86_MODE_REC_TABLE_OFF);
 }
+
+/* Diagnostic: the last few CS loads, oldest-first modulo 8.
+ * Each entry is (linear EIP at the moment of the load, new CS selector), which
+ * names whatever transferred control -- far jump, far call, RETF or interrupt,
+ * since all of them install CS through the same path. */
+uint32_t x86_cs_log[16];
+uint32_t x86_cs_log_idx;

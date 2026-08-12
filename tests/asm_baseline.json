@@ -2020,12 +2020,20 @@
    "insns": 3
   },
   "SET_SREG_16": {
-   "bytes": 92,
-   "insns": 26
+   "bytes": 58,
+   "insns": 17
   },
   "SET_SREG_32": {
-   "bytes": 44,
-   "insns": 12
+   "bytes": 58,
+   "insns": 17
+  },
+  "SET_SREG_NOLOG_16": {
+   "bytes": 78,
+   "insns": 22
+  },
+  "SET_SREG_NOLOG_32": {
+   "bytes": 30,
+   "insns": 8
   },
   "SHIFT8_DONE_16": {
    "bytes": 22,
@@ -2389,8 +2397,8 @@
   }
  },
  "totals": {
-  "bytes": 31848,
-  "insns": 8758,
-  "symbols": 596
+  "bytes": 31936,
+  "insns": 8784,
+  "symbols": 598
  }
 }

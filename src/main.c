@@ -78,6 +78,7 @@ volatile uint32_t dsk_mounted = 0;
 volatile uint32_t dsk_exec_rc = 0xFFFFFFFF;
 volatile uint32_t dsk_startup_ok = 0;
 static uint32_t core_clut[16];
+static uint8_t *upper_filler;
 
 /* Host-readable so a failure to place either block is visible rather than a
    black screen. */
@@ -298,6 +299,7 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
 
     guest_ram = (uint8_t *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM,
                                         1, GUEST_RAM_SIZE);
+    upper_filler = (uint8_t *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM, 1, 4096);
     guest_ram_bytes = guest_ram ? GUEST_RAM_SIZE : 0;
 
     if (guest_vram) {
@@ -429,8 +431,26 @@ static void guest_reset(void)
     };
     x86_hle_install(hle_vectors, sizeof(hle_vectors));
 
-    /* One page of BIOS ROM at 0xFF000 for the identification bytes. Mapped
-       from the pool because nothing else backs that address. */
+    /*
+     * Upper memory. A real machine has ROM and adapter space from 0xA0000 up,
+     * and a system tool scans it looking for option-ROM signatures. Leaving it
+     * unmapped makes every one of those probes fault.
+     *
+     * Backing it properly would cost 384 KB of pool. Instead one page of 0xFF
+     * -- open bus, which is what unpopulated memory reads as -- is ALIASED
+     * across the whole region: the fold maps each granule independently, so 96
+     * entries can share one page for 4 KB total. A scan reads 0xFF, finds no
+     * signature, and moves on.
+     */
+    if (upper_filler) {
+        memset(upper_filler, 0xFF, 4096);
+        for (uint32_t lin = 0xA0000u; lin < 0x100000u; lin += 4096u)
+            x86_map_fixed(lin, upper_filler, 4096u);
+    }
+    x86_video_map();                 /* VRAM overlays its part of that range */
+
+    /* The identification bytes need their own page: they must persist, and
+       everything else in the region is a shared alias. */
     x86_map_range(0xFF000u, 4096u);
     x86_bios_rom_install();
 

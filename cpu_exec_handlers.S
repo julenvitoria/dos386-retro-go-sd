@@ -3388,6 +3388,22 @@ L(SET_SREG):
        by shifting, so an unmasked register produced a base above the 1 MB real
        mode limit while the stored selector still looked correct. */
     UXTH R5, R5
+    /* Trace CS loads. Every far transfer and every interrupt installs CS here,
+       so this one place names them all. */
+    CMP R4, #1
+    BNE.N L(SET_SREG_NOLOG)
+    MOVW R3, #:lower16:x86_cs_log_idx
+    MOVT R3, #:upper16:x86_cs_log_idx
+    LDR R0, [R3]
+    ADD.W R12, R0, #1
+    STR R12, [R3]
+    AND.W R0, R0, #7
+    MOVW R3, #:lower16:x86_cs_log
+    MOVT R3, #:upper16:x86_cs_log
+    ADD.W R3, R3, R0, LSL #3
+    STR R10, [R3]                  @ linear EIP at the transfer
+    STR R5, [R3, #4]               @ the CS being installed
+L(SET_SREG_NOLOG):
     MOV.W R3, #SEG_STRIDE
     MLA R3, R4, R3, R8
     STRH.W R5, [R3, #SEG_ES_SEL]
