@@ -1537,6 +1537,35 @@ def run_test(args):
                 "expected_eip": 11,
             },
 
+            # --- MOV Ew,Sreg to memory ----------------------------------------
+            # The handler read the selector into R5 BEFORE calling
+            # DECODE_MODRM, which clobbers R2-R5. Storing a segment register
+            # into memory therefore wrote garbage -- and the classic way to
+            # hook an interrupt is exactly `MOV [vec+2], CS`, so the vector got
+            # a zero segment and the next interrupt ran off into low memory.
+            {
+                "name": "8C /3: MOV [disp16],DS stores the selector",
+                "code": bytes([0x8C, 0x1E, 0x40, 0x02, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000},
+                "sels_initial": {"DS": 0x1234},
+                "regs_initial": {},
+                "regs_expected": {},
+                "mem_expected": [(0x1240, bytes([0x34, 0x12]))],
+                "expected_eip": 5,
+            },
+            {
+                "name": "8C /0: MOV [BX+disp8],ES stores the selector",
+                "code": bytes([0x8C, 0x47, 0x20, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000},
+                "sels_initial": {"ES": 0xBEEF},
+                "regs_initial": {3: 0x0250},
+                "regs_expected": {},
+                "mem_expected": [(0x1270, bytes([0xEF, 0xBE]))],
+                "expected_eip": 4,
+            },
+
             # --- 16-bit control flow ------------------------------------------
             {
                 "name": "O16: JMP rel16 displacement is 2 bytes",
