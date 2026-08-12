@@ -100,6 +100,13 @@ L(raise_gp_fault):
  *
  * R4 = vector number.
  */
+#ifdef USE_16_BIT
+    /* Reachable from the shared exit code in cpu_exec.S, which is outside both
+       passes. Needs the Thumb marking or the linker cannot build the branch. */
+    .global HANDLE_INTERRUPT_16
+    .type HANDLE_INTERRUPT_16, %function
+    .thumb_func
+#endif
 L(HANDLE_INTERRUPT):
     LDR.W R12, [R8, #CPU_CR0]
     TST.W R12, #1

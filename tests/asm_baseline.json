@@ -7,6 +7,10 @@
    "bytes": 8,
    "insns": 2
   },
+  ".exit_timer": {
+   "bytes": 10,
+   "insns": 3
+  },
   ".fetch_decode_loop": {
    "bytes": 20,
    "insns": 6
@@ -16,8 +20,8 @@
    "insns": 7
   },
   ".handle_pit_or_irq": {
-   "bytes": 18,
-   "insns": 5
+   "bytes": 36,
+   "insns": 11
   },
   ".mem_fault": {
    "bytes": 10,
@@ -852,8 +856,8 @@
    "insns": 3
   },
   ".save_state_and_exit": {
-   "bytes": 22,
-   "insns": 6
+   "bytes": 20,
+   "insns": 5
   },
   ".str_exit": {
    "bytes": 52,
@@ -2385,8 +2389,8 @@
   }
  },
  "totals": {
-  "bytes": 31814,
-  "insns": 8743,
-  "symbols": 595
+  "bytes": 31840,
+  "insns": 8751,
+  "symbols": 596
  }
 }

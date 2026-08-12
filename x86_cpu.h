@@ -124,7 +124,15 @@ typedef struct {
     uint8_t  cga_color_select;/* 0x3D9 background + palette + intensity */
     uint16_t cga_beam;        /* 0..0xFFFF through the frame, set by the core */
     uint32_t cga_status_reads;/* advances per 0x3DA read so poll loops progress */
-    uint32_t input_keys;      /* host buttons, consumed by the BIOS layer */
+    uint32_t input_keys;      /* host buttons, latched each frame */
+    /* 8042-style scancode queue. Deliberately modelled at the port level:
+       ports and IRQs behave identically in real and protected mode, whereas an
+       INT 16h shim planted in the IVT is real-mode only. A game that installs
+       its own INT 09h and reads 0x60 directly -- which most action games do --
+       needs nothing above this layer. */
+    uint8_t  kbd_queue[16];
+    uint8_t  kbd_head, kbd_tail;
+    uint8_t  kbd_last;        /* last byte handed out on port 0x60 */
 } X86IOState;
 
 extern X86IOState x86_io;
@@ -155,6 +163,9 @@ void x86_video_set_palette_bios(uint8_t which, uint8_t value);
 void x86_bios_init(void);
 void x86_bios_tick(void);
 void x86_kb_push(uint8_t scancode, uint8_t ascii);
+void x86_kbd_scancode(uint8_t code);
+int x86_kbd_pending(void);
+int x86_bios_kbd_irq(void);
 void x86_hle_set_zf(int set);
 int x86_video_map(void);
 uint8_t *x86_video_vram(void);

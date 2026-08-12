@@ -7,11 +7,11 @@ Roadmap and phase definitions: [`PLAN.md`](PLAN.md).
 
 | Tier | State |
 |---|---|
-| 1. gwemu bare-metal | 182/182 `test_opcodes.py`, plus `test_video`/`test_dos`/`test_screen` |
+| 1. gwemu bare-metal | 188/188 `test_opcodes.py`, plus `test_video`/`test_dos`/`test_screen` |
 | 2. gwemu + retro-go | `core_dtcm_ok=1`, bonus pool 153,600 B, 1,000,001 insns — matches tier 1 |
 | 3. Hardware | 50.50 cyc/insn, 5.54 MIPS |
 
-`tests/asm_baseline.json`: 595 symbols, 8743 insns, 31814 bytes.
+`tests/asm_baseline.json`: 596 symbols, 8751 insns, 31840 bytes.
 Dispatch-table symbols are data; `objdump` counts them as instructions.
 
 Cycles/insn: 57.50 pre-fold → 50.00 fold + absolute dispatch → 50.50 segmentation
@@ -48,7 +48,11 @@ Details are in the git history; `git log --oneline` is the index.
 - [x] CGA text mode 3 (8x8 font, 16-colour attributes, 40 visible columns)
 - [x] DOS: real MCB arena (alloc/free/resize/coalesce, largest-block reporting),
       PSP, MZ loader with relocations, INT 21h core + file handles on FatFs
-- [ ] Hardware keyboard: port 0x60, IRQ 1, INT 09h feeding the BIOS ring
+- [x] Hardware keyboard: 8042-style queue on ports 0x60/0x64, IRQ 1 delivered
+      in-guest at the instruction boundary (gated by IF, no per-instruction
+      cost), INT 09h filling the BIOS ring for INT 16h. Port-level on purpose:
+      identical in protected mode, and a game with its own INT 09h needs none
+      of the BIOS layer
 - [ ] Stream the `.dsk` from SD through the firmware's FatFs
 - [ ] Load ALLEYCAT.EXE through `x86_dos_exec` instead of the built-in demo
 - [x] PC speaker: PIT ch2 + port 0x61 driven by real guest OUT; square-wave

@@ -73,6 +73,18 @@ int main(void)
     EMIT("CPU_TABLE_BASE",       offsetof(X86CPUState, opcode_table_base));
     printf("\n    .equ %-24s, %zu\n", "CPU_STATE_SIZE", sizeof(X86CPUState));
 
+    /* Device state. Separate struct, but the test harness reads it over the
+       debug backend and must not guess where the fields are. */
+    printf("\n");
+    EMIT("IO_PIT2_RELOAD",  offsetof(X86IOState, pit2_reload));
+    EMIT("IO_PORT61",       offsetof(X86IOState, port61));
+    EMIT("IO_CGA_MODE",     offsetof(X86IOState, cga_mode));
+    EMIT("IO_CGA_COLOUR",   offsetof(X86IOState, cga_color_select));
+    EMIT("IO_INPUT_KEYS",   offsetof(X86IOState, input_keys));
+    EMIT("IO_KBD_QUEUE",    offsetof(X86IOState, kbd_queue));
+    EMIT("IO_KBD_HEAD",     offsetof(X86IOState, kbd_head));
+    EMIT("IO_KBD_TAIL",     offsetof(X86IOState, kbd_tail));
+
     printf("\n");
     EMIT("X86_EXIT_TERMINATE",     X86_EXIT_TERMINATE);
     EMIT("X86_EXIT_HLE_INT",       X86_EXIT_HLE_INT);

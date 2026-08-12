@@ -110,6 +110,34 @@ void x86_bios_tick(void)
 }
 
 /* --------------------------------------------------------------------------
+ * INT 09h -- the BIOS keyboard interrupt.
+ *
+ * Only reached while the guest is still using the BIOS vector. A game that
+ * installs its own INT 09h replaces the IVT entry, our stub is never called,
+ * and it reads port 0x60 itself -- which is the whole reason the keyboard is
+ * modelled at the port level rather than as an INT 16h shim.
+ */
+static const uint8_t sc_to_ascii[128] = {
+    0,    27,  '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 8,  9,
+    'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', 13,  0,
+    'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', 39, '`',
+    0,   92,  'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0,  '*',
+    0,   ' ',
+};
+
+int x86_bios_kbd_irq(void)
+{
+    /* Read the controller exactly as a real handler does, so the queue drains
+       through the same path whichever handler is installed. */
+    uint8_t sc = (uint8_t)x86_port_read(0x60, 1);
+    if (sc & 0x80)
+        return 1;                    /* break code: nothing to buffer */
+    uint8_t ascii = (sc < sizeof(sc_to_ascii)) ? sc_to_ascii[sc] : 0;
+    x86_kb_push(sc, ascii);
+    return 1;
+}
+
+/* --------------------------------------------------------------------------
  * INT 10h
  */
 int x86_bios_video(uint8_t func)

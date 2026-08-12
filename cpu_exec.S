@@ -360,6 +360,32 @@ x86_cpu_interp_asm:
 .handle_pit_or_irq:
     LDR R1, [R8, #CPU_PIT_RELOAD]
     STR R1, [R8, #CPU_PIT_COUNTER]
+
+    /* Deliver a pending hardware interrupt IN-GUEST rather than exiting for
+     * it. The host raises one by writing the vector to hard_int_pending and
+     * dropping pit_counter to 1, so the check lands on the next instruction
+     * boundary and costs nothing anywhere else -- there is no per-instruction
+     * test for it.
+     *
+     * IF gates delivery, as the hardware does: a guest inside a critical
+     * section with interrupts masked must not be interrupted, and the request
+     * stays pending until it clears IF again.
+     *
+     * Dispatch goes to the 16-bit frame builder because delivery only happens
+     * in real mode (the handler traps on CR0.PE). A 32-bit code segment in
+     * real mode would want a 32-bit frame; that is unreal mode and nothing
+     * here needs it yet. */
+    LDR R1, [R8, #CPU_HARD_INT_PENDING]
+    CMP R1, #0
+    BEQ .exit_timer
+    TST R11, #(1 << 9)             @ IF
+    BEQ .exit_timer
+    MOV R0, #0
+    STR R0, [R8, #CPU_HARD_INT_PENDING]
+    MOV R4, R1
+    B.W HANDLE_INTERRUPT_16
+
+.exit_timer:
     MOV R0, #X86_EXIT_TIMER
     STR R0, [R8, #CPU_EXIT_REASON]
     B .save_state_and_exit

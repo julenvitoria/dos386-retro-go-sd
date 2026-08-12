@@ -144,6 +144,8 @@ int x86_hle_dispatch(uint8_t vector)
     case 0x08:                       /* PIT tick: keep the BDA count moving */
         x86_bios_tick();
         return 1;
+    case 0x09:
+        return x86_bios_kbd_irq();
     case 0x21:
         return x86_dos_int21(AH);
     case 0x20:

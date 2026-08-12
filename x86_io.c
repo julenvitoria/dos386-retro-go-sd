@@ -88,6 +88,36 @@ void x86_speaker_render(int16_t *dst, unsigned frames, unsigned sample_rate,
     x86_io.spk_phase = phase;
 }
 
+/* ---------------------------------------------------------------------------
+ * Keyboard controller.
+ *
+ * Queue a make or break code and raise IRQ 1. The interpreter delivers it at
+ * the next instruction boundary if IF allows; the host drops pit_counter to 1
+ * so that boundary arrives immediately rather than at the end of the slice.
+ */
+void x86_kbd_scancode(uint8_t code)
+{
+    uint8_t next = (uint8_t)((x86_io.kbd_tail + 1u) & 15u);
+    if (next == x86_io.kbd_head)
+        return;                      /* full: the controller drops it too */
+    x86_io.kbd_queue[x86_io.kbd_tail] = code;
+    x86_io.kbd_tail = next;
+}
+
+int x86_kbd_pending(void)
+{
+    return x86_io.kbd_head != x86_io.kbd_tail;
+}
+
+static uint8_t kbd_read_data(void)
+{
+    if (x86_io.kbd_head == x86_io.kbd_tail)
+        return x86_io.kbd_last;      /* re-reading holds the last code */
+    x86_io.kbd_last = x86_io.kbd_queue[x86_io.kbd_head];
+    x86_io.kbd_head = (uint8_t)((x86_io.kbd_head + 1u) & 15u);
+    return x86_io.kbd_last;
+}
+
 /* --------------------------------------------------------------------------- */
 
 uint32_t x86_port_read(uint32_t port, uint32_t size)
@@ -96,6 +126,12 @@ uint32_t x86_port_read(uint32_t port, uint32_t size)
     switch (port) {
     case 0x42:
         return x86_io.pit2_reload & 0xFF;
+    case 0x60:
+        return kbd_read_data();
+    case 0x64:
+        /* Status: bit 0 = output buffer full, bit 2 = self-test passed. Polled
+           by code that reads the port without using the interrupt. */
+        return (uint32_t)((x86_kbd_pending() ? 1u : 0u) | 4u);
     case 0x61:
         return x86_io.port61;
 
@@ -142,6 +178,10 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
         break;
     case 0x61:
         x86_io.port61 = (uint8_t)value;
+        break;
+    case 0x20:                       /* PIC end-of-interrupt: nothing to model
+                                        while only one IRQ source exists */
+    case 0x64:                       /* controller commands: accepted, ignored */
         break;
 
     case 0x3D8:

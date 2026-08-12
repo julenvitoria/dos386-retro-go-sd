@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import re
 import sys
 import subprocess
 import time
@@ -29,11 +30,28 @@ SEG_ORDER = ("ES", "CS", "SS", "DS", "FS", "GS")
 CS_FLAGS_OFFSET = 60 + 2
 # CR0 was never reset between cases either; bit 0 (PE) changes what a segment
 # load means, so a case that sets it would silently alter every later one.
-CR0_OFFSET = 120
-# Generated offsets, mirrored from x86_offsets.inc.
-EXIT_INFO_OFFSET = 2200
-EXIT_REASON_OFFSET = 2196
-HLE_ENABLED_OFFSET = 2220
+def _generated_offsets(path="x86_offsets.inc"):
+    """Read the offsets the build generates from the C structs.
+
+    Mirroring them by hand is how the CS 48/60 drift happened; there is one
+    source of truth and it is this file."""
+    out = {}
+    for line in open(path):
+        m = re.match(r"\s*\.equ\s+(\w+)\s*,\s*(\d+)", line)
+        if m:
+            out[m.group(1)] = int(m.group(2))
+    return out
+
+
+OFF = _generated_offsets()
+CR0_OFFSET = OFF["CPU_CR0"]
+EXIT_INFO_OFFSET = OFF["CPU_EXIT_INFO"]
+EXIT_REASON_OFFSET = OFF["CPU_EXIT_REASON"]
+HLE_ENABLED_OFFSET = OFF["CPU_HLE_ENABLED"]
+IO_KBD_QUEUE = OFF["IO_KBD_QUEUE"]
+IO_KBD_HEAD = OFF["IO_KBD_HEAD"]
+PIT_COUNTER_OFFSET = OFF["CPU_PIT_COUNTER"]
+HARD_INT_OFFSET = OFF["CPU_HARD_INT_PENDING"]
 CS_FLAG_D = 1 << 6
 
 FLAG_BITS = {
@@ -1901,6 +1919,86 @@ def run_test(args):
                 "io_expected": {"port61_low2": 3},
                 "expected_eip": 2,
             },
+
+            # --- keyboard ------------------------------------------------------
+            # The controller is modelled at the port level, so these work the
+            # same in protected mode. A game reading 0x60 directly needs none of
+            # the BIOS layer above it.
+            {
+                "name": "KBD: port 0x60 returns the queued scancode",
+                # IN AL,0x60 ; HLT
+                "code": bytes([0xE4, 0x60, 0xF4]),
+                "mode": 16,
+                "kbd_queue": [0x1E],          # 'a' make code
+                "regs_initial": {},
+                "regs_expected": {0: 0x001E},
+                "expected_eip": 3,
+            },
+            {
+                "name": "KBD: port 0x64 reports the output buffer full",
+                # IN AL,0x64 ; HLT -> bit0 set (data waiting) and bit2 set
+                "code": bytes([0xE4, 0x64, 0xF4]),
+                "mode": 16,
+                "kbd_queue": [0x1E],
+                "regs_initial": {},
+                "regs_expected": {0: 0x0005},
+                "expected_eip": 3,
+            },
+            {
+                "name": "KBD: port 0x64 reports empty when nothing is queued",
+                "code": bytes([0xE4, 0x64, 0xF4]),
+                "mode": 16,
+                "kbd_queue": [],
+                "regs_initial": {},
+                "regs_expected": {0: 0x0004},
+                "expected_eip": 3,
+            },
+            {
+                "name": "KBD: reads drain the queue in order",
+                # IN AL,0x60 ; MOV BL,AL ; IN AL,0x60 ; HLT
+                "code": bytes([0xE4, 0x60, 0x88, 0xC3, 0xE4, 0x60, 0xF4]),
+                "mode": 16,
+                "kbd_queue": [0x1E, 0x30],
+                "regs_initial": {},
+                "regs_expected": {0: 0x0030, 3: 0x001E},
+                "expected_eip": 7,
+            },
+            {
+                "name": "IRQ: a pending interrupt is delivered in-guest",
+                # NOP ; NOP ; HLT, with IRQ 1 pending and the boundary pulled
+                # forward. Vector 9 points at 0000:0x3000, which halts, so
+                # landing there proves delivery rather than the fallthrough.
+                "code": bytes([0x90, 0x90, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x0000},
+                "regs_initial": {4: 0x2000},
+                "regs_expected": {},
+                "eflags_initial": 0x0200,          # IF set
+                "irq_pending": 0x09,
+                "pit_counter": 1,
+                "ram_setup": [(0x24, bytes([0x00, 0x30, 0x00, 0x00])),
+                              (0x3000, bytes([0xF4]))],
+                "expected_eip": 0x3001,
+            },
+            {
+                "name": "IRQ: delivery waits while IF is clear",
+                # Same, but interrupts masked. The boundary still arrives, and
+                # the interpreter exits on the timer with EIP untouched instead
+                # of vectoring. What this pins down is that it did NOT reach
+                # 0x3001, which is where an implementation ignoring IF lands.
+                "code": bytes([0x90, 0x90, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x0000},
+                "regs_initial": {4: 0x2000},
+                "regs_expected": {},
+                "eflags_initial": 0x0000,          # IF clear
+                "irq_pending": 0x09,
+                "pit_counter": 1,
+                "ram_setup": [(0x24, bytes([0x00, 0x30, 0x00, 0x00])),
+                              (0x3000, bytes([0xF4]))],
+                "expected_exit_reason": 3,      # X86_EXIT_TIMER, not a vector
+                "expected_eip": 0,
+            },
         ])
 
         all_passed = True
@@ -1946,8 +2044,22 @@ def run_test(args):
             backend.write_uint32(dtcm_addr + CR0_OFFSET, 0)  # real mode
             backend.write_uint32(dtcm_addr + HLE_ENABLED_OFFSET,
                                  tc.get("hle_enabled", 0))
+
+            # Keyboard queue lives in x86_io, not the CPU struct.
+            q = tc.get("kbd_queue", [])
+            backend.write_memory(io_addr + IO_KBD_QUEUE, bytes(16))
+            if q:
+                backend.write_memory(io_addr + IO_KBD_QUEUE, bytes(q))
+            # head, tail, last -- tail = how many codes are queued
+            backend.write_memory(io_addr + IO_KBD_HEAD,
+                                 bytes([0, len(q) & 15, 0]))
             backend.write_uint32(dtcm_addr + 40, 0)   # idtr_base
-            backend.write_uint32(dtcm_addr + 2184, 0xFFFFFFFF)  # pit_counter
+            # A pending IRQ is delivered at the next boundary, so a case that
+            # wants one also pulls the PIT counter forward to reach it.
+            irq = tc.get("irq_pending", 0)
+            backend.write_uint32(dtcm_addr + HARD_INT_OFFSET, irq)
+            backend.write_uint32(dtcm_addr + PIT_COUNTER_OFFSET,
+                                 tc.get("pit_counter", 0xFFFFFFFF))
             backend.write_uint32(dtcm_addr + 2196, 0)  # exit_reason
             
             # Trigger run

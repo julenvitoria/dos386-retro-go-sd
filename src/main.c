@@ -339,7 +339,7 @@ static void guest_reset(void)
     /* Take over the vectors we serve. The guest reaches us through a planted
        0F 0B stub, so a program that hooks or chains one still works. */
     static const uint8_t hle_vectors[] = {
-        0x08, 0x10, 0x16, 0x1A, 0x20, 0x21,
+        0x08, 0x09, 0x10, 0x16, 0x1A, 0x20, 0x21,
     };
     x86_hle_install(hle_vectors, sizeof(hle_vectors));
 
@@ -356,8 +356,29 @@ static void guest_reset(void)
     cpu_state_ptr->pit_counter = 200000;
 }
 
-/* Map the G&W buttons onto what a DOS game reads. Until the BIOS keyboard
-   layer exists this only records state; INT 16h will consume it. */
+/*
+ * Gamepad -> scancodes.
+ *
+ * Edge-triggered: a make code when a button goes down, a break code when it
+ * comes up, exactly as a keyboard controller reports. Level-triggering would
+ * flood the queue and leave a game seeing an endless key repeat.
+ *
+ * Modelled at this level on purpose: ports and IRQs behave identically in real
+ * and protected mode, so nothing here has to be revisited for protected mode,
+ * and a game that installs its own INT 09h and reads port 0x60 directly -- as
+ * most action games do -- needs no BIOS layer at all.
+ */
+static const uint8_t pad_scancode[8] = {
+    0x48,  /* UP    */
+    0x50,  /* DOWN  */
+    0x4B,  /* LEFT  */
+    0x4D,  /* RIGHT */
+    0x39,  /* A      -> Space */
+    0x1D,  /* B      -> Ctrl  */
+    0x1C,  /* START  -> Enter */
+    0x01,  /* SELECT -> Esc   */
+};
+
 static void poll_input(const gw_firmware_abi_t *abi)
 {
     odroid_gamepad_state_t pad;
@@ -365,15 +386,33 @@ static void poll_input(const gw_firmware_abi_t *abi)
     abi->input_ctl(GW_INPUT_READ_GAMEPAD, &pad);
 
     uint32_t keys = 0;
-    if (pad.values[ODROID_INPUT_UP])    keys |= 1u << 0;
-    if (pad.values[ODROID_INPUT_DOWN])  keys |= 1u << 1;
-    if (pad.values[ODROID_INPUT_LEFT])  keys |= 1u << 2;
-    if (pad.values[ODROID_INPUT_RIGHT]) keys |= 1u << 3;
-    if (pad.values[ODROID_INPUT_A])     keys |= 1u << 4;
-    if (pad.values[ODROID_INPUT_B])     keys |= 1u << 5;
-    if (pad.values[ODROID_INPUT_START]) keys |= 1u << 6;
-    if (pad.values[ODROID_INPUT_SELECT])keys |= 1u << 7;
+    if (pad.values[ODROID_INPUT_UP])     keys |= 1u << 0;
+    if (pad.values[ODROID_INPUT_DOWN])   keys |= 1u << 1;
+    if (pad.values[ODROID_INPUT_LEFT])   keys |= 1u << 2;
+    if (pad.values[ODROID_INPUT_RIGHT])  keys |= 1u << 3;
+    if (pad.values[ODROID_INPUT_A])      keys |= 1u << 4;
+    if (pad.values[ODROID_INPUT_B])      keys |= 1u << 5;
+    if (pad.values[ODROID_INPUT_START])  keys |= 1u << 6;
+    if (pad.values[ODROID_INPUT_SELECT]) keys |= 1u << 7;
+
+    uint32_t changed = keys ^ x86_io.input_keys;
     x86_io.input_keys = keys;
+    if (!changed)
+        return;
+
+    for (unsigned i = 0; i < 8; i++) {
+        if (!(changed & (1u << i)))
+            continue;
+        uint8_t sc = pad_scancode[i];
+        x86_kbd_scancode((keys & (1u << i)) ? sc : (uint8_t)(sc | 0x80));
+    }
+
+    /* Raise IRQ 1 and pull the next instruction boundary forward, so it is
+       delivered now instead of at the end of the slice. */
+    if (x86_kbd_pending()) {
+        cpu_state_ptr->hard_int_pending = 0x09;
+        cpu_state_ptr->pit_counter = 1;
+    }
 }
 
 static void emulator_loop(const gw_firmware_abi_t *abi)
