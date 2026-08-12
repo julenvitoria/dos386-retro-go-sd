@@ -511,6 +511,13 @@ static void poll_input(const gw_firmware_abi_t *abi)
     memset(&pad, 0, sizeof(pad));
     abi->input_ctl(GW_INPUT_READ_GAMEPAD, &pad);
 
+    /* Hand the frame to the firmware before consuming it ourselves. This is
+       what makes PAUSE/SET open the Retro-Go overlay, and it owns save states,
+       brightness, volume and exit. Reading the gamepad directly and stopping
+       there -- which is what this did -- leaves the core running inside
+       Retro-Go with no way to get back out of it. */
+    abi->common_emu_input_loop(&pad, NULL, NULL);
+
     uint32_t keys = 0;
     if (pad.values[ODROID_INPUT_UP])     keys |= 1u << 0;
     if (pad.values[ODROID_INPUT_DOWN])   keys |= 1u << 1;
@@ -620,11 +627,17 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         if (abuf && audio_frames)
             x86_speaker_render(abuf, audio_frames, SAMPLE_RATE, 6000);
 
-        /* Pace to the panel; otherwise the loop renders and swaps as fast as
-           the guest returns, which with a halted guest is thousands of times a
-           second and shows as flicker. */
-        abi->lcd_ctl(GW_LCD_WAIT_VBLANK, 0, 0, 0);
+        /* Pace the loop. GW_LCD_WAIT_VBLANK is NOT usable here: gwemu does
+           not model vblank, so it never returns and the core never draws --
+           the screen stays black and nothing reaches the host. Wait on the
+           swap the firmware has already queued instead, which is modelled and
+           bounds the loop to the panel rate on both targets. */
         abi->lcd_ctl(GW_LCD_SWAP, 0, 0, 0);
+        for (unsigned spins = 0;
+             spins < 100000u && abi->lcd_ctl(GW_LCD_IS_SWAP_PENDING, 0, 0, 0);
+             spins++) {
+            /* bounded: never trade a black screen for a hang */
+        }
         frames_rendered++;
         abi->wdog_refresh();
     }
