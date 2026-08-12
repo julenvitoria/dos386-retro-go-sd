@@ -2332,6 +2332,65 @@ def run_test(args):
                                                   0x66, 0x66]))],
                 "expected_eip": 4,
             },
+
+            # ---- TEST, and the two 16-bit sign extensions -------------------
+            {
+                "name": "FLAGS: TEST AL,imm8 (A8) sets ZF/PF and clears CF/OF",
+                # STC ; MOV AL,0x0F ; TEST AL,0xF0 ; HLT. A8 set no flags at
+                # all, so anything branching on a bit test fell through.
+                "code": bytes([0xF9, 0xB0, 0x0F, 0xA8, 0xF0, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0F},   # TEST must not write the operand
+                "flags_expected": {"ZF": 1, "SF": 0, "CF": 0, "OF": 0, "PF": 1},
+                "expected_eip": 6,
+            },
+            {
+                "name": "FLAGS: TEST AL,imm8 sets SF on a set high bit",
+                "code": bytes([0xB0, 0x80, 0xA8, 0x80, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x80},
+                "flags_expected": {"ZF": 0, "SF": 1},
+                "expected_eip": 5,
+            },
+            {
+                "name": "FLAGS: TEST Eb,Gb (84) sets ZF",
+                # MOV AL,0x0F ; MOV BL,0xF0 ; TEST AL,BL ; HLT
+                "code": bytes([0xB0, 0x0F, 0xB3, 0xF0, 0x84, 0xD8, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0F, 3: 0xF0},
+                "flags_expected": {"ZF": 1, "CF": 0, "OF": 0},
+                "expected_eip": 7,
+            },
+            {
+                "name": "FLAGS: TEST AX,imm16 (A9) sets ZF at 16 bits",
+                "code": bytes([0xB8, 0x0F, 0x0F, 0xA9, 0xF0, 0xF0, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0F0F},
+                "flags_expected": {"ZF": 1, "CF": 0, "OF": 0},
+                "expected_eip": 7,
+            },
+            {
+                "name": "CBW (98) sign-extends AL into AX, not AX into EAX",
+                # 0x98/0x99 are emitted for both passes but had fixed 32-bit
+                # bodies, so 16-bit CBW/CWD executed CWDE/CDQ.
+                "code": bytes([0xB8, 0x80, 0x00, 0x98, 0xF4]),
+                "mode": 16,
+                "regs_initial": {0: 0},
+                "regs_expected": {0: 0xFF80},
+                "expected_eip": 5,
+            },
+            {
+                "name": "CWD (99) fills DX from the sign of AX",
+                "code": bytes([0xB8, 0x00, 0x80, 0x99, 0xF4]),
+                "mode": 16,
+                "regs_initial": {2: 0},
+                "regs_expected": {0: 0x8000, 2: 0xFFFF},
+                "expected_eip": 5,
+            },
         ])
 
         all_passed = True

@@ -699,6 +699,10 @@ L(ALU_DISPATCH_EV_IMM8_83):
 L(ALU_TABLE_EV_IMM8_83):
     ALU_TABLE_M L(ALU_TABLE_EV_IMM8_83), L(ALU_DISPATCH_EV_IMM8_83), 
 
+/* TEST is an AND that keeps the flags and throws away the result. All three
+   forms -- 84, A8 and A9 -- computed the AND and then set no flag at all, so a
+   program branching on a bit test always took the same path. 84 did not even
+   compute it: the handler decoded the ModRM and returned. */
 OP_AGNOSTIC .op_test_eb_gb_84
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
@@ -709,6 +713,23 @@ OP_AGNOSTIC .op_test_eb_gb_84
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
     CMP R3, #192
     BNE.W .exit_loop
+    UBFX R4, R1, #3, #3            @ Gb: high byte registers are regs 4-7
+    AND.W R5, R4, #3
+    MOV.W R5, R5, LSL #2
+    MOV.W R4, R4, LSR #2
+    ADD R4, R5
+    ADD.W R4, R4, #8
+    LDRB.W R5, [R8, R4]
+    AND.W R2, R1, #7               @ Eb
+    AND.W R3, R2, #3
+    MOV.W R3, R3, LSL #2
+    MOV.W R2, R2, LSR #2
+    ADD R2, R3
+    ADD.W R2, R2, #8
+    LDRB.W R3, [R8, R2]
+    AND.W R3, R3, R5
+    LSLS.W R0, R3, #24             @ set N/Z for the byte width
+    X86_FLAGS_LOGIC R3, R0, R1
     B.W .fetch_decode_loop
 
 OP .op_test_ev_gv_85
@@ -999,16 +1020,31 @@ OP .op_xchg_eax_r32
     STREG_V R3, #REG_EAX
     B.W .fetch_decode_loop
 
+/* CBW/CWDE and CWD/CDQ differ by operand size in what they read AND what they
+   write. Both were emitted for each pass but carried the 32-bit body, so a
+   16-bit guest got CWDE and CDQ -- CBW then destroyed AH instead of filling it
+   from AL's sign, and CWD left DX untouched. */
 OP .op_cwde_98
-    LDR.W R3, [R8, #8]
+#if NSH
+    LDRSB.W R3, [R8, #REG_EAX]     @ CBW: AL -> AX
+    STRH.W R3, [R8, #REG_EAX]
+#else
+    LDR.W R3, [R8, #REG_EAX]
     SXTH R3, R3
-    STR.W R3, [R8, #8]
+    STR.W R3, [R8, #REG_EAX]
+#endif
     B.W .fetch_decode_loop
 
 OP .op_cdq_99
-    LDR.W R3, [R8, #8]
+#if NSH
+    LDRSH.W R3, [R8, #REG_EAX]     @ CWD: the sign of AX fills DX
     MOV.W R4, R3, ASR #31
-    STR.W R4, [R8, #16]
+    STRH.W R4, [R8, #REG_EDX]
+#else
+    LDR.W R3, [R8, #REG_EAX]
+    MOV.W R4, R3, ASR #31
+    STR.W R4, [R8, #REG_EDX]
+#endif
     B.W .fetch_decode_loop
 
 OP .op_pushfd_9C
@@ -1093,6 +1129,8 @@ OP_AGNOSTIC .op_test_al_imm8_A8
     ADD.W R10, R10, #1
     LDRB.W R3, [R8, #8]
     AND.W R3, R3, R5
+    LSLS.W R0, R3, #24
+    X86_FLAGS_LOGIC R3, R0, R1
     B.W .fetch_decode_loop
 
 OP .op_test_eax_imm32_A9
@@ -1102,8 +1140,10 @@ OP .op_test_eax_imm32_A9
     BMI .mem_fault
     LD_V R5, R5
     EIP_ADV_V
-    LDR.W R3, [R8, #8]
+    LDREG_V R3, #REG_EAX
     AND.W R3, R3, R5
+    VTEST(R0, R3)
+    X86_FLAGS_LOGIC R3, R0, R1
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_movsb_A4
