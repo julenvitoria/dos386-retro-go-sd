@@ -7,11 +7,11 @@ Roadmap and phase definitions: [`PLAN.md`](PLAN.md).
 
 | Tier | State |
 |---|---|
-| 1. gwemu bare-metal | 162/162 `tests/test_opcodes.py`, plus `test_video.py` |
+| 1. gwemu bare-metal | 182/182 `test_opcodes.py`, plus `test_video`/`test_dos`/`test_screen` |
 | 2. gwemu + retro-go | `core_dtcm_ok=1`, bonus pool 153,600 B, 1,000,001 insns — matches tier 1 |
 | 3. Hardware | 50.50 cyc/insn, 5.54 MIPS |
 
-`tests/asm_baseline.json`: 577 symbols, 8252 insns, 29904 bytes.
+`tests/asm_baseline.json`: 595 symbols, 8743 insns, 31814 bytes.
 Dispatch-table symbols are data; `objdump` counts them as instructions.
 
 Cycles/insn: 57.50 pre-fold → 50.00 fold + absolute dispatch → 50.50 segmentation
@@ -29,8 +29,6 @@ Details are in the git history; `git log --oneline` is the index.
 - [ ] `XLAT`, BCD (`27`/`2F`/`37`/`3F`), `WAIT`, `INS`/`OUTS`, `BOUND`/`ARPL`
 - [ ] Limit checks off the R6 descriptor, incl. real-mode 64 KB wrap
 - [ ] Lazy PF/AF (currently eager, ~9 of ~16 insns per ALU op)
-- [ ] Flag coverage: 8-bit `NEG`, `MUL`/`DIV`, rotates, 8-bit shift cores,
-      shift `OF` for count==1, count==0 for every shift form
 - [ ] Size-aware `MEM_R*`/`MEM_W*` macros + CI grep banning raw `[R9,`
 - [ ] Software TLB above the 16 MB direct window
 - [ ] Assertions in `test_game.py` / `test_benchmark.py`

@@ -1645,6 +1645,215 @@ def run_test(args):
                 "expected_eip": 0x5001,
             },
 
+            # --- flag coverage: MUL / DIV -------------------------------------
+            # CF and OF on a multiply mean "the result did not fit in the
+            # destination", which is the only way a program can tell. SF/ZF/AF/PF
+            # are architecturally undefined here, so nothing asserts them.
+            {
+                "name": "FLAGS: MUL r/m8 sets CF+OF when AH is non-zero",
+                # MOV AL,0x10 ; MOV BL,0x10 ; MUL BL -> AX=0x0100
+                "code": bytes([0xB0, 0x10, 0xB3, 0x10, 0xF6, 0xE3, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0100, 3: 0x10},
+                "flags_expected": {"CF": 1, "OF": 1},
+                "expected_eip": 7,
+            },
+            {
+                "name": "FLAGS: MUL r/m8 clears CF+OF when the result fits",
+                # MOV AL,0x10 ; MOV BL,0x0F ; MUL BL -> AX=0x00F0
+                "code": bytes([0xB0, 0x10, 0xB3, 0x0F, 0xF6, 0xE3, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x00F0, 3: 0x0F},
+                "flags_expected": {"CF": 0, "OF": 0},
+                "expected_eip": 7,
+            },
+            {
+                "name": "FLAGS: MUL r/m16 reports overflow through DX",
+                # MOV AX,0x1000 ; MOV BX,0x0010 ; MUL BX -> DX:AX = 0x0001_0000
+                "code": bytes([0xB8, 0x00, 0x10, 0xBB, 0x10, 0x00,
+                               0xF7, 0xE3, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0000, 2: 0x0001, 3: 0x0010},
+                "flags_expected": {"CF": 1, "OF": 1},
+                "expected_eip": 9,
+            },
+            {
+                "name": "IMUL r/m8 sign-extends the product",
+                # MOV AL,0xFF (-1) ; MOV BL,0x02 ; IMUL BL -> AX = 0xFFFE (-2)
+                "code": bytes([0xB0, 0xFF, 0xB3, 0x02, 0xF6, 0xEB, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0xFFFE, 3: 0x02},
+                "expected_eip": 7,
+            },
+            {
+                "name": "DIV r/m8 gives quotient in AL, remainder in AH",
+                # MOV AX,23 ; MOV BL,5 ; DIV BL -> AL=4, AH=3
+                "code": bytes([0xB8, 0x17, 0x00, 0xB3, 0x05, 0xF6, 0xF3, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0304, 3: 0x05},
+                "expected_eip": 8,
+            },
+            {
+                "name": "IDIV r/m8 handles a negative dividend",
+                # MOV AX,0xFFF6 (-10) ; MOV BL,3 ; IDIV BL -> AL=-3, AH=-1
+                "code": bytes([0xB8, 0xF6, 0xFF, 0xB3, 0x03, 0xF6, 0xFB, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0xFFFD, 3: 0x03},
+                "expected_eip": 8,
+            },
+
+            # --- flag coverage: NEG -------------------------------------------
+            {
+                "name": "FLAGS: 8-bit NEG sets CF for a non-zero operand",
+                # MOV AL,1 ; NEG AL -> 0xFF
+                "code": bytes([0xB0, 0x01, 0xF6, 0xD8, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x00FF},
+                "flags_expected": {"CF": 1, "SF": 1, "ZF": 0},
+                "expected_eip": 5,
+            },
+            {
+                "name": "FLAGS: 8-bit NEG of zero clears CF",
+                "code": bytes([0xB0, 0x00, 0xF6, 0xD8, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0000},
+                "flags_expected": {"CF": 0, "ZF": 1, "SF": 0},
+                "expected_eip": 5,
+            },
+
+            # --- flag coverage: rotates ---------------------------------------
+            {
+                "name": "FLAGS: ROL r/m8,1 puts the rotated-out bit in CF",
+                # MOV AL,0x81 ; ROL AL,1 -> 0x03, CF=1, OF = MSB(res)^CF = 1
+                "code": bytes([0xB0, 0x81, 0xD0, 0xC0, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0003},
+                "flags_expected": {"CF": 1, "OF": 1},
+                "expected_eip": 5,
+            },
+            {
+                "name": "FLAGS: ROR r/m8,1 puts the rotated-out bit in CF",
+                # MOV AL,0x01 ; ROR AL,1 -> 0x80, CF=1
+                "code": bytes([0xB0, 0x01, 0xD0, 0xC8, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0080},
+                "flags_expected": {"CF": 1},
+                "expected_eip": 5,
+            },
+            {
+                "name": "FLAGS: RCL r/m8,1 rotates CF into the low bit",
+                # STC ; MOV AL,0 ; RCL AL,1 -> 0x01, CF=0
+                "code": bytes([0xF9, 0xB0, 0x00, 0xD0, 0xD0, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0001},
+                "flags_expected": {"CF": 0},
+                "expected_eip": 6,
+            },
+            {
+                "name": "FLAGS: RCR r/m8,1 rotates CF into the high bit",
+                # STC ; MOV AL,0 ; RCR AL,1 -> 0x80, CF=0
+                "code": bytes([0xF9, 0xB0, 0x00, 0xD0, 0xD8, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0080},
+                "flags_expected": {"CF": 0},
+                "expected_eip": 6,
+            },
+
+            # --- flag coverage: shifts ----------------------------------------
+            {
+                "name": "FLAGS: SHL r/m8,1 CF and OF",
+                # MOV AL,0x40 ; SHL AL,1 -> 0x80. CF=0, OF = MSB(res)^CF = 1
+                "code": bytes([0xB0, 0x40, 0xD0, 0xE0, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0080},
+                "flags_expected": {"CF": 0, "OF": 1, "SF": 1},
+                "expected_eip": 5,
+            },
+            {
+                "name": "FLAGS: SHR r/m8,1 OF is the ORIGINAL msb",
+                # MOV AL,0x80 ; SHR AL,1 -> 0x40, CF=0, OF=1
+                "code": bytes([0xB0, 0x80, 0xD0, 0xE8, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0040},
+                "flags_expected": {"CF": 0, "OF": 1, "SF": 0},
+                "expected_eip": 5,
+            },
+            {
+                "name": "FLAGS: SAR r/m8,1 keeps the sign and clears OF",
+                # MOV AL,0x80 ; SAR AL,1 -> 0xC0, CF=0, OF=0
+                "code": bytes([0xB0, 0x80, 0xD0, 0xF8, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x00C0},
+                "flags_expected": {"CF": 0, "OF": 0, "SF": 1},
+                "expected_eip": 5,
+            },
+            {
+                "name": "FLAGS: SHR r/m8,1 CF is the bit shifted out",
+                # MOV AL,0x03 ; SHR AL,1 -> 0x01, CF=1
+                "code": bytes([0xB0, 0x03, 0xD0, 0xE8, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0001},
+                "flags_expected": {"CF": 1},
+                "expected_eip": 5,
+            },
+            {
+                "name": "FLAGS: a shift of zero must not touch any flag",
+                # STC ; MOV AL,0 ; MOV CL,0 ; SHL AL,CL
+                # CF must survive, and ZF must NOT be set from the zero result.
+                # This is the case the shift-dispatch bug hid behind for months.
+                "code": bytes([0xF9, 0xB0, 0x00, 0xB1, 0x00, 0xD2, 0xE0, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0000},
+                "flags_expected": {"CF": 1, "ZF": 0},
+                "expected_eip": 8,
+            },
+            {
+                "name": "FLAGS: a rotate of zero must not touch any flag",
+                # STC ; MOV AL,0x01 ; MOV CL,0 ; ROR AL,CL
+                "code": bytes([0xF9, 0xB0, 0x01, 0xB1, 0x00, 0xD2, 0xC8, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0001},
+                "flags_expected": {"CF": 1},
+                "expected_eip": 8,
+            },
+            {
+                "name": "Shift counts are masked to 5 bits",
+                # MOV AL,1 ; MOV CL,33 ; SHL AL,CL -> count 1, so AL=2
+                "code": bytes([0xB0, 0x01, 0xB1, 0x21, 0xD2, 0xE0, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0002},
+                "expected_eip": 7,
+            },
+            {
+                "name": "FLAGS: 32-bit SHL CF, ZF and OF together",
+                # MOV EAX,0x80000000 ; SHL EAX,1 -> 0, CF=1, ZF=1, OF=0^1=1
+                "code": bytes([0xB8, 0x00, 0x00, 0x00, 0x80, 0xD1, 0xE0, 0xF4]),
+                "mode": 32,
+                "regs_initial": {},
+                "regs_expected": {0: 0x00000000},
+                "flags_expected": {"CF": 1, "ZF": 1, "OF": 1, "SF": 0},
+                "expected_eip": 8,
+            },
+
             # --- PC speaker ---------------------------------------------------
             # The classic sequence: program PIT channel 2, then enable the gate
             # and data line on port 0x61. Checked through x86_io, which is what

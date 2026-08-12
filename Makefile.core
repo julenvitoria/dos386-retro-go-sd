@@ -22,7 +22,10 @@ x86_mem.c \
 x86_video.c \
 x86_hle.c \
 x86_bios.c \
-x86_dos.c
+x86_dos.c \
+lib/FatFs/ff.c \
+lib/FatFs/ffunicode.c \
+tests/vdisk.c
 
 CORE_ASM_SOURCES := \
 cpu_exec.S \
@@ -43,6 +46,26 @@ CORE_C_DEFS := \
 -DCHEAT_CODES=1 \
 -DMAX_CHEAT_CODES=13 \
 -DIS_LITTLE_ENDIAN
+
+# Our FatFs interprets the guest .dsk; the firmware's FatFs (reached through
+# the SDK bridge, which maps f_* to core_f_*) reads the SD card underneath it.
+# Two instances in one binary, so ours gets its own namespace -- without this
+# they collide on every public entry point.
+CORE_C_DEFS += -Df_mount=dsk_f_mount -Df_open=dsk_f_open -Df_close=dsk_f_close \
+               -Df_read=dsk_f_read -Df_write=dsk_f_write -Df_lseek=dsk_f_lseek \
+               -Df_opendir=dsk_f_opendir -Df_closedir=dsk_f_closedir \
+               -Df_readdir=dsk_f_readdir -Df_stat=dsk_f_stat \
+               -Df_unlink=dsk_f_unlink -Df_sync=dsk_f_sync \
+               -Df_getfree=dsk_f_getfree -Df_truncate=dsk_f_truncate \
+               -Df_rename=dsk_f_rename -Df_mkdir=dsk_f_mkdir \
+               -Df_chdir=dsk_f_chdir -Df_chmod=dsk_f_chmod \
+               -Df_utime=dsk_f_utime -Df_getcwd=dsk_f_getcwd \
+               -Df_setlabel=dsk_f_setlabel -Df_getlabel=dsk_f_getlabel \
+               -Df_expand=dsk_f_expand -Df_forward=dsk_f_forward \
+               -Df_mkfs=dsk_f_mkfs -Df_fdisk=dsk_f_fdisk \
+               -Df_putc=dsk_f_putc -Df_puts=dsk_f_puts -Df_printf=dsk_f_printf \
+               -Df_gets=dsk_f_gets
+
 
 GNW_CORE_SDK ?= sdk
 BUILD_DIR ?= build/$(PROJECT_KIND)

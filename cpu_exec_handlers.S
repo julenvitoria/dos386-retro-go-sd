@@ -282,9 +282,19 @@
 #if NSH
 #define VNORM(r)   LSL.W r, r, #NSH
 #define VDENORM(r) LSR.W r, r, #NSH
+#define VSEXT(r)   SXTH r, r
+#define VMASK(r)   UXTH r, r
+#define VTEST(d,s) LSLS d, s, #NSH
+#define VBITS      16
+#define VMSB       15
 #else
 #define VNORM(r)
 #define VDENORM(r)
+#define VSEXT(r)
+#define VMASK(r)
+#define VTEST(d,s) MOVS d, s
+#define VBITS      32
+#define VMSB       31
 #endif
 
 #define ALU_TABLE_M CONCAT(ALU_TABLE, OP_SUFFIX)
@@ -1424,42 +1434,157 @@ L(SHIFT_TBH_32):
     TBH [PC, R12, LSL #1]
 L(SHIFT_TABLE):
     SHIFT_TABLE_M L(SHIFT_TABLE), L(SHIFT_TBH_32), 
+/* v-width shifts and rotates, 16- or 32-bit by pass.
+ *
+ * Same defects as the 8-bit set had: the rotates set no flags, RCL/RCR were
+ * empty stubs, OF was never written, the count was not masked to five bits,
+ * and every one of them operated on the full 32-bit register regardless of
+ * operand size. In the 16-bit pass that last one alone made every result wrong
+ * above bit 15.
+ *
+ * The count is masked BEFORE the zero test so a masked-to-zero count leaves
+ * the flags alone, which is what a program relies on when it shifts by a
+ * variable that may be zero while carrying a CF it still needs.
+ */
 L(SHIFT_ROL):
+    ANDS R5, R5, #31
+    BEQ.W L(SHIFT_NOFLAGS)
+    AND.W R5, R5, #(VBITS - 1)
     CMP R5, #0
-    BEQ.N L(SHIFT_DONE)
-    RSB R12, R5, #32
-    ROR.W R3, R3, R12
-    B.N L(SHIFT_DONE)
+    BEQ.W L(SHIFT_ROT_CF_ONLY)
+    RSB R12, R5, #VBITS
+    LSL.W R4, R3, R5
+    LSR.W R3, R3, R12
+    ORR.W R3, R3, R4
+    VMASK(R3)
+    AND.W R0, R3, #1
+    B.W L(SHIFT_ROT_FLAGS)
+
 L(SHIFT_ROR):
+    ANDS R5, R5, #31
+    BEQ.W L(SHIFT_NOFLAGS)
+    AND.W R5, R5, #(VBITS - 1)
     CMP R5, #0
-    BEQ.N L(SHIFT_DONE)
-    ROR.W R3, R3, R5
-    B.N L(SHIFT_DONE)
+    BEQ.W L(SHIFT_ROT_CF_ONLY)
+    RSB R12, R5, #VBITS
+    LSR.W R4, R3, R5
+    LSL.W R3, R3, R12
+    ORR.W R3, R3, R4
+    VMASK(R3)
+    UBFX R0, R3, #VMSB, #1
+    B.W L(SHIFT_ROT_FLAGS)
+
+L(SHIFT_ROT_CF_ONLY):
+    UBFX R0, R3, #VMSB, #1
+L(SHIFT_ROT_FLAGS):
+    BFI R11, R0, #0, #1             @ CF
+    UBFX R1, R3, #VMSB, #1
+    EOR.W R1, R1, R0
+    BFI R11, R1, #11, #1            @ OF, defined for a count of 1
+    B.W L(SHIFT_DONE)
+
 L(SHIFT_RCL):
-    B.N L(SHIFT_DONE)
+    ANDS R5, R5, #31
+    BEQ.W L(SHIFT_NOFLAGS)
+    /* Rotating through carry is a VBITS+1 rotate, so the modulus is not a
+       power of two. A 33-bit value does not fit a register, so this is built
+       from explicit shifts rather than by parking CF above the operand:
+       result = (v << c) | (cf << (c-1)) | (v >> (VBITS+1-c)), which works for
+       both widths because an ARM register shift of 32 or more yields zero. */
+    MOV.W R4, #(VBITS + 1)
+    UDIV R12, R5, R4
+    MLS R5, R12, R4, R5
+    CMP R5, #0
+    BEQ.W L(SHIFT_DONE)
+    UBFX R0, R11, #0, #1            @ CF in
+    RSB R1, R5, #VBITS
+    LSR.W R1, R3, R1
+    AND.W R1, R1, #1                @ CF out = bit (VBITS - c)
+    RSB R12, R5, #(VBITS + 1)
+    LSR.W R4, R3, R12
+    SUB.W R12, R5, #1
+    LSL.W R0, R0, R12
+    LSL.W R3, R3, R5
+    ORR.W R3, R3, R4
+    ORR.W R3, R3, R0
+    VMASK(R3)
+    MOV R0, R1
+    B.W L(SHIFT_ROT_FLAGS)
+
 L(SHIFT_RCR):
-    B.N L(SHIFT_DONE)
-    /* A zero count leaves every flag untouched, which falls out of the
-       existing early branch straight to SHIFT_DONE. */
+    ANDS R5, R5, #31
+    BEQ.W L(SHIFT_NOFLAGS)
+    MOV.W R4, #(VBITS + 1)
+    UDIV R12, R5, R4
+    MLS R5, R12, R4, R5
+    CMP R5, #0
+    BEQ.W L(SHIFT_DONE)
+    UBFX R0, R11, #0, #1
+    SUB.W R12, R5, #1
+    LSR.W R1, R3, R12
+    AND.W R1, R1, #1                @ CF out = bit (c - 1)
+    RSB R12, R5, #VBITS
+    LSL.W R4, R0, R12
+    RSB R12, R5, #(VBITS + 1)
+    LSL.W R0, R3, R12
+    LSR.W R3, R3, R5
+    ORR.W R3, R3, R4
+    ORR.W R3, R3, R0
+    VMASK(R3)
+    MOV R0, R1
+    B.W L(SHIFT_ROT_FLAGS)
+
 L(SHIFT_SHL):
-    CMP R5, #0
-    BEQ.N L(SHIFT_DONE)
-    LSLS.W R3, R3, R5
-    X86_FLAGS_SHIFT R3, R0, R1
-    B.N L(SHIFT_DONE)
+    ANDS R5, R5, #31
+    BEQ.W L(SHIFT_NOFLAGS)
+    VNORM(R3)
+    LSLS R3, R3, R5                 @ C = last bit out, N = SF, Z = ZF
+    MRS R0, APSR
+    VDENORM(R3)
+    UBFX R1, R0, #29, #1
+    BFI R11, R1, #0, #1             @ CF
+    UBFX R4, R3, #VMSB, #1
+    EOR.W R4, R4, R1
+    BFI R11, R4, #11, #1            @ OF = MSB(result) ^ CF
+    X86_SF_ZF R0, R1
+    X86_PF R3, R1
+    B.W L(SHIFT_DONE)
+
 L(SHIFT_SHR):
-    CMP R5, #0
-    BEQ.N L(SHIFT_DONE)
-    LSRS.W R3, R3, R5
-    X86_FLAGS_SHIFT R3, R0, R1
-    B.N L(SHIFT_DONE)
+    ANDS R5, R5, #31
+    BEQ.W L(SHIFT_NOFLAGS)
+    UBFX R4, R3, #VMSB, #1          @ OF is the ORIGINAL msb
+    LSRS R3, R3, R5
+    MRS R0, APSR
+    UBFX R0, R0, #29, #1
+    BFI R11, R0, #0, #1             @ CF
+    BFI R11, R4, #11, #1            @ OF
+    VTEST(R1, R3)
+    MRS R12, APSR
+    X86_SF_ZF R12, R1
+    X86_PF R3, R1
+    B.W L(SHIFT_DONE)
+
 L(SHIFT_SAR):
-    CMP R5, #0
-    BEQ.N L(SHIFT_DONE)
-    ASRS.W R3, R3, R5
-    X86_FLAGS_SHIFT R3, R0, R1
+    ANDS R5, R5, #31
+    BEQ.W L(SHIFT_NOFLAGS)
+    VSEXT(R3)
+    ASRS R3, R3, R5
+    MRS R0, APSR
+    UBFX R0, R0, #29, #1
+    BFI R11, R0, #0, #1             @ CF
+    BIC.W R11, R11, #(1 << 11)      @ SAR always clears OF
+    VMASK(R3)
+    VTEST(R1, R3)
+    MRS R12, APSR
+    X86_SF_ZF R12, R1
+    X86_PF R3, R1
+    B.W L(SHIFT_DONE)
+
+L(SHIFT_NOFLAGS):
+    /* Masked count of zero: value unchanged, no flag moves. */
 L(SHIFT_DONE):
-    STR R3, [R2, #0]
+    ST_V R3, R2
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_shift_eb_imm8_C0
@@ -1553,48 +1678,145 @@ L(SHIFT_TBH_8):
     TBH [PC, R12, LSL #1]
 L(SHIFT8_TABLE):
     SHIFT_TABLE_M L(SHIFT8_TABLE), L(SHIFT_TBH_8), 8
+/* 8-bit shifts and rotates.
+ *
+ * These set no flags at all before now, and RCL/RCR did not rotate: they were
+ * empty stubs that fell straight through to the store. Nothing tested them.
+ *
+ * The count is masked to five bits FIRST, because a masked count of zero must
+ * leave every flag untouched -- including CF, which is the case a program uses
+ * to shift "maybe zero" times without disturbing a carry it is carrying
+ * around. Testing the raw count instead would treat 32 as non-zero and clobber
+ * the flags.
+ *
+ * Operands are normalized to the top of the word where that lets the ARM shift
+ * produce the x86 flags directly: after LSLS on a value sitting at bit 31, C is
+ * the last bit shifted out, N is the result's MSB and Z covers exactly the byte.
+ */
 L(SHIFT8_ROL):
-    CMP R5, #0
-    BEQ.N L(SHIFT8_DONE)
+    ANDS R5, R5, #31
+    BEQ.W L(SHIFT8_NOFLAGS)
     AND.W R5, R5, #7
+    CBZ R5, L(SHIFT8_ROT_CF_ONLY)   @ count%8==0: value unchanged, CF = bit 7
     RSB R12, R5, #8
     LSL.W R4, R3, R5
     LSR.W R3, R3, R12
     ORR.W R3, R3, R4
     UXTB R3, R3
-    B.N L(SHIFT8_DONE)
+    AND.W R0, R3, #1                @ CF = the bit rotated into bit 0
+    B.N L(SHIFT8_ROT_FLAGS)
+
 L(SHIFT8_ROR):
-    CMP R5, #0
-    BEQ.N L(SHIFT8_DONE)
+    ANDS R5, R5, #31
+    BEQ.W L(SHIFT8_NOFLAGS)
     AND.W R5, R5, #7
+    CBZ R5, L(SHIFT8_ROT_CF_ONLY)
     RSB R12, R5, #8
     LSR.W R4, R3, R5
     LSL.W R3, R3, R12
     ORR.W R3, R3, R4
     UXTB R3, R3
+    UBFX R0, R3, #7, #1             @ CF = the bit rotated into bit 7
+    B.N L(SHIFT8_ROT_FLAGS)
+
+L(SHIFT8_ROT_CF_ONLY):
+    UBFX R0, R3, #7, #1
+L(SHIFT8_ROT_FLAGS):
+    /* Rotates touch only CF and OF; SF, ZF, AF and PF are left alone. OF is
+       architecturally defined for a count of 1 only, as MSB(result) ^ CF. */
+    BFI R11, R0, #0, #1
+    UBFX R1, R3, #7, #1
+    EOR.W R1, R1, R0
+    BFI R11, R1, #11, #1
     B.N L(SHIFT8_DONE)
+
 L(SHIFT8_RCL):
-    B.N L(SHIFT8_DONE)
+    ANDS R5, R5, #31
+    BEQ.W L(SHIFT8_NOFLAGS)
+    /* 9-bit rotate: CF is part of the value. Build it, rotate within 9 bits,
+       then split it apart again. */
+    MOV.W R4, #9
+    UDIV R12, R5, R4
+    MLS R5, R12, R4, R5             @ count %= 9
+    CMP R5, #0
+    BEQ.W L(SHIFT8_DONE)
+    UBFX R0, R11, #0, #1
+    ORR.W R3, R3, R0, LSL #8        @ 9-bit value
+    RSB R12, R5, #9
+    LSL.W R4, R3, R5
+    LSR.W R3, R3, R12
+    ORR.W R3, R3, R4
+    UBFX R0, R3, #8, #1             @ new CF
+    UXTB R3, R3
+    B.N L(SHIFT8_ROT_FLAGS)
+
 L(SHIFT8_RCR):
-    B.N L(SHIFT8_DONE)
+    ANDS R5, R5, #31
+    BEQ.W L(SHIFT8_NOFLAGS)
+    MOV.W R4, #9
+    UDIV R12, R5, R4
+    MLS R5, R12, R4, R5
+    CMP R5, #0
+    BEQ.W L(SHIFT8_DONE)
+    UBFX R0, R11, #0, #1
+    ORR.W R3, R3, R0, LSL #8
+    RSB R12, R5, #9
+    LSR.W R4, R3, R5
+    LSL.W R3, R3, R12
+    ORR.W R3, R3, R4
+    UBFX R0, R3, #8, #1
+    UXTB R3, R3
+    B.N L(SHIFT8_ROT_FLAGS)
+
 L(SHIFT8_SHL):
-    CMP R5, #0
-    BEQ.N L(SHIFT8_DONE)
-    LSL.W R3, R3, R5
-    UXTB R3, R3
+    ANDS R5, R5, #31
+    BEQ.W L(SHIFT8_NOFLAGS)
+    LSL.W R3, R3, #24               @ to the top, so the ARM flags are the x86 ones
+    LSLS R3, R3, R5                 @ C = last bit out, N = SF, Z = ZF
+    MRS R0, APSR
+    LSR.W R3, R3, #24
+    UBFX R1, R0, #29, #1            @ CF
+    BFI R11, R1, #0, #1
+    UBFX R4, R3, #7, #1
+    EOR.W R4, R4, R1                @ OF = MSB(result) ^ CF
+    BFI R11, R4, #11, #1
+    X86_SF_ZF R0, R1
+    X86_PF R3, R1
     B.N L(SHIFT8_DONE)
+
 L(SHIFT8_SHR):
-    CMP R5, #0
-    BEQ.N L(SHIFT8_DONE)
-    LSR.W R3, R3, R5
-    UXTB R3, R3
+    ANDS R5, R5, #31
+    BEQ.W L(SHIFT8_NOFLAGS)
+    UBFX R4, R3, #7, #1             @ OF is the ORIGINAL msb, so grab it first
+    LSRS R3, R3, R5                 @ C = last bit out
+    MRS R0, APSR
+    UBFX R0, R0, #29, #1
+    BFI R11, R0, #0, #1             @ CF
+    BFI R11, R4, #11, #1            @ OF
+    LSLS R1, R3, #24                @ N and Z for the byte, not the word
+    MRS R12, APSR
+    X86_SF_ZF R12, R1
+    X86_PF R3, R1
     B.N L(SHIFT8_DONE)
+
 L(SHIFT8_SAR):
-    CMP R5, #0
-    BEQ.N L(SHIFT8_DONE)
+    ANDS R5, R5, #31
+    BEQ.W L(SHIFT8_NOFLAGS)
     SXTB R3, R3
-    ASR.W R3, R3, R5
+    ASRS R3, R3, R5                 @ C = last bit out
+    MRS R0, APSR
+    UBFX R0, R0, #29, #1
+    BFI R11, R0, #0, #1             @ CF
+    BIC.W R11, R11, #(1 << 11)      @ SAR always clears OF
     UXTB R3, R3
+    LSLS R1, R3, #24
+    MRS R12, APSR
+    X86_SF_ZF R12, R1
+    X86_PF R3, R1
+    B.N L(SHIFT8_DONE)
+
+L(SHIFT8_NOFLAGS):
+    /* A masked count of zero: the value is unchanged and NO flag moves. */
 L(SHIFT8_DONE):
     STRB R3, [R2, #0]
     B.W .fetch_decode_loop
@@ -2821,15 +3043,19 @@ L(GRP3_F6_MEM):
 L(GRP3_F6_DISPATCH):
     UBFX R12, R1, #3, #3
     CMP R12, #0
-    BEQ.N L(GRP3_F6_TEST)
+    BEQ.W L(GRP3_F6_TEST)
     CMP R12, #2
-    BEQ.N L(GRP3_F6_NOT)
+    BEQ.W L(GRP3_F6_NOT)
     CMP R12, #3
-    BEQ.N L(GRP3_F6_NEG)
+    BEQ.W L(GRP3_F6_NEG)
     CMP R12, #4
-    BEQ.N L(GRP3_F6_MUL)
+    BEQ.W L(GRP3_F6_MUL)
+    CMP R12, #5
+    BEQ.W L(GRP3_F6_IMUL)
     CMP R12, #6
-    BEQ.N L(GRP3_F6_DIV)
+    BEQ.W L(GRP3_F6_DIV)
+    CMP R12, #7
+    BEQ.W L(GRP3_F6_IDIV)
     B.W .exit_loop
 L(GRP3_F6_TEST):
     UBFX R5, R10, #12, #12
@@ -2844,23 +3070,81 @@ L(GRP3_F6_NOT):
     STRB R3, [R2, #0]
     B.W .fetch_decode_loop
 L(GRP3_F6_NEG):
-    RSB R3, R3, #0
+    /* CF is "the operand was non-zero", which ARM gives as NOT-borrow, hence
+       the inversion. Normalized to the top so SF/ZF/OF and the AF nibble all
+       describe the byte rather than the register. */
+    LSL.W R3, R3, #24
+    MOV.W R4, R3                   @ AF aux: 0 ^ operand
+    RSBS R3, R3, #0
+    EOR.W R4, R4, R3
+    LSR.W R3, R3, #24
+    X86_FLAGS_ARITH R3, R4, R0, R1, 1, 24
     STRB R3, [R2, #0]
     B.W .fetch_decode_loop
+
 L(GRP3_F6_MUL):
-    LDRB.W R4, [R8, #8]
+    /* AX = AL * r/m8. CF and OF both mean "the product did not fit in AL",
+       which is the only way a program can tell; SF/ZF/AF/PF are undefined. */
+    LDRB.W R4, [R8, #REG_EAX]
     MUL.W R3, R3, R4
-    STRH.W R3, [R8, #8]
+    STRH.W R3, [R8, #REG_EAX]
+    UBFX R0, R3, #8, #8
+    CMP R0, #0
+    IT NE
+    MOVNE R0, #1
+    BFI R11, R0, #0, #1
+    BFI R11, R0, #11, #1
     B.W .fetch_decode_loop
+
+L(GRP3_F6_IMUL):
+    /* Signed: CF/OF mean the 16-bit product is not the sign extension of its
+       own low byte, i.e. the answer does not fit in AL. */
+    LDRSB.W R4, [R8, #REG_EAX]
+    SXTB R3, R3
+    MUL.W R3, R3, R4
+    STRH.W R3, [R8, #REG_EAX]
+    SXTB R0, R3
+    UXTH R0, R0
+    UXTH R1, R3
+    CMP R0, R1
+    ITE EQ
+    MOVEQ R0, #0
+    MOVNE R0, #1
+    BFI R11, R0, #0, #1
+    BFI R11, R0, #11, #1
+    B.W .fetch_decode_loop
+
 L(GRP3_F6_DIV):
-    LDRH.W R4, [R8, #8]
+    LDRH.W R4, [R8, #REG_EAX]
     CMP R3, #0
-    BEQ.W .exit_loop
+    BEQ.W L(DIVIDE_ERROR)
     UDIV R5, R4, R3
+    CMP R5, #255                   @ quotient must fit in AL
+    BHI.W L(DIVIDE_ERROR)
     MLS R12, R5, R3, R4
-    STRB.W R5, [R8, #8]
-    STRB.W R12, [R8, #9]
+    STRB.W R5, [R8, #REG_EAX]
+    STRB.W R12, [R8, #(REG_EAX + 1)]
     B.W .fetch_decode_loop
+
+L(GRP3_F6_IDIV):
+    LDRSH.W R4, [R8, #REG_EAX]
+    SXTB R3, R3
+    CMP R3, #0
+    BEQ.W L(DIVIDE_ERROR)
+    SDIV R5, R4, R3
+    SXTB R0, R5
+    CMP R0, R5                     @ quotient must fit in a signed byte
+    BNE.W L(DIVIDE_ERROR)
+    MLS R12, R5, R3, R4
+    STRB.W R5, [R8, #REG_EAX]
+    STRB.W R12, [R8, #(REG_EAX + 1)]
+    B.W .fetch_decode_loop
+
+/* Vector 0. A divide error is an exception, not an exit: DOS installs a
+   handler for it and programs rely on that. */
+L(DIVIDE_ERROR):
+    MOV.W R4, #0
+    B.W L(HANDLE_INTERRUPT)
 
 OP .op_grp3_ev_F7
     UBFX R1, R10, #12, #12
@@ -2889,15 +3173,19 @@ L(GRP3_F7_MEM):
 L(GRP3_F7_DISPATCH):
     UBFX R12, R1, #3, #3
     CMP R12, #0
-    BEQ.N L(GRP3_F7_TEST)
+    BEQ.W L(GRP3_F7_TEST)
     CMP R12, #2
-    BEQ.N L(GRP3_F7_NOT)
+    BEQ.W L(GRP3_F7_NOT)
     CMP R12, #3
-    BEQ.N L(GRP3_F7_NEG)
+    BEQ.W L(GRP3_F7_NEG)
     CMP R12, #4
-    BEQ.N L(GRP3_F7_MUL)
+    BEQ.W L(GRP3_F7_MUL)
+    CMP R12, #5
+    BEQ.W L(GRP3_F7_IMUL)
     CMP R12, #6
-    BEQ.N L(GRP3_F7_DIV)
+    BEQ.W L(GRP3_F7_DIV)
+    CMP R12, #7
+    BEQ.W L(GRP3_F7_IDIV)
     B.W .exit_loop
 L(GRP3_F7_TEST):
     UBFX R5, R10, #12, #12
@@ -2914,29 +3202,114 @@ L(GRP3_F7_NOT):
     ST_V R3, R2
     B.W .fetch_decode_loop
 L(GRP3_F7_NEG):
-    MOV.W R4, R3                   @ AF aux: (0 ^ operand)
+    VNORM(R3)
+    MOV.W R4, R3                   @ AF aux: 0 ^ operand
     RSBS R3, R3, #0
     EOR.W R4, R4, R3
-    X86_FLAGS_ARITH R3, R4, R0, R1, 1   @ CF = (operand != 0)
+    VDENORM(R3)
+    X86_FLAGS_ARITH R3, R4, R0, R1, 1, NSH   @ CF = (operand != 0)
     ST_V R3, R2
     B.W .fetch_decode_loop
+
 L(GRP3_F7_MUL):
-    LDR.W R4, [R8, #8]
-    UMULL R3, R5, R4, R3
-    STR.W R3, [R8, #8]
-    STR.W R5, [R8, #16]
+    /* DX:AX = AX * r/m16, or EDX:EAX = EAX * r/m32. CF and OF say the product
+       needed the high half. The 32-bit form needs UMULL for a 64-bit result;
+       the 16-bit form fits a single register, and writing a 32-bit product
+       into AX -- which is what this did -- both loses DX and corrupts the high
+       half of EAX. */
+#if NSH
+    LDRH.W R4, [R8, #REG_EAX]
+    MUL.W R3, R3, R4
+    STRH.W R3, [R8, #REG_EAX]
+    LSR.W R0, R3, #16
+    STRH.W R0, [R8, #REG_EDX]
+#else
+    LDR.W R4, [R8, #REG_EAX]
+    UMULL R3, R0, R4, R3
+    STR.W R3, [R8, #REG_EAX]
+    STR.W R0, [R8, #REG_EDX]
+#endif
+    CMP R0, #0
+    IT NE
+    MOVNE R0, #1
+    BFI R11, R0, #0, #1
+    BFI R11, R0, #11, #1
     B.W .fetch_decode_loop
+
+L(GRP3_F7_IMUL):
+#if NSH
+    LDRSH.W R4, [R8, #REG_EAX]
+    SXTH R3, R3
+    MUL.W R3, R3, R4
+    STRH.W R3, [R8, #REG_EAX]
+    ASR.W R0, R3, #16
+    STRH.W R0, [R8, #REG_EDX]
+    SXTH R1, R3
+    CMP R1, R3                     @ fits in 16 bits?
+#else
+    LDR.W R4, [R8, #REG_EAX]
+    SMULL R3, R0, R4, R3
+    STR.W R3, [R8, #REG_EAX]
+    STR.W R0, [R8, #REG_EDX]
+    ASR.W R1, R3, #31              @ the high half must be the sign extension
+    CMP R1, R0
+#endif
+    ITE EQ
+    MOVEQ R0, #0
+    MOVNE R0, #1
+    BFI R11, R0, #0, #1
+    BFI R11, R0, #11, #1
+    B.W .fetch_decode_loop
+
 L(GRP3_F7_DIV):
-    LDR.W R5, [R8, #16]
-    CMP R5, #0
-    BNE.W .exit_loop
-    LDR.W R4, [R8, #8]
+#if NSH
+    LDRH.W R4, [R8, #REG_EAX]
+    LDRH.W R0, [R8, #REG_EDX]
+    ORR.W R4, R4, R0, LSL #16      @ DX:AX
+#else
+    LDR.W R4, [R8, #REG_EAX]       @ 64-bit DIV is not modelled; EDX must be 0
+    LDR.W R0, [R8, #REG_EDX]
+    CMP R0, #0
+    BNE.W L(DIVIDE_ERROR)
+#endif
     CMP R3, #0
-    BEQ.W .exit_loop
+    BEQ.W L(DIVIDE_ERROR)
     UDIV R5, R4, R3
     MLS R12, R5, R3, R4
-    STR.W R5, [R8, #8]
-    STR.W R12, [R8, #16]
+#if NSH
+    CMP R5, #0x10000
+    BHS.W L(DIVIDE_ERROR)          @ quotient must fit in AX
+    STRH.W R5, [R8, #REG_EAX]
+    STRH.W R12, [R8, #REG_EDX]
+#else
+    STR.W R5, [R8, #REG_EAX]
+    STR.W R12, [R8, #REG_EDX]
+#endif
+    B.W .fetch_decode_loop
+
+L(GRP3_F7_IDIV):
+#if NSH
+    LDRH.W R4, [R8, #REG_EAX]
+    LDRH.W R0, [R8, #REG_EDX]
+    ORR.W R4, R4, R0, LSL #16
+    SXTH R3, R3
+#else
+    LDR.W R4, [R8, #REG_EAX]
+#endif
+    CMP R3, #0
+    BEQ.W L(DIVIDE_ERROR)
+    SDIV R5, R4, R3
+    MLS R12, R5, R3, R4
+#if NSH
+    SXTH R0, R5
+    CMP R0, R5
+    BNE.W L(DIVIDE_ERROR)
+    STRH.W R5, [R8, #REG_EAX]
+    STRH.W R12, [R8, #REG_EDX]
+#else
+    STR.W R5, [R8, #REG_EAX]
+    STR.W R12, [R8, #REG_EDX]
+#endif
     B.W .fetch_decode_loop
 
 #include "cpu_exec_handlers_0f.S"
