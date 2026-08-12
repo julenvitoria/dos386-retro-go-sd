@@ -1626,6 +1626,35 @@ def run_test(args):
                 "expected_eip": 3,
             },
             {
+                "name": "REP MOVSW copies words across a granule boundary",
+                # REP MOVSW ; HLT. 0x40 words from DS:SI to ES:DI, arranged so
+                # the copy crosses a 4 KB fold granule -- each element is a
+                # 2-byte access and the fold answers per granule, so a word
+                # straddling the boundary is the case that breaks.
+                "code": bytes([0xF3, 0xA5, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000, "ES": 0x2000},
+                "ram_setup": [(0x1FC0, bytes(range(0x40)) * 2)],
+                "regs_initial": {1: 0x40, 6: 0xFC0, 7: 0xFC0},
+                "regs_expected": {1: 0, 6: 0x1040, 7: 0x1040},
+                "mem_expected": [(0x2FC0, bytes(range(0x40)) * 2)],
+                "expected_eip": 3,
+            },
+            {
+                "name": "REP MOVSW with a large count runs to completion",
+                # 0x400 words = 2 KB. The rewind implementation re-enters the
+                # fetch loop per element, so a big count is where a per-element
+                # bookkeeping error shows up rather than at CX=4.
+                "code": bytes([0xF3, 0xA5, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000, "ES": 0x3000},
+                "ram_setup": [(0x10000, bytes([0x5A, 0xA5]) * 0x400)],
+                "regs_initial": {1: 0x400, 6: 0x0000, 7: 0x0000},
+                "regs_expected": {1: 0, 6: 0x800, 7: 0x800},
+                "mem_expected": [(0x30000, bytes([0x5A, 0xA5]) * 8)],
+                "expected_eip": 3,
+            },
+            {
                 "name": "REP is ignored on a non-string opcode",
                 # F3 B8 imm16 -> just MOV AX,imm16
                 "code": bytes([0xF3, 0xB8, 0x34, 0x12, 0xF4]),
