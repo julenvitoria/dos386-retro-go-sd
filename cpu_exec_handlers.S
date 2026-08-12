@@ -980,14 +980,7 @@ OP .op_pop_ev_8F
     AND.W R2, R1, #7
     MOV.W R2, R2, LSL #2
     ADD.W R2, R2, #8
-    LDR.W R4, [R8, #24]
-    UBFX R3, R4, #12, #12
-    LDR.W R3, [R9, R3, LSL #2]
-    ADDS R3, R3, R4
-    BMI .mem_fault
-    LD_V R3, R3
-    ADD.W R4, R4, #4
-    STR.W R4, [R8, #24]
+    POP_V R3, R4, R12
     STREG_V R3, R2
     B.W .fetch_decode_loop
 
@@ -1014,25 +1007,16 @@ OP .op_cdq_99
     B.W .fetch_decode_loop
 
 OP .op_pushfd_9C
-    LDR.W R4, [R8, #24]
-    SUB.W R4, R4, #4
-    STR.W R4, [R8, #24]
-    UBFX R12, R4, #12, #12
-    LDR.W R12, [R9, R12, LSL #2]
-    ADDS R12, R12, R4
-    BMI .mem_fault
-    ST_V R11, R12
+    PUSH_V R11, R4, R12
     B.W .fetch_decode_loop
 
 OP .op_popfd_9D
-    LDR.W R4, [R8, #24]
-    UBFX R3, R4, #12, #12
-    LDR.W R3, [R9, R3, LSL #2]
-    ADDS R3, R3, R4
-    BMI .mem_fault
-    LDR.W R11, [R3]
-    ADD.W R4, R4, #4
-    STR.W R4, [R8, #24]
+    POP_V R3, R4, R12
+#if NSH
+    BFI R11, R3, #0, #16           @ POPF at 16 bits leaves EFLAGS[31:16] alone
+#else
+    MOV.W R11, R3
+#endif
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_mov_al_moffs8_A0
@@ -1274,30 +1258,22 @@ OP .op_ret_imm16_C2
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
     BMI .mem_fault
-    LDRH R5, [R5, #0]
-    LDR.W R4, [R8, #24]
-    UBFX R10, R4, #12, #12
-    LDR.W R10, [R9, R10, LSL #2]
-    ADDS R10, R10, R4
-    BMI .mem_fault
-    LDR.W R10, [R10]
-    ADD.W R4, R4, #4
+    LDRH R5, [R5, #0]              @ bytes to drop; always 16 bits
+    POP_V R4, R0, R12
+    LDR.W R3, [R8, #SEG_CS_BASE]
+    ADD.W R10, R4, R3              @ the popped value is an OFFSET
+    LDR.W R4, [R8, #REG_ESP]
     ADD R4, R5
-    STR.W R4, [R8, #24]
+    SP_WRAP R4
+    STR.W R4, [R8, #REG_ESP]
     B.W .fetch_decode_loop
 
 OP .op_leave_C9
-    LDR.W R3, [R8, #28]
-    STR.W R3, [R8, #24]
-    LDR.W R4, [R8, #24]
-    UBFX R3, R4, #12, #12
-    LDR.W R3, [R9, R3, LSL #2]
-    ADDS R3, R3, R4
-    BMI .mem_fault
-    LD_V R3, R3
-    ADD.W R4, R4, #4
-    STR.W R4, [R8, #24]
-    STR.W R3, [R8, #28]
+    LDR.W R3, [R8, #REG_EBP]
+    SP_WRAP R3
+    STR.W R3, [R8, #REG_ESP]
+    POP_V R3, R4, R12
+    STREG_V R3, #REG_EBP
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_mov_eb_imm8_C6
@@ -2331,37 +2307,41 @@ L(GRP5_DISPATCH):
     CMP R12, #6
     BEQ.N L(GRP5_PUSH)
     B.W .exit_loop
+/* INC/DEC Ev set the same five flags their r/m8 twins do, and set none
+   before. CALL/JMP near indirect take an OFFSET in CS, not a linear address,
+   and the return address pushed is likewise an offset -- R10 carries CS.base
+   folded in, so both directions need the base added or removed. PUSH Ev goes
+   through SS like every other push. */
 L(GRP5_INC):
-    ADD.W R3, R3, #1
+    VNORM(R3)
+    EOR.W R4, R3, #(1 << NSH)      @ a ^ b, with b == 1
+    ADDS R3, R3, #(1 << NSH)
+    EOR.W R4, R4, R3
+    VDENORM(R3)
+    X86_FLAGS_INCDEC R3, R4, R0, R1, NSH
     ST_V R3, R2
     B.W .fetch_decode_loop
 L(GRP5_DEC):
-    SUB.W R3, R3, #1
+    VNORM(R3)
+    EOR.W R4, R3, #(1 << NSH)
+    SUBS R3, R3, #(1 << NSH)
+    EOR.W R4, R4, R3
+    VDENORM(R3)
+    X86_FLAGS_INCDEC R3, R4, R0, R1, NSH
     ST_V R3, R2
     B.W .fetch_decode_loop
 L(GRP5_CALL):
-    LDR.W R4, [R8, #24]
-    SUB.W R4, R4, #4
-    STR.W R4, [R8, #24]
-    UBFX R12, R4, #12, #12
-    LDR.W R12, [R9, R12, LSL #2]
-    ADDS R12, R12, R4
-    BMI .mem_fault
-    ST_V R10, R12
-    MOV R10, R3
+    LDR.W R4, [R8, #SEG_CS_BASE]
+    SUB.W R5, R10, R4              @ return address, as an offset
+    ADD.W R10, R3, R4
+    PUSH_V R5, R0, R12
     B.W .fetch_decode_loop
 L(GRP5_JMP):
-    MOV R10, R3
+    LDR.W R4, [R8, #SEG_CS_BASE]
+    ADD.W R10, R3, R4
     B.W .fetch_decode_loop
 L(GRP5_PUSH):
-    LDR.W R4, [R8, #24]
-    SUB.W R4, R4, #4
-    STR.W R4, [R8, #24]
-    UBFX R12, R4, #12, #12
-    LDR.W R12, [R9, R12, LSL #2]
-    ADDS R12, R12, R4
-    BMI .mem_fault
-    ST_V R3, R12
+    PUSH_V R3, R4, R12
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_jcc_rel8_7X
@@ -2483,119 +2463,50 @@ L(COND_F):
     BX LR
 
 OP .op_pusha_60
-    LDR.W R4, [R8, #24]
-    MOV R5, R4
-    LDR.W R3, [R8, #8]
-    SUB.W R4, R4, #4
-    UBFX R12, R4, #12, #12
-    LDR.W R12, [R9, R12, LSL #2]
-    ADDS R12, R12, R4
-    BMI .mem_fault
-    ST_V R3, R12
-    LDR.W R3, [R8, #12]
-    SUB.W R4, R4, #4
-    UBFX R12, R4, #12, #12
-    LDR.W R12, [R9, R12, LSL #2]
-    ADDS R12, R12, R4
-    BMI .mem_fault
-    ST_V R3, R12
-    LDR.W R3, [R8, #16]
-    SUB.W R4, R4, #4
-    UBFX R12, R4, #12, #12
-    LDR.W R12, [R9, R12, LSL #2]
-    ADDS R12, R12, R4
-    BMI .mem_fault
-    ST_V R3, R12
-    LDR.W R3, [R8, #20]
-    SUB.W R4, R4, #4
-    UBFX R12, R4, #12, #12
-    LDR.W R12, [R9, R12, LSL #2]
-    ADDS R12, R12, R4
-    BMI .mem_fault
-    ST_V R3, R12
-    SUB.W R4, R4, #4
-    UBFX R12, R4, #12, #12
-    LDR.W R12, [R9, R12, LSL #2]
-    ADDS R12, R12, R4
-    BMI .mem_fault
-    ST_V R5, R12
-    LDR.W R3, [R8, #28]
-    SUB.W R4, R4, #4
-    UBFX R12, R4, #12, #12
-    LDR.W R12, [R9, R12, LSL #2]
-    ADDS R12, R12, R4
-    BMI .mem_fault
-    ST_V R3, R12
-    LDR.W R3, [R8, #32]
-    SUB.W R4, R4, #4
-    UBFX R12, R4, #12, #12
-    LDR.W R12, [R9, R12, LSL #2]
-    ADDS R12, R12, R4
-    BMI .mem_fault
-    ST_V R3, R12
-    LDR.W R3, [R8, #36]
-    SUB.W R4, R4, #4
-    UBFX R12, R4, #12, #12
-    LDR.W R12, [R9, R12, LSL #2]
-    ADDS R12, R12, R4
-    BMI .mem_fault
-    ST_V R3, R12
-    STR.W R4, [R8, #24]
+    /* Eight pushes through SS at the operand size. This was open-coded with a
+       hard-wired 4-byte slot and ESP used as a linear address, so PUSHA in a
+       16-bit real-mode program wrote 32 bytes at the wrong place; it also
+       pushed only three of the eight registers. The SP that gets pushed is the
+       one from BEFORE the sequence, which is what POPA and a debugger expect. */
+    LDR.W R5, [R8, #REG_ESP]
+    LDR.W R3, [R8, #REG_EAX]
+    PUSH_V R3, R4, R12
+    LDR.W R3, [R8, #REG_ECX]
+    PUSH_V R3, R4, R12
+    LDR.W R3, [R8, #REG_EDX]
+    PUSH_V R3, R4, R12
+    LDR.W R3, [R8, #REG_EBX]
+    PUSH_V R3, R4, R12
+    PUSH_V R5, R4, R12             @ the ORIGINAL SP
+    LDR.W R3, [R8, #REG_EBP]
+    PUSH_V R3, R4, R12
+    LDR.W R3, [R8, #REG_ESI]
+    PUSH_V R3, R4, R12
+    LDR.W R3, [R8, #REG_EDI]
+    PUSH_V R3, R4, R12
     B.W .fetch_decode_loop
 
 OP .op_popa_61
-    LDR.W R4, [R8, #24]
-    UBFX R3, R4, #12, #12
-    LDR.W R3, [R9, R3, LSL #2]
-    ADDS R3, R3, R4
-    BMI .mem_fault
-    LD_V R3, R3
-    ADD.W R4, R4, #4
-    STR.W R3, [R8, #36]
-    UBFX R3, R4, #12, #12
-    LDR.W R3, [R9, R3, LSL #2]
-    ADDS R3, R3, R4
-    BMI .mem_fault
-    LD_V R3, R3
-    ADD.W R4, R4, #4
-    STR.W R3, [R8, #32]
-    UBFX R3, R4, #12, #12
-    LDR.W R3, [R9, R3, LSL #2]
-    ADDS R3, R3, R4
-    BMI .mem_fault
-    LD_V R3, R3
-    ADD.W R4, R4, #4
-    STR.W R3, [R8, #28]
-    ADD.W R4, R4, #4
-    UBFX R3, R4, #12, #12
-    LDR.W R3, [R9, R3, LSL #2]
-    ADDS R3, R3, R4
-    BMI .mem_fault
-    LD_V R3, R3
-    ADD.W R4, R4, #4
-    STR.W R3, [R8, #20]
-    UBFX R3, R4, #12, #12
-    LDR.W R3, [R9, R3, LSL #2]
-    ADDS R3, R3, R4
-    BMI .mem_fault
-    LD_V R3, R3
-    ADD.W R4, R4, #4
-    STR.W R3, [R8, #16]
-    UBFX R3, R4, #12, #12
-    LDR.W R3, [R9, R3, LSL #2]
-    ADDS R3, R3, R4
-    BMI .mem_fault
-    LD_V R3, R3
-    ADD.W R4, R4, #4
-    STR.W R3, [R8, #12]
-    UBFX R3, R4, #12, #12
-    LDR.W R3, [R9, R3, LSL #2]
-    ADDS R3, R3, R4
-    BMI .mem_fault
-    LD_V R3, R3
-    ADD.W R4, R4, #4
-    STR.W R3, [R8, #8]
-    STR.W R4, [R8, #24]
+    /* The mirror image, and the stored SP is DISCARDED rather than loaded --
+       loading it would undo the pops still to come. */
+    POP_V R3, R4, R12
+    STREG_V R3, #REG_EDI
+    POP_V R3, R4, R12
+    STREG_V R3, #REG_ESI
+    POP_V R3, R4, R12
+    STREG_V R3, #REG_EBP
+    LDR.W R4, [R8, #REG_ESP]       @ step over the saved SP without using it
+    SP_INC R4
+    SP_WRAP R4
+    STR.W R4, [R8, #REG_ESP]
+    POP_V R3, R4, R12
+    STREG_V R3, #REG_EBX
+    POP_V R3, R4, R12
+    STREG_V R3, #REG_EDX
+    POP_V R3, R4, R12
+    STREG_V R3, #REG_ECX
+    POP_V R3, R4, R12
+    STREG_V R3, #REG_EAX
     B.W .fetch_decode_loop
 
 OP .op_push_imm32_68
@@ -2605,14 +2516,7 @@ OP .op_push_imm32_68
     BMI .mem_fault
     LD_V R5, R5
     EIP_ADV_V
-    LDR.W R4, [R8, #24]
-    SUB.W R4, R4, #4
-    STR.W R4, [R8, #24]
-    UBFX R12, R4, #12, #12
-    LDR.W R12, [R9, R12, LSL #2]
-    ADDS R12, R12, R4
-    BMI .mem_fault
-    ST_V R5, R12
+    PUSH_V R5, R4, R12
     B.W .fetch_decode_loop
 
 OP .op_imul_imm32_69
@@ -2660,14 +2564,7 @@ OP .op_push_imm8_6A
     BMI .mem_fault
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
-    LDR.W R4, [R8, #24]
-    SUB.W R4, R4, #4
-    STR.W R4, [R8, #24]
-    UBFX R12, R4, #12, #12
-    LDR.W R12, [R9, R12, LSL #2]
-    ADDS R12, R12, R4
-    BMI .mem_fault
-    ST_V R5, R12
+    PUSH_V R5, R4, R12
     B.W .fetch_decode_loop
 
 OP .op_imul_imm8_6B
@@ -2724,18 +2621,13 @@ OP .op_enter_C8
     BMI .mem_fault
     LDRB R12, [R12, #0]
     ADD.W R10, R10, #1
-    LDR.W R4, [R8, #24]
-    LDR.W R3, [R8, #28]
-    SUB.W R4, R4, #4
-    UBFX R12, R4, #12, #12
-    LDR.W R12, [R9, R12, LSL #2]
-    ADDS R12, R12, R4
-    BMI .mem_fault
-    ST_V R3, R12
-    MOV R3, R4
-    STR.W R3, [R8, #28]
-    SUB.W R4, R4, R5
-    STR.W R4, [R8, #24]
+    LDR.W R3, [R8, #REG_EBP]
+    PUSH_V R3, R4, R12
+    LDR.W R3, [R8, #REG_ESP]
+    STREG_V R3, #REG_EBP
+    SUB.W R3, R3, R5
+    SP_WRAP R3
+    STR.W R3, [R8, #REG_ESP]
     B.W .fetch_decode_loop
 
 OP .op_retf_CB
@@ -2753,28 +2645,31 @@ OP .op_retf_CB
     ADD.W R10, R4, R3
     B.W .fetch_decode_loop
 
-OP_AGNOSTIC .op_retf_imm16_CA
+OP .op_retf_imm16_CA
+    /* RETF imm16. It popped CS and discarded it -- the same defect CB had --
+       and used raw ESP as a linear address with a 4-byte slot. Pop IP then CS,
+       install CS so the base is recomputed, rebuild the linear EIP from it,
+       and only then drop the caller's arguments. */
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
     BMI .mem_fault
-    LDRH R5, [R5, #0]
-    ADD.W R10, R10, #2
-    LDR.W R4, [R8, #24]
-    UBFX R10, R4, #12, #12
-    LDR.W R10, [R9, R10, LSL #2]
-    ADDS R10, R10, R4
-    BMI .mem_fault
-    LDR.W R10, [R10]
-    ADD.W R4, R4, #4
-    UBFX R3, R4, #12, #12
-    LDR.W R3, [R9, R3, LSL #2]
-    ADDS R3, R3, R4
-    BMI .mem_fault
-    LDR R3, [R3, #0]
-    ADD.W R4, R4, #4
+    LDRH R5, [R5, #0]              @ bytes to drop; always 16 bits
+    PUSH {R5, LR}
+    POP_V R4, R3, R12              @ IP
+    POP_V R5, R3, R12              @ CS selector
+    UXTH R5, R5
+    PUSH {R4, R6}
+    MOV.W R4, #1                   @ CS
+    BL L(SET_SREG)
+    POP {R4, R6}
+    LDR.W R3, [R8, #SEG_CS_BASE]
+    ADD.W R10, R4, R3
+    POP {R5, LR}
+    LDR.W R4, [R8, #REG_ESP]
     ADD R4, R5
-    STR.W R4, [R8, #24]
+    SP_WRAP R4
+    STR.W R4, [R8, #REG_ESP]
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_aam_D4

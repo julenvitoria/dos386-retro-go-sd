@@ -2149,6 +2149,111 @@ def run_test(args):
                 "flags_expected": {"ZF": 1},
                 "expected_eip": 7,
             },
+
+            # ---- The stack, through a NON-ZERO SS.base -----------------------
+            # Every case below puts SS.base at 0x20000 and the data at a small
+            # SP, so a handler that uses raw ESP as a linear address reads and
+            # writes near zero instead. That was the state of thirteen of them:
+            # correct only on a flat stack at base 0, which is the one case a
+            # real-mode DOS program never has. They also hard-coded a 4-byte
+            # slot, so a 16-bit push moved SP by twice what it should.
+            {
+                "name": "STACK: PUSH Ev (FF /6) goes through SS.base at 16 bits",
+                # MOV BX,0x1234 ; PUSH BX (FF F3) ; HLT
+                "code": bytes([0xBB, 0x34, 0x12, 0xFF, 0xF3, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x20000},
+                "ram_setup": [(0x20000, bytes(0x20))],
+                "regs_initial": {4: 0x0010},
+                "regs_expected": {3: 0x1234, 4: 0x000E},
+                "mem_expected": [(0x2000E, bytes([0x34, 0x12]))],
+                "expected_eip": 6,
+            },
+            {
+                "name": "STACK: CALL near indirect (FF /2) is CS-relative",
+                # CS.base is 0x1000 here, so a handler that treats the operand
+                # as a LINEAR address lands 0x1000 bytes short, and one that
+                # pushes the linear EIP makes the matching RET land 0x1000 too
+                # far. MOV BX,8 ; CALL BX ; (at CS:8) HLT
+                "code": bytes([0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x20000, "CS": 0x1000},
+                "ram_setup": [(0x20000, bytes(0x20)),
+                              (0x1000, (bytes([0xBB, 0x08, 0x00, 0xFF, 0xD3])
+                                        + bytes(3) + bytes([0xF4])))],
+                "regs_initial": {4: 0x0010},
+                "regs_expected": {3: 0x0008, 4: 0x000E},
+                # the pushed return address is the OFFSET after the CALL (5),
+                # not the linear EIP
+                "mem_expected": [(0x2000E, bytes([0x05, 0x00]))],
+                "expected_eip": 9,
+            },
+            {
+                "name": "STACK: PUSHF/POPF round-trip on a based stack",
+                # STC ; PUSHF ; CLC ; POPF ; HLT -> CF comes back set, and SP
+                # returns to where it started.
+                "code": bytes([0xF9, 0x9C, 0xF8, 0x9D, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x20000},
+                "ram_setup": [(0x20000, bytes(0x20))],
+                "regs_initial": {4: 0x0010},
+                "regs_expected": {4: 0x0010},
+                "flags_expected": {"CF": 1},
+                "expected_eip": 5,
+            },
+            {
+                "name": "STACK: PUSH imm16 (68) and POP Ev (8F)",
+                # PUSH 0xBEEF ; POP BX (8F C3) ; HLT
+                "code": bytes([0x68, 0xEF, 0xBE, 0x8F, 0xC3, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x20000},
+                "ram_setup": [(0x20000, bytes(0x20))],
+                "regs_initial": {4: 0x0010},
+                "regs_expected": {3: 0xBEEF, 4: 0x0010},
+                "expected_eip": 6,
+            },
+            {
+                "name": "STACK: RET imm16 (C2) returns and unwinds arguments",
+                # The return offset and two argument words are planted by hand;
+                # C2 0004 must return to 0x0008 and leave SP past both.
+                "code": bytes([0xC2, 0x04, 0x00]) + bytes(5) + bytes([0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x20000},
+                "ram_setup": [(0x20000, bytes(0x20)),
+                              (0x2000A, bytes([0x08, 0x00,      # return offset
+                                               0x11, 0x11,      # arg
+                                               0x22, 0x22]))],
+                "regs_initial": {4: 0x000A},
+                "regs_expected": {4: 0x0010},
+                "expected_eip": 9,
+            },
+            {
+                "name": "STACK: PUSH imm8 (6A) sign-extends into one word",
+                # PUSH -2 ; POP BX ; HLT
+                "code": bytes([0x6A, 0xFE, 0x8F, 0xC3, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x20000},
+                "ram_setup": [(0x20000, bytes(0x20))],
+                "regs_initial": {4: 0x0010},
+                "regs_expected": {3: 0xFFFE, 4: 0x0010},
+                "expected_eip": 5,
+            },
+            {
+                "name": "STACK: RETF imm16 (CA) installs CS and unwinds",
+                # IP=0x0008, CS=0x0300, then one argument word. CB does this
+                # correctly; CA popped CS and discarded it.
+                "code": bytes([0xCA, 0x02, 0x00]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x20000},
+                "ram_setup": [(0x20000, bytes(0x20)),
+                              (0x2000A, bytes([0x08, 0x00,      # IP
+                                               0x00, 0x03,      # CS
+                                               0x99, 0x99])),   # argument
+                              (0x3008, bytes([0xF4]))],
+                "regs_initial": {4: 0x000A},
+                "regs_expected": {4: 0x0010},
+                "expected_eip": 9,
+            },
         ])
 
         all_passed = True
