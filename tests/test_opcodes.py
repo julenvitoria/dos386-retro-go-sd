@@ -1647,12 +1647,38 @@ def run_test(args):
                 # bookkeeping error shows up rather than at CX=4.
                 "code": bytes([0xF3, 0xA5, 0xF4]),
                 "mode": 16,
-                "segs_initial": {"DS": 0x1000, "ES": 0x3000},
+                # segs_initial sets the BASE, not the selector.
+                "segs_initial": {"DS": 0x10000, "ES": 0x30000},
                 "ram_setup": [(0x10000, bytes([0x5A, 0xA5]) * 0x400)],
                 "regs_initial": {1: 0x400, 6: 0x0000, 7: 0x0000},
                 "regs_expected": {1: 0, 6: 0x800, 7: 0x800},
                 "mem_expected": [(0x30000, bytes([0x5A, 0xA5]) * 8)],
                 "expected_eip": 3,
+            },
+            {
+                "name": "STD + REP MOVSW copies backwards",
+                # STD ; REP MOVSW ; HLT. SI/DI start at the TOP of the block and
+                # walk down, which is how a relocator moves an image without
+                # overwriting itself. Getting the direction wrong here does not
+                # corrupt the copy, it corrupts whatever sits ABOVE the
+                # destination -- which for a self-relocating program is its own
+                # code.
+                "code": bytes([0xFD, 0xF3, 0xA5, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x10000, "ES": 0x30000},
+                # Clear the destination first: the scratch wipe only covers
+                # 0x200-0x3000, so an earlier case's data lingers here and would
+                # satisfy the "untouched" check by accident.
+                "ram_setup": [(0x30000, bytes(0x40)),
+                              (0x10000, bytes(range(16)) * 2)],
+                "regs_initial": {1: 8, 6: 0x1E, 7: 0x1E},
+                # 8 words from offset 0x1E downward -> offsets 0x10..0x1F moved,
+                # SI/DI end two below the last word touched.
+                "regs_expected": {1: 0, 6: 0x0E, 7: 0x0E},
+                "mem_expected": [(0x30010, bytes(range(16))),
+                                 # nothing above the block may be touched
+                                 (0x30020, bytes(8))],
+                "expected_eip": 4,
             },
             {
                 "name": "REP is ignored on a non-string opcode",
