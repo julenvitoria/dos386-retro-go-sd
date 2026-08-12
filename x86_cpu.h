@@ -124,6 +124,16 @@ typedef struct {
 
 extern X86IOState x86_io;
 
+/* The fold table the interpreter dereferences. Defined in x86_cpu.c and
+   repointed at runtime by the core, which allocates DTCM through mem_ctl. */
+extern uint32_t *guest_page_table_ptr;
+
+void x86_mem_pool_init(void *base, uint32_t bytes);
+uint32_t x86_mem_pool_free(void);
+int x86_map_range(uint32_t guest, uint32_t bytes);
+int x86_map_fixed(uint32_t guest, void *host, uint32_t bytes);
+void x86_unmap_all(void);
+
 uint32_t x86_port_read(uint32_t port, uint32_t size);
 void x86_port_write(uint32_t port, uint32_t value, uint32_t size);
 uint32_t x86_speaker_hz(void);

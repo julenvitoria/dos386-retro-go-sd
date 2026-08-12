@@ -268,20 +268,28 @@
    "insns": 15
   },
   ".op_in_al_dx_EC": {
-   "bytes": 10,
-   "insns": 3
+   "bytes": 6,
+   "insns": 2
   },
   ".op_in_al_imm8_E4": {
-   "bytes": 28,
-   "insns": 8
+   "bytes": 22,
+   "insns": 6
   },
   ".op_in_eax_dx_ED": {
-   "bytes": 8,
+   "bytes": 6,
+   "insns": 2
+  },
+  ".op_in_eax_dx_ED_32": {
+   "bytes": 6,
    "insns": 2
   },
   ".op_in_eax_imm8_E5": {
-   "bytes": 28,
-   "insns": 8
+   "bytes": 22,
+   "insns": 6
+  },
+  ".op_in_eax_imm8_E5_32": {
+   "bytes": 22,
+   "insns": 6
   },
   ".op_inc_r32": {
    "bytes": 76,
@@ -512,20 +520,28 @@
    "insns": 1
   },
   ".op_out_dx_al_EE": {
-   "bytes": 14,
-   "insns": 4
+   "bytes": 6,
+   "insns": 2
   },
   ".op_out_dx_eax_EF": {
-   "bytes": 12,
-   "insns": 3
+   "bytes": 6,
+   "insns": 2
+  },
+  ".op_out_dx_eax_EF_32": {
+   "bytes": 6,
+   "insns": 2
   },
   ".op_out_imm8_al_E6": {
-   "bytes": 32,
-   "insns": 9
+   "bytes": 22,
+   "insns": 6
   },
   ".op_out_imm8_eax_E7": {
-   "bytes": 32,
-   "insns": 9
+   "bytes": 22,
+   "insns": 6
+  },
+  ".op_out_imm8_eax_E7_32": {
+   "bytes": 22,
+   "insns": 6
   },
   ".op_pfx_66": {
    "bytes": 8,
@@ -836,8 +852,8 @@
    "insns": 3
   },
   ".save_state_and_exit": {
-   "bytes": 20,
-   "insns": 5
+   "bytes": 22,
+   "insns": 6
   },
   ".str_exit": {
    "bytes": 52,
@@ -1363,77 +1379,37 @@
    "bytes": 26,
    "insns": 7
   },
-  "DO_IN_16": {
-   "bytes": 28,
-   "insns": 8
-  },
-  "DO_IN_32": {
-   "bytes": 28,
-   "insns": 8
-  },
-  "DO_IN_CPL_OK_16": {
-   "bytes": 48,
+  "DO_IN_B_16": {
+   "bytes": 56,
    "insns": 15
   },
-  "DO_IN_CPL_OK_32": {
-   "bytes": 48,
+  "DO_IN_B_32": {
+   "bytes": 56,
    "insns": 15
   },
-  "DO_IN_SLOW_16": {
-   "bytes": 92,
-   "insns": 26
+  "DO_IN_V_16": {
+   "bytes": 84,
+   "insns": 23
   },
-  "DO_IN_SLOW_32": {
-   "bytes": 2,
-   "insns": 1
-  },
-  "DO_IN_STORE_16": {
-   "bytes": 12,
-   "insns": 4
-  },
-  "DO_IN_STORE_32": {
-   "bytes": 12,
-   "insns": 4
-  },
-  "DO_IN_STORE_BYTE_16": {
-   "bytes": 8,
-   "insns": 2
-  },
-  "DO_IN_STORE_BYTE_32": {
-   "bytes": 8,
-   "insns": 2
-  },
-  "DO_IN_UNASSIGNED_16": {
-   "bytes": 6,
-   "insns": 2
-  },
-  "DO_IN_UNASSIGNED_32": {
-   "bytes": 6,
-   "insns": 2
-  },
-  "DO_OUT_16": {
-   "bytes": 28,
-   "insns": 8
-  },
-  "DO_OUT_32": {
-   "bytes": 28,
-   "insns": 8
-  },
-  "DO_OUT_CPL_OK_16": {
-   "bytes": 52,
+  "DO_IN_V_32": {
+   "bytes": 56,
    "insns": 15
   },
-  "DO_OUT_CPL_OK_32": {
-   "bytes": 52,
+  "DO_OUT_B_16": {
+   "bytes": 56,
    "insns": 15
   },
-  "DO_OUT_SLOW_16": {
-   "bytes": 86,
-   "insns": 25
+  "DO_OUT_B_32": {
+   "bytes": 56,
+   "insns": 15
   },
-  "DO_OUT_SLOW_32": {
-   "bytes": 4,
-   "insns": 1
+  "DO_OUT_V_16": {
+   "bytes": 138,
+   "insns": 39
+  },
+  "DO_OUT_V_32": {
+   "bytes": 56,
+   "insns": 15
   },
   "EVAL_COND_16": {
    "bytes": 16,
@@ -1944,8 +1920,8 @@
    "insns": 13
   },
   "OP_STI_FB_OK_16": {
-   "bytes": 82,
-   "insns": 23
+   "bytes": 36,
+   "insns": 10
   },
   "OP_STI_FB_OK_32": {
    "bytes": 8,
@@ -2279,6 +2255,14 @@
    "bytes": 8,
    "insns": 2
   },
+  "__x86_port_read_veneer": {
+   "bytes": 8,
+   "insns": 2
+  },
+  "__x86_port_write_veneer": {
+   "bytes": 8,
+   "insns": 2
+  },
   "decode_modrm_addr16": {
    "bytes": 44,
    "insns": 14
@@ -2325,8 +2309,8 @@
   }
  },
  "totals": {
-  "bytes": 28412,
-  "insns": 7880,
-  "symbols": 580
+  "bytes": 28398,
+  "insns": 7865,
+  "symbols": 576
  }
 }
