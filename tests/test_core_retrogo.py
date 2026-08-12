@@ -101,7 +101,8 @@ def main():
     for name in ("core_ready", "core_dtcm_ok", "benchmark_cycles",
                  "benchmark_insns", "bonus_pool_size", "core_magic",
                  "run_benchmark_flag", "frames_rendered", "fb_sample",
-                 "clut_sample", "guest_ram_bytes", "guest_vram_ok"):
+                 "clut_sample", "guest_ram_bytes", "guest_vram_ok",
+                 "hle_calls_seen", "hle_bad_vector", "hle_bad_func"):
         if name not in syms:
             sys.exit(f"symbol {name} not in {args.elf}")
 
@@ -147,6 +148,10 @@ def main():
         guest_ram = runner.backend.read_uint32(syms["guest_ram_bytes"])
         vram_ok = runner.backend.read_uint32(syms["guest_vram_ok"])
 
+        hle_calls = runner.backend.read_uint32(syms["hle_calls_seen"])
+        bad_vec = runner.backend.read_uint32(syms["hle_bad_vector"])
+        bad_fn = runner.backend.read_uint32(syms["hle_bad_func"])
+
         print("\n--- emulator loop ---")
         print(f"frames           {frames_a} -> {frames_b}")
         print(f"guest RAM        {guest_ram} bytes")
@@ -154,7 +159,19 @@ def main():
         print(f"fb first 4 px    0x{fb_sample:08x}")
         print(f"clut[1]          0x{clut_sample:08x}")
 
+        print(f"HLE calls        {hle_calls}")
+
         loop_ok = True
+        # The demo guest makes exactly two service calls, INT 10h AH=0Eh and
+        # INT 21h AH=30h, through planted 0F 0B stubs. Zero would mean the
+        # stubs or the IVT never took.
+        if hle_calls < 2:
+            print(f"FAIL: expected at least 2 HLE calls, saw {hle_calls}")
+            loop_ok = False
+        if bad_vec or bad_fn:
+            print(f"FAIL: unhandled HLE service: vector 0x{bad_vec:02x} "
+                  f"function 0x{bad_fn:02x}")
+            loop_ok = False
         if frames_b <= frames_a:
             print("FAIL: frame counter is not advancing")
             loop_ok = False

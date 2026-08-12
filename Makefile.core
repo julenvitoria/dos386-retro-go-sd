@@ -19,7 +19,10 @@ src/main.c \
 x86_cpu.c \
 x86_io.c \
 x86_mem.c \
-x86_video.c
+x86_video.c \
+x86_hle.c \
+x86_bios.c \
+x86_dos.c
 
 CORE_ASM_SOURCES := \
 cpu_exec.S \

@@ -132,6 +132,7 @@ extern X86IOState x86_io;
 /* The fold table the interpreter dereferences. Defined in x86_cpu.c and
    repointed at runtime by the core, which allocates DTCM through mem_ctl. */
 extern uint32_t *guest_page_table_ptr;
+extern X86CPUState *cpu_state_ptr;
 
 /* Dedicated CGA VRAM. Sized for the full 32 KB aperture at 0xB8000 even though
    mode 4 uses 16 KB, so text and the other CGA modes fit without remapping. */
@@ -141,6 +142,20 @@ void x86_video_init(void *vram, void *lut8_palette);
 void x86_video_refresh_palette(void);
 extern uint32_t cga_clut_dirty;   /* frame loop re-pushes the CLUT when set */
 void x86_video_set_beam(uint32_t frac);
+void x86_video_set_mode(uint8_t mode);
+uint8_t x86_video_mode(void);
+int x86_video_is_text(void);
+void x86_video_set_cursor(uint8_t col, uint8_t row);
+uint16_t x86_video_get_cursor(void);
+void x86_video_scroll(uint8_t lines, uint8_t attr);
+void x86_video_putc_attr(uint8_t ch, uint8_t attr, uint16_t count);
+void x86_video_teletype(uint8_t ch);
+void x86_video_putpixel(uint16_t x, uint16_t y, uint8_t colour);
+void x86_video_set_palette_bios(uint8_t which, uint8_t value);
+void x86_bios_init(void);
+void x86_bios_tick(void);
+void x86_kb_push(uint8_t scancode, uint8_t ascii);
+void x86_hle_set_zf(int set);
 int x86_video_map(void);
 uint8_t *x86_video_vram(void);
 void x86_video_render(uint8_t *dst, uint32_t stride);
@@ -150,6 +165,28 @@ uint32_t x86_mem_pool_free(void);
 int x86_map_range(uint32_t guest, uint32_t bytes);
 int x86_map_fixed(uint32_t guest, void *host, uint32_t bytes);
 void x86_unmap_all(void);
+void *x86_guest_ptr(uint32_t lin, uint32_t bytes);
+uint32_t x86_guest_copy_out(void *dst, uint32_t lin, uint32_t bytes);
+uint32_t x86_guest_copy_in(uint32_t lin, const void *src, uint32_t bytes);
+
+/* HLE services. */
+int x86_hle_install(const uint8_t *vectors, unsigned count);
+int x86_hle_dispatch(uint8_t vector);
+int x86_hle_service(void);
+extern uint32_t x86_hle_calls;
+void x86_hle_set_cf(int set);
+void x86_set_ax(uint16_t v);
+void x86_set_bx(uint16_t v);
+void x86_set_cx(uint16_t v);
+void x86_set_dx(uint16_t v);
+void x86_set_al(uint8_t v);
+void x86_set_ah(uint8_t v);
+int x86_bios_video(uint8_t func);
+int x86_bios_keyboard(uint8_t func);
+int x86_bios_time(uint8_t func);
+int x86_dos_int21(uint8_t func);
+int x86_dos_terminate(void);
+extern uint32_t x86_hle_unhandled_vector, x86_hle_unhandled_func;
 
 uint32_t x86_port_read(uint32_t port, uint32_t size);
 void x86_port_write(uint32_t port, uint32_t value, uint32_t size);

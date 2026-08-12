@@ -91,6 +91,19 @@ standby. Called automatically by `make retrogo_media`.
 `make_sdcard_image.py` (partitioned SD image), `sync_from_firmware.sh`
 (re-vendor `sdk/` from a firmware checkout, then update `SDK_VERSION`).
 
+## Source layout (emulator side)
+
+| File | Role |
+|---|---|
+| `cpu_exec*.S`, `opcode*.S` | the Thumb-2 interpreter and its dispatch tables |
+| `x86_mem.c` | guest page pool, fold mapping, guest↔host copies |
+| `x86_io.c` | port dispatch, PIT ch2 + speaker, CGA registers |
+| `x86_video.c`, `cga_blit.S` | mode 4 blitter, mode 3 text renderer, palette |
+| `x86_hle.c` | `0F 0B` stubs, IVT planting, service dispatch |
+| `x86_bios.c` | INT 10h / 16h / 1Ah and the BIOS Data Area |
+| `x86_dos.c` | INT 21h, PSP, MCB arena, MZ loader |
+| `font8x8.h` | 8x8 font, public domain (Daniel Hepper), copied in |
+
 ## Harnesses (`tests/`)
 
 ```bash

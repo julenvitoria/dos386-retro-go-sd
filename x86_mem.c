@@ -95,6 +95,68 @@ int x86_map_fixed(uint32_t guest, void *host, uint32_t bytes)
     return 0;
 }
 
+/*
+ * Guest linear -> host pointer, for host-side code servicing an HLE call.
+ *
+ * Goes through the same fold table the interpreter uses, so an unmapped page
+ * is reported rather than silently dereferenced, and a request that would
+ * straddle out of its granule is refused: the fold answers for one 4 KB page,
+ * and a service copying a filename or a disk buffer can easily cross one. The
+ * caller must split or use x86_guest_copy.
+ */
+void *x86_guest_ptr(uint32_t lin, uint32_t bytes)
+{
+    if (bytes == 0)
+        return NULL;
+    uint32_t idx = lin >> FOLD_SHIFT;
+    if (idx >= FOLD_ENTRIES)
+        return NULL;
+    uint32_t k = guest_page_table_ptr[idx];
+    if (k == FOLD_INVALID)
+        return NULL;
+    if (((lin + bytes - 1u) >> FOLD_SHIFT) != idx)
+        return NULL;                 /* would cross a granule */
+    return (void *)(lin + k);
+}
+
+/* Copy across granules, one page at a time. Returns bytes actually moved, so
+   a short result means the guest range ran into unmapped memory. */
+uint32_t x86_guest_copy_out(void *dst, uint32_t lin, uint32_t bytes)
+{
+    uint8_t *d = (uint8_t *)dst;
+    uint32_t done = 0;
+    while (done < bytes) {
+        uint32_t off = (lin + done) & (PAGE_SIZE - 1u);
+        uint32_t run = PAGE_SIZE - off;
+        if (run > bytes - done)
+            run = bytes - done;
+        void *p = x86_guest_ptr(lin + done, run);
+        if (!p)
+            break;
+        memcpy(d + done, p, run);
+        done += run;
+    }
+    return done;
+}
+
+uint32_t x86_guest_copy_in(uint32_t lin, const void *src, uint32_t bytes)
+{
+    const uint8_t *s = (const uint8_t *)src;
+    uint32_t done = 0;
+    while (done < bytes) {
+        uint32_t off = (lin + done) & (PAGE_SIZE - 1u);
+        uint32_t run = PAGE_SIZE - off;
+        if (run > bytes - done)
+            run = bytes - done;
+        void *p = x86_guest_ptr(lin + done, run);
+        if (!p)
+            break;
+        memcpy(p, s + done, run);
+        done += run;
+    }
+    return done;
+}
+
 void x86_unmap_all(void)
 {
     for (uint32_t i = 0; i < FOLD_ENTRIES; i++)

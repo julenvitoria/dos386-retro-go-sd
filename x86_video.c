@@ -17,6 +17,20 @@
 
 #include "cutils.h"
 #include "x86_cpu.h"
+#include "font8x8.h"
+
+/*
+ * Text mode 3 is 80x25 in 8x8 cells: 640x200, which does not fit a 320x240
+ * panel. We render 8x8 cells into a 320x200 area, i.e. 40 columns and 25 rows,
+ * and scroll the visible window horizontally with the cursor. Halving each
+ * glyph instead would make 80 columns fit but leaves text unreadable at this
+ * size, and DOS output is mostly the left-hand columns anyway.
+ */
+#define TEXT_COLS       80
+#define TEXT_ROWS       25
+#define TEXT_VIS_COLS   40
+#define CELL_W          8
+#define CELL_H          8
 
 /* Mode 4 planes: even scanlines at +0x0000, odd at +0x2000, 80 bytes a row. */
 #define CGA_PLANE_ODD   0x2000u
@@ -28,6 +42,7 @@ void cga_mode4_blit(uint8_t *dst, const uint8_t *even, const uint8_t *odd,
                     const uint32_t *tab, uint32_t dst_advance);
 
 static uint8_t *cga_vram;
+static void text_render(uint8_t *dst, uint32_t stride);
 /* 2bpp -> four palette bytes. In DTCM: the blitter hits it once per source
    byte, and DTCM's second port keeps that off the AXI path the source is on. */
 static uint32_t cga_expand[256] __attribute__((section(".dtcm_bss")));
@@ -75,6 +90,15 @@ void x86_video_refresh_palette(void)
         c1 = 3; c2 = 5; c3 = 7;
     } else {                               /* palette 0: green, red, brown */
         c1 = 2; c2 = 4; c3 = 6;
+    }
+
+    if (x86_video_is_text()) {
+        /* Attributes index all 16 colours directly, so the CLUT is the whole
+           CGA palette rather than the four graphics entries. */
+        for (unsigned i = 0; i < 16; i++)
+            cga_clut[i] = cga_argb[i];
+        cga_clut_dirty = 1;
+        return;
     }
 
     cga_clut[0] = cga_argb[background];
@@ -138,6 +162,152 @@ uint8_t *x86_video_vram(void)
 void x86_video_render(uint8_t *dst, uint32_t stride)
 {
     uint8_t *top = dst + ((240u - CGA_HEIGHT) / 2u) * stride;
-    cga_mode4_blit(top, cga_vram, cga_vram + CGA_PLANE_ODD,
-                   cga_expand, stride - CGA_WIDTH);
+    if (x86_video_is_text())
+        text_render(top, stride);
+    else
+        cga_mode4_blit(top, cga_vram, cga_vram + CGA_PLANE_ODD,
+                       cga_expand, stride - CGA_WIDTH);
+}
+
+/* ---------------------------------------------------------------------------
+ * Mode and cursor state.
+ */
+static uint8_t  video_mode = 0x04;
+static uint8_t  cur_row, cur_col;
+static uint16_t text_scroll_col;    /* leftmost visible column */
+
+void x86_video_set_mode(uint8_t mode)
+{
+    video_mode = mode;
+    cur_row = cur_col = 0;
+    text_scroll_col = 0;
+    memset(cga_vram, (mode == 0x03 || mode == 0x02) ? 0 : 0, X86_VRAM_BYTES);
+    if (mode == 0x03 || mode == 0x02) {
+        /* Text mode: blank cells are space on black, not zero bytes -- a zero
+           attribute renders black-on-black and hides everything written
+           before the guest sets its own colours. */
+        uint16_t *cell = (uint16_t *)cga_vram;
+        for (unsigned i = 0; i < TEXT_COLS * TEXT_ROWS; i++)
+            cell[i] = 0x0720;
+    }
+    x86_video_refresh_palette();
+}
+
+uint8_t x86_video_mode(void) { return video_mode; }
+
+void x86_video_set_cursor(uint8_t col, uint8_t row)
+{
+    cur_col = col; cur_row = row;
+    if (cur_col < text_scroll_col)
+        text_scroll_col = cur_col;
+    else if (cur_col >= text_scroll_col + TEXT_VIS_COLS)
+        text_scroll_col = (uint16_t)(cur_col - TEXT_VIS_COLS + 1);
+}
+
+uint16_t x86_video_get_cursor(void)
+{
+    return (uint16_t)((cur_row << 8) | cur_col);
+}
+
+static uint16_t *text_cell(unsigned row, unsigned col)
+{
+    return (uint16_t *)cga_vram + row * TEXT_COLS + col;
+}
+
+void x86_video_scroll(uint8_t lines, uint8_t attr)
+{
+    if (lines == 0 || lines >= TEXT_ROWS) {
+        uint16_t *c = (uint16_t *)cga_vram;
+        for (unsigned i = 0; i < TEXT_COLS * TEXT_ROWS; i++)
+            c[i] = (uint16_t)(0x20 | (attr << 8));
+        return;
+    }
+    memmove(cga_vram, cga_vram + lines * TEXT_COLS * 2,
+            (TEXT_ROWS - lines) * TEXT_COLS * 2);
+    uint16_t *c = text_cell(TEXT_ROWS - lines, 0);
+    for (unsigned i = 0; i < lines * TEXT_COLS; i++)
+        c[i] = (uint16_t)(0x20 | (attr << 8));
+}
+
+void x86_video_putc_attr(uint8_t ch, uint8_t attr, uint16_t count)
+{
+    if (count == 0) count = 1;
+    for (unsigned i = 0; i < count && cur_col + i < TEXT_COLS; i++)
+        *text_cell(cur_row, cur_col + i) = (uint16_t)(ch | (attr << 8));
+}
+
+void x86_video_teletype(uint8_t ch)
+{
+    switch (ch) {
+    case 0x0D: cur_col = 0; break;
+    case 0x0A: cur_row++; break;
+    case 0x08: if (cur_col) cur_col--; break;
+    default:
+        *text_cell(cur_row, cur_col) =
+            (uint16_t)(ch | ((*text_cell(cur_row, cur_col) >> 8) << 8));
+        if (++cur_col >= TEXT_COLS) { cur_col = 0; cur_row++; }
+        break;
+    }
+    if (cur_row >= TEXT_ROWS) {
+        x86_video_scroll(1, 0x07);
+        cur_row = TEXT_ROWS - 1;
+    }
+    x86_video_set_cursor(cur_col, cur_row);
+}
+
+void x86_video_putpixel(uint16_t x, uint16_t y, uint8_t colour)
+{
+    if (x >= CGA_WIDTH || y >= CGA_HEIGHT)
+        return;
+    uint32_t off = ((y & 1) ? CGA_PLANE_ODD : 0) + (y >> 1) * CGA_ROW_BYTES
+                 + (x >> 2);
+    unsigned shift = 6 - 2 * (x & 3);
+    cga_vram[off] = (uint8_t)((cga_vram[off] & ~(3u << shift))
+                              | ((colour & 3u) << shift));
+}
+
+/* INT 10h AH=0Bh: BH=0 sets the background/border, BH=1 the palette. Both land
+   in the same colour-select register the ports write. */
+void x86_video_set_palette_bios(uint8_t which, uint8_t value)
+{
+    if (which == 0)
+        x86_io.cga_color_select = (uint8_t)((x86_io.cga_color_select & 0xF0)
+                                            | (value & 0x0F));
+    else
+        x86_io.cga_color_select = (uint8_t)((x86_io.cga_color_select & ~0x20)
+                                            | ((value & 1) ? 0x20 : 0));
+    x86_video_refresh_palette();
+}
+
+/* ---------------------------------------------------------------------------
+ * Text rendering. One glyph row is eight 1-bit pixels; the attribute byte
+ * gives foreground in the low nibble and background in the high, both indexing
+ * the 16-colour CGA palette. Text mode therefore needs all 16 CLUT entries
+ * where mode 4 needs four.
+ */
+static void text_render(uint8_t *dst, uint32_t stride)
+{
+    for (unsigned row = 0; row < TEXT_ROWS; row++) {
+        for (unsigned vc = 0; vc < TEXT_VIS_COLS; vc++) {
+            unsigned col = text_scroll_col + vc;
+            uint16_t cell = (col < TEXT_COLS) ? *text_cell(row, col) : 0x0720;
+            const unsigned char *glyph = font8x8_basic[cell & 0x7F];
+            uint8_t fg = (uint8_t)((cell >> 8) & 0x0F);
+            uint8_t bg = (uint8_t)((cell >> 12) & 0x07);
+
+            for (unsigned gy = 0; gy < CELL_H; gy++) {
+                uint8_t bits = glyph[gy];
+                uint8_t *o = dst + (row * CELL_H + gy) * stride + vc * CELL_W;
+                /* font8x8 stores the leftmost pixel in bit 0. */
+                for (unsigned gx = 0; gx < CELL_W; gx++)
+                    o[gx] = (bits & (1u << gx)) ? fg : bg;
+            }
+        }
+    }
+}
+
+int x86_video_is_text(void)
+{
+    return video_mode == 0x02 || video_mode == 0x03 || video_mode == 0x00
+        || video_mode == 0x01;
 }

@@ -83,6 +83,10 @@ volatile uint32_t guest_exit_reason = 0;
 volatile uint32_t fb_addr = 0;        /* the buffer the blit was handed */
 volatile uint32_t fb_sample = 0;      /* first 4 pixels of the picture area */
 volatile uint32_t clut_sample = 0;    /* colour 1, to prove the CLUT took */
+volatile uint32_t hle_calls_seen = 0;
+volatile uint32_t hle_bad_vector = 0;
+volatile uint32_t hle_bad_func = 0;
+volatile uint32_t guest_ax = 0;
 
 /*
  * Built-in guest, 16-bit real mode, entered at 0000:0100.
@@ -94,6 +98,13 @@ volatile uint32_t clut_sample = 0;    /* colour 1, to prove the CLUT took */
  * not in a missing DOS layer.
  */
 static const uint8_t demo_guest[] = {
+    /* INT 10h AH=0Eh: teletype a character through the BIOS */
+    0xB4, 0x0E,                   /* mov ah, 0x0E        */
+    0xB0, 0x41,                   /* mov al, 'A'         */
+    0xCD, 0x10,                   /* int 0x10            */
+    /* INT 21h AH=30h: ask DOS its version */
+    0xB4, 0x30,                   /* mov ah, 0x30        */
+    0xCD, 0x21,                   /* int 0x21            */
     /* colour select: palette 1, high intensity */
     0xBA, 0xD9, 0x03,             /* mov dx, 0x03D9      */
     0xB0, 0x30,                   /* mov al, 0x30        */
@@ -324,6 +335,14 @@ static void guest_reset(void)
         guest_page_table_ptr[i] = FOLD_K((uint32_t)guest_ram + i * 4096, i);
     x86_video_map();
 
+    x86_bios_init();
+    /* Take over the vectors we serve. The guest reaches us through a planted
+       0F 0B stub, so a program that hooks or chains one still works. */
+    static const uint8_t hle_vectors[] = {
+        0x08, 0x10, 0x16, 0x1A, 0x20, 0x21,
+    };
+    x86_hle_install(hle_vectors, sizeof(hle_vectors));
+
     memcpy(guest_ram + 0x100, demo_guest, sizeof(demo_guest));
     cpu_state_ptr->eip = 0x100;
     cpu_state_ptr->regs[4] = 0xFFFE;             /* SP just under the segment */
@@ -395,9 +414,8 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                 break;
             }
             if (reason == X86_EXIT_HLE_INT) {
-                /* No DOS layer yet: acknowledge and continue so the shape of
-                   the loop is right for when there is one. */
                 cpu_state_ptr->exit_reason = 0;
+                x86_hle_service();
                 continue;
             }
             break;   /* fault, HLT or unimplemented: stop stepping */
@@ -414,6 +432,10 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
             fb_sample = *(volatile uint32_t *)(fb + 20 * FRAME_W);
         }
         clut_sample = core_clut[1];
+        hle_calls_seen = x86_hle_calls;
+        hle_bad_vector = x86_hle_unhandled_vector;
+        hle_bad_func = x86_hle_unhandled_func;
+        guest_ax = cpu_state_ptr->regs[0] & 0xFFFF;
         x86_video_set_beam(0x0000);
 
         /* A guest write to 0x3D9 changes the palette; the firmware holds its
