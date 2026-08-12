@@ -320,12 +320,16 @@
 OP_AGNOSTIC .op_nop
     B.W .fetch_decode_loop
 
+/* AF is bit 4 of (a ^ b ^ result). With b == 1 that aux word is a ^ 1, NOT
+   ~a -- MVN inverts every bit including the one the macro reads, so AF came
+   out exactly backwards on every INC and DEC of a register. The ModRM forms
+   already use the right aux. */
 OP .op_inc_r32
     AND.W R2, R0, #7
     MOV.W R2, R2, LSL #2
     ADD.W R2, R2, #8
     LDREG_V R3, R2
-    MVN.W R4, R3                   @ AF aux: a ^ b with b == 1
+    EOR.W R4, R3, #1               @ AF aux: a ^ b, with b == 1
     ADDS R3, R3, #1
     EOR.W R4, R4, R3
     X86_FLAGS_INCDEC R3, R4, R0, R1    @ INC must not disturb CF
@@ -336,7 +340,7 @@ OP .op_dec_r32
     MOV.W R2, R2, LSL #2
     ADD.W R2, R2, #8
     LDREG_V R3, R2
-    MVN.W R4, R3
+    EOR.W R4, R3, #1
     SUBS R3, R3, #1
     EOR.W R4, R4, R3
     X86_FLAGS_INCDEC R3, R4, R0, R1    @ DEC must not disturb CF

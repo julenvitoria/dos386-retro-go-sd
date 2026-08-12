@@ -2436,6 +2436,38 @@ def run_test(args):
                 "regs_expected": {1: 0x00010000},
                 "expected_eip": 5,
             },
+            {
+                "name": "FLAGS: DEC r16 AF is the borrow out of bit 3",
+                # MOV DX,0x10 ; DEC DX ; HLT -> 0x0F, which borrows from bit 4.
+                # The AF aux was ~a rather than a^b, which inverts the bit the
+                # macro reads, so AF came out exactly backwards.
+                "code": bytes([0xBA, 0x10, 0x00, 0x4A, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {2: 0x000F},
+                "flags_expected": {"AF": 1, "ZF": 0, "SF": 0, "OF": 0, "PF": 1},
+                "expected_eip": 5,
+            },
+            {
+                "name": "FLAGS: DEC r16 leaves AF clear when bit 3 does not borrow",
+                # 0x12 -> 0x11 borrows nothing out of bit 3.
+                "code": bytes([0xBA, 0x12, 0x00, 0x4A, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {2: 0x0011},
+                "flags_expected": {"AF": 0},
+                "expected_eip": 5,
+            },
+            {
+                "name": "FLAGS: INC r16 AF is the carry out of bit 3",
+                # 0x0F + 1 carries out of bit 3.
+                "code": bytes([0xB8, 0x0F, 0x00, 0x40, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0010},
+                "flags_expected": {"AF": 1, "ZF": 0},
+                "expected_eip": 5,
+            },
         ])
 
         all_passed = True
