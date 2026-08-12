@@ -99,6 +99,8 @@ python3 tests/test_opcodes.py            # 162 cases: EFLAGS, segmentation,
 python3 tests/test_benchmark.py
 python3 tests/test_game.py
 python3 tests/test_video.py              # CGA mode 4 blitter, pixel-exact
+python3 tests/test_screen.py             # what the LTDC actually scans out,
+                                         # reconstructed to build/artifacts/screen.png
 python3 tests/test_core_retrogo.py       # tier 2
 ```
 

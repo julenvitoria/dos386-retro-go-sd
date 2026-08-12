@@ -84,7 +84,8 @@ path. The fold and dispatch were measured together and are not separable.
       retrace status (both bits must move or a polling guest spins forever)
 - [x] Core emulator loop: 640 KB RAM + 32 KB VRAM from AXI, frame-paced CPU
       slices, CGA blit to the LCD, speaker to the audio buffer, gamepad polled.
-      A built-in real-mode guest drives all three
+      A built-in real-mode guest drives all three, and `test_screen.py`
+      confirms the image the display controller is scanning
 - [ ] Input into a BIOS keyboard buffer (state captured; INT 16h will consume it)
 - [ ] Real 18.2 Hz PIT tick driving INT 08h
 - [ ] DWT per-opcode-class profile over a real Alley Cat frame
@@ -111,8 +112,10 @@ path. The fold and dispatch were measured together and are not separable.
 - Tier 2 harness had two faults, now fixed: it polled for 150 s against a 35 s
   timeline (so every run ended in a GDB traceback), and it never armed
   `run_benchmark_flag`, so it read a figure the core had stopped producing.
-- **Headless gwemu renders nothing** — even Retro-Go's own menu screenshots come
-  back fully black, so the picture cannot be confirmed there. Tier 2 asserts the
-  framebuffer contents and the CLUT instead. Visual confirmation needs hardware.
+- gwemu's headless **screendump** produces nothing — Retro-Go's own menu comes
+  back black too, so those PNGs prove nothing either way. Its **LTDC registers
+  are modelled**, though, so `tests/test_screen.py` reconstructs the scanned-out
+  image from L1CFBAR + the firmware's CLUT and checks it. Do not read a black
+  timeline screenshot as a video bug.
 - The hardware probe was not detected during this session, so `50.50 cyc/insn`
   is the last measured figure and predates the interrupt, speaker and video work.
