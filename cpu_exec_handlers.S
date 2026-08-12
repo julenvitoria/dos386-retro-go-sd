@@ -923,11 +923,24 @@ OP .op_lea_8D
     MOV.W R4, R4, LSL #2
     ADD.W R4, R4, #8
     ADD R4, R8
-    PUSH {R4}
+    PUSH {R2, R4}
     LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
     BLX R12
-    POP {R4}
-    STR R7, [R4, #0]
+    POP {R2, R4}
+    /* The decoder returns a LINEAR address -- L(MODRM_SEG) folds the segment
+       base in, because that is what every memory operand needs. LEA is the one
+       instruction that wants the offset instead, so take the base back out and
+       wrap at the address size. Storing R7 raw made LEA return base+offset,
+       which is invisible while DS.base is 0 and catastrophic the moment it is
+       not: TOPBENCH's unpacker turns an overflowing DI into a segment bump with
+       LEA, and got 0x967 paragraphs instead of 0x5FE. The store is ST_V so a
+       16-bit LEA leaves the high half of the destination alone. */
+    LDR.W R5, [R6, #4]             @ the base MODRM_SEG added
+    SUB.W R7, R7, R5
+    TST.W R2, #ADDRSIZE_XOR
+    IT EQ
+    UXTHEQ R7, R7
+    ST_V R7, R4
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_mov_gb_eb_8A

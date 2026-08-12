@@ -2468,6 +2468,45 @@ def run_test(args):
                 "flags_expected": {"AF": 1, "ZF": 0},
                 "expected_eip": 5,
             },
+            {
+                "name": "FLAGS: SHR r/m16,1 PF is the parity of the LOW BYTE",
+                # The exact values TOPBENCH's bit-stream decoder reaches:
+                # BP = 0xA05B, SHR BP,1 -> 0x502D. Low byte 0x2D has four bits
+                # set, so PF is 1; CF is the bit shifted out; OF is the
+                # ORIGINAL msb.
+                "code": bytes([0xBD, 0x5B, 0xA0, 0xD1, 0xED, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {5: 0x502D},
+                "flags_expected": {"CF": 1, "PF": 1, "SF": 0, "ZF": 0, "OF": 1},
+                "expected_eip": 6,
+            },
+            {
+                "name": "LEA yields the OFFSET, not the linear address",
+                # MOV DI,0x7FEB ; LEA BX,[DI-0x2000] ; HLT, with DS based at
+                # 0x19690. The ModRM decoder folds the segment base into the
+                # address it returns because that is what a memory operand
+                # needs; LEA must take it back out. TOPBENCH's unpacker uses
+                # exactly this to turn an overflowing DI into a segment bump,
+                # and with the base left in it advanced ES by 0x967 paragraphs
+                # instead of 0x5FE.
+                "code": bytes([0xBF, 0xEB, 0x7F, 0x8D, 0x9D, 0x00, 0xE0, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x19690},
+                "regs_initial": {},
+                "regs_expected": {3: 0x5FEB, 7: 0x7FEB},
+                "expected_eip": 8,
+            },
+            {
+                "name": "LEA wraps its result at the address size",
+                # MOV DI,4 ; LEA BX,[DI-0x10] ; HLT -> 0xFFF4, not 0x0FFFF4.
+                "code": bytes([0xBF, 0x04, 0x00, 0x8D, 0x9D, 0xF0, 0xFF, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x19690},
+                "regs_initial": {3: 0xAAAA0000},
+                "regs_expected": {3: 0xAAAAFFF4},
+                "expected_eip": 8,
+            },
         ])
 
         all_passed = True
