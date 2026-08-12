@@ -13,40 +13,27 @@ Under gwemu this proves everything up to the LTDC registers. gwemu's headless
 display renders nothing at all (Retro-Go's own menu screenshots come back
 black), so the panel itself can only be confirmed on hardware -- run with
 --target hardware for that.
+
+This checks a FIXED pattern, so it needs an SD image whose .dsk fails to load,
+which is what makes the core fall back to its built-in demo guest. With a real
+game on the card it reports that game's palette and fails. To just look at
+whatever is on screen, use scripts/screenshot.py instead.
 """
 import argparse
 import os
-import struct
 import sys
 import time
-import zlib
 
 sys.path.insert(0, ".")
 from scripts.common.target import Image, add_target_args, open_target
 from scripts.common.elf import get_symbols
+from scripts.common.screen import (
+    LTDC_L1CFBAR, LTDC_L1CFBLNR, LTDC_L1CFBLR, LTDC_L1CR, LTDC_L1PFCR,
+    SCREEN_H, SCREEN_W, write_png,
+)
 
-LTDC_BASE = 0x50001000
-LTDC_L1CR     = LTDC_BASE + 0x84    # layer enable
-LTDC_L1PFCR   = LTDC_BASE + 0x94    # pixel format (5 = L8)
-LTDC_L1CFBAR  = LTDC_BASE + 0xAC    # colour frame buffer address
-LTDC_L1CFBLR  = LTDC_BASE + 0xB0    # pitch / line length
-LTDC_L1CFBLNR = LTDC_BASE + 0xB4    # line count
-
-SCREEN_W, SCREEN_H = 320, 240
 CGA_W, CGA_H = 320, 200
 CGA_TOP = (SCREEN_H - CGA_H) // 2
-
-
-def write_png(path, w, h, rgb):
-    raw = b"".join(b"\x00" + rgb[y * w * 3:(y + 1) * w * 3] for y in range(h))
-    def chunk(tag, data):
-        c = struct.pack(">I", len(data)) + tag + data
-        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-    png = (b"\x89PNG\r\n\x1a\n"
-           + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
-           + chunk(b"IDAT", zlib.compress(raw, 9))
-           + chunk(b"IEND", b""))
-    open(path, "wb").write(png)
 
 
 def expected_indices():

@@ -7,7 +7,7 @@ Roadmap and phase definitions: [`PLAN.md`](PLAN.md).
 
 | Tier | State |
 |---|---|
-| 1. gwemu bare-metal | 215/215 `test_opcodes.py`, plus `test_video`/`test_dos`/`test_screen` |
+| 1. gwemu bare-metal | 229/229 `test_opcodes.py`, plus `test_video`/`test_dos` |
 | 2. gwemu + retro-go | `core_dtcm_ok=1`, bonus pool 153,600 B, 1,000,001 insns — matches tier 1 |
 | 3. Hardware | 50.50 cyc/insn, 5.54 MIPS |
 
@@ -44,8 +44,23 @@ PIT ch2; port I/O on a C dispatch; the guest page pool and fold mapping; the
 frame-paced emulator loop; and the DOS layer -- MCB arena, PSP, MZ loader with
 relocations, INT 21h on FatFs -- fed by the guest `.dsk` streamed from SD.
 
+**Alley Cat draws its title screen** — `build/artifacts/alleycat.png`, captured
+with `scripts/screenshot.py`. The guest runs continuously: `guest_halted=0`, no
+unhandled vector, ~2 M HLE calls per 4 s, BDA ticks advancing at 18.2 Hz.
+Five defects stood between it and this, all fixed with tier-1 cases first: the
+bare-IRET stub sat inside the DOS arena; `moffs` ignored the segment base and
+always fetched 4 bytes; `MOV r/m,imm` (C6/C7) had no memory form; `MOV Ew,Sreg`
+to memory stored the decoder's leftovers instead of the selector; and nothing
+drove the PIT tick.
+
+- [ ] It stays ON the title screen. Scancodes reach the guest (`kbd_head ==
+      kbd_tail`, `kbd_last=0xB9`) and its own INT 09h hook is installed
+      correctly (`IVT[9] = 07A4:14B3`), so the next step is to find what the
+      title loop is actually waiting on — trace it from the poll at CS 0x7A4.
+- [ ] `sdcard.py`'s default ROM is now ALLEYCAT, so `test_screen.py` (which
+      asserts the built-in demo pattern) needs an SD image with no loadable
+      .dsk. Use `scripts/screenshot.py` to look at a real guest.
 - [ ] Input into a BIOS keyboard buffer (state captured; INT 16h will consume it)
-- [ ] Real 18.2 Hz PIT tick driving INT 08h
 - [ ] DWT per-opcode-class profile; gate NOR backing on a code-vs-data measurement
 
 ## Phase 3 — Wolf3D
@@ -55,32 +70,16 @@ relocations, INT 21h on FatFs -- fed by the guest `.dsk` streamed from SD.
 - [ ] Protected mode: descriptor validation, far transfers, IRET privilege change, paging walk
 - [ ] Profile-directed tuning against a Wolf3D DWT profile
 
-## TOPBENCH (the current 16-bit correctness driver)
+## TOPBENCH (the previous 16-bit correctness driver)
 
-The .dsk streams, AUTOEXEC.BAT names the program, the MZ loader places it and
-its Borland relocator runs. Five bug classes found and fixed against it so far
-(see `git log`): the v-width shift group was pass-agnostic; `INC`/`DEC r/m8` and
-`INC`/`DEC Ev` set no flags; thirteen stack handlers ignored `SS.base` and used a
-4-byte slot; the shift operand FETCH and `XCHG` were 32-bit in 16-bit mode; and
-all three `TEST` forms set no flags while 16-bit `CBW`/`CWD` ran `CWDE`/`CDQ`.
-
-It now runs ~1.34 M instructions and dies inside the self-unpacker.
-`scripts/ref_trace.py` says a real 8086 takes 1,553,044 to reach INT 21h, so
-roughly one bug remains between here and the first DOS call. The failure is that
-our machine leaves the relocation copy loop sooner than the reference does; the
-copy itself, its direction, large counts, granule crossing and the 16-bit index
-wrap are all covered by passing tier-1 cases, so the cause is elsewhere. No
-screenshot yet: `hle_calls_seen` is still 0, meaning nothing has been printed.
-
-Next step is `scripts/ref_trace.py` against a fresh trace: the divergence is
-between the relocation copy and the first INT 21h, and the alignment traps in
-TOOLING have to be respected or the diff points at the wrong instruction --
-they cost most of a session here.
+Superseded by Alley Cat, which now gets further. TOPBENCH still dies inside its
+self-unpacker at ~1.34 M instructions, where `scripts/ref_trace.py` says a real
+8086 needs 1,553,044 to reach INT 21h. It has not been re-measured since the
+moffs, C6/C7 and 8C fixes, any of which could account for it -- re-run it before
+resuming the trace diff, and respect TOOLING's alignment traps if you do.
 
 ## Open defects
 
-- `moffs` (`A0`–`A3`) takes its offset at the operand size; it should follow the
-  ADDRESS size.
 - `MOV SS,x` does not inhibit interrupts for the following instruction, so an
   interrupt can land on a half-switched stack.
 - Protected-mode segment loads trap out (`CR0.PE` set) — no descriptor walk yet.

@@ -554,6 +554,8 @@ static void poll_input(const gw_firmware_abi_t *abi)
 
 static void emulator_loop(const gw_firmware_abi_t *abi)
 {
+    uint32_t pit_accum = 0;          /* 1/600ths of a frame, see below */
+
     guest_reset();
     guest_halted = 0;
 
@@ -575,6 +577,33 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         }
 
         poll_input(abi);
+
+        /*
+         * The 18.2 Hz PIT tick.
+         *
+         * Nothing drove it before, so the BDA tick count never moved and any
+         * guest that waits on it waited forever -- Alley Cat draws its title
+         * screen and then polls INT 1Ah for a delay, which is why the picture
+         * was correct and completely frozen.
+         *
+         * The count is advanced HERE rather than in the INT 08h service,
+         * because a game that hooks INT 08h (most do) replaces our stub and
+         * the BIOS count would stop dead. IRQ 0 is raised at the same moment
+         * so a hooked handler still runs, and the instruction boundary is
+         * pulled in so it is delivered now instead of at the end of the slice.
+         *
+         * 182/600 = 18.2 ticks per 60 frames, accumulated so the rate is right
+         * even though no single frame carries a whole tick.
+         */
+        pit_accum += 182u;
+        if (pit_accum >= 600u) {
+            pit_accum -= 600u;
+            x86_bios_tick();
+            if (!cpu_state_ptr->hard_int_pending) {
+                cpu_state_ptr->hard_int_pending = 0x08;
+                cpu_state_ptr->pit_counter = 1;
+            }
+        }
 
         /*
          * Run guest instructions until the slice's PIT budget expires. Other

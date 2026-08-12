@@ -193,8 +193,10 @@ int x86_hle_dispatch(uint8_t vector)
         return x86_bios_keyboard(AH);
     case 0x1A:
         return x86_bios_time(AH);
-    case 0x08:                       /* PIT tick: keep the BDA count moving */
-        x86_bios_tick();
+    case 0x08:
+        /* Nothing to do. The BDA tick count is advanced by the frame loop,
+           not here: a guest that hooks INT 08h never reaches this stub, and
+           the count has to keep moving anyway. */
         return 1;
     case 0x09:
         return x86_bios_kbd_irq();

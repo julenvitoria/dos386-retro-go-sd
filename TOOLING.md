@@ -68,6 +68,25 @@ Samples PC (labelled ITCM / firmware symbol / region), watched globals, and
 pointer dereferences. Reach for this when a harness reports a value that makes
 no sense — it is faster than lengthening a timeline, which is capped at 60s.
 
+### `screenshot.py` — capture what the panel is showing
+
+```bash
+python3 scripts/screenshot.py --wait-frames 150 --out build/artifacts/game.png
+python3 scripts/screenshot.py --shots 4 --interval 3   # a short sequence
+python3 scripts/screenshot.py --timeline timelines/start-and-play.tl
+```
+
+Reconstructs the frame from the LTDC's Layer-1 registers and the firmware's
+CLUT, like `tests/test_screen.py`, but asserts nothing about the content — it
+is for looking at a guest that is running. It prints a palette-index histogram
+with every shot, because a single-index frame is a blank screen however good
+the PNG looks in a viewer. Do NOT use gwemu's own timeline `screenshot`
+directive to judge this: it returns black even for Retro-Go's menu.
+
+`timelines/start-and-play.tl` launches the preselected ROM and then keeps
+pressing keys, which `start-preselected-game.tl` does not — a DOS game sits on
+its title screen until input arrives.
+
 ### `watch_memory.py` — catch whatever is writing to an address
 
 ```bash
@@ -222,6 +241,7 @@ Importable support only — no CLIs.
 | `probe.py` | Sample PC, globals, pointer derefs and array dumps on a running target; `read_faults` decodes CFSR/HFSR/BFAR |
 | `watchpoint.py` | Z2/Z3 data watchpoints over the GDB remote protocol, and the unsolicited stop reply that follows a resume |
 | `dosimage.py` | FAT12 reader + MZ loader that mirrors `x86_dos_exec`, so a reference emulator starts from OUR entry state |
+| `screen.py` | LTDC Layer-1 readback, CLUT lookup and PNG writing — the image the panel actually receives |
 | `verify.py` | Symbol-region checks and ELF-vs-target section comparison |
 | `builder.py`, `runner.py` | Tier-1 build convenience |
 
