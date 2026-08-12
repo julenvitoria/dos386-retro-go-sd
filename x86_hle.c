@@ -82,7 +82,13 @@ void x86_hle_set_cf(int set)
 #define STUB_SEG      0x0060u        /* linear 0x600: below the 640 KB arena,
                                         above the IVT and the BIOS data area */
 #define STUB_BYTES    4u
-#define IRET_OFF      0x300u         /* a bare IRET, inside the same page */
+/* The stub block must fit between STUB_SEG and the first MCB of the DOS arena
+   at segment 0x0070 -- 0x600..0x6FF, 256 bytes. It used to be sized to the
+   4 KB page instead, which put the bare IRET at linear 0x900: inside the arena,
+   so the first program loaded overwrote it, and the next interrupt to an
+   unserved vector executed the program's data as code. */
+#define STUB_LIMIT    0x0100u        /* 0x600..0x6FF; 0x700 is the arena */
+#define IRET_OFF      0x00FCu        /* a bare IRET, last dword of the block */
 
 /* Where a PC keeps its ROM identification. A system tool reads these directly
    rather than asking, so they have to exist as memory. */
@@ -93,7 +99,10 @@ void x86_hle_set_cf(int set)
 int x86_hle_install(const uint8_t *vectors, unsigned count)
 {
     uint32_t base = (uint32_t)STUB_SEG << 4;
-    uint8_t *stubs = (uint8_t *)x86_guest_ptr(base, count * STUB_BYTES);
+    uint8_t *stubs;
+    if (count * STUB_BYTES > IRET_OFF)
+        return -1;                   /* would run into the bare IRET */
+    stubs = (uint8_t *)x86_guest_ptr(base, STUB_LIMIT);
     uint8_t *ivt = (uint8_t *)x86_guest_ptr(0, 1024);
     if (!stubs || !ivt)
         return -1;
