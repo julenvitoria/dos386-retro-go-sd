@@ -28,8 +28,7 @@ Details are in the git history; `git log --oneline` is the index.
 - [ ] Lazy PF/AF (currently eager, ~9 of ~16 insns per ALU op)
 - [ ] Size-aware `MEM_R*`/`MEM_W*` macros + CI grep banning raw `[R9,`
 - [ ] Software TLB above the 16 MB direct window
-- [ ] Assertions in `test_game.py` / `test_benchmark.py`
-- [ ] Realign `docs/01`–`03`, `05`; `docs/04`, `docs/06` current
+- [ ] Assertions in `test_game.py`/`test_benchmark.py`; realign `docs/01`–`03`, `05`
 
 ## Phase 2 — Alley Cat
 
@@ -47,8 +46,7 @@ relocations, INT 21h on FatFs -- fed by the guest `.dsk` streamed from SD.
 
 - [ ] Input into a BIOS keyboard buffer (state captured; INT 16h will consume it)
 - [ ] Real 18.2 Hz PIT tick driving INT 08h
-- [ ] DWT per-opcode-class profile over a real Alley Cat frame
-- [ ] Gate: measure NOR code-vs-data clean fraction before any NOR backing
+- [ ] DWT per-opcode-class profile; gate NOR backing on a code-vs-data measurement
 
 ## Phase 3 — Wolf3D
 

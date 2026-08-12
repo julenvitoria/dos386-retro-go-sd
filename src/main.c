@@ -468,7 +468,8 @@ static void guest_reset(void)
     dsk_exec_rc = 0xFFFFFFFF;
     if (dsk_mounted && find_startup_program(startup, sizeof(startup)) == 0) {
         dsk_startup_ok = 1;
-        dsk_exec_rc = (uint32_t)x86_dos_exec(startup, "");
+        /* TOPBENCH wants "-l" (log/list mode) on its command tail. */
+        dsk_exec_rc = (uint32_t)x86_dos_exec(startup, "-l");
     }
     if (dsk_exec_rc != 0) {
         memcpy(guest_ram + 0x100, demo_guest, sizeof(demo_guest));
