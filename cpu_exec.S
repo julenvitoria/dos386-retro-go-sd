@@ -405,6 +405,10 @@ x86_cpu_interp_asm:
 // HLT, or an opcode with no handler. Distinct from the timer so the host can
 // tell "ran out of budget" from "cannot execute this".
 .exit_loop:
+    /* Record the opcode. "Unimplemented" without saying which one sends you
+       disassembling guest memory to guess; R0 still holds the byte that
+       dispatched here. */
+    STR R0, [R8, #CPU_EXIT_INFO]
     MOV R0, #X86_EXIT_UNIMPLEMENTED
     STR R0, [R8, #CPU_EXIT_REASON]
 

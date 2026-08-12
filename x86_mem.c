@@ -157,6 +157,33 @@ uint32_t x86_guest_copy_in(uint32_t lin, const void *src, uint32_t bytes)
     return done;
 }
 
+/*
+ * Real-mode address wrap.
+ *
+ * With A20 masked, an 8086 address space is 20 bits: segment:offset can reach
+ * 0x10FFEF, and everything at or above 1 MB wraps to the bottom. Programs rely
+ * on it -- a block-copy loop walking segments upward runs off the top and
+ * expects to come back round, and faulting there instead stops it dead.
+ *
+ * Every fold entry above 1 MB is aliased onto its counterpart in the low 1 MB.
+ * The table is index-based, so this is a plain copy of k values; no memory is
+ * spent and the wrap costs nothing at access time.
+ */
+void x86_mem_wrap_1mb(void)
+{
+    const uint32_t low = 0x100000u >> FOLD_SHIFT;   /* 256 granules in 1 MB */
+    for (uint32_t i = low; i < FOLD_ENTRIES; i++) {
+        uint32_t src = i & (low - 1u);
+        uint32_t k = guest_page_table_ptr[src];
+        if (k == FOLD_INVALID) {
+            guest_page_table_ptr[i] = FOLD_INVALID;
+            continue;
+        }
+        /* k is host - guest_index<<12, so re-bias it for this index. */
+        guest_page_table_ptr[i] = k - ((i - src) << FOLD_SHIFT);
+    }
+}
+
 void x86_unmap_all(void)
 {
     for (uint32_t i = 0; i < FOLD_ENTRIES; i++)

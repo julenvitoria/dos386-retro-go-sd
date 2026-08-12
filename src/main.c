@@ -455,6 +455,9 @@ static void guest_reset(void)
     x86_map_range(0xFF000u, 4096u);
     x86_bios_rom_install();
 
+    /* Everything above 1 MB wraps to the bottom, as it does with A20 masked. */
+    x86_mem_wrap_1mb();
+
     x86_dos_arena_init();
 
     /* Load the real program if the disk mounted; fall back to the built-in

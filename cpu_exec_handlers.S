@@ -2301,8 +2301,12 @@ L(GRP5_DISPATCH):
     BEQ.N L(GRP5_DEC)
     CMP R12, #2
     BEQ.N L(GRP5_CALL)
+    CMP R12, #3
+    BEQ.W L(GRP5_CALLF)
     CMP R12, #4
     BEQ.N L(GRP5_JMP)
+    CMP R12, #5
+    BEQ.W L(GRP5_JMPF)
     CMP R12, #6
     BEQ.N L(GRP5_PUSH)
     B.W .exit_loop
@@ -3723,3 +3727,45 @@ L(HYPERCALL_UD):
     SUB.W R10, R10, #3
     MOV.W R4, #6                   @ #UD
     B.W L(HANDLE_INTERRUPT)
+
+/* FF /3 CALL FAR m16:16 and FF /5 JMP FAR m16:16.
+ *
+ * Indirect far transfers: the target is a pointer IN MEMORY, offset first then
+ * selector -- not an immediate. Every relocating program uses one to reach its
+ * relocated copy, so their absence stopped TOPBENCH dead with an unimplemented
+ * 0xFF. R7 holds the effective address from the ModRM decode. */
+L(GRP5_FAR_ENTRY):
+    UBFX R3, R7, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R7
+    BMI .mem_fault
+    LDRH R4, [R3, #0]              @ new IP
+    ADD.W R7, R7, #2
+    UBFX R3, R7, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R7
+    BMI .mem_fault
+    LDRH R5, [R3, #0]              @ new CS selector
+    CMP R0, #0
+    BEQ.N L(GRP5_FAR_SET)
+    /* CALL: push the return CS:IP before switching. */
+    LDRH.W R3, [R8, #SEG_CS_SEL]
+    PUSH_V R3, R0, R12
+    LDR.W R3, [R8, #SEG_CS_BASE]
+    SUB.W R3, R10, R3
+    PUSH_V R3, R0, R12
+L(GRP5_FAR_SET):
+    PUSH {R4, LR}
+    MOV.W R4, #1                   @ CS
+    BL L(SET_SREG)
+    POP {R4, LR}
+    LDR.W R3, [R8, #SEG_CS_BASE]
+    ADD.W R10, R4, R3
+    B.W .fetch_decode_loop
+
+L(GRP5_CALLF):
+    MOV.W R0, #1
+    B.W L(GRP5_FAR_ENTRY)
+L(GRP5_JMPF):
+    MOV.W R0, #0
+    B.W L(GRP5_FAR_ENTRY)

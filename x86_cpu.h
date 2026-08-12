@@ -176,6 +176,7 @@ uint32_t x86_mem_pool_free(void);
 int x86_map_range(uint32_t guest, uint32_t bytes);
 int x86_map_fixed(uint32_t guest, void *host, uint32_t bytes);
 void x86_unmap_all(void);
+void x86_mem_wrap_1mb(void);
 void *x86_guest_ptr(uint32_t lin, uint32_t bytes);
 uint32_t x86_guest_copy_out(void *dst, uint32_t lin, uint32_t bytes);
 uint32_t x86_guest_copy_in(uint32_t lin, const void *src, uint32_t bytes);
