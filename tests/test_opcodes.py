@@ -2054,6 +2054,54 @@ def run_test(args):
                 "expected_exit_reason": 3,      # X86_EXIT_TIMER, not a vector
                 "expected_eip": 0,
             },
+            {
+                "name": "TOPBENCH relocator prologue computes its copy state",
+                # The literal 42 bytes of TOPBENCH's Borland self-relocator,
+                # from the STD up to (not including) the REP MOVSW, run with
+                # the exact state the real program reaches: DS=PSP=0x71,
+                # CS=0x2E92 (the relocated copy), DX=0x1529 (image paragraphs).
+                #
+                # This is where the program dies on the target, and every
+                # instruction in it is a candidate: 8C reading a selector, a
+                # shift by CL at 16 bits, INC/DEC on a HIGH byte register, and
+                # 16-bit SUB feeding a segment load. Running the real sequence
+                # pins all of them at once, and DF has to survive to the end or
+                # the copy runs forwards and eats the code above its
+                # destination -- which is exactly the observed corruption.
+                #
+                #   fd        std
+                #   8c db     mov bx,ds       53      push bx
+                #   83 c3 39  add bx,0x39     03 da   add bx,dx
+                #   8c cd     mov bp,cs
+                #   8b c2     mov ax,dx       80 e4 0f and ah,0x0f
+                #   b1 04     mov cl,4
+                #   8b f2     mov si,dx       d3 e6   shl si,cl
+                #   d3 ea     shr dx,cl       fe c6   inc dh
+                #   8b ce     mov cx,si       d1 e9   shr cx,1
+                #   4e 4e     dec si; dec si  8b fe   mov di,si
+                #   2b e8     sub bp,ax       2b d8   sub bx,ax
+                #   8e c5     mov es,bp       8e db   mov ds,bx
+                "code": bytes([
+                    0xFD, 0x8C, 0xDB, 0x53, 0x83, 0xC3, 0x39, 0x03, 0xDA,
+                    0x8C, 0xCD, 0x8B, 0xC2, 0x80, 0xE4, 0x0F, 0xB1, 0x04,
+                    0x8B, 0xF2, 0xD3, 0xE6, 0xD3, 0xEA, 0xFE, 0xC6, 0x8B,
+                    0xCE, 0xD1, 0xE9, 0x4E, 0x4E, 0x8B, 0xFE, 0x2B, 0xE8,
+                    0x2B, 0xD8, 0x8E, 0xC5, 0x8E, 0xDB, 0xF4]),
+                "mode": 16,
+                "sels_initial": {"DS": 0x0071, "CS": 0x2E92},
+                "regs_initial": {2: 0x1529, 4: 0x2000},
+                "regs_expected": {
+                    0: 0x0529,      # AX  = DX & 0x0FFF
+                    1: 0x2948,      # CX  = (DX<<4)>>1, all at 16 bits
+                    2: 0x0252,      # DX  = (DX>>4) with DH incremented
+                    3: 0x10AA,      # BX  = DS+0x39+DX - AX
+                    5: 0x2969,      # BP  = CS - AX
+                    6: 0x528E,      # SI  = (DX<<4) - 2
+                    7: 0x528E,      # DI  = SI
+                },
+                "flags_expected": {"DF": 1},
+                "expected_eip": 43,
+            },
         ])
 
         all_passed = True
@@ -2095,6 +2143,15 @@ def run_test(args):
                 backend.write_uint32(dtcm_addr + off + 4, 0)         # base
             for seg_name, base in tc.get("segs_initial", {}).items():
                 backend.write_uint32(dtcm_addr + SEG_BASE_OFFSETS[seg_name], base)
+            # Selectors are a separate axis from the base. `MOV r16,Sreg` reads
+            # the SELECTOR, so a case exercising real-mode segment arithmetic
+            # has to seed it -- segs_initial alone leaves it zero and the
+            # arithmetic then runs on the wrong number.
+            for seg_name, sel in tc.get("sels_initial", {}).items():
+                off = SEG_BASE_OFFSETS[seg_name] - 4
+                flags = CS_FLAG_D if (seg_name == "CS"
+                                      and tc.get("mode", 32) == 32) else 0
+                backend.write_uint32(dtcm_addr + off, (flags << 16) | sel)
 
             backend.write_uint32(dtcm_addr + CR0_OFFSET, 0)  # real mode
             backend.write_uint32(dtcm_addr + HLE_ENABLED_OFFSET,

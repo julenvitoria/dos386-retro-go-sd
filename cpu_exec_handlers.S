@@ -1347,7 +1347,13 @@ OP .op_mov_ev_imm32_C7
     STREG_V R5, R2
     B.W .fetch_decode_loop
 
-OP_AGNOSTIC .op_shift_ev_imm8_C1
+/* C1 / D1 / D3 shift a v-width operand, so they are NOT pass-agnostic: they
+   were, which meant the single 32-bit-pass body served both opcode tables and
+   every 16-bit shift ran at 32 bits. The result was right whenever it happened
+   to fit in 16 bits and silently wrong when it did not -- `SHL SI,CL` with a
+   carry out of bit 15 left the overflow in the high half of ESI, which a
+   16-bit relocator then used as an address. */
+OP .op_shift_ev_imm8_C1
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
@@ -1387,7 +1393,7 @@ L(SHIFT_EV_IMM8_C1_MEM):
     AND.W R5, R5, #31
     B.N L(SHIFT_DISPATCH_32)
 
-OP_AGNOSTIC .op_shift_ev_1_D1
+OP .op_shift_ev_1_D1
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
@@ -1397,7 +1403,7 @@ OP_AGNOSTIC .op_shift_ev_1_D1
     MOV.W R5, #1
     B.N L(SHIFT_EV_DECODE)
 
-OP_AGNOSTIC .op_shift_ev_cl_D3
+OP .op_shift_ev_cl_D3
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10

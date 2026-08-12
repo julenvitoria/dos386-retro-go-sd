@@ -408,6 +408,9 @@ L(OP_0F_MOVSX_GV_EW_WRITE):
 .set .op_imul_imm8_6B, .op_imul_imm8_6B_32
 .set .op_test_ev_gv_85, .op_test_ev_gv_85_32
 .set .op_test_eax_imm32_A9, .op_test_eax_imm32_A9_32
+.set .op_shift_ev_imm8_C1, .op_shift_ev_imm8_C1_32
+.set .op_shift_ev_1_D1, .op_shift_ev_1_D1_32
+.set .op_shift_ev_cl_D3, .op_shift_ev_cl_D3_32
     .global opcode_table_32
 .set .op_les_C4, .op_les_C4_32
 .set .op_lds_C5, .op_lds_C5_32
@@ -490,6 +493,9 @@ opcode_table_0f_32:
 .set .op_imul_imm8_6B, .op_imul_imm8_6B_16
 .set .op_test_ev_gv_85, .op_test_ev_gv_85_16
 .set .op_test_eax_imm32_A9, .op_test_eax_imm32_A9_16
+.set .op_shift_ev_imm8_C1, .op_shift_ev_imm8_C1_16
+.set .op_shift_ev_1_D1, .op_shift_ev_1_D1_16
+.set .op_shift_ev_cl_D3, .op_shift_ev_cl_D3_16
     .global opcode_table_16
 .set .op_les_C4, .op_les_C4_16
 .set .op_lds_C5, .op_lds_C5_16
