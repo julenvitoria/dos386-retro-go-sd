@@ -239,7 +239,9 @@ class GwemuTarget(Target):
         if os.path.exists(os.path.join(self.tmpdir, "extflash.bin")):
             cmd += ["-global", "gnw-h7b0-soc.extflash-image=extflash.bin"]
         # Silent by default: these run in the background repeatedly.
-        cmd += ["-audiodev", ("sdl,id=snd0" if self.audio else "none,id=snd0"),
+        # sdl3, not sdl: gwemu is built against SDL3 and the older backend
+        # name makes it fail SDL audio init and exit before QMP ever opens.
+        cmd += ["-audiodev", ("sdl3,id=snd0" if self.audio else "none,id=snd0"),
                 "-global", "gnw-h7b0-sai1.audiodev=snd0"]
         if os.path.exists(os.path.join(self.tmpdir, "sdcard.img")):
             cmd += ["-drive", "if=sd,format=raw,file=sdcard.img"]
