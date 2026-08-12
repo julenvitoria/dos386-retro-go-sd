@@ -2102,6 +2102,53 @@ def run_test(args):
                 "flags_expected": {"DF": 1},
                 "expected_eip": 43,
             },
+            {
+                "name": "FLAGS: INC r/m8 wrapping to zero sets ZF and keeps CF",
+                # STC ; MOV DH,0xFF ; INC DH ; HLT. The FE group is the only
+                # INC/DEC that takes a ModRM, and it set no flags at all --
+                # which is invisible until something branches on the result.
+                "code": bytes([0xF9, 0xB6, 0xFF, 0xFE, 0xC6, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {2: 0x0000},
+                "flags_expected": {"ZF": 1, "SF": 0, "OF": 0, "PF": 1,
+                                   "AF": 1, "CF": 1},
+                "expected_eip": 6,
+            },
+            {
+                "name": "FLAGS: DEC r/m8 to zero sets ZF, and below it sets SF",
+                # MOV DH,1 ; DEC DH ; HLT
+                "code": bytes([0xB6, 0x01, 0xFE, 0xCE, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {2: 0x0000},
+                "flags_expected": {"ZF": 1, "SF": 0, "OF": 0},
+                "expected_eip": 5,
+            },
+            {
+                "name": "FLAGS: DEC r/m8 through zero sets SF and clears ZF",
+                # MOV DH,0 ; DEC DH ; HLT -> DH = 0xFF
+                "code": bytes([0xB6, 0x00, 0xFE, 0xCE, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {2: 0xFF00},
+                "flags_expected": {"ZF": 0, "SF": 1, "OF": 0},
+                "expected_eip": 5,
+            },
+            {
+                "name": "DEC r/m8 terminates the loop it controls",
+                # MOV DH,3 ; (loop) DEC DH ; JNE loop ; HLT -- TOPBENCH's
+                # relocator counts its 64K chunks exactly like this. Without
+                # flags on DEC the branch reads a stale ZF and the loop never
+                # ends, which is how a relocator walks off into memory it does
+                # not own.
+                "code": bytes([0xB6, 0x03, 0xFE, 0xCE, 0x75, 0xFC, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {2: 0x0000},
+                "flags_expected": {"ZF": 1},
+                "expected_eip": 7,
+            },
         ])
 
         all_passed = True

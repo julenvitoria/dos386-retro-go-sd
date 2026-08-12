@@ -132,12 +132,12 @@
 .endm
 
 /* INC/DEC are ADD/SUB that must leave CF untouched. */
-.macro X86_FLAGS_INCDEC res, afaux, t0, t1
+.macro X86_FLAGS_INCDEC res, afaux, t0, t1, sh=0
     MRS  \t0, APSR
     X86_SF_ZF \t0, \t1
     LSR  \t1, \t0, #28
     BFI  R11, \t1, #11, #1         @ OF
-    X86_AF \afaux, \t1
+    X86_AF \afaux, \t1, \sh
     X86_PF \res, \t1
 .endm
 
@@ -2266,12 +2266,27 @@ L(GRP4_DISPATCH):
     CMP R12, #1
     BEQ.N L(GRP4_DEC)
     B.W .exit_loop
+/* INC/DEC r/m8 set SF, ZF, AF, PF and OF and leave CF alone. Both arms used to
+   set NO flag at all, which is silent until a program branches on the result --
+   `DEC DH ; JNE` then reads a stale ZF and never leaves its loop. The operand
+   is normalized to the top of the word so the host N/Z/V are already the x86
+   SF/ZF/OF for a byte, and the AF aux is the true a^b^result rather than ~a. */
 L(GRP4_INC):
-    ADD.W R3, R3, #1
-    STRB R3, [R2, #0]
-    B.W .fetch_decode_loop
+    LSL.W R3, R3, #24
+    EOR.W R4, R3, #(1 << 24)       @ a ^ b, with b == 1
+    ADDS R3, R3, #(1 << 24)
+    EOR.W R4, R4, R3               @ a ^ b ^ result, for AF
+    LSR.W R3, R3, #24
+    X86_FLAGS_INCDEC R3, R4, R0, R1, 24
+    B.N L(GRP4_STORE)
 L(GRP4_DEC):
-    SUB.W R3, R3, #1
+    LSL.W R3, R3, #24
+    EOR.W R4, R3, #(1 << 24)
+    SUBS R3, R3, #(1 << 24)
+    EOR.W R4, R4, R3
+    LSR.W R3, R3, #24
+    X86_FLAGS_INCDEC R3, R4, R0, R1, 24
+L(GRP4_STORE):
     STRB R3, [R2, #0]
     B.W .fetch_decode_loop
 
