@@ -64,6 +64,7 @@
 
 extern void x86_cpu_interp_asm(void);
 static void emulator_loop(const gw_firmware_abi_t *abi);
+static int mount_guest_disk(void);
 
 /* The interpreter dereferences these; it never references the symbols
  * directly, which is what lets one assembly source serve both builds. */
@@ -72,6 +73,10 @@ extern uint32_t *guest_page_table_ptr;
 
 static uint8_t *guest_ram;
 static uint8_t *guest_vram;
+static char dsk_path[256];
+volatile uint32_t dsk_mounted = 0;
+volatile uint32_t dsk_exec_rc = 0xFFFFFFFF;
+volatile uint32_t dsk_startup_ok = 0;
 static uint32_t core_clut[16];
 
 /* Host-readable so a failure to place either block is visible rather than a
@@ -315,6 +320,7 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
      * the host races a reset. Staying alive here makes the checkpoints
      * readable; the host triggers the run deliberately via run_benchmark_flag. */
 
+    mount_guest_disk();
     emulator_loop(abi);
 }
 
@@ -322,6 +328,86 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
  * Set the guest up in real mode with conventional RAM mapped flat, VRAM at the
  * video aperture, and the demo program at 0000:0100.
  */
+/*
+ * Sector reads for our FatFs, served straight off the SD card.
+ *
+ * rg_storage_copy_file_range_to_ram reads a byte range of a file, which is
+ * exactly a sector fetch, and it holds no handle open between calls -- so the
+ * 1.44 MB image costs no AXI at all and any .dsk in /roms/dos works without a
+ * rebuild.
+ */
+static int sd_sector_read(void *ctx, void *dst, uint32_t offset, uint32_t len)
+{
+    const gw_firmware_abi_t *abi = gw_firmware_abi();
+    size_t got = abi->rg_storage_copy_file_range_to_ram(
+        (char *)ctx, (uint8_t *)dst, offset, len, NULL);
+    return (got == len) ? 0 : -1;
+}
+
+/*
+ * Work out what to run. The disk images are built to boot FreeDOS, so the
+ * program to launch is named in AUTOEXEC.BAT rather than being guessable from
+ * the .dsk name -- ALLEYCAT.dsk runs CAT.EXE. Reading it keeps this working
+ * for the other images too instead of hardcoding one game.
+ */
+static int find_startup_program(char *out, unsigned max)
+{
+    FIL f;
+    if (f_open(&f, "AUTOEXEC.BAT", FA_READ) != FR_OK)
+        return -1;
+
+    /* Read it whole and split by hand: f_gets needs FF_USE_STRFUNC, which this
+       FatFs build does not enable, and AUTOEXEC.BAT is never large. */
+    static char buf[1024];
+    UINT got = 0;
+    FRESULT rc = f_read(&f, buf, sizeof(buf) - 1, &got);
+    f_close(&f);
+    if (rc != FR_OK || got == 0)
+        return -1;
+    buf[got] = 0;
+
+    char *p = buf;
+    while (*p) {
+        char *line = p;
+        while (*p && *p != '\r' && *p != '\n') p++;
+        while (*p == '\r' || *p == '\n') *p++ = 0;
+
+        char *q = line;
+        while (*q == ' ' || *q == '\t') q++;
+        if (*q == '@') q++;
+        if (!*q || *q == ';' || *q == ':')
+            continue;
+        /* Skip the scaffolding; the first real command is the program. */
+        if (!strncasecmp(q, "REM", 3) || !strncasecmp(q, "ECHO", 4) ||
+            !strncasecmp(q, "PROMPT", 6) || !strncasecmp(q, "SET", 3) ||
+            !strncasecmp(q, "PATH", 4) || !strncasecmp(q, "CD", 2))
+            continue;
+
+        unsigned i = 0;
+        while (q[i] && q[i] != ' ' && q[i] != '\t' && i < max - 1) {
+            out[i] = q[i];
+            i++;
+        }
+        out[i] = 0;
+        return i ? 0 : -1;
+    }
+    return -1;
+}
+
+static FATFS dsk_fs;
+
+static int mount_guest_disk(void)
+{
+    if (!ACTIVE_FILE || !ACTIVE_FILE->path[0])
+        return -1;
+    strncpy(dsk_path, ACTIVE_FILE->path, sizeof(dsk_path) - 1);
+    x86_disk_set_reader(sd_sector_read, dsk_path, ACTIVE_FILE->size);
+    if (f_mount(&dsk_fs, "", 1) != FR_OK)
+        return -1;
+    dsk_mounted = 1;
+    return 0;
+}
+
 static void guest_reset(void)
 {
     memset(cpu_state_ptr, 0, sizeof(X86CPUState));
@@ -343,9 +429,23 @@ static void guest_reset(void)
     };
     x86_hle_install(hle_vectors, sizeof(hle_vectors));
 
-    memcpy(guest_ram + 0x100, demo_guest, sizeof(demo_guest));
-    cpu_state_ptr->eip = 0x100;
-    cpu_state_ptr->regs[4] = 0xFFFE;             /* SP just under the segment */
+    x86_dos_arena_init();
+
+    /* Load the real program if the disk mounted; fall back to the built-in
+       demo so a missing or unreadable .dsk shows a picture rather than a black
+       screen with no explanation. */
+    char startup[64];
+    dsk_startup_ok = 0;
+    dsk_exec_rc = 0xFFFFFFFF;
+    if (dsk_mounted && find_startup_program(startup, sizeof(startup)) == 0) {
+        dsk_startup_ok = 1;
+        dsk_exec_rc = (uint32_t)x86_dos_exec(startup, "");
+    }
+    if (dsk_exec_rc != 0) {
+        memcpy(guest_ram + 0x100, demo_guest, sizeof(demo_guest));
+        cpu_state_ptr->eip = 0x100;
+        cpu_state_ptr->regs[4] = 0xFFFE;
+    }
     cpu_state_ptr->eflags = 0x0202;              /* IF set, bit 1 reserved-1 */
     cpu_state_ptr->hle_enabled = 1;
 

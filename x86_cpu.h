@@ -198,6 +198,10 @@ int x86_bios_time(uint8_t func);
 int x86_dos_int21(uint8_t func);
 int x86_dos_terminate(void);
 void x86_dos_arena_init(void);
+void x86_disk_set_memory(const void *base, uint32_t bytes);
+void x86_disk_set_reader(int (*rd)(void *, void *, uint32_t, uint32_t),
+                         void *ctx, uint32_t bytes);
+int x86_disk_ready(void);
 int x86_dos_exec(const char *path, const char *cmdline);
 uint16_t x86_dos_psp(void);
 extern uint32_t x86_dos_last_error;

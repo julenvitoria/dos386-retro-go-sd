@@ -25,7 +25,7 @@ x86_bios.c \
 x86_dos.c \
 lib/FatFs/ff.c \
 lib/FatFs/ffunicode.c \
-tests/vdisk.c
+x86_disk.c
 
 CORE_ASM_SOURCES := \
 cpu_exec.S \
