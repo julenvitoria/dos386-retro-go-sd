@@ -92,17 +92,14 @@ path. The fold and dispatch were measured together and are not separable.
 - [ ] FreeDOS bring-up; INT 13h → FatFs; INT 10h/16h/1Ah
 - [x] PC speaker: PIT ch2 + port 0x61 driven by real guest OUT; square-wave
       renderer with phase carried across buffers
-- [x] Port I/O rebuilt on a C dispatch — it had indexed function-pointer tables
-      at hardcoded, never-initialised AXI addresses and read the port number
-      from ESP instead of DX
-- [x] Guest page pool + fold mapping (`x86_mem.c`). NOT a pager: no faults, no
-      eviction, no COW — 640 KB conventional + 32 KB VRAM fits the pool, so
-      every guest page is resident
-- [x] CGA mode 4 → LUT8 blitter in Thumb-2, pixel-exact against an independent
-      Python expansion (`tests/test_video.py`). 0.59 instructions/pixel: a DTCM
-      expansion table turns 2bpp→8bpp into one load, source arrives by LDM,
-      output leaves by 4-register STM, row body fully unrolled so the only
-      branch is one backward hop per 640 pixels
+- [x] Port I/O on a C dispatch — it had indexed function-pointer tables at
+      hardcoded, never-initialised AXI addresses and took the port number from
+      ESP instead of DX
+- [x] Guest page pool + fold mapping (`x86_mem.c`). Not a pager: no faults, no
+      eviction, no COW — 640 KB conventional + 32 KB VRAM fits, so every guest
+      page stays resident
+- [x] CGA mode 4 → LUT8 blitter in Thumb-2 at 0.59 instructions/pixel,
+      pixel-exact against an independent Python expansion (`test_video.py`)
 - [ ] Wire the core loop: LCD framebuffer + audio buffer + input, VRAM
       allocated below the framebuffer in AXI (it is a static array in the
       bare-metal harness today)
