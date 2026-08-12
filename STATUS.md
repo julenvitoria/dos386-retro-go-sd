@@ -19,49 +19,22 @@ Cycles/insn: 57.50 pre-fold → 50.00 fold + absolute dispatch → 50.50 segment
 and REP: the width macros vanish at NSH=0 and none of it sits on the 32-bit hot
 path. The fold and dispatch were measured together and are not separable.
 
-## Phase 0 — repo baseline
+## Phase 0/1 — baseline and CPU foundations
 
-- [x] ITCM/DTCM placement; generated `x86_offsets.inc`; flag layer; PIT reload
-      and distinct `X86_EXIT_*`; dead code and `.text.discard` removed
-- [x] `scripts/` CLIs + `scripts/common/` modules; `asm_metrics.py` baseline
-- [x] Hardware tier reachable; retro-go core with ITCM segment, DTCM via
-      `mem_ctl`, and the 153,600-byte LUT8 bonus pool
-- [ ] Assertions in `test_game.py` / `test_benchmark.py`; `_Static_assert` for `hw_accel.S` PIC offsets
-- [ ] Realign `docs/01`–`03`, `05`. [`docs/03`](docs/03_devices_and_hle.md) §3 still describes the rejected INT 21h bypass. `docs/04`, `docs/06` current.
+Complete except where listed below. The interpreter does 16/32-bit with the
+`66`/`67` axes switching per instruction, segmentation on a descriptor pointer,
+real-mode interrupts, string ops with `REP`, far transfers and segment loads.
+Details are in the git history; `git log --oneline` is the index.
 
-## Phase 1 — CPU foundations
-
-- [x] Checked fold: `host = lin + k`, `FOLD_INVALID` + `ADDS`/`BMI`, 171 inline walks replaced
-- [x] Absolute-pointer dispatch (`LDR.W PC, [R2, R0, LSL #2]`): −4 insns per
-      dispatched instruction, ±64 KB anchor constraint gone
-- [x] `TBH` table audit — 11 sites, all anchors correct
-- [x] R6 reserved as the active segment descriptor pointer (net −48 insns)
-- [x] Segmentation on the ModRM path: DS default, SS for `[(E)BP]`/ESP-EBP SIB,
-      all six override prefixes at 2 insns each. +0.5 cyc/insn on silicon
-- [x] `MOV` 88/89/8A/8B memory forms (previously `.exit_loop`)
-- [x] 16-bit operand size, via width macros and the `LSL #NSH` ALU-core collapse
-      (shifts vanish at NSH=0, so 32-bit is unchanged)
-- [x] addr16 ModRM decoder — a different grammar, not a narrower one
-- [x] Dynamic `66`/`67` as independent axes, per instruction, in either default
-      mode: four DTCM mode records, one `EOR` per prefix, no per-instruction
-      cost. +1 insn per memory operand for the indirect decoder
-- [x] Segment bases outside the ModRM path
-  - [x] stack ops — all stack access goes through SS.base with SP wrap
-  - [x] string ops — DS:(E)SI → ES:(E)DI, override honoured, index wrap
-  - [x] `PUSH`/`POP`/`CALL`/`RET`
-  - [ ] `moffs` `A0`–`A3` (offset should follow ADDRESS size)
-- [x] Segment register loads — `MOV Sreg,Ew` / `MOV Ew,Sreg`, `PUSH`/`POP` Sreg,
-      `LES`/`LDS`. Real mode installs base = sel<<4, limit 0xFFFF; CR0.PE traps
-      out rather than quietly installing a real-mode base
-- [x] Far `JMP`/`CALL` (`EA`/`9A`) and `RETF`
-- [x] `REP`/`REPNE` by rewind — one element per pass through the fetch loop, so
-      a long `REP MOVS` cannot stall the PIT
 - [ ] `XLAT`, BCD (`27`/`2F`/`37`/`3F`), `WAIT`, `INS`/`OUTS`, `BOUND`/`ARPL`
 - [ ] Limit checks off the R6 descriptor, incl. real-mode 64 KB wrap
 - [ ] Lazy PF/AF (currently eager, ~9 of ~16 insns per ALU op)
-- [ ] Flag coverage: 8-bit `NEG`, `MUL`/`DIV`, rotates, 8-bit shift cores, shift `OF` for count==1, count==0 for every shift form
-- [ ] Size-aware `MEM_R*`/`MEM_W*` macros + CI grep banning raw `[R9,` outside them
+- [ ] Flag coverage: 8-bit `NEG`, `MUL`/`DIV`, rotates, 8-bit shift cores,
+      shift `OF` for count==1, count==0 for every shift form
+- [ ] Size-aware `MEM_R*`/`MEM_W*` macros + CI grep banning raw `[R9,`
 - [ ] Software TLB above the 16 MB direct window
+- [ ] Assertions in `test_game.py` / `test_benchmark.py`
+- [ ] Realign `docs/01`–`03`, `05`; `docs/04`, `docs/06` current
 
 ## Phase 2 — Alley Cat
 
