@@ -173,18 +173,23 @@ OP .op_iret_CF
    In-guest IRQ injection needs the real-mode IVT dispatch that does not exist
    yet; see PLAN.md Phase 2. Until then the timer exits to the host. */
 
+/* Near Jcc. The displacement follows the OPERAND size -- rel16 under 16-bit,
+   rel32 under 32-bit -- and it is signed. The handler was dual-emitted but read
+   a hard-coded four bytes, so at 16 bits it consumed two bytes too many and
+   jumped by a number assembled out of the following instruction. */
 OP .op_0f_jcc_rel32
     UBFX R2, R1, #0, #4
     UBFX R4, R10, #12, #12
     LDR.W R4, [R9, R4, LSL #2]
     ADDS R4, R4, R10
     BMI .mem_fault
-    LDR R4, [R4, #0]
-    ADD.W R10, R10, #4
+    LDS_V R4, R4
+    EIP_ADV_V
     BL L(EVAL_COND)
     CMP R3, #1
     IT EQ
     ADDEQ R10, R4
+    EIP_WRAP
     B.W .fetch_decode_loop
 
 OP .op_0f_setcc

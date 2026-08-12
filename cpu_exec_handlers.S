@@ -228,6 +228,23 @@
         STR.W \tmp, [R8, #\off]
     .endm
 
+    /* LOOP/JCXZ count in CX or ECX by ADDRESS size, exactly like the string
+       ops' index registers -- R2 is the live mode record here too. They used
+       the full 32-bit ECX unconditionally, which is correct only while the
+       high half happens to be zero. */
+    .macro CNT_LOAD out
+        LDR.W \out, [R8, #REG_ECX]
+        TST.W R2, #ADDRSIZE_XOR
+        IT EQ
+        UXTHEQ \out, \out
+    .endm
+    .macro CNT_STORE val
+        TST.W R2, #ADDRSIZE_XOR
+        ITE EQ
+        STRHEQ.W \val, [R8, #REG_ECX]
+        STRNE.W \val, [R8, #REG_ECX]
+    .endm
+
     /* +w or -w according to DF, in two instructions plus the scale. */
     .macro STR_DELTA out, w
         SBFX \out, R11, #10, #1
@@ -2778,9 +2795,12 @@ OP_AGNOSTIC .op_loopnz_E0
     BMI .mem_fault
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
-    LDR.W R3, [R8, #12]
+    CNT_LOAD R3
     SUB.W R3, R3, #1
-    STR.W R3, [R8, #12]
+    TST.W R2, #ADDRSIZE_XOR
+    IT EQ
+    UXTHEQ R3, R3
+    CNT_STORE R3
     CMP R3, #0
     BEQ.W .fetch_decode_loop
     UBFX R4, R11, #6, #1
@@ -2795,9 +2815,12 @@ OP_AGNOSTIC .op_loopz_E1
     BMI .mem_fault
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
-    LDR.W R3, [R8, #12]
+    CNT_LOAD R3
     SUB.W R3, R3, #1
-    STR.W R3, [R8, #12]
+    TST.W R2, #ADDRSIZE_XOR
+    IT EQ
+    UXTHEQ R3, R3
+    CNT_STORE R3
     CMP R3, #0
     BEQ.W .fetch_decode_loop
     UBFX R4, R11, #6, #1
@@ -2812,9 +2835,12 @@ OP_AGNOSTIC .op_loop_E2
     BMI .mem_fault
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
-    LDR.W R3, [R8, #12]
+    CNT_LOAD R3
     SUB.W R3, R3, #1
-    STR.W R3, [R8, #12]
+    TST.W R2, #ADDRSIZE_XOR
+    IT EQ
+    UXTHEQ R3, R3
+    CNT_STORE R3
     CMP R3, #0
     BNE.N L(LOOP_TAKEN)
     B.W .fetch_decode_loop
@@ -2826,7 +2852,7 @@ OP_AGNOSTIC .op_jcxz_E3
     BMI .mem_fault
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
-    LDR.W R3, [R8, #12]
+    CNT_LOAD R3
     CMP R3, #0
     BEQ.N L(LOOP_TAKEN)
     B.W .fetch_decode_loop

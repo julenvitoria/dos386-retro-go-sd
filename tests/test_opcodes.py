@@ -2391,6 +2391,51 @@ def run_test(args):
                 "regs_expected": {0: 0x8000, 2: 0xFFFF},
                 "expected_eip": 5,
             },
+
+            # ---- near Jcc and the LOOP family at 16 bits -------------------
+            {
+                "name": "0F 8x near Jcc takes a rel16 at 16-bit operand size",
+                # XOR AX,AX (sets ZF) ; JZ rel16 +3 ; 3 filler ; HLT.
+                # The handler read a hard-coded 4-byte displacement, so it
+                # consumed two bytes too many and jumped by a number assembled
+                # from the following instruction.
+                "code": bytes([0x31, 0xC0, 0x0F, 0x84, 0x03, 0x00,
+                               0x90, 0x90, 0x90, 0xF4]),
+                "mode": 16,
+                "regs_initial": {0: 1},
+                "regs_expected": {0: 0},
+                "expected_eip": 10,
+            },
+            {
+                "name": "0F 8x not taken advances by exactly four bytes",
+                # XOR AX,AX ; JNZ rel16 (not taken) ; HLT at offset 6
+                "code": bytes([0x31, 0xC0, 0x0F, 0x85, 0x40, 0x00, 0xF4]),
+                "mode": 16,
+                "regs_initial": {0: 1},
+                "regs_expected": {0: 0},
+                "expected_eip": 7,
+            },
+            {
+                "name": "LOOP counts in CX, not ECX, at 16-bit address size",
+                # E2 FE loops to itself. ECX carries a dirty high half: a
+                # 32-bit counter runs 0x10003 times and leaves ECX zero, a
+                # correct one runs three and leaves the high half alone.
+                "code": bytes([0xE2, 0xFE, 0xF4]),
+                "mode": 16,
+                "regs_initial": {1: 0x00010003},
+                "regs_expected": {1: 0x00010000},
+                "expected_eip": 3,
+            },
+            {
+                "name": "JCXZ tests CX, not ECX",
+                # ECX high half set, CX zero -> the branch must be TAKEN and
+                # skip the HLT sitting in the shadow.
+                "code": bytes([0xE3, 0x01, 0xF4, 0x90, 0xF4]),
+                "mode": 16,
+                "regs_initial": {1: 0x00010000},
+                "regs_expected": {1: 0x00010000},
+                "expected_eip": 5,
+            },
         ])
 
         all_passed = True
