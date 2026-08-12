@@ -182,6 +182,7 @@ uint32_t x86_guest_copy_in(uint32_t lin, const void *src, uint32_t bytes);
 
 /* HLE services. */
 int x86_hle_install(const uint8_t *vectors, unsigned count);
+int x86_bios_rom_install(void);
 int x86_hle_dispatch(uint8_t vector);
 int x86_hle_service(void);
 extern uint32_t x86_hle_calls;

@@ -82,6 +82,13 @@ void x86_hle_set_cf(int set)
 #define STUB_SEG      0x0060u        /* linear 0x600: below the 640 KB arena,
                                         above the IVT and the BIOS data area */
 #define STUB_BYTES    4u
+#define IRET_OFF      0x300u         /* a bare IRET, inside the same page */
+
+/* Where a PC keeps its ROM identification. A system tool reads these directly
+   rather than asking, so they have to exist as memory. */
+#define BIOS_ROM_LIN  0xFF000u
+#define BIOS_DATE_OFF 0xFF5u         /* F000:FFF5, "MM/DD/YY" */
+#define BIOS_MODEL_OFF 0xFFEu        /* F000:FFFE, model byte */
 
 int x86_hle_install(const uint8_t *vectors, unsigned count)
 {
@@ -90,6 +97,18 @@ int x86_hle_install(const uint8_t *vectors, unsigned count)
     uint8_t *ivt = (uint8_t *)x86_guest_ptr(0, 1024);
     if (!stubs || !ivt)
         return -1;
+
+    /* Every vector gets a bare IRET first. An unserved interrupt otherwise
+       lands on whatever the IVT happens to hold -- zero, i.e. 0000:0000, where
+       the guest executes its own zeroed memory. A stray INT should be a no-op,
+       not a wander. */
+    stubs[IRET_OFF] = 0xCF;
+    for (unsigned v = 0; v < 256; v++) {
+        ivt[v * 4 + 0] = (uint8_t)IRET_OFF;
+        ivt[v * 4 + 1] = (uint8_t)(IRET_OFF >> 8);
+        ivt[v * 4 + 2] = (uint8_t)STUB_SEG;
+        ivt[v * 4 + 3] = (uint8_t)(STUB_SEG >> 8);
+    }
 
     for (unsigned i = 0; i < count; i++) {
         uint8_t v = vectors[i];
@@ -106,6 +125,30 @@ int x86_hle_install(const uint8_t *vectors, unsigned count)
         ivt[v * 4 + 3] = (uint8_t)(STUB_SEG >> 8);
     }
     cpu_state_ptr->hle_enabled = 1;
+    return 0;
+}
+
+/*
+ * A minimal BIOS ROM image. One page is enough: the fields a program actually
+ * reads all sit in the last 16 bytes of the segment, and mapping the whole
+ * 64 KB would cost pool pages for memory that is never touched.
+ */
+int x86_bios_rom_install(void)
+{
+    uint8_t *rom = (uint8_t *)x86_guest_ptr(BIOS_ROM_LIN, 4096);
+    if (!rom)
+        return -1;
+    memset(rom, 0xFF, 4096);
+
+    /* F000:FFF0 is the power-on entry: far jump to the same place, so a guest
+       that reaches it stops there instead of running off into 0xFF filler. */
+    rom[0xFF0] = 0xEA;
+    rom[0xFF1] = 0xF0; rom[0xFF2] = 0xFF;
+    rom[0xFF3] = 0x00; rom[0xFF4] = 0xF0;
+
+    memcpy(rom + BIOS_DATE_OFF, "01/01/90", 8);
+    rom[BIOS_MODEL_OFF] = 0xFC;      /* AT-class machine */
+    rom[0xFFF] = 0x00;
     return 0;
 }
 

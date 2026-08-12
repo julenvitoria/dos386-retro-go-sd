@@ -429,6 +429,11 @@ static void guest_reset(void)
     };
     x86_hle_install(hle_vectors, sizeof(hle_vectors));
 
+    /* One page of BIOS ROM at 0xFF000 for the identification bytes. Mapped
+       from the pool because nothing else backs that address. */
+    x86_map_range(0xFF000u, 4096u);
+    x86_bios_rom_install();
+
     x86_dos_arena_init();
 
     /* Load the real program if the disk mounted; fall back to the built-in
