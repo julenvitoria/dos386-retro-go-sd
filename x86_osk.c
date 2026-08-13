@@ -189,6 +189,25 @@ static uint8_t  osk_row;
 static uint8_t  osk_col;
 static uint8_t  osk_sticky;          /* STICKY_* below */
 static uint32_t osk_prev;            /* edge detection for navigation */
+
+/* Typematic repeat, LEFT/RIGHT only.
+ *
+ * The grid is edge-driven on purpose -- a key must not fire twice for one
+ * press. Holding a direction to scan along a row is a different gesture, so it
+ * gets its own level-driven path: the edge does the first step, then nothing
+ * for OSK_REPEAT_DELAY_MS, then a step every OSK_REPEAT_RATE_MS. Only the
+ * horizontal axis repeats; with two rows, a repeating UP/DOWN would just
+ * oscillate.
+ *
+ * Time comes from the host via x86_osk_set_now_ms(). If a caller never sets it
+ * -- the bare-metal harness does not -- now stays 0, the delay never elapses,
+ * and the behaviour is exactly the old edge-only one. That is deliberate: the
+ * existing tests keep passing unchanged and still assert no repeat. */
+#define OSK_REPEAT_DELAY_MS 400u
+#define OSK_REPEAT_RATE_MS   90u
+static uint32_t osk_now_ms;          /* host clock, 0 if the caller has none */
+static uint32_t osk_hold_dir;        /* the LEFT/RIGHT bits currently held */
+static uint32_t osk_repeat_at;       /* when the next repeat step is due */
 static char     osk_echo[OSK_ECHO_MAX + 1];
 static uint8_t  osk_echo_len;
 
@@ -650,6 +669,24 @@ void x86_osk_input(uint32_t buttons)
         return;
     }
 
+    /* Level-driven repeat, decided BEFORE the edge early-out because a held
+       button produces no edges at all. A change of direction (including
+       release) restarts the delay, so tapping never repeats. */
+    {
+        uint32_t dir = buttons & (X86_OSK_LEFT | X86_OSK_RIGHT);
+        if (dir != osk_hold_dir) {
+            osk_hold_dir = dir;
+            osk_repeat_at = osk_now_ms + OSK_REPEAT_DELAY_MS;
+        } else if (dir && osk_now_ms && osk_now_ms >= osk_repeat_at) {
+            uint8_t n = osk_layout[osk_layer][osk_row].n;
+            if (dir & X86_OSK_LEFT)
+                osk_col = (uint8_t)((osk_col + n - 1) % n);
+            else
+                osk_col = (uint8_t)((osk_col + 1) % n);
+            osk_repeat_at = osk_now_ms + OSK_REPEAT_RATE_MS;
+        }
+    }
+
     if (!went)
         return;
 
@@ -682,8 +719,14 @@ void x86_osk_input(uint32_t buttons)
  * Lifecycle
  * ------------------------------------------------------------------------- */
 
+void x86_osk_set_now_ms(uint32_t ms)
+{
+    osk_now_ms = ms;
+}
+
 void x86_osk_reset(void)
 {
+    osk_now_ms = osk_hold_dir = osk_repeat_at = 0;
     x86_osk_mode  = MODE_OFF;
     osk_layer = osk_row = osk_col = 0;
     osk_sticky = 0;

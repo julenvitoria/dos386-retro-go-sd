@@ -1141,8 +1141,12 @@ static void poll_input(const gw_firmware_abi_t *abi)
         }
 
         if (x86_osk_visible() || was_up) {
-            if (x86_osk_visible() && was_up)
+            if (x86_osk_visible() && was_up) {
+                /* Real host time, so held-direction repeat runs at a fixed
+                   rate rather than a frame-rate-dependent one. */
+                x86_osk_set_now_ms(abi->HAL_GetTick());
                 x86_osk_input(keys);
+            }
             goto deliver;
         }
     }

@@ -49,6 +49,10 @@ void x86_osk_cycle(void);
 
 /* Consume one frame of button state. Edge detection is internal, so this must
    be called exactly once per frame and only while visible. */
+/* Host clock in milliseconds, for typematic repeat when a direction is held.
+   Call before x86_osk_input(). Never calling it leaves repeat disabled. */
+void x86_osk_set_now_ms(uint32_t ms);
+
 void x86_osk_input(uint32_t buttons);
 
 /* Paint over the rendered frame. Call once per painted frame, AFTER
