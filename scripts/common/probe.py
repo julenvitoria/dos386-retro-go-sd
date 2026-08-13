@@ -64,8 +64,15 @@ VECTORS = {0: "thread", 2: "NMI", 3: "HardFault", 4: "MemManage",
            15: "SysTick"}
 
 
-def read_faults(backend, out=print):
-    """Report the CPU's exception/fault state. Returns the raw values."""
+def read_faults(backend, out=print, symbol_maps=()):
+    """Report the CPU's exception/fault state, including WHERE it faulted.
+
+    CFSR and BFAR say what went wrong and to which address; neither says which
+    instruction did it, and the sampled PC is inside the fault handler by then.
+    ARMv7-M stacks R0-R3, R12, LR, PC and xPSR on entry, so the faulting PC is
+    six words up the stack the exception came from -- EXC_RETURN bit 2 picks
+    MSP or PSP. Resolving that PC against the ELF is usually the whole answer.
+    """
     from .faults import decode_cfsr
     vals = {k: backend.read_uint32(a) for k, a in SCB.items()}
     active = vals["ICSR"] & 0x1FF
@@ -74,6 +81,27 @@ def read_faults(backend, out=print):
     out(f"  CFSR  0x{vals['CFSR']:08x}  [{decode_cfsr(vals['CFSR'])}]")
     out(f"  HFSR  0x{vals['HFSR']:08x}")
     out(f"  BFAR  0x{vals['BFAR']:08x}   MMFAR 0x{vals['MMFAR']:08x}")
+    if not active:
+        return vals
+    try:
+        lr = backend.read_register("lr")
+        sp_name = "psp" if (lr & 0x4) else "msp"
+        try:
+            sp = backend.read_register(sp_name)
+        except Exception:
+            sp = backend.read_register("sp")
+        frame = [backend.read_uint32(sp + 4 * i) for i in range(8)]
+    except Exception as e:                       # nothing to unwind
+        out(f"  (could not read the stacked frame: {e})")
+        return vals
+    names = ["R0", "R1", "R2", "R3", "R12", "LR", "PC", "xPSR"]
+    vals["frame"] = dict(zip(names, frame))
+    out(f"  stacked frame via {sp_name}=0x{sp:08x}:")
+    for n, v in zip(names, frame):
+        note = ""
+        if n in ("PC", "LR"):
+            note = "  " + describe_pc(v & ~1, symbol_maps or ())
+        out(f"    {n:<4} 0x{v:08x}{note}")
     return vals
 
 

@@ -127,7 +127,7 @@ def main():
             from scripts.common.probe import read_faults
             print("fault state:")
             target.backend.halt()
-            read_faults(target.backend)
+            read_faults(target.backend, symbol_maps=maps)
             target.backend.resume()
     finally:
         target.stop()

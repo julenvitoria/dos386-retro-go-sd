@@ -2507,6 +2507,66 @@ def run_test(args):
                 "regs_expected": {3: 0xAAAAFFF4},
                 "expected_eip": 8,
             },
+
+            # ---- MOV moffs: address size, and the segment base --------------
+            {
+                "name": "MOV AL,moffs8 (A0) is DS-relative and takes a moffs16",
+                # A0 reads the offset with a fixed 32-bit load and uses it as a
+                # LINEAR address. At 16-bit address size it must read two bytes
+                # and add DS.base -- the old form both mis-decoded the
+                # instruction length and indexed the fold table with garbage.
+                "code": bytes([0xA0, 0x40, 0x00, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x10000},
+                "ram_setup": [(0x10040, bytes([0x5A]))],
+                "regs_initial": {0: 0x1100},
+                "regs_expected": {0: 0x115A},
+                "expected_eip": 4,
+            },
+            {
+                "name": "MOV moffs8,AL (A2) writes through DS",
+                "code": bytes([0xA2, 0x50, 0x00, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x10000},
+                "ram_setup": [(0x10050, bytes(4))],
+                "regs_initial": {0: 0x0099},
+                "regs_expected": {0: 0x0099},
+                "mem_expected": [(0x10050, bytes([0x99, 0x00]))],
+                "expected_eip": 4,
+            },
+            {
+                "name": "MOV AX,moffs16 (A1) is DS-relative",
+                "code": bytes([0xA1, 0x60, 0x00, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x10000},
+                "ram_setup": [(0x10060, bytes([0x34, 0x12]))],
+                "regs_initial": {0: 0xAAAA0000},
+                "regs_expected": {0: 0xAAAA1234},
+                "expected_eip": 4,
+            },
+            {
+                "name": "MOV moffs16,AX (A3) writes through DS",
+                "code": bytes([0xA3, 0x70, 0x00, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x10000},
+                "ram_setup": [(0x10070, bytes(4))],
+                "regs_initial": {0: 0xBEEF},
+                "regs_expected": {0: 0xBEEF},
+                "mem_expected": [(0x10070, bytes([0xEF, 0xBE, 0x00, 0x00]))],
+                "expected_eip": 4,
+            },
+            {
+                "name": "MOV AL,moffs8 honours a segment override",
+                # 26 A0 40 00 -> ES:[0x0040]
+                "code": bytes([0x26, 0xA0, 0x40, 0x00, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x10000, "ES": 0x30000},
+                "ram_setup": [(0x10040, bytes([0x5A])),
+                              (0x30040, bytes([0xC7]))],
+                "regs_initial": {},
+                "regs_expected": {0: 0x00C7},
+                "expected_eip": 5,
+            },
         ])
 
         all_passed = True

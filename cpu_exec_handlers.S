@@ -228,6 +228,30 @@
         STR.W \tmp, [R8, #\off]
     .endm
 
+    /* A `moffs` is an OFFSET in DS (or an override), taken at the ADDRESS
+       size -- not at the operand size, and not a linear address. A0-A3 read a
+       fixed 32 bits and used the result raw: at 16-bit address size that
+       mis-decoded the instruction length AND indexed the fold table far past
+       its end, so the handler dereferenced whatever lay beyond it. */
+    .macro MOFFS_ADDR out, tmp
+        UBFX \tmp, R10, #12, #12
+        LDR.W \tmp, [R9, \tmp, LSL #2]
+        ADDS \tmp, \tmp, R10
+        BMI .mem_fault
+        TST.W R2, #ADDRSIZE_XOR
+        BNE 9f
+        LDRH \out, [\tmp]             @ 16-bit addressing: moffs16
+        ADD.W R10, R10, #2
+        B.N 8f
+9:      LDR \out, [\tmp]              @ 32-bit addressing: moffs32
+        ADD.W R10, R10, #4
+8:      SUBS \tmp, R6, R8             @ segment override in play?
+        IT EQ
+        ADDEQ R6, R8, #SEG_DS_SEL
+        LDR.W \tmp, [R6, #4]
+        ADD.W \out, \out, \tmp
+    .endm
+
     /* LOOP/JCXZ count in CX or ECX by ADDRESS size, exactly like the string
        ops' index registers -- R2 is the live mode record here too. They used
        the full 32-bit ECX unconditionally, which is correct only while the
@@ -1095,62 +1119,30 @@ OP .op_popfd_9D
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_mov_al_moffs8_A0
-    UBFX R4, R10, #12, #12
-    LDR.W R4, [R9, R4, LSL #2]
-    ADDS R4, R4, R10
-    BMI .mem_fault
-    LDR R4, [R4, #0]
-    ADD.W R10, R10, #4
-    UBFX R3, R4, #12, #12
-    LDR.W R3, [R9, R3, LSL #2]
-    ADDS R3, R3, R4
-    BMI .mem_fault
+    MOFFS_ADDR R4, R3
+    MEM_GET_PTR R3, R4
     LDRB R3, [R3, #0]
-    STRB.W R3, [R8, #8]
+    STRB.W R3, [R8, #REG_EAX]
     B.W .fetch_decode_loop
 
 OP .op_mov_eax_moffs32_A1
-    UBFX R4, R10, #12, #12
-    LDR.W R4, [R9, R4, LSL #2]
-    ADDS R4, R4, R10
-    BMI .mem_fault
-    LD_V R4, R4
-    EIP_ADV_V
-    UBFX R3, R4, #12, #12
-    LDR.W R3, [R9, R3, LSL #2]
-    ADDS R3, R3, R4
-    BMI .mem_fault
+    MOFFS_ADDR R4, R3
+    MEM_GET_PTR R3, R4
     LD_V R3, R3
-    STR.W R3, [R8, #8]
+    STREG_V R3, #REG_EAX           @ 16-bit MOV must not clear the high half
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_mov_moffs8_al_A2
-    UBFX R4, R10, #12, #12
-    LDR.W R4, [R9, R4, LSL #2]
-    ADDS R4, R4, R10
-    BMI .mem_fault
-    LDR R4, [R4, #0]
-    ADD.W R10, R10, #4
-    LDRB.W R3, [R8, #8]
-    UBFX R12, R4, #12, #12
-    LDR.W R12, [R9, R12, LSL #2]
-    ADDS R12, R12, R4
-    BMI .mem_fault
+    MOFFS_ADDR R4, R3
+    LDRB.W R3, [R8, #REG_EAX]
+    MEM_GET_PTR R12, R4
     STRB.W R3, [R12]
     B.W .fetch_decode_loop
 
 OP .op_mov_moffs32_eax_A3
-    UBFX R4, R10, #12, #12
-    LDR.W R4, [R9, R4, LSL #2]
-    ADDS R4, R4, R10
-    BMI .mem_fault
-    LD_V R4, R4
-    EIP_ADV_V
-    LDR.W R3, [R8, #8]
-    UBFX R12, R4, #12, #12
-    LDR.W R12, [R9, R12, LSL #2]
-    ADDS R12, R12, R4
-    BMI .mem_fault
+    MOFFS_ADDR R4, R3
+    LDREG_V R3, #REG_EAX
+    MEM_GET_PTR R12, R4
     ST_V R3, R12
     B.W .fetch_decode_loop
 
