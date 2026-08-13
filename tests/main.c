@@ -4,6 +4,7 @@
 
 #include "../cutils.h"
 #include "../x86_cpu.h"
+#include "../x86_profile.h"
 
 // Address-translation fold. Entries are OFFSETS (host = guest_linear + k), and
 // every index the 12-bit lookup can produce must exist -- a short table meant
@@ -259,6 +260,12 @@ void Reset_Handler(void) {
     CoreDebug_DEMCR |= (1 << 24); 
     DWT_CYCCNT = 0;
     DWT_CTRL |= 1;
+
+#if X86_PROFILE
+    /* After DWT is running, before anything dispatches: the profiler reads
+       CYCCNT on every dispatch and calibrates itself here. */
+    x86_profile_init(0);
+#endif
 
     io_port_read_table[0x3DA] = cga_status_read;
 

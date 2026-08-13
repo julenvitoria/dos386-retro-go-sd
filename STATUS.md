@@ -35,7 +35,8 @@ blitter, both pixel-exact; CGA registers with a moving retrace bit; a 8042
 keyboard with IRQ 1; PC speaker on PIT ch2; port I/O; the guest page pool and
 fold mapping; the frame-paced loop; and the DOS layer.
 
-- [ ] DWT per-opcode-class profile; gate NOR backing on a code-vs-data measurement
+- [ ] DWT per-opcode profile: tool done (`profile_opcodes.py`, `X86_PROFILE=1`),
+      clean under gwemu, silicon pending; gate NOR backing on code-vs-data
 ## Phase 3 — Wolf3D
 
 - [ ] COW/pool/eviction with dirty tracking, loud exhaustion; pool sizing

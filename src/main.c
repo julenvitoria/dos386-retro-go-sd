@@ -36,6 +36,7 @@
 
 #include "cutils.h"   /* BOOL/TRUE, needed by iomem.h via x86_cpu.h */
 #include "x86_cpu.h"
+#include "x86_profile.h"
 
 #define APP_ID       100
 #define SAMPLE_RATE  16000
@@ -377,6 +378,17 @@ static bool dtcm_state_init(void)
     cpu_state_ptr = st;
     guest_page_table_ptr = pt;
     x86_build_mode_records(mr);
+
+#if X86_PROFILE
+    /* Profiling build only. DTCM is a firmware bump pool here, not a load
+       target, so the block is allocated like everything else -- and a failure
+       must reach core_dtcm_ok, because the dispatch tail dereferences
+       x86_profile_ptr on EVERY instruction. */
+    if (!x86_profile_init((void *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_DTC, 1,
+                                               X86_PROFILE_BYTES))) {
+        return false;
+    }
+#endif
     return true;
 }
 

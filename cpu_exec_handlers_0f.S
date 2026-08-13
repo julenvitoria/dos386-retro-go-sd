@@ -9,6 +9,12 @@ OP .op_0f_0F
     BMI .mem_fault
     LDRB R1, [R1, #0]
     ADD R10, R10, #1
+#if X86_PROFILE
+    /* Second dispatch of a two-byte opcode, so it CLOSES slot 0x0F (the escape
+       fetch itself) and opens slot 256+n. R2 and R3 must survive -- the record
+       and the 0F table -- so the macro gets R0/R4/R5/R12, all dead here. */
+    PROF_DISPATCH R1, R12, R0, R4, R5, bias=256
+#endif
     LDR.W PC, [R3, R1, LSL #2]
 L(opcode_0f_dispatch_target):
 
