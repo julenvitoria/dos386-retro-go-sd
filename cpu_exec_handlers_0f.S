@@ -229,6 +229,48 @@ L(OP_0F_SETCC_MEM):
     STRB.W R3, [R12]
     B.W .fetch_decode_loop
 
+/* 0F 20 /r  MOV r32, CRn      0F 22 /r  MOV CRn, r32
+ *
+ * How a program tells a 386 from a 286: the 286 has no such instruction, so a
+ * CPU benchmark runs this before anything else. TOPBENCH does, and without it
+ * the interpreter stopped on the 0F escape.
+ *
+ * Both are ALWAYS 32-bit whatever the operand size, and the ModRM's mod field
+ * is ignored -- the operand is a register however mod is encoded. Only CR0 is
+ * modelled; the others read as zero, which is what a 386 with no paging and no
+ * task switching would report anyway. Writing CR0 does not itself switch the
+ * machine: a segment load with PE set is what traps, and that check already
+ * exists in SET_SREG.
+ */
+OP_AGNOSTIC .op_0f_mov_r32_cr_20
+    MOV.W R4, #0
+    B.N L(OP_0F_CR)
+OP_AGNOSTIC .op_0f_mov_cr_r32_22
+    MOV.W R4, #1
+L(OP_0F_CR):
+    UBFX R1, R10, #12, #12
+    LDR.W R1, [R9, R1, LSL #2]
+    ADDS R1, R1, R10
+    BMI .mem_fault
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    AND.W R2, R1, #7               @ the r32
+    MOV.W R2, R2, LSL #2
+    ADD.W R2, R2, #8
+    UBFX R3, R1, #3, #3            @ which control register
+    CBNZ R4, 1f
+    MOV.W R5, #0
+    CMP R3, #0
+    IT EQ
+    LDREQ.W R5, [R8, #CPU_CR0]
+    STR.W R5, [R8, R2]
+    B.W .fetch_decode_loop
+1:  LDR.W R5, [R8, R2]
+    CMP R3, #0
+    IT EQ
+    STREQ.W R5, [R8, #CPU_CR0]
+    B.W .fetch_decode_loop
+
 OP .op_0f_movzx_gv_eb
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]

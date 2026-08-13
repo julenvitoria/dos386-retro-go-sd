@@ -2679,6 +2679,32 @@ def run_test(args):
                 "mem_expected": [(0x10470, bytes([0x0F, 0x00]))],
                 "expected_eip": 8,
             },
+            {
+                "name": "MOV CRn,r32 and MOV r32,CRn (0F 22 / 0F 20)",
+                # 0F 22 C0 = MOV CR0,EAX ; 0F 20 C3 = MOV EBX,CR0 ; HLT.
+                # A 386 is detected by reading CR0 -- a 286 has no such
+                # instruction -- so a CPU benchmark runs this before it runs
+                # anything else. Both are always 32-bit whatever the operand
+                # size, and the ModRM's mod field is ignored. EAX is 0x10 (ET),
+                # deliberately not 0x11: setting PE would switch the machine to
+                # protected mode, which segment loads still trap on.
+                "code": bytes([0x0F, 0x22, 0xC0, 0x0F, 0x20, 0xC3, 0xF4]),
+                "mode": 16,
+                "regs_initial": {0: 0x00000010, 3: 0xDEADBEEF},
+                "regs_expected": {0: 0x00000010, 3: 0x00000010},
+                "expected_eip": 7,
+            },
+            {
+                "name": "MOV r32,CR0 reads the whole 32 bits at 16-bit size",
+                # No operand-size prefix, 16-bit code: the destination is still
+                # written at 32 bits, so the high half of ECX must be replaced,
+                # not preserved.
+                "code": bytes([0x0F, 0x22, 0xC0, 0x0F, 0x20, 0xC1, 0xF4]),
+                "mode": 16,
+                "regs_initial": {0: 0x00000010, 1: 0xFFFFFFFF},
+                "regs_expected": {1: 0x00000010},
+                "expected_eip": 7,
+            },
         ])
 
         all_passed = True

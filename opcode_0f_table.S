@@ -31,9 +31,9 @@
     .word .exit_loop + 1 // 0x1d
     .word .exit_loop + 1 // 0x1e
     .word .exit_loop + 1 // 0x1f
-    .word .exit_loop + 1 // 0x20
+    .word .op_0f_mov_r32_cr_20 + 1 // 0x20
     .word .exit_loop + 1 // 0x21
-    .word .exit_loop + 1 // 0x22
+    .word .op_0f_mov_cr_r32_22 + 1 // 0x22
     .word .exit_loop + 1 // 0x23
     .word .exit_loop + 1 // 0x24
     .word .exit_loop + 1 // 0x25
