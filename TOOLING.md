@@ -85,7 +85,10 @@ python3 scripts/probe.py --retrogo --wait-magic --set guest_kips=330     # 8088
 
 | Symbol | Meaning |
 |---|---|
-| `guest_kips` | emulated CPU speed in thousands of insns/s. **0 = unthrottled.** `KIPS_*` in `src/main.c` has the profile rungs |
+| `guest_kips` | emulated CPU speed in thousands of insns/s. **0 = unthrottled, and the default.** `KIPS_*` in `src/main.c` has the profile rungs; the PAUSE/SET menu's "CPU Speed" entry sets it too |
+| `cpu_profile_persisted` / `cpu_profile_events` | what the settings store kept when the menu entry was changed, and how many dialog callbacks reached us. The menu path has no other witness — a malformed options array never calls us at all |
+| `frame_10us_avg` | mean iteration period, 8x oversampled, in 10 us units. What the firmware's `common_emu_frame_loop()` observer is fed |
+| `upper_filler_ok` | is 0xA0000-0xFFFFF backed? It comes from the bonus pool now, but a 0 here explains an option-ROM scan faulting |
 | `guest_insn_deficit` | instructions the emulated CPU owed and never ran. The answer to "I asked for a 386 — am I getting one?". Meaningful only in paced mode |
 | `guest_ips_achieved` / `guest_fps_achieved` | measured over a 1 s window. The number that matters in unthrottled mode |
 | `guest_ticks` / `guest_ticks_dropped` | 18.2065 Hz BIOS ticks emitted, and ones refused by the catch-up cap |
@@ -420,6 +423,12 @@ mapping. A timeline that says `press start` exercises nothing, which is how
 `timelines/press-game.tl` presses TIME (N, to answer Alley Cat's joystick
 prompt) and then GAME, and `tests/test_core_retrogo.py` asserts the byte
 0x1C reaches the guest through `x86_kbd_read_log`.
+`timelines/set-cpu-option.tl` walks the PAUSE/SET menu to the core's own
+"CPU Speed" entry, changes it, then Save & Quits and relaunches — so one run
+covers "the menu opens", "the change takes effect" and "it survives a restart".
+It navigates by pressing UP once in the settings menu: the dialog's selection
+wraps and our entry is appended last, so this keeps working if the firmware
+grows an option.
 `timelines/run-to-completion.tl` is the same launch with a 58 s window, for a
 guest doing real work whose result only appears at the end -- the one case where
 the wait IS the result rather than a symptom to chase with `probe.py`.
@@ -486,20 +495,25 @@ make sdcard X86_TEXT_AA=1      # capture-only core: AA on, bilevel table dropped
 
 It is **off by default**, and the reason is size, not quality:
 
-> RAM_EMU spans `0x2404B000`-`0x24100000` (741,376 B). The shipping core ends at
-> `__CORE_BSS_END__ = 0x24056620`, leaving 694,752 B, and the guest asks for
-> 32 KB VRAM + 640 KB RAM + a 4 KB filler = 692,224 B. **Headroom: 2,528 bytes.**
-> The AA core ends at `0x24056FD8` — 40 bytes spare.
+> RAM_EMU spans `0x2404B000`-`0x24100000` (741,376 B). The core ends at
+> `__CORE_BSS_END__` (measure it: `arm-none-eabi-nm build/core/dos_core.elf`),
+> and the guest asks for 32 KB VRAM + 640 KB RAM = 688,128 B from that region.
+> **Measured 2026-08-13: BSS end `0x24057078`, headroom 4,016 bytes.** It was
+> 424 bytes before the 4 KB open-bus filler was moved to the bonus pool; the
+> "2,528 bytes" this document used to quote was two commits of growth out of
+> date, which is why the number is now a measurement instruction and not a
+> constant.
 
 Each narrow table is 2 KB, so an AA core must drop the bilevel one to pay for
 it (`X86_TEXT_BILEVEL_FONT=0`, set automatically) and degrades by thresholding
 the 2-bit glyph instead. The bare-metal harness has no such limit and links
 both, which is how `test_text.py` checks each renderer against its own font.
 
-**The trap this hid behind:** the firmware's RAM allocator does not refuse the
-over-allocation. It returns a pointer past the end of the region, `core_ready`
-stays 1, and the only symptom is `X86_EXIT_MEM_FAULT` in the GUEST about a
-second in — which reads as a CPU or DOS bug and is neither. Adding 2,624 bytes
-of dead `const` data, or 3 KB of BSS, to an otherwise untouched tree reproduces
-it exactly. If a change to the core makes a previously working guest fault
-early, check `__CORE_BSS_END__` before anything else.
+**The trap this hid behind:** an over-allocation is quiet. `ram_malloc()` does
+bound-check and returns NULL (`Core/Src/gw_malloc.c`) — so nothing is
+overwritten — but a NULL that a caller tolerates is a feature silently missing,
+not an error. That is exactly what happened to the 4 KB open-bus filler: it was
+the LAST allocation, `if (upper_filler)` skipped the mapping, and the symptom
+was an option-ROM scan faulting in the guest. It comes from the bonus pool now,
+and `upper_filler_ok` reports it. If a change to the core makes a previously
+working guest fault early, check `__CORE_BSS_END__` before anything else.

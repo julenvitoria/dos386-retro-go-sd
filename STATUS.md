@@ -132,9 +132,47 @@ a beep shorter than one frame is heard; the 8253 lo-only/hi-only writes keep
 the other byte; a counter-latch command is no longer stored as an access mode;
 and `AUTOEXEC.BAT`'s command tail is no longer dropped (`TOPBENCH.EXE -l`).
 
-`guest_kips` is a single global. Per-title selection via `roms/dos/*.cfg` is
-**not** wired: those files belong to another project's core and nothing here
-parses them.
+`guest_kips` is a single global, and its default is now **KIPS_MAX** —
+unthrottled, "as fast as the silicon delivers". The deficit has no meaning with
+no target, so it is held at zero in that mode and `guest_ips_achieved` is the
+number to read. Per-title selection via `roms/dos/*.cfg` is **not** wired: those
+files belong to another project's core and nothing here parses them.
+
+## The CPU is a menu entry, and fps/busy are no longer zero
+
+**CPU Speed** is a Retro-Go game-options entry now (Max / 8088 4.77 / 286 8 /
+286 12 / 386SX 16 / 386DX 33), passed where we used to pass `NULL`. The key it
+persists under is **"Palette"**, not a name of our own: the firmware's
+`odroid_settings_app_int32_get/set` match against a fixed whitelist and ignore
+anything else *silently*, and the slot is per-app so the name is ours alone.
+`cpu_profile_persisted` reads the value straight back so the round trip is
+visible without a reboot.
+
+Measured under gwemu, `timelines/set-cpu-option.tl`: menu opens, our callback
+fires (`cpu_profile_events`), RIGHT sets `guest_kips` 0 → 330 and the achieved
+rate goes 12.0 M → **330,000 insn/s exactly**, CFSR/HFSR/BFAR clean. Save & Quit
+back to the launcher and relaunch: the core comes up at **330** with no menu
+touched — persistence across a restart, measured, not argued.
+
+`common_emu_frame_loop()` is now called once per iteration, which is the only
+thing that feeds `odroid_system_tick()` — never calling it is why the overlay
+read `0.0 (0.0) fps` and `busy: 0.0%`. **Pacing is not shared**: the panel's
+swap signal (clock 1) still owns it and the frame loop DEFERS — its draw/skip
+verdict is ignored and it is fed our measured mean period so its integrator
+agrees with the pacer that is really running. Feeding it `panel_ms_min` instead
+(the *shortest* iteration) made it call 768 of 1032 drawn frames "skipped".
+`cpumon_sleep()` in the swap wait is what makes `busy_ms` accumulate.
+
+Measured: firmware `counters` = 1024 frames, **0** skipped, 8198 ms busy over
+17.4 s → **58.7 fps, 47.0% busy**, cross-checked against an independent
+`frames_rendered` rate of 59.0 fps. The 18.2 Hz tick survives both ends: 18.18 Hz
+at 59 fps, and 18.2 Hz at ~10 fps (forced with `--set max_slice=4000000`) once
+the ticks the catch-up cap deliberately dropped are counted.
+
+The 4 KB open-bus filler for 0xA0000-0xFFFFF now comes from the **bonus pool**,
+not RAM_EMU. It was the last allocation in a region with a few hundred bytes
+spare, so any growth in the core silently unmapped upper memory;
+`upper_filler_ok` says whether it is backed at all.
 
 ## Open defects
 
@@ -151,15 +189,14 @@ parses them.
   window has to start at `--settle 0`: past ~3 s there is no guest running and
   the table comes back empty.
 
-- **RAM_EMU headroom is 2,528 bytes, and running out is SILENT.** The core ends
-  at `__CORE_BSS_END__ = 0x24056620` in a region ending at `0x24100000` — 694,752
-  B left against the 692,224 B the guest asks for (32 KB VRAM + 640 KB RAM + 4 KB
-  filler). The firmware allocator does not refuse the overrun; it returns a
-  pointer past the end, `core_ready` stays 1, and the GUEST takes
-  `X86_EXIT_MEM_FAULT` a second in, which reads as a CPU or DOS bug. Reproduced
-  from a clean tree with 2,624 B of dead `const` data, and again with 3 KB of
-  BSS. Fix is core-side (put the guest pool on the 150 KB bonus pool, or make the
-  overrun loud). See `TOOLING.md`.
+- **RAM_EMU headroom is 4,016 bytes (measured 2026-08-13), and running out is
+  QUIET.** The core ends at `__CORE_BSS_END__ = 0x24057078` in a region ending
+  at `0x24100000` — 692,144 B against the 688,128 B the guest asks for (32 KB
+  VRAM + 640 KB RAM). `ram_malloc()` bound-checks and returns NULL rather than
+  overrunning, so nothing is corrupted, but a caller that tolerates NULL loses a
+  feature in silence — which is what happened to the 4 KB open-bus filler, now
+  moved to the bonus pool and reported by `upper_filler_ok`. Half the fix
+  `TOOLING.md` asked for; the guest POOL itself is still RAM_EMU-only.
 - Anti-aliased text is measured VIABLE on palette — TOPBENCH's menu uses exactly
   8 distinct (fg,bg) pairs and 32 CLUT entries buy exactly 8 four-entry blocks
   (`screenshot.py --pairs`) — and blocked only by the above. It is a build-time
