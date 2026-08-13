@@ -36,12 +36,20 @@
    "insns": 8
   },
   ".op_0f_jcc_rel32": {
-   "bytes": 40,
-   "insns": 12
+   "bytes": 58,
+   "insns": 16
   },
   ".op_0f_jcc_rel32_32": {
    "bytes": 40,
    "insns": 12
+  },
+  ".op_0f_mov_cr_r32_22": {
+   "bytes": 4,
+   "insns": 1
+  },
+  ".op_0f_mov_r32_cr_20": {
+   "bytes": 6,
+   "insns": 2
   },
   ".op_0f_movsx_gv_eb": {
    "bytes": 58,
@@ -83,6 +91,10 @@
    "bytes": 72,
    "insns": 21
   },
+  ".op_aaa_37": {
+   "bytes": 44,
+   "insns": 13
+  },
   ".op_aad_D5": {
    "bytes": 56,
    "insns": 15
@@ -90,6 +102,10 @@
   ".op_aam_D4": {
    "bytes": 52,
    "insns": 14
+  },
+  ".op_aas_3F": {
+   "bytes": 50,
+   "insns": 15
   },
   ".op_alu_al_imm8": {
    "bytes": 28,
@@ -200,12 +216,20 @@
    "insns": 59
   },
   ".op_cwde_98": {
-   "bytes": 14,
-   "insns": 4
+   "bytes": 12,
+   "insns": 3
   },
   ".op_cwde_98_32": {
    "bytes": 14,
    "insns": 4
+  },
+  ".op_daa_27": {
+   "bytes": 72,
+   "insns": 23
+  },
+  ".op_das_2F": {
+   "bytes": 78,
+   "insns": 25
   },
   ".op_dec_r32": {
    "bytes": 74,
@@ -216,12 +240,12 @@
    "insns": 19
   },
   ".op_enter_C8": {
-   "bytes": 96,
-   "insns": 25
+   "bytes": 112,
+   "insns": 30
   },
   ".op_enter_C8_32": {
-   "bytes": 96,
-   "insns": 25
+   "bytes": 108,
+   "insns": 28
   },
   ".op_grp3_eb_F6": {
    "bytes": 58,
@@ -240,16 +264,16 @@
    "insns": 18
   },
   ".op_grp5_FF": {
-   "bytes": 48,
-   "insns": 15
+   "bytes": 68,
+   "insns": 20
   },
   ".op_grp5_FF_32": {
-   "bytes": 48,
-   "insns": 15
+   "bytes": 68,
+   "insns": 20
   },
   ".op_hlt_F4": {
-   "bytes": 30,
-   "insns": 8
+   "bytes": 24,
+   "insns": 7
   },
   ".op_hypercall_0F0B": {
    "bytes": 44,
@@ -340,8 +364,8 @@
    "insns": 12
   },
   ".op_jcxz_E3": {
-   "bytes": 36,
-   "insns": 10
+   "bytes": 44,
+   "insns": 13
   },
   ".op_jmp_far_EA": {
    "bytes": 6,
@@ -376,20 +400,20 @@
    "insns": 1
   },
   ".op_lea_8D": {
-   "bytes": 150,
-   "insns": 43
+   "bytes": 166,
+   "insns": 48
   },
   ".op_lea_8D_32": {
-   "bytes": 62,
-   "insns": 19
+   "bytes": 78,
+   "insns": 24
   },
   ".op_leave_C9": {
-   "bytes": 128,
-   "insns": 35
+   "bytes": 140,
+   "insns": 39
   },
   ".op_leave_C9_32": {
-   "bytes": 44,
-   "insns": 12
+   "bytes": 54,
+   "insns": 14
   },
   ".op_les_C4": {
    "bytes": 6,
@@ -416,39 +440,39 @@
    "insns": 25
   },
   ".op_loop_E2": {
-   "bytes": 44,
-   "insns": 12
+   "bytes": 70,
+   "insns": 21
   },
   ".op_loopnz_E0": {
-   "bytes": 54,
-   "insns": 15
+   "bytes": 80,
+   "insns": 24
   },
   ".op_loopz_E1": {
-   "bytes": 54,
-   "insns": 15
+   "bytes": 80,
+   "insns": 24
   },
   ".op_mov_Ew_seg_8C": {
    "bytes": 66,
    "insns": 18
   },
   ".op_mov_al_moffs8_A0": {
-   "bytes": 46,
-   "insns": 13
+   "bytes": 78,
+   "insns": 23
   },
   ".op_mov_eax_moffs32_A1": {
-   "bytes": 96,
-   "insns": 26
+   "bytes": 160,
+   "insns": 46
   },
   ".op_mov_eax_moffs32_A1_32": {
-   "bytes": 46,
-   "insns": 13
+   "bytes": 78,
+   "insns": 23
   },
   ".op_mov_eb_gb_88": {
    "bytes": 88,
    "insns": 24
   },
   ".op_mov_eb_imm8_C6": {
-   "bytes": 84,
+   "bytes": 82,
    "insns": 23
   },
   ".op_mov_ev_gv_89": {
@@ -460,11 +484,11 @@
    "insns": 18
   },
   ".op_mov_ev_imm32_C7": {
-   "bytes": 148,
-   "insns": 42
+   "bytes": 72,
+   "insns": 20
   },
   ".op_mov_ev_imm32_C7_32": {
-   "bytes": 74,
+   "bytes": 72,
    "insns": 20
   },
   ".op_mov_gb_eb_8A": {
@@ -480,16 +504,16 @@
    "insns": 18
   },
   ".op_mov_moffs32_eax_A3": {
-   "bytes": 84,
-   "insns": 22
+   "bytes": 160,
+   "insns": 43
   },
   ".op_mov_moffs32_eax_A3_32": {
-   "bytes": 50,
-   "insns": 13
+   "bytes": 82,
+   "insns": 23
   },
   ".op_mov_moffs8_al_A2": {
-   "bytes": 50,
-   "insns": 13
+   "bytes": 82,
+   "insns": 23
   },
   ".op_mov_r32_imm32": {
    "bytes": 126,
@@ -572,12 +596,12 @@
    "insns": 2
   },
   ".op_pop_ev_8F": {
-   "bytes": 112,
-   "insns": 30
+   "bytes": 90,
+   "insns": 25
   },
   ".op_pop_ev_8F_32": {
-   "bytes": 80,
-   "insns": 22
+   "bytes": 88,
+   "insns": 24
   },
   ".op_pop_r32": {
    "bytes": 60,
@@ -596,20 +620,20 @@
    "insns": 2
   },
   ".op_popa_61": {
-   "bytes": 184,
-   "insns": 53
+   "bytes": 326,
+   "insns": 89
   },
   ".op_popa_61_32": {
-   "bytes": 184,
-   "insns": 53
+   "bytes": 310,
+   "insns": 81
   },
   ".op_popfd_9D": {
-   "bytes": 80,
-   "insns": 22
+   "bytes": 126,
+   "insns": 36
   },
   ".op_popfd_9D_32": {
-   "bytes": 34,
-   "insns": 9
+   "bytes": 46,
+   "insns": 12
   },
   ".op_push_cs_0E": {
    "bytes": 6,
@@ -636,20 +660,20 @@
    "insns": 2
   },
   ".op_push_imm32_68": {
-   "bytes": 58,
-   "insns": 15
+   "bytes": 66,
+   "insns": 18
   },
   ".op_push_imm32_68_32": {
-   "bytes": 58,
-   "insns": 15
+   "bytes": 64,
+   "insns": 17
   },
   ".op_push_imm8_6A": {
-   "bytes": 60,
-   "insns": 15
+   "bytes": 68,
+   "insns": 18
   },
   ".op_push_imm8_6A_32": {
-   "bytes": 60,
-   "insns": 15
+   "bytes": 66,
+   "insns": 17
   },
   ".op_push_r32": {
    "bytes": 60,
@@ -668,20 +692,20 @@
    "insns": 2
   },
   ".op_pusha_60": {
-   "bytes": 234,
-   "insns": 59
+   "bytes": 356,
+   "insns": 97
   },
   ".op_pusha_60_32": {
-   "bytes": 234,
-   "insns": 59
+   "bytes": 340,
+   "insns": 89
   },
   ".op_pushfd_9C": {
-   "bytes": 36,
-   "insns": 9
+   "bytes": 46,
+   "insns": 12
   },
   ".op_pushfd_9C_32": {
-   "bytes": 36,
-   "insns": 9
+   "bytes": 44,
+   "insns": 11
   },
   ".op_rep_F3": {
    "bytes": 4,
@@ -700,24 +724,28 @@
    "insns": 13
   },
   ".op_ret_imm16_C2": {
-   "bytes": 56,
-   "insns": 15
+   "bytes": 82,
+   "insns": 23
   },
   ".op_ret_imm16_C2_32": {
-   "bytes": 56,
-   "insns": 15
+   "bytes": 78,
+   "insns": 21
   },
   ".op_retf_CB": {
-   "bytes": 538,
-   "insns": 150
+   "bytes": 108,
+   "insns": 30
   },
   ".op_retf_CB_32": {
    "bytes": 104,
    "insns": 28
   },
   ".op_retf_imm16_CA": {
-   "bytes": 80,
-   "insns": 22
+   "bytes": 578,
+   "insns": 169
+  },
+  ".op_retf_imm16_CA_32": {
+   "bytes": 136,
+   "insns": 38
   },
   ".op_sahf_9E": {
    "bytes": 12,
@@ -779,11 +807,23 @@
    "bytes": 28,
    "insns": 8
   },
+  ".op_shift_ev_1_D1_32": {
+   "bytes": 28,
+   "insns": 8
+  },
   ".op_shift_ev_cl_D3": {
    "bytes": 30,
    "insns": 8
   },
+  ".op_shift_ev_cl_D3_32": {
+   "bytes": 30,
+   "insns": 8
+  },
   ".op_shift_ev_imm8_C1": {
+   "bytes": 74,
+   "insns": 22
+  },
+  ".op_shift_ev_imm8_C1_32": {
    "bytes": 74,
    "insns": 22
   },
@@ -812,39 +852,47 @@
    "insns": 22
   },
   ".op_test_al_imm8_A8": {
-   "bytes": 34,
-   "insns": 9
+   "bytes": 78,
+   "insns": 20
   },
   ".op_test_eax_imm32_A9": {
-   "bytes": 172,
-   "insns": 49
+   "bytes": 214,
+   "insns": 60
   },
   ".op_test_eax_imm32_A9_32": {
-   "bytes": 34,
-   "insns": 9
+   "bytes": 76,
+   "insns": 20
   },
   ".op_test_eb_gb_84": {
-   "bytes": 36,
-   "insns": 10
+   "bytes": 82,
+   "insns": 23
   },
   ".op_test_ev_gv_85": {
-   "bytes": 372,
-   "insns": 99
+   "bytes": 62,
+   "insns": 17
   },
   ".op_test_ev_gv_85_32": {
-   "bytes": 112,
-   "insns": 29
+   "bytes": 62,
+   "insns": 17
   },
   ".op_xchg_eax_r32": {
    "bytes": 32,
    "insns": 8
   },
+  ".op_xchg_eax_r32_32": {
+   "bytes": 32,
+   "insns": 8
+  },
   ".op_xchg_eb_gb_86": {
-   "bytes": 96,
+   "bytes": 94,
    "insns": 26
   },
   ".op_xchg_ev_gv_87": {
-   "bytes": 76,
+   "bytes": 74,
+   "insns": 20
+  },
+  ".op_xchg_ev_gv_87_32": {
+   "bytes": 74,
    "insns": 20
   },
   ".op_xlat_D7": {
@@ -856,12 +904,12 @@
    "insns": 3
   },
   ".save_state_and_exit": {
-   "bytes": 22,
-   "insns": 6
+   "bytes": 11788,
+   "insns": 3343
   },
   ".str_exit": {
-   "bytes": 52,
-   "insns": 17
+   "bytes": 120,
+   "insns": 37
   },
   "ALU8_ADC_16": {
    "bytes": 96,
@@ -1232,8 +1280,8 @@
    "insns": 4
   },
   "ALU_TABLE_EV_IMM8_83_16": {
-   "bytes": 52,
-   "insns": 14
+   "bytes": 98,
+   "insns": 27
   },
   "ALU_TABLE_EV_IMM8_83_32": {
    "bytes": 16,
@@ -1262,6 +1310,14 @@
   "ALU_XOR_32": {
    "bytes": 46,
    "insns": 12
+  },
+  "BCD_RESULT_FLAGS_16": {
+   "bytes": 150,
+   "insns": 42
+  },
+  "BCD_RESULT_FLAGS_32": {
+   "bytes": 40,
+   "insns": 10
   },
   "COND_1_16": {
    "bytes": 14,
@@ -1512,12 +1568,12 @@
    "insns": 3
   },
   "GRP3_F6_TEST_16": {
-   "bytes": 26,
-   "insns": 7
+   "bytes": 74,
+   "insns": 19
   },
   "GRP3_F6_TEST_32": {
-   "bytes": 26,
-   "insns": 7
+   "bytes": 74,
+   "insns": 19
   },
   "GRP3_F7_DISPATCH_16": {
    "bytes": 64,
@@ -1592,12 +1648,12 @@
    "insns": 18
   },
   "GRP4_DEC_16": {
-   "bytes": 10,
-   "insns": 3
+   "bytes": 68,
+   "insns": 17
   },
   "GRP4_DEC_32": {
-   "bytes": 10,
-   "insns": 3
+   "bytes": 68,
+   "insns": 17
   },
   "GRP4_DISPATCH_16": {
    "bytes": 20,
@@ -1608,12 +1664,12 @@
    "insns": 6
   },
   "GRP4_INC_16": {
-   "bytes": 10,
-   "insns": 3
+   "bytes": 70,
+   "insns": 18
   },
   "GRP4_INC_32": {
-   "bytes": 10,
-   "insns": 3
+   "bytes": 70,
+   "insns": 18
   },
   "GRP4_MEM_16": {
    "bytes": 22,
@@ -1622,6 +1678,14 @@
   "GRP4_MEM_32": {
    "bytes": 22,
    "insns": 7
+  },
+  "GRP4_STORE_16": {
+   "bytes": 6,
+   "insns": 2
+  },
+  "GRP4_STORE_32": {
+   "bytes": 6,
+   "insns": 2
   },
   "GRP5_CALLF_16": {
    "bytes": 8,
@@ -1632,20 +1696,20 @@
    "insns": 2
   },
   "GRP5_CALL_16": {
-   "bytes": 38,
-   "insns": 10
+   "bytes": 56,
+   "insns": 15
   },
   "GRP5_CALL_32": {
-   "bytes": 38,
-   "insns": 10
+   "bytes": 54,
+   "insns": 14
   },
   "GRP5_DEC_16": {
-   "bytes": 10,
-   "insns": 3
+   "bytes": 74,
+   "insns": 19
   },
   "GRP5_DEC_32": {
-   "bytes": 10,
-   "insns": 3
+   "bytes": 64,
+   "insns": 17
   },
   "GRP5_DISPATCH_16": {
    "bytes": 54,
@@ -1656,7 +1720,7 @@
    "insns": 16
   },
   "GRP5_FAR_ENTRY_16": {
-   "bytes": 124,
+   "bytes": 132,
    "insns": 38
   },
   "GRP5_FAR_ENTRY_32": {
@@ -1672,12 +1736,12 @@
    "insns": 7
   },
   "GRP5_INC_16": {
-   "bytes": 10,
-   "insns": 3
+   "bytes": 74,
+   "insns": 19
   },
   "GRP5_INC_32": {
-   "bytes": 10,
-   "insns": 3
+   "bytes": 64,
+   "insns": 17
   },
   "GRP5_JMPF_16": {
    "bytes": 8,
@@ -1688,12 +1752,12 @@
    "insns": 3
   },
   "GRP5_JMP_16": {
-   "bytes": 6,
-   "insns": 2
+   "bytes": 12,
+   "insns": 3
   },
   "GRP5_JMP_32": {
-   "bytes": 6,
-   "insns": 2
+   "bytes": 12,
+   "insns": 3
   },
   "GRP5_MEM_16": {
    "bytes": 22,
@@ -1704,12 +1768,12 @@
    "insns": 7
   },
   "GRP5_PUSH_16": {
-   "bytes": 80,
-   "insns": 21
+   "bytes": 88,
+   "insns": 24
   },
   "GRP5_PUSH_32": {
-   "bytes": 36,
-   "insns": 9
+   "bytes": 42,
+   "insns": 11
   },
   "HANDLE_INTERRUPT_16": {
    "bytes": 232,
@@ -1718,6 +1782,14 @@
   "HANDLE_INTERRUPT_32": {
    "bytes": 226,
    "insns": 58
+  },
+  "HLT_IDLE_16": {
+   "bytes": 64,
+   "insns": 17
+  },
+  "HLT_IDLE_32": {
+   "bytes": 12,
+   "insns": 3
   },
   "HYPERCALL_UD_16": {
    "bytes": 12,
@@ -1768,8 +1840,8 @@
    "insns": 33
   },
   "LOOP_TAKEN_16": {
-   "bytes": 92,
-   "insns": 25
+   "bytes": 34,
+   "insns": 10
   },
   "LOOP_TAKEN_32": {
    "bytes": 6,
@@ -1843,6 +1915,14 @@
    "bytes": 52,
    "insns": 15
   },
+  "MOV_EB_IMM8_C6_MEM_16": {
+   "bytes": 52,
+   "insns": 14
+  },
+  "MOV_EB_IMM8_C6_MEM_32": {
+   "bytes": 52,
+   "insns": 14
+  },
   "MOV_EV_GV_MEM_16": {
    "bytes": 42,
    "insns": 12
@@ -1851,13 +1931,21 @@
    "bytes": 42,
    "insns": 12
   },
+  "MOV_EV_IMM_C7_MEM_16": {
+   "bytes": 52,
+   "insns": 14
+  },
+  "MOV_EV_IMM_C7_MEM_32": {
+   "bytes": 52,
+   "insns": 14
+  },
   "MOV_EW_SREG_MEM_16": {
-   "bytes": 26,
-   "insns": 8
+   "bytes": 42,
+   "insns": 12
   },
   "MOV_EW_SREG_MEM_32": {
-   "bytes": 26,
-   "insns": 8
+   "bytes": 42,
+   "insns": 12
   },
   "MOV_GB_EB_MEM_16": {
    "bytes": 52,
@@ -1891,6 +1979,14 @@
    "bytes": 18,
    "insns": 5
   },
+  "OP_0F_CR_16": {
+   "bytes": 76,
+   "insns": 22
+  },
+  "OP_0F_CR_32": {
+   "bytes": 76,
+   "insns": 22
+  },
   "OP_0F_MOVSX_GV_EB_MEM_16": {
    "bytes": 22,
    "insns": 6
@@ -1920,8 +2016,8 @@
    "insns": 5
   },
   "OP_0F_MOVSX_GV_EW_WRITE_32": {
-   "bytes": 20,
-   "insns": 5
+   "bytes": 22,
+   "insns": 6
   },
   "OP_0F_MOVZX_GV_EB_MEM_16": {
    "bytes": 20,
@@ -1956,8 +2052,8 @@
    "insns": 5
   },
   "OP_0F_SETCC_MEM_16": {
-   "bytes": 40,
-   "insns": 12
+   "bytes": 50,
+   "insns": 15
   },
   "OP_0F_SETCC_MEM_32": {
    "bytes": 40,
@@ -2003,6 +2099,14 @@
    "bytes": 8,
    "insns": 2
   },
+  "POP_EV_8F_MEM_16": {
+   "bytes": 74,
+   "insns": 21
+  },
+  "POP_EV_8F_MEM_32": {
+   "bytes": 72,
+   "insns": 20
+  },
   "POP_SREG_16": {
    "bytes": 58,
    "insns": 17
@@ -2036,12 +2140,12 @@
    "insns": 15
   },
   "REP_ONE_16": {
-   "bytes": 82,
-   "insns": 23
+   "bytes": 100,
+   "insns": 27
   },
   "REP_ONE_32": {
-   "bytes": 40,
-   "insns": 11
+   "bytes": 56,
+   "insns": 15
   },
   "REP_STRING_16": {
    "bytes": 6,
@@ -2068,8 +2172,8 @@
    "insns": 8
   },
   "SHIFT8_DONE_16": {
-   "bytes": 22,
-   "insns": 6
+   "bytes": 156,
+   "insns": 50
   },
   "SHIFT8_DONE_32": {
    "bytes": 6,
@@ -2149,7 +2253,7 @@
   },
   "SHIFT8_TABLE_16": {
    "bytes": 16,
-   "insns": 4
+   "insns": 5
   },
   "SHIFT8_TABLE_32": {
    "bytes": 16,
@@ -2212,8 +2316,8 @@
    "insns": 9
   },
   "SHIFT_EV_IMM8_C1_MEM_16": {
-   "bytes": 108,
-   "insns": 31
+   "bytes": 50,
+   "insns": 15
   },
   "SHIFT_EV_IMM8_C1_MEM_32": {
    "bytes": 50,
@@ -2301,7 +2405,7 @@
   },
   "SHIFT_TABLE_16": {
    "bytes": 16,
-   "insns": 5
+   "insns": 4
   },
   "SHIFT_TABLE_32": {
    "bytes": 16,
@@ -2347,6 +2451,38 @@
    "bytes": 26,
    "insns": 8
   },
+  "TEST_EB_GB_84_FLAGS_16": {
+   "bytes": 52,
+   "insns": 13
+  },
+  "TEST_EB_GB_84_FLAGS_32": {
+   "bytes": 52,
+   "insns": 13
+  },
+  "TEST_EB_GB_84_MEM_16": {
+   "bytes": 54,
+   "insns": 15
+  },
+  "TEST_EB_GB_84_MEM_32": {
+   "bytes": 54,
+   "insns": 15
+  },
+  "TEST_EV_GV_85_FLAGS_16": {
+   "bytes": 50,
+   "insns": 13
+  },
+  "TEST_EV_GV_85_FLAGS_32": {
+   "bytes": 50,
+   "insns": 13
+  },
+  "TEST_EV_GV_85_MEM_16": {
+   "bytes": 138,
+   "insns": 38
+  },
+  "TEST_EV_GV_85_MEM_32": {
+   "bytes": 44,
+   "insns": 12
+  },
   "WRITEBACK_REG8_16": {
    "bytes": 6,
    "insns": 2
@@ -2368,6 +2504,30 @@
    "insns": 2
   },
   "WRITE_REG_32": {
+   "bytes": 8,
+   "insns": 2
+  },
+  "XCHG_EB_GB_86_MEM_16": {
+   "bytes": 64,
+   "insns": 17
+  },
+  "XCHG_EB_GB_86_MEM_32": {
+   "bytes": 64,
+   "insns": 17
+  },
+  "XCHG_EV_GV_87_MEM_16": {
+   "bytes": 142,
+   "insns": 38
+  },
+  "XCHG_EV_GV_87_MEM_32": {
+   "bytes": 54,
+   "insns": 14
+  },
+  "__x86_nor_slow_r_veneer": {
+   "bytes": 8,
+   "insns": 2
+  },
+  "__x86_nor_slow_w_veneer": {
    "bytes": 8,
    "insns": 2
   },
@@ -2429,8 +2589,8 @@
   }
  },
  "totals": {
-  "bytes": 32430,
-  "insns": 8917,
-  "symbols": 606
+  "bytes": 48206,
+  "insns": 13379,
+  "symbols": 646
  }
 }
