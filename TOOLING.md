@@ -706,7 +706,16 @@ python3 tests/test_sysinfo.py            # the machine DESCRIPTION services,
                                          # pre-fix: INT 12h answered 65,535 KB
                                          # of conventional memory. There is no
                                          # host-side symptom for that at all
+python3 tests/test_timeline.py --offline # the .tl parser and event schedule,
+                                         # no target at all
 python3 tests/test_core_retrogo.py       # tier 2
+python3 tests/test_timeline.py           # tier 2: replays a timeline through
+                                         # the HARDWARE player (shadow word at
+                                         # 0x30001FF4, which gwemu maps) and
+                                         # times each button's arrival in
+                                         # input_pad_seen. The one way to prove
+                                         # the hardware input path without
+                                         # silicon
 ```
 
 `test_disk_cache.py` is the one harness that does NOT drive a target. It
@@ -736,6 +745,19 @@ python3 tests/test_core_retrogo.py
 
 `make sdcard` chains the core build, so the image can never be assembled around
 a stale core.
+
+**`gwemu_release` does NOT rebuild the emulator bank images.** Its prep block is
+guarded by `if [ ! -f build/sdcard.img ]` and prints "QEMU images already exist
+(skipping prep)" — so once any gwemu media exists, `qemu_bank1.bin` keeps
+whatever the FIRST build put there while every later build updates
+`gw_retro_go_intflash.bin` beside it. Tier 2 then boots hours-old firmware with
+a successful build log above it; that is how a `REMOTE_INPUT=1` firmware came up
+with no remote input in it, and it cost most of an evening. `retrogo_build.py`
+now re-cuts the bank the firmware was linked for after every build (bank 1 on a
+bank-2 build is the stock-firmware backup and is left alone). Same failure shape
+as the stale SD image in docs/04, one layer down: **when tier 2 behaves like
+code you did not write, check the mtime of `qemu_bank1.bin` against
+`gw_retro_go_intflash.bin` before anything else.**
 
 **Where the line sits:** make compiles (`Makefile` for the bare-metal harness,
 `Makefile.core` for the packed core) — it owns source→binary dependency graphs.
@@ -815,23 +837,83 @@ python3 scripts/probe.py --retrogo --gui --audio --timeline "" \
     --record timelines/alleycat-ingame.tl --samples 150 --interval 5
 ```
 
-**The `.tl` grammar, confirmed by recording one** (docs/gwemu.md in the firmware
-deliberately refused to guess it):
+**The `.tl` grammar, read out of gwemu's own parser**
+(`references/gwemu/hw/misc/gnw_timeline.c`):
 
 ```
 # comment
-<seconds> down <button>       e.g. 5.567 down start
-<seconds> release <button>
-<seconds> quit
+[MM:]SS[.fff][s] | @FRAME    press   <btn>[+<btn>...]      # down, +100ms, up
+                             hold    <btn>[+...] <secs>    # down, +secs, up
+                             down    <btn>[+...]           # and stays down
+                             release <btn>[+...]
+                             screenshot <file.png>
+                             quit
 ```
 
-Float seconds from start; button names are lowercase `up down left right a b
-game time start select pause power`. Every press is a `down`/`release` pair --
-a `down` with no `release` leaves the button held. Playback is `--timeline`.
+Buttons are case-insensitive: `up down left right a b game time start select
+pause pwr` (gwemu spells it `pwr`; `power` is accepted too). `@N` addresses a
+vblank FRAME rather than a time.
+
+**A recording uses only half of this language.** `--record` emits `down` /
+`release` pairs and nothing else, and every hand-written timeline in
+`timelines/` is written in `press` / `screenshot` — so a parser built from a
+recorded file rejects almost the whole directory. `scripts/common/timeline.py`
+implements the grammar above, from the source, and `tests/test_timeline.py
+--offline` parses every checked-in `.tl` as a smoke test.
 
 `timelines/alleycat-ingame.tl` is a real session driving Alley Cat from launch
 to gameplay: TIME answers the joystick prompt with N, then the skill menu needs
 a LETTER, which is only reachable through the on-screen keyboard.
+
+### Replaying a timeline on REAL HARDWARE
+
+`--timeline FILE.tl` means the same thing on every tier: the tests do not know
+which one they are on.
+
+```bash
+# gwemu (unchanged): the emulator replays the file itself, against emulated
+# time -- exact.
+python3 scripts/probe.py --retrogo --timeline timelines/press-game.tl
+
+# hardware: the same file, injected over the debug probe.
+python3 scripts/probe.py --retrogo --target hardware \
+    --timeline timelines/press-game.tl --watch input_pad_seen,input_scancodes
+```
+
+How it works: a `REMOTE_INPUT` firmware build ORs a 32-bit shadow word at
+`0x30001FF4` into the live button state on every input poll, so a probe write is
+indistinguishable from a physical press. `HardwareTarget` folds the timeline
+into a schedule of button masks and writes them from a background thread while
+the harness keeps polling — the mechanism is vendored from the firmware's proven
+`scripts/remote_input.py` (`references/` is gitignored, so nothing may depend on
+it at runtime).
+
+**The firmware must be built with `REMOTE_INPUT=1`.** Ours always is —
+`retrogo_build.py`'s `RELEASE_DEFAULTS` — deliberately not a switch, because a
+firmware without it turns every hardware timeline into a test that presses
+nothing and passes. **Do not check for it by grepping the binary for
+`30001FF4`: the compiler puts `.word 0x30001000` in the literal pool and reaches
+the cell with `ldr.w rX,[rY,#4084]`, so the address never appears as four
+consecutive bytes.** `retrogo_build.verify_remote_input(elf)` disassembles
+`buttons_get` and checks the arithmetic; the build fails if the define did not
+take.
+
+**`quit` on hardware stops injecting** — buttons released, shadow word zeroed,
+the player finishes. There is no process to kill, and the device keeps running;
+harnesses still derive their wait from `timeline_quit_time()`, so a run ends
+where it would under gwemu.
+
+**Accuracy.** Every state change is one 32-bit write; nothing compensates for
+its latency, and the file is replayed as written. Measured under gwemu over
+`GDBBackend` on `timelines/alleycat-ingame.tl` (78 state changes): the write
+itself costs **0.11 ms mean / 0.28 ms max**, and events left **0.1–0.2 ms** late
+against the file. End to end — press in the file to the bit appearing in the
+firmware's `input_pad_seen` — was **+13 to +60 ms**, nearly all of it the
+harness's own 50 ms observation poll. **OpenOCD over SWD has not been measured;
+expect it to be slower than GDB-to-gwemu.** A press held for less than one input
+poll (~16 ms) may be delivered and never observed; the player prints a warning
+naming each such press rather than letting it silently do nothing. The shortest
+press in any checked-in timeline is 40 ms.
 
 ## Modules (`scripts/common/`)
 
@@ -842,7 +924,8 @@ Importable support only — no CLIs.
 | `target.py` | `Image` (what boots) + `GwemuTarget`/`HardwareTarget` (where). One launch path for every tier. Also `timeline_quit_time(path)`: a test that polls longer than the timeline's `quit` outlives gwemu, and the dropped GDB link looks like a target fault. Derive waits from it; never hardcode. |
 | `elf.py` | `get_symbols`, `nearest_symbol` |
 | `sdcard.py` | Three SD destinations (image / probe / mounted) plus `compose()`, which lays out what the firmware needs |
-| `retrogo_build.py` | Firmware build + artifact staging |
+| `timeline.py` | The `.tl` grammar (gwemu's, in full) plus the two players: gwemu replays a file itself, hardware gets `ShadowWordPlayer` writing `0x30001FF4` over the probe. `--timeline` therefore means the same thing on both tiers. Reports what was ACTUALLY delivered — lateness per state change and the hold each press got — instead of assuming the file's schedule |
+| `retrogo_build.py` | Firmware build + artifact staging. Builds with `REMOTE_INPUT=1` and CHECKS the built image for it; also re-cuts `qemu_bank{1,2}.bin`, which `gwemu_release` silently does not (see below) |
 | `retrogo_config.py` | `/CONFIG` blob generation |
 | `core_abi.py` | Preflight: will this firmware accept this core? |
 | `rglog.py` | Read retro-go's in-memory log ring |
