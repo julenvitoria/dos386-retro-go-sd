@@ -455,6 +455,65 @@ RAM_EMU headroom with `X86_ZONES=1` in: **2,352 B** (`__CORE_BSS_END__`
 
 Silicon is where the CYCLES become real. Nothing above claims otherwise.
 
+## "I had to turn off the keyboard before it would send the keys"
+
+The device report was that Alley Cat goes deaf to input, and the suggested
+cause was a host/guest desync wedging `changed = keys ^ x86_io.input_keys` to
+zero. **Measured under gwemu, that is not it, and the desync is not reachable:**
+`x86_io.input_keys` has exactly one writer and `poll_input()` updates it
+*before* the OSK branch, so `prev` and `keys` cannot disagree; a run with LEFT
+held for 12 s across a full off→keyboard→mouse→off cycle
+(`timelines/osk-held-across.tl`) kept emitting, and the release-all on OSK open
+delivered the held key's break exactly as the previous port's
+`dos_input_release_all()` does. Both directions of the hypothesis were already
+handled.
+
+**What is real is the user's own second sentence.** With the OSK up
+(`timelines/osk-live-keys.tl`, three cell presses seconds apart):
+
+| | before | after |
+|---|---|---|
+| codes the guest read, of 6 injected | **1** | **6**, each within the same second as its press |
+| 8042 queue at the last press | head 7 / tail 12 — **5 stuck** | head 12 / tail 12 — empty |
+| `input_irqs` over the window | 6 → **1,066** (60/s) | 6 → **12**, one per code |
+| `guest_tick_irq_lost` | 0 → **329** (every 18.2 Hz tick refused) | 2 → 4 |
+| guest EFLAGS.IF | **0 for 18 seconds** | 1 |
+
+All five queued codes arrived at once the moment the OSK closed — which is
+precisely the reported experience.
+
+**The mechanism is `pit_counter`, not the keyboard.** `pit_counter = 1` pulls
+the guest's next instruction boundary in so an IRQ lands now instead of at the
+end of the slice. It only *delivers* anything if IF is set — and a guest running
+its own INT 09h handler has IF CLEAR. `poll_input()` set it once a frame,
+unguarded, for as long as anything sat in the queue, so the boundary could not
+deliver and merely **ended the slice: the guest ran one instruction per frame**,
+inching through its own interrupt handler for eighteen seconds while the OSK
+kept the queue full. `x86_io_log` shows the handler's shape
+(`IN 60 / IN 61 / OUT 61 x2 / OUT 20`) creeping forward a few accesses per
+sample. The same store also overwrote the **one-deep** pending slot, so the
+18.2 Hz tick was discarded 18 times a second.
+
+The decision now lives in one place, `x86_kbd_raise_irq()` in `x86_io.c`, with
+both guards: refuse when the pending slot is taken, and pull the boundary in
+only when IF allows delivery. The slice loop's copy already had the first guard
+and `poll_input()` had neither — two call sites disagreeing about one rule is
+the whole defect.
+
+Tier 1: `tests/test_osk.py` grew four checks over that function (the grid checks
+could not see this — they call `x86_bios_kbd_irq()` themselves and never go
+through the arming rule). Two of them fail on the pre-fix behaviour and pass
+after. `test_opcodes` 273/273, `test_dos`, `test_video`, `test_text`,
+`test_keyboard`, `test_audio`, `test_disk_cache`, `test_nor`, `test_sysinfo`
+all green. RAM_EMU headroom **27,232 B** (`__CORE_BSS_END__` 0x240595a0); the
+change is net-negative in code.
+
+Still open, and NOT this bug: a button held across an OSK open/close is released
+in the guest and never re-made while it stays held, so the user must let go and
+press again. The previous port has the same property (`dos_prev_down[]` is
+resynced from raw state on the transition), so it is a shared UX defect rather
+than a regression.
+
 ## Phase 3 — Wolf3D
 
 - [ ] COW/pool/eviction with dirty tracking, loud exhaustion; pool sizing

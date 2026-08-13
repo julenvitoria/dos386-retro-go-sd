@@ -259,6 +259,10 @@ void x86_bios_tick(void);
 void x86_kb_push(uint8_t scancode, uint8_t ascii);
 void x86_kbd_scancode(uint8_t code);
 int x86_kbd_pending(void);
+/* Arm IRQ 1 for a queued scancode, refusing when the one-deep pending slot is
+   taken and pulling the instruction boundary in only when IF allows delivery.
+   See the comment on the definition -- both guards are measured defects. */
+int x86_kbd_raise_irq(X86CPUState *cpu);
 int x86_bios_kbd_irq(void);
 /* Scancode -> ASCII, the same decode INT 09h uses. Shared with the on-screen
    keyboard, whose echo line must show what the guest was actually sent. */

@@ -93,7 +93,7 @@ volatile uint32_t kbd_r[20];
    into the right SCANCODES and that the BIOS decodes them into the right BDA
    entry -- shift included, which is the part with no other witness. */
 volatile uint32_t run_osk_flag = 0;
-volatile uint32_t osk_r[16];
+volatile uint32_t osk_r[20];
 
 /* DOS file I/O self-test: INT 21h 3Dh/3Fh/42h/3Eh/43h/4Eh/4Fh, driven from
    GUEST code against a FAT12 volume the HOST built in dosfile_img.
@@ -761,6 +761,48 @@ static void osk_test_run(void)
     osk_r[14] = (uint32_t)x86_osk_visible();     /* expect 1                 */
     x86_osk_cycle();
     osk_r[15] = (uint32_t)x86_osk_visible();     /* expect 0                 */
+
+    /* ---- IRQ 1 arming, which is what decides WHEN a cell press is visible.
+     *
+     * The grid checks above prove a code reaches the guest's ring; they cannot
+     * see the defect that made an OSK keypress take SECONDS, because they call
+     * x86_bios_kbd_irq() themselves instead of going through the frame loop's
+     * arming rule. That rule is x86_kbd_raise_irq(), and both of its guards
+     * were measured failures under gwemu -- see the comment on the definition.
+     *
+     * The IF=0 case is the one that mattered: the guest is inside its own INT
+     * 09h handler, so pulling the instruction boundary in cannot deliver
+     * anything and only ends the slice. Doing it once a frame ran the guest at
+     * one instruction per frame and the OSK's codes piled up in the queue
+     * until the keyboard was closed. */
+    while (x86_kbd_pending())
+        (void)x86_bios_kbd_irq();
+
+    cpu_state_dtcm.hard_int_pending = 0;
+    cpu_state_dtcm.pit_counter = 0x5A5A;
+    cpu_state_dtcm.eflags = 0x0002;              /* IF CLEAR */
+    x86_kbd_scancode(0x1E);
+    osk_r[16] = (uint32_t)x86_kbd_raise_irq(&cpu_state_dtcm);
+    osk_r[17] = cpu_state_dtcm.pit_counter;      /* expect 0x5A5A, untouched */
+
+    /* The one-deep pending slot belongs to whoever got there first. An
+       unguarded store here discarded the 18.2 Hz tick every time a key was
+       held. */
+    cpu_state_dtcm.hard_int_pending = 0x08;
+    osk_r[18] = (uint32_t)((x86_kbd_raise_irq(&cpu_state_dtcm) << 8) |
+                           cpu_state_dtcm.hard_int_pending);  /* expect 0x08 */
+
+    /* With IF set the boundary CAN deliver, so it is pulled in -- the property
+       that makes a keypress land this frame rather than at the end of a slice. */
+    cpu_state_dtcm.hard_int_pending = 0;
+    cpu_state_dtcm.pit_counter = 0x5A5A;
+    cpu_state_dtcm.eflags = 0x0202;              /* IF SET */
+    osk_r[19] = (uint32_t)((x86_kbd_raise_irq(&cpu_state_dtcm) << 16) |
+                           (cpu_state_dtcm.hard_int_pending << 8) |
+                           (cpu_state_dtcm.pit_counter == 1u));  /* 0x10901 */
+
+    while (x86_kbd_pending())
+        (void)x86_bios_kbd_irq();
 }
 
 /* --------------------------------------------------------------------------

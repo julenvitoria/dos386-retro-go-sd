@@ -1507,15 +1507,19 @@ static void poll_input(const gw_firmware_abi_t *abi)
 deliver:
     input_kbd_ht = (uint32_t)x86_io.kbd_head | ((uint32_t)x86_io.kbd_tail << 8);
 
-    /* Raise IRQ 1 and pull the next instruction boundary forward, so it is
-       delivered now instead of at the end of the slice. The OSK reaches the
+    /* Raise IRQ 1 for anything the controller is holding. The OSK reaches the
        guest through this SAME path a button does -- x86_kbd_scancode() then
-       IRQ 1 -- which is the whole point of porting only the front end. */
-    if (x86_kbd_pending()) {
-        cpu_state_ptr->hard_int_pending = 0x09;
-        cpu_state_ptr->pit_counter = 1;
-        input_irqs++;
-    }
+       IRQ 1 -- which is the whole point of porting only the front end.
+
+       The decision lives in x86_kbd_raise_irq() because this site and the one
+       in the slice loop below used to disagree about it, and the unguarded
+       version here is what made an OSK keypress invisible until the keyboard
+       was closed: it re-armed the one-deep pending slot and forced
+       pit_counter to 1 every frame, including while the guest was inside its
+       own INT 09h handler with IF clear and could not take the interrupt at
+       all -- which does not deliver anything, it just ends the slice after one
+       instruction. */
+    input_irqs += (uint32_t)x86_kbd_raise_irq(cpu_state_ptr);
 }
 
 static void emulator_loop(const gw_firmware_abi_t *abi)
@@ -1766,11 +1770,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
              * pending tick keeps priority -- the one-deep slot is the emulated
              * 8259A's whole model of one.
              */
-            if (x86_kbd_pending() && !cpu_state_ptr->hard_int_pending) {
-                cpu_state_ptr->hard_int_pending = 0x09;
-                cpu_state_ptr->pit_counter = 1;
-                input_irqs++;
-            }
+            input_irqs += (uint32_t)x86_kbd_raise_irq(cpu_state_ptr);
             X86_ZONE_ENTER(X86_ZONE_GUEST);         /* ZONES */
             x86_cpu_interp_asm();
             X86_ZONE_EXIT();                        /* ZONES */

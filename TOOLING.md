@@ -800,6 +800,22 @@ this document used to warn was inert. Three timelines drive the keyboard:
   because "the callback faulted" and "the menu is drawn over it" look identical
   in a screenshot.
 
+Two more drive the keyboard's DELIVERY rather than its picture, and both were
+written for the "keys only arrive once the OSK is closed" report:
+
+- `timelines/osk-live-keys.tl` -- answer Alley Cat's prompt, open the OSK and
+  press the same cell three times several seconds apart, leaving the keyboard
+  UP throughout. Watch `x86_osk_codes` (codes injected) against
+  `x86_kbd_port60_reads` (codes the guest took) and `input_kbd_ht` (the 8042
+  head/tail): reads that lag the injections and then catch up all at once when
+  the OSK closes ARE the defect, and nothing else in the tree shows it.
+  `input_irqs` is the second witness -- 60/s means IRQ 1 is being re-armed
+  every frame at a guest that cannot take it.
+- `timelines/osk-held-across.tl` -- LEFT held for 12 s while GAME cycles the
+  OSK all the way round underneath it, then ordinary taps after the release.
+  This is the "a button held across the transition" case; the release code goes
+  out when the OSK takes the frame and the taps afterwards must still emit.
+
 Which key each captures is worth knowing: the OSK opens on layer 0 cell 0, so
 `press a` sends the letter `a` (scancode 0x1E) and `x86_kbd_read_log` is where
 it is confirmed to have reached the guest.

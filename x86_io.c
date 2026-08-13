@@ -332,6 +332,47 @@ int x86_kbd_pending(void)
 }
 
 /*
+ * Arm IRQ 1 for a queued scancode. THE ONE PLACE that decides it, because the
+ * two callers in src/main.c disagreeing about it is the defect this exists to
+ * close.
+ *
+ * Two guards, and the second one is the whole point:
+ *
+ *  - The pending slot is ONE DEEP -- it is the emulated 8259A's entire model of
+ *    one. Writing 0x09 over whatever is in it discards the other interrupt: the
+ *    frame loop raises the 18.2 Hz tick as 0x08 later in the same iteration, so
+ *    an unguarded store here silently ate keyboard IRQs and timer ticks in
+ *    turn. Refuse instead; the queue is still there and the next call re-tries.
+ *
+ *  - pit_counter = 1 pulls the guest's next instruction boundary in so the IRQ
+ *    lands NOW rather than at the end of the slice. That is only useful if the
+ *    boundary can actually deliver, i.e. if IF is set. With IF CLEAR -- which
+ *    is exactly the state a guest is in while it runs its own INT 09h handler
+ *    -- the boundary cannot deliver, so it just ENDS THE SLICE, and a caller
+ *    doing this once a frame leaves the guest running ONE INSTRUCTION PER
+ *    FRAME. Measured under gwemu with the on-screen keyboard up: 60 IRQ arms a
+ *    second, the guest 18 seconds inside one INT 09h handler, five queued
+ *    codes it could not reach, every BIOS tick refused (guest_tick_irq_lost
+ *    +18/s) -- and all five codes delivered at once the moment the OSK closed
+ *    and the queue stopped being refilled. That is the "I had to turn off the
+ *    keyboard before it would send the keys" report, in full.
+ *
+ * eflags is authoritative here: the interpreter caches it in R11 and writes it
+ * back on exit, and every caller is outside the interpreter.
+ *
+ * Returns 1 if the IRQ was armed.
+ */
+int x86_kbd_raise_irq(X86CPUState *cpu)
+{
+    if (!x86_kbd_pending() || cpu->hard_int_pending)
+        return 0;
+    cpu->hard_int_pending = 0x09;
+    if (cpu->eflags & 0x200u)
+        cpu->pit_counter = 1;
+    return 1;
+}
+
+/*
  * What the guest actually got off port 0x60, and how often it asked.
  *
  * The counters upstream of this (input_scancodes, input_irqs, kbd_head/tail)

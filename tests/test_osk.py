@@ -68,10 +68,11 @@ def main(args):
             print("FAIL: the OSK arm never completed")
             return False
 
-        r = [b.read_uint32(syms["osk_r"] + 4 * i) for i in range(16)]
+        r = [b.read_uint32(syms["osk_r"] + 4 * i) for i in range(20)]
         (cells_max, overflow, vis0, vis1, key_a, key_b, key_bsp, key_bang,
          shift_flags, vram_same, top_ink, bottom_ink, picture_ink,
-         mouse_mode, vis_mouse, vis_off) = r
+         mouse_mode, vis_mouse, vis_off,
+         irq_armed_if0, pit_if0, irq_refused, irq_armed_if1) = r
 
         def check(label, got, want, fmt=str):
             nonlocal ok
@@ -95,6 +96,18 @@ def main(args):
         check("mouse mode is the second state", mouse_mode, 2)
         check("mouse mode owns the buttons", vis_mouse, 1)
         check("third GAME closes it", vis_off, 0)
+
+        # WHEN a cell press becomes visible to the guest, not just whether it
+        # arrives. The frame loop arms IRQ 1 once per frame through
+        # x86_kbd_raise_irq(); doing that unguarded is what made an OSK
+        # keypress invisible until the keyboard was CLOSED -- measured under
+        # gwemu as 60 arms/second, five codes stuck in the queue, and the guest
+        # one instruction per frame inside its own INT 09h handler.
+        check("queued code arms IRQ 1", irq_armed_if0, 1)
+        check("IF clear: boundary NOT pulled in", pit_if0, 0x5A5A, hexw)
+        check("pending slot not stolen from the tick", irq_refused, 0x0008, hexw)
+        check("IF set: armed and boundary pulled in", irq_armed_if1, 0x10901,
+              lambda v: f"0x{v:05x}")
 
         # The bars must carry ink and the picture area must not have been
         # scribbled on by the keyboard (the pointer is off in KBD mode).
