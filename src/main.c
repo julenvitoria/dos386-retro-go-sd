@@ -77,7 +77,7 @@ static char dsk_path[256];
 volatile uint32_t dsk_mounted = 0;
 volatile uint32_t dsk_exec_rc = 0xFFFFFFFF;
 volatile uint32_t dsk_startup_ok = 0;
-static uint32_t core_clut[16];
+static uint32_t core_clut[32];
 static uint8_t *upper_filler;
 
 /* Host-readable so a failure to place either block is visible rather than a
@@ -315,12 +315,23 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
         /* The CLUT the LCD scans out through. LUT8 gives 256 entries; CGA
          * mode 4 uses four and the palette registers pick which. */
         /* ARGB8888; lcd_set_clut() caps the count at 32 and reads 32-bit
-         * entries. All SIXTEEN are pushed, not four: mode 4 uses only entries
-         * 0-3, but text attributes index the whole CGA palette, and pushing
-         * four left 4-15 holding whatever retro-go's menu had -- so every
-         * bright or coloured attribute drew in a stale colour or in black. */
+         * entries. All THIRTY-TWO are pushed, not four and not sixteen.
+         *
+         * Mode 4 uses only entries 0-3, but text attributes index the whole
+         * CGA palette, and pushing four left 4-15 holding whatever retro-go's
+         * menu had -- so every bright or coloured attribute drew in a stale
+         * colour or in black.
+         *
+         * Sixteen is not enough either, for a reason that is invisible until
+         * someone opens retro-go's menu: lcd_set_clut() writes a darkened twin
+         * of entry i at `count + i`, but the overlay reaches those twins by
+         * OR-ing LCD_DARKEN_BIT = 0x20 into each framebuffer byte, a fixed
+         * +32. The two only agree at count == 32. At 16 the twins sat at 16-31
+         * while the overlay read 32-47, which are zeros, so the menu dimmed
+         * the game to solid black. Pushing 32 also gives the anti-aliased text
+         * renderer the eight four-entry blocks it allocates per frame. */
         x86_video_init(guest_vram, core_clut);
-        abi->lcd_ctl(GW_LCD_SET_CLUT, (uintptr_t)core_clut, 16, 0);
+        abi->lcd_ctl(GW_LCD_SET_CLUT, (uintptr_t)core_clut, 32, 0);
         cga_clut_dirty = 0;
     }
 
@@ -702,7 +713,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         /* A guest write to 0x3D9 changes the palette; the firmware holds its
          * own copy, so push ours again when it moves. */
         if (cga_clut_dirty) {
-            abi->lcd_ctl(GW_LCD_SET_CLUT, (uintptr_t)core_clut, 16, 0);
+            abi->lcd_ctl(GW_LCD_SET_CLUT, (uintptr_t)core_clut, 32, 0);
             cga_clut_dirty = 0;
         }
 

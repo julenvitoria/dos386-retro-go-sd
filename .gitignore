@@ -34,3 +34,5 @@ test_macro*.S
 test_pic_opt
 test_pic_opt.c
 test_tbh.S
+__pycache__/
+*.pyc

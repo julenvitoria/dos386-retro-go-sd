@@ -153,13 +153,19 @@ python3 scripts/screenshot.py --target hardware --wait 20
 ```
 
 `--text` dumps the 80x25 character buffer alongside the image, decoded as
-**CP437**; judging 8x8 glyphs by eye is how a `Runtime error 203` went unread
+**CP437**; judging small glyphs by eye is how a `Runtime error 203` went unread
 through two captures, and printing only 0x20-0x7E hid every box-drawing and
 shading code behind a `.`, which made a correctly drawn full-screen UI read as
 four rows of stray letters on an empty screen.
-`--pan N` pins the text window's leftmost column: the panel shows 40 of the 80
-columns and normally follows the cursor, so anything further right -- a score at
-the end of a wide line -- is invisible until you pin it.
+`--text-aa 0|1` picks the renderer before capturing, so the SAME screen can be
+grabbed both ways from one run rather than from two builds that also differ in
+where the guest got to. `--pairs` counts the DISTINCT (fg,bg) attribute pairs a
+text screen uses — the number that decides whether anti-aliasing fits, since
+each pair costs a contiguous block of four CLUT entries.
+
+`--pan N` pins the text window's leftmost column. It is now a no-op: the text
+cell is 4 px wide, so all 80 columns land on the 320 px panel and there is
+nothing off-screen to pan to. It is kept for a mode wider than the panel.
 
 gwemu's own headless screendump comes back black, so it proves nothing. The
 LTDC registers ARE modelled: this reads Layer 1's framebuffer address, pitch
@@ -168,17 +174,53 @@ frame. It also prints a coarse text map of the result, so a black or garbage
 capture is obvious without opening the file. `tests/test_screen.py` does this
 for one expected image; this is the general form.
 
-### `make_font.py` — regenerate `font8x8.h`
+### `make_font.py` — regenerate `font8x8.h`, `font4x8.h`, `font4x8aa.h`
 
 ```bash
-python3 scripts/make_font.py                  # rewrite font8x8.h
-python3 scripts/make_font.py --check          # fail if it is out of date
+python3 scripts/make_font.py                  # rewrite all three headers
+python3 scripts/make_font.py --check          # fail if any is out of date
+python3 scripts/make_font.py --show 0xC9      # one glyph, all three tables
 ```
 
 Assembles a full 256-glyph **CP437** table from Daniel Hepper's public-domain
 `font8x8` blocks, which are indexed by Unicode, plus 42 glyphs (card suits,
 arrows, the maths operators at 0xEC-0xFE) drawn in the generator. Run it only
-when the font changes; the result is committed.
+when the font changes; the results are committed.
+
+It then emits the two **4-pixel-wide tables the renderer draws from**. 80
+columns of 8 px is 640 and the panel is 320, so an 8x8 cell could only ever
+show 40 of the 80 columns — and a DOS UI is centred on the 80, so the window
+sliced it in half wherever it sat. At 4 px the whole 80x25 screen is exactly
+320x200.
+
+`font4x8.h` (1 bit per pixel) is the shipping face. Its letters are
+**Bm437_EverexME_5x8** from VileR's Int10h Oldschool PC Font Pack, squeezed 5→4.
+That replaced an OR-condensation of the 8x8 face, which looked poor for a
+reason no tuning fixes: an 8 px face encodes stem placement and counters chosen
+for eight columns, and halving the width destroys all of them at once. Everex
+Micro Enhancer is a real character generator that showed 80 columns in a
+five-pixel cell, so it was designed narrow. Measured over the 256 glyphs, only
+77 put ink in the fifth column and 48 of those are line art that is hand-drawn
+anyway, so the squeeze is exact almost everywhere; where it is not, columns 3
+and 4 are OR-ed, touching only a right edge.
+
+**0xB0–0xDF is hand-drawn in the generator, not converted** (`LINEART`,
+`SHADES`, `SOLIDS`). This is what decides whether a narrow font is usable: a
+horizontal rule must reach both cell edges or every frame comes out dashed, and
+the vertical rule must sit in the same column in every glyph or corners miss. So
+the grid is fixed — vertical at column 1, single horizontal at row 4, double
+horizontals at rows 3 and 5. **Double VERTICAL rules deliberately alias to
+single**: two strokes with a one-pixel gap in a four-pixel cell is mush and makes
+every corner ambiguous. Double horizontals survive, so a `╔═╗` frame still reads
+differently from a `┌─┐` one. `tests/test_text.py` asserts both properties over
+the whole range, not just samples.
+
+`font4x8aa.h` (2 bits per pixel) is the anti-aliased table: the authentic 8x8
+glyph box-filtered 2:1 keeping the intermediate level, so a stem falling between
+two output pixels becomes two half-lit pixels instead of vanishing. Line art is
+promoted from the hand-drawn bilevel art at full level rather than filtered —
+filtering a one-pixel rule would draw every frame at half brightness. See
+"Anti-aliased text" below for why it is not the default.
 
 DOS text is CP437, so the renderer indexes the font with the whole character
 byte. The tree used to carry Hepper's 128 ASCII glyphs only, which forced a
@@ -230,11 +272,13 @@ standby. Called automatically by `make retrogo_media`.
 | `cpu_exec*.S`, `opcode*.S` | the Thumb-2 interpreter and its dispatch tables |
 | `x86_mem.c` | guest page pool, fold mapping, guest↔host copies |
 | `x86_io.c` | port dispatch, PIT ch2 + speaker, CGA registers |
-| `x86_video.c`, `cga_blit.S` | mode 4 blitter, mode 3 text renderer, palette |
+| `x86_video.c`, `cga_blit.S` | mode 4 blitter, mode 3 text renderer (4x8 cells, all 80 columns), palette |
 | `x86_hle.c` | `0F 0B` stubs, IVT planting, service dispatch |
 | `x86_bios.c` | INT 10h / 16h / 1Ah and the BIOS Data Area |
 | `x86_dos.c` | INT 21h, PSP, MCB arena, MZ loader |
-| `font8x8.h` | 8x8 font, public domain (Daniel Hepper), copied in |
+| `font8x8.h` | 8x8 CP437 font, public domain (Daniel Hepper); the BIOS font handed to the guest |
+| `font4x8.h` | 4x8 1-bit CP437, generated — Everex letters + hand-drawn line art; what `text_render` draws |
+| `font4x8aa.h` | 4x8 2-bit CP437, generated — the anti-aliased table, linked only when `X86_TEXT_AA=1` |
 
 ## Harnesses (`tests/`)
 
@@ -246,7 +290,11 @@ python3 tests/test_game.py
 python3 tests/test_dos.py                # MCB arena, walked from the host
 python3 tests/test_video.py              # CGA mode 4 blitter, pixel-exact
 python3 tests/test_text.py               # CGA text mode 3, pixel-exact:
-                                         # CP437, attributes, pan, scroll
+                                         # CP437 at 4x8 and 8x8, attributes,
+                                         # all 80 columns, scroll, line-art
+                                         # continuity, the 32-entry CLUT, and
+                                         # BOTH renderers with their per-frame
+                                         # palette allocation
 python3 tests/test_screen.py             # what the LTDC actually scans out,
                                          # reconstructed to build/artifacts/screen.png
                                          # (checks whichever mode the core is
@@ -303,7 +351,7 @@ Importable support only — no CLIs.
 | `dosimage.py` | FAT12 reader + MZ loader that mirrors `x86_dos_exec`, so a reference emulator starts from OUR entry state |
 | `refx86.py` | Unicorn run of that image, sampled like the target's own sampler |
 | `refdos.py` | A minimal DOS/BIOS for the reference, so it can run PAST the first INT 21h and say what the program should do. Deliberately not modelled on our x86_dos.c -- mirroring it would make the two agree on the same mistake. It has no port I/O, so it cannot follow a program that times against the CGA retrace |
-| `textmode.py` | Host-side model of the CGA text renderer: CP437 font load, the 80x25 -> palette-index render including the 40-column window, AH=06 scrolling, and a readable CP437 dump. Shared by `test_text.py` (seeded pattern) and `test_screen.py` (the live guest) |
+| `textmode.py` | Host-side model of the CGA text renderer: CP437 font load (4x8 by default, the table the renderer uses), the 80x25 -> palette-index render at 4x8 cells, AH=06 scrolling, and a readable CP437 dump. Shared by `test_text.py` (seeded pattern) and `test_screen.py` (the live guest) |
 | `verify.py` | Symbol-region checks and ELF-vs-target section comparison |
 | `builder.py`, `runner.py` | Tier-1 build convenience |
 
@@ -318,3 +366,46 @@ Importable support only — no CLIs.
 Detail lives with the code: each module's docstring, plus
 [`docs/04`](docs/04_retro_go_and_gwemu.md) (gwemu/retro-go traps) and
 [`docs/06`](docs/06_gwemu_determinism.md) (determinism data).
+
+## Anti-aliased text, and the CLUT budget it lives in
+
+`lcd_set_clut(clut, count)` clamps `count` to 32 and then writes a 40%-darkened
+twin of entry `i` at `count + i`. Retro-go's overlay reaches those twins by
+OR-ing `LCD_DARKEN_BIT = 0x20` — a FIXED +32 — into every framebuffer byte, so
+the two only agree when `count` is exactly 32. Indices 64-67 are the overlay's
+own theme (`LCD_OVERLAY_CLUT_BASE`), and the firmware cache is 68 entries.
+
+**So the budget is 32 entries, not 64.** 32-63 are not free; they are the twins.
+The core published 16, which put the twins at 16-31 while the overlay read
+32-47 — zeros — so opening retro-go's menu dimmed the game to solid black. It
+publishes 32 now, in every mode.
+
+Anti-aliasing spends that budget as eight four-entry blocks, allocated **per
+frame** to the (fg,bg) pairs the 2,000 cells actually use, ranked by cell count;
+pairs that miss out degrade to bilevel in the nearest published colour.
+Measured with `screenshot.py --pairs`, TOPBENCH's menu uses exactly 8 — a fit
+with nothing to spare — and its boot console uses 1.
+
+```bash
+make sdcard X86_TEXT_AA=1      # capture-only core: AA on, bilevel table dropped
+```
+
+It is **off by default**, and the reason is size, not quality:
+
+> RAM_EMU spans `0x2404B000`-`0x24100000` (741,376 B). The shipping core ends at
+> `__CORE_BSS_END__ = 0x24056620`, leaving 694,752 B, and the guest asks for
+> 32 KB VRAM + 640 KB RAM + a 4 KB filler = 692,224 B. **Headroom: 2,528 bytes.**
+> The AA core ends at `0x24056FD8` — 40 bytes spare.
+
+Each narrow table is 2 KB, so an AA core must drop the bilevel one to pay for
+it (`X86_TEXT_BILEVEL_FONT=0`, set automatically) and degrades by thresholding
+the 2-bit glyph instead. The bare-metal harness has no such limit and links
+both, which is how `test_text.py` checks each renderer against its own font.
+
+**The trap this hid behind:** the firmware's RAM allocator does not refuse the
+over-allocation. It returns a pointer past the end of the region, `core_ready`
+stays 1, and the only symptom is `X86_EXIT_MEM_FAULT` in the GUEST about a
+second in — which reads as a CPU or DOS bug and is neither. Adding 2,624 bytes
+of dead `const` data, or 3 KB of BSS, to an otherwise untouched tree reproduces
+it exactly. If a change to the core makes a previously working guest fault
+early, check `__CORE_BSS_END__` before anything else.

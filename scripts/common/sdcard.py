@@ -79,9 +79,14 @@ class HardwareProbeSDCardManager(SDCardManager):
         self.gnw = gnw_instance
 
     def push_file(self, local_path, remote_path):
-        print(f"[SD probe] {local_path} -> {remote_path}")
+        # gnwmanager rejects a relative path outright ("path shall start with
+        # '/'"), while the image and mount managers want one relative to the
+        # card root. compose() speaks the relative form, so anchor it here
+        # rather than making every caller know which manager it holds.
+        remote = remote_path if remote_path.startswith("/") else "/" + remote_path
+        print(f"[SD probe] {local_path} -> {remote}")
         with open(local_path, "rb") as f:
-            self.gnw.sd_write_file(remote_path, f.read())
+            self.gnw.sd_write_file(remote, f.read())
 
     def mkdir(self, remote_path):
         # gnwmanager creates parents on write; nothing to do.

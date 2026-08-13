@@ -76,6 +76,19 @@ class Image:
     sdcard: str = ""
     elf: str = ""            # for symbol lookup
     intflash_bank: int = 1   # which bank the firmware was LINKED for
+    intflash: str = ""       # HARDWARE image; see hw_primary
+
+    @property
+    def hw_primary(self):
+        """The image to write to a real device's internal flash.
+
+        NOT the same file as `primary`. The build emits
+        gw_retro_go_intflash.bin for silicon and qemu_bank{1,2}.bin for gwemu;
+        the qemu banks are PADDED OUT to a full 256 KB bank so the emulator can
+        map them. Flashing the padded twin writes 35 KB of padding over the
+        rest of the bank, and is not what a working hardware flash does.
+        """
+        return self.intflash or self.primary
 
     @property
     def primary(self):
@@ -319,22 +332,38 @@ class GwemuTarget(Target):
 class HardwareTarget(Target):
     """Boot an Image on the real device over a debug probe."""
 
-    def __init__(self, image, physical_sdcard=None):
+    def __init__(self, image, physical_sdcard=None, no_flash=False):
         super().__init__(image)
         self.physical_sdcard = physical_sdcard
+        self.no_flash = no_flash
         self.gnw = None
 
     def start(self):
         print("Attaching to hardware via OpenOCD...")
         self.backend = OpenOCDBackend()
         self.backend.open()
+
+        # OBSERVE-ONLY: attach without disturbing what is running.
+        #
+        # gnw.start_gnwmanager() is NOT a passive handshake -- it does
+        # reset_and_halt(), loads gnwmanager's own firmware into RAM and jumps
+        # to it, i.e. it destroys the running application. It is needed only to
+        # flash and to reach the SD card; reading memory, registers, the LTDC
+        # registers and the framebuffer needs nothing but an attached probe.
+        # Starting it unconditionally is why reading a benchmark's result used
+        # to restart the benchmark.
+        if getattr(self, "no_flash", False):
+            print("--no-flash: observing the device WITHOUT reset "
+                  "(no gnwmanager, no flash, no SD)")
+            return
+
         self.gnw = GnW(self.backend)
         self.gnw.start_gnwmanager()
 
         # Flash the bank the image was LINKED for. A bank-2 firmware written to
         # bank 1 boots nothing, and this used to be hardcoded to bank 1.
         bank = self.image.intflash_bank
-        src = self.image.primary
+        src = self.image.hw_primary
         print(f"Flashing {src} to internal flash bank {bank}...")
         with open(src, "rb") as fh:
             self.gnw.flash(bank, 0, fh.read())
@@ -343,7 +372,23 @@ class HardwareTarget(Target):
                        if self.physical_sdcard
                        else HardwareProbeSDCardManager(self.gnw))
 
+        self._start_firmware()
+
+    def _start_firmware(self):
+        """Boot the flashed firmware, the way `gnwmanager start` does it.
+
+        A plain reset_and_halt()+resume() is NOT enough once gnwmanager's stub
+        has been loaded, and that is what this used to do: it resumed into
+        whatever state the stub left rather than into the firmware, so the
+        device sat there not booting after a flash that had actually written
+        the right bytes. gnwmanager's own `start` subcommand is explicit about
+        it ("Do NOT start gnwmanager") -- it reloads MSP and PC from the
+        target bank's vector table before resuming.
+        """
+        base = 0x08100000 if self.image.intflash_bank == 2 else 0x08000000
         self.gnw.reset_and_halt()
+        self.backend.write_register("msp", self.gnw.read_uint32(base))
+        self.backend.write_register("pc", self.gnw.read_uint32(base + 4))
         self.backend.resume()
 
     def stop(self):
@@ -370,6 +415,9 @@ def add_target_args(parser):
                         help="input timeline to replay under gwemu")
     parser.add_argument("--physical-sdcard", default=None,
                         help="mounted SD path for bulk hardware copies")
+    parser.add_argument("--no-flash", action="store_true",
+                        help="attach to hardware WITHOUT flashing or resetting "
+                             "-- observe what is already running")
     parser.add_argument("--keep-temp", action="store_true",
                         help="keep the run directory under build/run/ for "
                              "analysis (deleted by default -- each run copies "
@@ -379,7 +427,8 @@ def add_target_args(parser):
 def open_target(args, image):
     """Build the Target an argparse namespace asks for."""
     if getattr(args, "target", "gwemu") == "hardware":
-        return HardwareTarget(image, physical_sdcard=args.physical_sdcard)
+        return HardwareTarget(image, physical_sdcard=args.physical_sdcard,
+                              no_flash=getattr(args, "no_flash", False))
     return GwemuTarget(image, display=getattr(args, "gui", False),
                        audio=getattr(args, "audio", False),
                        icount=getattr(args, "icount", None),

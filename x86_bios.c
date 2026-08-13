@@ -217,6 +217,24 @@ int x86_bios_video(uint8_t func)
     case 0x01:                      /* set cursor shape: nothing to model */
     case 0x05:                      /* set active page: single page only */
         return 1;
+    /*
+     * The EGA/VGA detection cascade. Neither of these exists on a CGA BIOS,
+     * where the vector simply IRETs -- and answering them that way is not
+     * pedantry, it is the difference between a program deciding "no EGA" and a
+     * program walking off a pointer. Leaving AH=12h unanswered is what stopped
+     * TOPBENCH one second into its run: its detection unit called it, got no
+     * answer, kept whatever ES:DI it had, read through it and took a memory
+     * fault on an unmapped page. Exactly the shape AH=11h above was fixed for.
+     */
+    case 0x12:
+        /* AH=12h/BL=10h asks for EGA configuration; a machine without EGA
+           returns BL UNCHANGED, which is precisely "do nothing". */
+        return 1;
+    case 0x1A:
+        /* AH=1Ah is VGA's display-combination call. It reports support by
+           returning AL=1Ah, so AL=0 is the documented "not supported". */
+        x86_set_al(0);
+        return 1;
     default:
         x86_hle_unhandled_vector = 0x10;
         x86_hle_unhandled_func = func;

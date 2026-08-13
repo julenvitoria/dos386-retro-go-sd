@@ -72,7 +72,8 @@ def main():
         image = Image(bank1=os.path.join(fw, "qemu_bank1.bin"),
                       bank2=os.path.join(fw, "qemu_bank2.bin"),
                       extflash=os.path.join(fw, "extflash.bin"),
-                      sdcard=args.sd, elf=elf, intflash_bank=1)
+                      sdcard=args.sd, elf=elf, intflash_bank=1,
+                      intflash=os.path.join(fw, "gw_retro_go_intflash.bin"))
         if args.timeline is None:
             args.timeline = "timelines/start-preselected-game.tl"
         fw_elf = os.path.join(fw, "gw_retro_go.elf")

@@ -144,10 +144,12 @@ def main(args):
         fw_syms = get_symbols(image.elf)
         clut_sym = fw_syms.get("active_clut")
         if clut_sym:
-            clut = [b.read_uint32(clut_sym + 4 * i) for i in range(16)]
+            clut = [b.read_uint32(clut_sym + 4 * i)
+                    for i in range(textmode.TEXT_CLUT_ENTRIES)]
             src = "firmware active_clut"
         else:
-            clut = [b.read_uint32(core["core_clut"] + 4 * i) for i in range(16)]
+            clut = [b.read_uint32(core["core_clut"] + 4 * i)
+                    for i in range(textmode.TEXT_CLUT_ENTRIES)]
             src = "core copy (firmware symbol not found)"
         print(f"  CLUT via {src}: " + " ".join(f"0x{c:08x}" for c in clut[:8]))
 
@@ -159,18 +161,24 @@ def main(args):
         is_text = mode in (0x00, 0x01, 0x02, 0x03)
         print(f"  video mode 0x{mode:02x} ({'text' if is_text else 'graphics'})")
 
-        if is_text:
+        # Absent from a core built without the anti-aliased renderer at all;
+        # that is itself the answer, so do not make it an error.
+        aa_sym = core.get("x86_text_aa")
+        aa = b.read_memory(aa_sym, 1)[0] if (is_text and aa_sym) else 0
+        if is_text and not aa:
             # Text attributes index the whole 16-colour CGA palette, so all 16
             # entries must have reached the firmware -- pushing only the four
             # mode 4 needs left every bright attribute drawing in a stale
-            # colour from retro-go's menu.
-            if clut != textmode.CGA_ARGB:
+            # colour from retro-go's menu. Under the anti-aliased renderer the
+            # 32 entries are eight per-frame (fg,bg) blocks instead, and the
+            # expectation is computed from the guest's own buffer below.
+            if clut != textmode.CGA_ARGB * 2:
                 print("FAIL: text mode but the CLUT is not the 16 CGA colours")
-                for i, (g, w) in enumerate(zip(clut, textmode.CGA_ARGB)):
+                for i, (g, w) in enumerate(zip(clut, textmode.CGA_ARGB * 2)):
                     if g != w:
                         print(f"  entry {i}: 0x{g:08x} expected 0x{w:08x}")
                 return False
-        else:
+        elif not is_text:
             want_clut = [0xFF000000, 0xFF55FFFF, 0xFFFF55FF, 0xFFFFFFFF]
             if clut[:4] != want_clut:
                 print("FAIL: CLUT is not the CGA palette the guest selected; "
@@ -199,8 +207,20 @@ def main(args):
             b.resume()
             for r, line in textmode.dump(cells):
                 print(f"  {r:2d} |{line}|")
+            font_aa = textmode.load_font("font4x8aa.h") if aa else None
+            if aa:
+                want_clut = textmode.alloc_palette(cells, font_aa)[2]
+                if clut != want_clut:
+                    print("FAIL: the per-frame anti-aliased palette on the "
+                          "target is not the one this buffer implies")
+                    for i, (g, w) in enumerate(zip(clut, want_clut)):
+                        if g != w:
+                            print(f"  entry {i}: 0x{g:08x} expected 0x{w:08x}")
+                    return False
+                print(f"  AA palette: {len(textmode.alloc_palette(cells, font_aa)[4])}"
+                      f" (fg,bg) blocks, exact")
             want = textmode.render(cells, textmode.load_font(), 0,
-                                   SCREEN_W, SCREEN_H)
+                                   SCREEN_W, SCREEN_H, font_aa=font_aa)
         else:
             b.resume()
             want = expected_indices()

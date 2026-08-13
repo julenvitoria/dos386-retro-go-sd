@@ -24,6 +24,10 @@ SDK_INC = $(SDK)/include
 # submodule) and our own headers, which is what keeps it a clean, isolated
 # measurement tier.
 CFLAGS += -DIS_LITTLE_ENDIAN -Ilib/FatFs
+# The bare-metal harness is NOT constrained by RAM_EMU -- it is its own image --
+# so it always builds the anti-aliased text path, and tests/test_text.py checks
+# both renderers. The packed core defaults it OFF; see Makefile.core.
+CFLAGS += -DX86_TEXT_AA=1
 
 LDFLAGS = -mcpu=cortex-m7 -mthumb -T STM32H7B0VBTx_SDCARD.ld -Wl,--gc-sections --specs=nosys.specs
 

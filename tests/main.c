@@ -78,9 +78,11 @@ volatile uint32_t run_video_flag = 0;
 volatile uint32_t video_blit_cycles = 0;
 uint8_t cga_test_vram[X86_VRAM_BYTES];
 uint8_t cga_test_out[320 * 240];
-/* 32-bit ARGB entries, matching lcd_set_clut(). Sized 16 so a palette
-   change can never write past it. */
-uint32_t cga_test_palette[16];
+/* 32-bit ARGB entries, matching lcd_set_clut(). */
+uint32_t cga_test_palette[32];   /* X86_TEXT_CLUT_ENTRIES: 32 is what the
+                                    firmware needs for its darkened twins to
+                                    line up with LCD_DARKEN_BIT, and what the
+                                    anti-aliased text path allocates from */
 /* Text-mode arms. run_video_flag 4 selects a mode (so the host can put the
    renderer into mode 3 and get the CLUT reloaded), 5 runs a scroll. The cell
    pattern itself is written straight into cga_test_vram, which IS the text

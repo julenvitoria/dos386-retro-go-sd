@@ -19,15 +19,27 @@ What it pins down:
   * attributes -- all 16 foregrounds, all 8 backgrounds, and the blink bit,
     which must be masked out of the background rather than selecting colours
     8-15.
-  * the 40-column window, at both ends of the 80-column buffer.
+  * the full-width window: all 80 columns must reach the panel. At an 8 px cell
+    only 40 did, which sliced a centred DOS UI in half; the cell is 4 px now
+    and 80 x 4 is exactly the 320 px panel.
   * INT 10h AH=06 scrolling, checked on the buffer itself.
   * the text-mode CLUT, which must hold all 16 CGA colours (mode 4 needs only
-    four, and the text branch is a separate path that can rot unnoticed).
+    four, and the text branch is a separate path that can rot unnoticed) --
+    and must publish 32 entries, because retro-go's overlay reaches a darkened
+    twin by OR-ing a FIXED +32 into the pixel byte and lcd_set_clut() only puts
+    the twins there when count is exactly 32.
+  * BOTH narrow font paths, selected through `x86_text_aa`: the 1-bit Everex
+    table, and the anti-aliased one whose per-frame allocation of four-entry
+    CLUT blocks to the (fg,bg) pairs actually on screen is the whole reason
+    anti-aliasing fits at all. The seeded pattern uses far more than the eight
+    pairs the budget buys, so it exercises the degradation path too -- which is
+    where a renderer would otherwise silently draw in the wrong colours.
 
-The font is read out of `font8x8.h` for the pixel comparison -- the point of
+The font is read out of `font4x8.h` for the pixel comparison -- the point of
 that comparison is layout, not glyph art -- but a handful of well-known CP437
-shapes are asserted against hard-coded bitmaps as well, so a font that is the
-wrong size, wrong encoding or wrong bit order cannot pass.
+shapes are asserted against hard-coded bitmaps in BOTH tables, so a font that
+is the wrong size, wrong encoding or wrong bit order cannot pass, and neither
+can a 4x8 table that has drifted from the 8x8 one it is condensed from.
 """
 import sys
 import time
@@ -59,20 +71,58 @@ KNOWN = {
            "...#####", "...#....", "...#....", "...#...."],   # top-left corner
 }
 
+# The same characters in the 4-wide table the renderer draws from. These are
+# hand-drawn in the generator on a fixed grid -- vertical rule at column 1,
+# single horizontal at row 4 -- and that grid is the whole point: a rule that
+# stopped short of a cell edge draws every frame on the screen dashed, and a
+# rule that moved column between glyphs leaves every corner disconnected.
+KNOWN4 = {
+    0xC4: ["....", "....", "....", "....", "####", "....", "....", "...."],
+    0xB3: [".#..", ".#..", ".#..", ".#..", ".#..", ".#..", ".#..", ".#.."],
+    0xDB: ["####", "####", "####", "####", "####", "####", "####", "####"],
+    0xB0: ["#.#.", "....", ".#.#", "....", "#.#.", "....", ".#.#", "...."],
+    0xDA: ["....", "....", "....", "....", ".###", ".#..", ".#..", ".#.."],
+}
 
-def check_font(font):
+
+def check_font(font, known=KNOWN4, name="font4x8.h", width=4):
     if len(font) != 256:
-        print(f"FAIL: font8x8.h has {len(font)} glyphs, need 256 (CP437). "
+        print(f"FAIL: {name} has {len(font)} glyphs, need 256 (CP437). "
               f"A 128-entry font forces the renderer to mask the character "
               f"byte, so every box-drawing and shading code draws a letter.")
         return False
     ok = True
-    for code, art in KNOWN.items():
+    for code, art in known.items():
+        assert all(len(r) == width for r in art), code
         want = [sum(1 << i for i, c in enumerate(r) if c == "#") for r in art]
         if font[code] != want:
-            print(f"FAIL: glyph 0x{code:02X} is "
+            print(f"FAIL: {name} glyph 0x{code:02X} is "
                   f"{[hex(v) for v in font[code]]}, expected "
                   f"{[hex(v) for v in want]}")
+            ok = False
+    return ok
+
+
+def check_lineart(font4):
+    """Frames must be continuous. A horizontal rule has to reach BOTH cell
+    edges and a vertical rule has to occupy the same column in every glyph that
+    contains one, or a box drawn out of these codes comes out dashed and its
+    corners miss. Checked over the whole line-drawing range rather than the
+    five samples above, because it is a property of the set, not of a glyph."""
+    ok = True
+    horiz = {0xC4, 0xC5, 0xC1, 0xC2, 0xCD, 0xCE, 0xCA, 0xCB, 0xD7, 0xD8}
+    for code in horiz:
+        rows = font4[code]
+        if not any(r == 0x0F for r in rows):
+            print(f"FAIL: 0x{code:02X} has no rule spanning all 4 columns, so "
+                  f"a horizontal run drawn with it comes out dashed")
+            ok = False
+    vert = {0xB3, 0xBA, 0xC3, 0xB4, 0xC5, 0xCE, 0xCC, 0xB9, 0xD7, 0xD8}
+    for code in vert:
+        rows = font4[code]
+        if sum(1 for r in rows if r & 0x02) < 6:
+            print(f"FAIL: 0x{code:02X} does not carry a vertical rule at "
+                  f"column 1 through the cell")
             ok = False
     return ok
 
@@ -116,9 +166,17 @@ def compare(got, want, label):
 
 def main(args):
     font = textmode.load_font()
-    if not check_font(font):
+    font8 = textmode.load_font("font8x8.h")
+    font_aa = textmode.load_font("font4x8aa.h")
+    if not check_font(font) or not check_font(font8, KNOWN, "font8x8.h", 8):
         return False
-    print(f"font: {len(font)} CP437 glyphs, known shapes exact")
+    if len(font_aa) != 256:
+        print(f"FAIL: font4x8aa.h has {len(font_aa)} glyphs, need 256")
+        return False
+    if not check_lineart(font):
+        return False
+    print(f"font: {len(font)} CP437 glyphs at 4x8 (renderer), 4x8 AA and 8x8 "
+          f"(BIOS); known shapes exact, line art continuous")
 
     runner = build_and_create_runner(args)
     try:
@@ -127,7 +185,7 @@ def main(args):
         syms = get_symbols(getattr(args, "elf", None) or "test_core.elf")
         for n in ("run_video_flag", "cga_test_vram", "cga_test_out",
                   "cga_test_palette", "text_mode_arg", "text_scroll_arg",
-                  "x86_video_pan"):
+                  "x86_video_pan", "x86_text_aa"):
             if n not in syms:
                 print(f"missing symbol {n}")
                 return False
@@ -144,31 +202,61 @@ def main(args):
         if not wait_flag(b, syms["run_video_flag"], 0, "mode 3 not selected"):
             return False
 
+        # 32 entries, the 16 CGA colours written twice. Not decoration: the
+        # firmware puts a darkened twin of entry i at `count + i`, while the
+        # overlay finds it by OR-ing a fixed +32, so anything short of 32
+        # leaves retro-go's menu dimming the screen to solid black.
         clut = [b.read_uint32(syms["cga_test_palette"] + 4 * i)
-                for i in range(16)]
-        if clut != CGA_ARGB:
-            print("FAIL: text-mode CLUT is not the 16 CGA colours")
-            for i, (g, w) in enumerate(zip(clut, CGA_ARGB)):
+                for i in range(textmode.TEXT_CLUT_ENTRIES)]
+        want_clut = CGA_ARGB * (textmode.TEXT_CLUT_ENTRIES // 16)
+        if clut != want_clut:
+            print("FAIL: text-mode CLUT is not the 16 CGA colours, twice")
+            for i, (g, w) in enumerate(zip(clut, want_clut)):
                 if g != w:
                     print(f"  entry {i}: {g:08x} expected {w:08x}")
             return False
-        print("CLUT: 16 CGA colours exact")
+        print(f"CLUT: {len(clut)} entries, 16 CGA colours twice, exact")
 
         cells = make_cells()
         ok = True
-        for left in (0, TEXT_COLS - VIS_COLS):
-            b.write_memory(syms["cga_test_vram"], cells)
-            b.write_uint32(syms["x86_video_pan"], left)
-            b.write_uint32(syms["run_video_flag"], 3)
-            if not wait_flag(b, syms["run_video_flag"], 0, "blit stalled"):
-                return False
-            got = bytes(b.read_memory(syms["cga_test_out"], FB_STRIDE * 240))
-            if compare(got, textmode.render(cells, font, left),
-                       f"pan={left}"):
-                print(f"PASS: pan={left}: "
-                      f"{VIS_COLS * TEXT_ROWS} cells pixel-exact")
-            else:
-                ok = False
+        # Both a pinned window and an out-of-range one: with 80 visible columns
+        # every value must clamp to 0 and render the whole screen. A renderer
+        # that still windowed would fail the second.
+        for aa in (0, 1):
+            b.write_uint32(syms["x86_text_aa"], aa)
+            for left in (0, 40):
+                b.write_memory(syms["cga_test_vram"], cells)
+                b.write_uint32(syms["x86_video_pan"], left)
+                b.write_uint32(syms["run_video_flag"], 3)
+                if not wait_flag(b, syms["run_video_flag"], 0, "blit stalled"):
+                    return False
+                got = bytes(b.read_memory(syms["cga_test_out"],
+                                          FB_STRIDE * 240))
+                want = textmode.render(cells, font, left,
+                                       font_aa=font_aa if aa else None)
+                label = "AA" if aa else "bilevel"
+                if compare(got, want, f"{label} pan={left}"):
+                    print(f"PASS: {label} pan={left}: "
+                          f"{VIS_COLS * TEXT_ROWS} cells pixel-exact")
+                else:
+                    ok = False
+            if aa:
+                # The per-frame allocation IS the feature; check the palette it
+                # published, not just that the indices are self-consistent.
+                _b, _f, want_clut, _lb, keys = textmode.alloc_palette(
+                    cells, font_aa)
+                got_clut = [b.read_uint32(syms["cga_test_palette"] + 4 * i)
+                            for i in range(textmode.TEXT_CLUT_ENTRIES)]
+                if got_clut == want_clut:
+                    print(f"PASS: AA palette: {len(keys)} (fg,bg) pairs got a "
+                          f"4-entry block, all 32 entries exact")
+                else:
+                    print("FAIL: AA palette mismatch")
+                    for i, (g, w) in enumerate(zip(got_clut, want_clut)):
+                        if g != w:
+                            print(f"  entry {i}: {g:08x} expected {w:08x}")
+                    ok = False
+        b.write_uint32(syms["x86_text_aa"], 1)
 
         # Scrolling, checked on the buffer rather than the picture: it is a
         # memmove plus a fill and the picture would only obscure which.

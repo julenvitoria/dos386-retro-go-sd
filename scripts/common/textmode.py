@@ -14,8 +14,8 @@ Used by `tests/test_text.py` (tier 1, against a seeded pattern) and
 import re
 
 TEXT_COLS, TEXT_ROWS = 80, 25
-VIS_COLS = 40                   # 320 px panel / 8 px cell
-CELL_W = CELL_H = 8
+VIS_COLS = 80                   # 320 px panel / 4 px cell -- the whole screen
+CELL_W, CELL_H = 4, 8
 CGA_HEIGHT = 200
 
 # The 16 CGA colours in hardware index order, ARGB8888. Text attributes index
@@ -29,23 +29,112 @@ CGA_ARGB = [
 ]
 
 
-def load_font(path="font8x8.h"):
-    """The generated CP437 table: 256 glyphs of 8 rows, leftmost pixel bit 0."""
+TEXT_CLUT_ENTRIES = 32          # X86_TEXT_CLUT_ENTRIES
+AA_LEVELS = 4
+AA_BLOCKS = TEXT_CLUT_ENTRIES // AA_LEVELS
+AA_NONE = 0xFF
+
+
+def load_font(path="font4x8.h"):
+    """The generated CP437 table: 256 glyphs of 8 rows, leftmost pixel bit 0.
+
+    Defaults to the 4-wide table, which is what `text_render` draws from: 80
+    columns of 8 px would be 640, so an 8x8 cell showed only half the screen.
+    Pass `font8x8.h` for the 8-wide table the BIOS hands to the guest.
+    """
     txt = open(path).read()
     rows = [[int(v, 16) for v in re.findall(r"0x([0-9A-Fa-f]{2})", body)]
             for body in re.findall(r"\{([^}]*)\}", txt)]
     return [r for r in rows if len(r) == 8]
 
 
-def render(cells, font, left, stride=320, height=240):
+def _trunc(a, b):
+    """C's integer division: truncate towards zero, not Python's floor."""
+    return -(-a // b) if (a < 0) != (b < 0) else a // b
+
+
+def glyph_flat(font_aa):
+    """Which glyphs paint a single flat colour -- space, NUL, a solid block.
+
+    They need no intermediate levels, so `text_alloc_palette` excludes them
+    from the ranking; counting them would spend blocks on pairs that cannot
+    use one.
+    """
+    return [all(r == g[0] for r in g) and g[0] in (0x00, 0xFF) for g in font_aa]
+
+
+def alloc_palette(cells, font_aa):
+    """Model of `text_alloc_palette`: rank the (fg,bg) pairs a frame uses and
+    give the top eight a four-entry CLUT block each.
+
+    Returns `(base, flat, clut, letterbox, keys)`. Every tie-break here matches
+    the C deliberately -- the ranking scans keys ascending with a strict `>`,
+    so the lowest key wins a tie, and a model that disagreed would report a
+    palette bug on every screen with two equally common attributes.
+    """
+    flat_glyph = glyph_flat(font_aa)
+    count = [0] * 128
+    for i in range(TEXT_COLS * TEXT_ROWS):
+        ch, attr = cells[i * 2], cells[i * 2 + 1]
+        fg, bg = attr & 0x0F, (attr >> 4) & 0x07
+        if fg == bg or flat_glyph[ch]:
+            continue
+        count[(bg << 4) | fg] += 1
+
+    keys = []
+    for _ in range(AA_BLOCKS):
+        best = max(count)
+        if best == 0:
+            break
+        keys.append(count.index(best))
+        count[keys[-1]] = 0
+
+    base = [AA_NONE] * 128
+    clut = [0] * TEXT_CLUT_ENTRIES
+    for b, k in enumerate(keys):
+        base[k] = b * AA_LEVELS
+        f, g = CGA_ARGB[k & 15], CGA_ARGB[(k >> 4) & 7]
+        for lv in range(AA_LEVELS):
+            v = 0xFF000000
+            for s in (0, 8, 16):
+                a, z = (g >> s) & 0xFF, (f >> s) & 0xFF
+                v |= (a + _trunc((z - a) * lv, AA_LEVELS - 1)) << s
+            clut[b * AA_LEVELS + lv] = v
+
+    n = len(keys) * AA_LEVELS
+    flat = []
+    for c in range(16):
+        best, besti = None, 0
+        for e in range(n):
+            d = sum((((clut[e] >> s) & 0xFF) - ((CGA_ARGB[c] >> s) & 0xFF)) ** 2
+                    for s in (0, 8, 16))
+            if best is None or d < best:
+                best, besti = d, e
+        flat.append(besti)
+    for e in range(n, TEXT_CLUT_ENTRIES):
+        clut[e] = CGA_ARGB[0]
+    return base, flat, clut, (flat[0] if keys else 0), keys
+
+
+def render(cells, font, left, stride=320, height=240, font_aa=None):
     """The 8-bit palette-index image `text_render` should produce.
 
-    `left` is the leftmost visible column: only 40 of the 80 columns fit a
-    320 px panel, and the window slides. The picture is centred vertically in
-    the panel, so there is a blank band above and below.
+    `left` is the leftmost visible column. All 80 fit now, so it is clamped to
+    0; the argument survives because the window machinery does. The picture is
+    centred vertically in the panel, so there is a blank band above and below.
+
+    Pass `font_aa` (the 2-bits-per-pixel table) to model the ANTI-ALIASED path:
+    pairs that won a CLUT block are drawn as levels offset by the block base,
+    and everything else degrades to bilevel in the nearest published colour.
     """
+    left = min(left, TEXT_COLS - VIS_COLS)
     top = ((height - CGA_HEIGHT) // 2) * stride
-    img = bytearray(stride * height)
+    if font_aa is None:
+        base = flat = None
+        clear = 0
+    else:
+        base, flat, _clut, clear, _k = alloc_palette(cells, font_aa)
+    img = bytearray([clear]) * (stride * height)
     for r in range(TEXT_ROWS):
         for vc in range(VIS_COLS):
             col = left + vc
@@ -56,12 +145,20 @@ def render(cells, font, left, stride=320, height=240):
                 ch, attr = cells[o], cells[o + 1]
             fg = attr & 0x0F
             bg = (attr >> 4) & 0x07         # bit 7 is blink, not a colour
-            glyph = font[ch]
+            blk = base[(bg << 4) | fg] if base else AA_NONE
             for gy in range(CELL_H):
-                bits = glyph[gy]
-                base = top + (r * CELL_H + gy) * stride + vc * CELL_W
-                for gx in range(CELL_W):
-                    img[base + gx] = fg if bits & (1 << gx) else bg
+                o = top + (r * CELL_H + gy) * stride + vc * CELL_W
+                if blk != AA_NONE:
+                    bits = font_aa[ch][gy]
+                    for gx in range(CELL_W):
+                        img[o + gx] = blk + ((bits >> (2 * gx)) & 3)
+                else:
+                    bits = font[ch][gy]
+                    f = flat[fg] if flat else fg
+                    g = flat[bg] if flat else bg
+                    for gx in range(CELL_W):
+                        img[o + gx] = f if bits & (1 << gx) else g
+    # The 20-row bands above and below the 200-row picture are already `clear`.
     return bytes(img)
 
 

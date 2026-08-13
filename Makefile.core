@@ -40,7 +40,22 @@ CORE_C_INCLUDES := -I. -Ilib/FatFs
 # Match the template's release-firmware layout. COVERFLOW fields sit BEFORE
 # cheat_* in retro_emulator_file_t, so CHEAT_CODES with COVERFLOW=0 misaligns
 # pointers -- our old Makefile had exactly that combination.
+# Anti-aliased text: 2 KB for font4x8aa.h in place of font4x8.h, plus its
+# per-frame CLUT allocator. OFF by default -- see the X86_TEXT_AA comment in
+# x86_video.c for the RAM_EMU headroom measurement that makes this a choice
+# rather than a feature you simply add.
+X86_TEXT_AA ?= 0
+# An AA core must DROP the 1-bit table to pay for the 2-bit one; there is not
+# room for both. Capture builds use `make sdcard X86_TEXT_AA=1`.
+ifeq ($(X86_TEXT_AA),1)
+X86_TEXT_BILEVEL_FONT ?= 0
+else
+X86_TEXT_BILEVEL_FONT ?= 1
+endif
+
 CORE_C_DEFS := \
+-DX86_TEXT_AA=$(X86_TEXT_AA) \
+-DX86_TEXT_BILEVEL_FONT=$(X86_TEXT_BILEVEL_FONT) \
 -DPROJECT_KIND_CORE=1 \
 -DCOVERFLOW=1 \
 -DCHEAT_CODES=1 \

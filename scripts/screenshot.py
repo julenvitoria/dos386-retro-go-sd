@@ -75,6 +75,34 @@ def text_map(indices, w, h, cols=64, rows=24):
     return out
 
 
+def report_pairs(cells, cols=80, rows=25):
+    """Distinct (fg,bg) attribute pairs in an 80x25 buffer, by cell count.
+
+    Anti-aliased text spends a CONTIGUOUS block of CLUT entries per distinct
+    pair, so the budget is consumed by this number and not by the 256 pairs an
+    attribute byte can express. Cells that draw only one colour are excluded:
+    a space, a NUL and a solid block (0xDB) each paint a single flat colour, so
+    they need no intermediate levels and no block of their own -- counting them
+    overstates the requirement, which is the easy way to talk yourself out of a
+    feature that fits.
+    """
+    flat = {0x00, 0x20, 0xDB, 0xFF}
+    hist, flat_hist = {}, {}
+    for i in range(cols * rows):
+        ch, attr = cells[i * 2], cells[i * 2 + 1]
+        key = (attr & 0x0F, (attr >> 4) & 0x07)
+        if ch in flat or key[0] == key[1]:
+            flat_hist[key] = flat_hist.get(key, 0) + 1
+        else:
+            hist[key] = hist.get(key, 0) + 1
+    order = sorted(hist.items(), key=lambda kv: -kv[1])
+    print(f"distinct (fg,bg) pairs needing intermediate levels: {len(order)}"
+          f"  (flat-only cells use {len(flat_hist)} more)")
+    for (fg, bg), n in order:
+        print(f"  fg={fg:2d} bg={bg:2d}  {n:5d} cells")
+    return len(order)
+
+
 def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -86,16 +114,26 @@ def main():
     p.add_argument("--wait", type=float, default=15.0,
                    help="seconds to let the guest run before capturing")
     p.add_argument("--pan", type=int, default=None,
-                   help="pin the text window's leftmost column instead of "
-                        "letting it follow the cursor. The panel shows 40 of "
-                        "the 80 columns, so anything past column 40 -- a score "
-                        "at the end of a wide line, say -- is only visible with "
-                        "this")
+                   help="pin the text window's leftmost column. All 80 columns "
+                        "fit the panel now (4 px cells), so this clamps to 0 "
+                        "and changes nothing; kept for a future mode wider "
+                        "than the panel")
     p.add_argument("--text", action="store_true",
-                   help="also dump the 80x25 character buffer, which is much "
-                        "easier to judge than 8x8 glyphs and shows the 40 "
-                        "columns the panel cannot fit")
-    p.add_argument("--clut-entries", type=int, default=16,
+                   help="also dump the 80x25 character buffer as CP437, which "
+                        "is much easier to judge than condensed glyphs")
+    p.add_argument("--text-aa", type=int, choices=(0, 1), default=None,
+                   help="select the text renderer before capturing: 0 is the "
+                        "1-bit Everex font, 1 the anti-aliased one. Both live "
+                        "in one build so the SAME screen can be captured each "
+                        "way -- rebuilding between them would change the guest "
+                        "run as well as the font, and the comparison with it")
+    p.add_argument("--pairs", action="store_true",
+                   help="count the DISTINCT (fg,bg) attribute pairs actually "
+                        "used by the 80x25 buffer. Anti-aliased text needs a "
+                        "contiguous block of CLUT entries per pair, so this "
+                        "number -- not the 256 possible pairs -- is what "
+                        "decides whether AA fits the 32-entry budget")
+    p.add_argument("--clut-entries", type=int, default=32,
                    help="palette entries to read (4 for CGA graphics, 16 for "
                         "text mode's attribute colours)")
     args = p.parse_args()
@@ -127,9 +165,12 @@ def main():
             return 1
         print(f"core drawing; letting it run {args.wait:g}s")
         time.sleep(args.wait)
-        if args.pan is not None:
+        if args.pan is not None or args.text_aa is not None:
             b.halt()
-            b.write_uint32(core["x86_video_pan"], args.pan & 0xFFFFFFFF)
+            if args.pan is not None:
+                b.write_uint32(core["x86_video_pan"], args.pan & 0xFFFFFFFF)
+            if args.text_aa is not None:
+                b.write_memory(core["x86_text_aa"], bytes([args.text_aa]))
             b.resume()
             # Let the core draw at least one frame with the new window.
             start = b.read_uint32(core["frames_rendered"])
@@ -175,7 +216,7 @@ def main():
                 rgb[o + 1] = (argb >> 8) & 0xFF
                 rgb[o + 2] = argb & 0xFF
         size = write_png(args.out, w, h, bytes(rgb))
-        if args.text:
+        if args.text or args.pairs:
             # In text mode the framebuffer is a rendering of an 80x25 character
             # buffer; reading the characters back is far easier to judge than
             # looking at 8x8 glyphs, and it shows the 40 columns the panel
@@ -186,14 +227,17 @@ def main():
             # box-drawing and shading code behind a '.', which made a
             # perfectly good full-screen UI read as four rows of stray
             # letters on an otherwise empty screen.
-            print("text buffer (80x25), CP437, '.' = space:")
-            for r in range(25):
-                raw = bytes(cells[(r * 80 + c) * 2] for c in range(80))
-                line = "".join("." if ch == 0x20 else
-                               bytes([ch]).decode("cp437") if ch else "."
-                               for ch in raw)
-                if line.strip("."):
-                    print(f"  {r:2d} |{line}|")
+            if args.text:
+                print("text buffer (80x25), CP437, '.' = space:")
+                for r in range(25):
+                    raw = bytes(cells[(r * 80 + c) * 2] for c in range(80))
+                    line = "".join("." if ch == 0x20 else
+                                   bytes([ch]).decode("cp437") if ch else "."
+                                   for ch in raw)
+                    if line.strip("."):
+                        print(f"  {r:2d} |{line}|")
+            if args.pairs:
+                report_pairs(cells)
         nz = sum(1 for v in indices if v)
         print(f"wrote {args.out} ({w}x{h}, {size} bytes); "
               f"{nz} of {w * h} pixels non-zero")
