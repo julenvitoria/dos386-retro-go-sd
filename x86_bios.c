@@ -170,6 +170,24 @@ int x86_bios_video(uint8_t func)
         x86_video_scroll((uint8_t)((cpu_state_ptr->regs[0]) & 0xFF),
                          (uint8_t)((cpu_state_ptr->regs[3] >> 8) & 0xFF));
         return 1;
+    case 0x11:                      /* character generator */
+        /* AL=30h: return a pointer to a font. A CGA BIOS has no AH=11h at all,
+           so leaving it unanswered left ES:BP holding the caller's own garbage
+           and a program that reads through it walked into memory it does not
+           own. We do have an 8x8 font and it is mapped at F000:F000. */
+        if ((cpu_state_ptr->regs[0] & 0xFF) == 0x30) {
+            cpu_state_ptr->segs[0].sel  = 0xF000;
+            cpu_state_ptr->segs[0].base = 0xF0000u;
+            cpu_state_ptr->segs[0].limit = 0xFFFF;
+            cpu_state_ptr->regs[5] = 0xF000;        /* BP: F000:F000 */
+            x86_set_cx(8);                          /* bytes per character */
+            cpu_state_ptr->regs[2] =
+                (cpu_state_ptr->regs[2] & 0xFFFFFF00u) | 24;   /* DL = rows-1 */
+            return 1;
+        }
+        x86_hle_unhandled_vector = 0x10;
+        x86_hle_unhandled_func = func;
+        return 0;
     case 0x08:                      /* read char + attribute at cursor */
         /* Unimplemented, this returned nothing and left AX holding whatever
            the caller had -- and a program that probes the display this way

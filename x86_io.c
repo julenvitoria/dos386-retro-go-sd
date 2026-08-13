@@ -136,24 +136,38 @@ uint32_t x86_port_read(uint32_t port, uint32_t size)
         return x86_io.port61;
 
     /*
-     * CGA status (0x3DA). Games poll this to sync to the display: the usual
-     * idiom waits for vertical retrace to END and then to BEGIN, so both bits
-     * must actually change or the guest spins forever. Bit 3 is vertical
-     * retrace, bit 0 is "display disabled", which is true during either
-     * retrace.
+     * CGA status (0x3DA). A program polls this to sync to the display, and a
+     * benchmark TIMES against it -- counting how much work fits between two
+     * retraces and then dividing by the count.
      *
-     * The vertical position comes from cga_beam, which the frame loop advances,
-     * so a wait for vsync lasts about the right length of time. The horizontal
-     * bit is driven off the read counter instead: a tight poll loop makes no
-     * forward progress in emulated time otherwise, and would hang on a beam
-     * value that never moves between two reads.
+     * That is why the position has to come from the PIT counter rather than
+     * from a value the frame loop pokes. The frame loop only moves cga_beam
+     * while the guest is STOPPED, so from inside the guest the vertical
+     * retrace bit was a constant zero: a wait for vsync-begin never fired, the
+     * count came out zero, and TOPBENCH divided by it and took a #DE.
+     *
+     * The PIT slice IS the frame here, so how far the counter has run down is
+     * how far the beam has swept. Vertical retrace covers the last sixteenth,
+     * horizontal is a bit of the same counter, and neither costs a divide.
+     * Bit 3 is vertical retrace; bit 0 is "display disabled", true during
+     * either.
      */
     case 0x3DA: {
         unsigned v = 0;
+        uint32_t reload = cpu_state_ptr->pit_reload;
+        if (reload) {
+            uint32_t elapsed = reload - cpu_state_ptr->pit_counter;
+            if (elapsed >= reload - (reload >> 4))
+                return 0x08u | 0x01u;           /* vertical retrace */
+            if ((elapsed >> 6) & 1u)
+                v |= 0x01u;                     /* horizontal retrace */
+            return v;
+        }
+        /* No slice running (the bare-metal harness drives the beam directly). */
         if (x86_io.cga_beam >= 0xD000u)
-            v |= 0x08u | 0x01u;                 /* vertical retrace */
+            v |= 0x08u | 0x01u;
         else if (++x86_io.cga_status_reads & 8u)
-            v |= 0x01u;                         /* horizontal retrace */
+            v |= 0x01u;
         return v;
     }
     case 0x3D8:

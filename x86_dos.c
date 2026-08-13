@@ -543,6 +543,32 @@ int x86_dos_int21(uint8_t func)
         ok_clear_cf();
         return 1;
     }
+    case 0x44:                                  /* IOCTL */
+        /* AL=00 get device information. A program asks this about its own
+           stdout to find out whether it is talking to the console or to a
+           redirected file, and TOPBENCH asks it before deciding how to report.
+           Unanswered, it read whatever DX happened to hold and went off into
+           memory it does not own.
+           Handles 0-2 are the console: 0x80D3 is what a real DOS returns for
+           CON (character device, is-stdin, is-stdout, special). Anything else
+           is one of our FatFs handles, i.e. a file on drive A. */
+        switch ((uint8_t)(r[0] & 0xFF)) {
+        case 0x00:
+            if (bx <= 2)
+                x86_set_dx(0x80D3);
+            else if (handle_get(bx))
+                x86_set_dx(0x0000);             /* file, drive A, not a device */
+            else { fail(0x06); return 1; }
+            x86_set_ax((uint16_t)(cpu_state_ptr->regs[2] & 0xFFFF));
+            ok_clear_cf();
+            return 1;
+        case 0x01:                              /* set device information */
+            ok_clear_cf();
+            return 1;
+        default:
+            fail(0x01);                         /* invalid function */
+            return 1;
+        }
     case 0x3E: {                                /* close */
         FIL *f = handle_get(bx);
         if (!f) { fail(0x06); return 1; }

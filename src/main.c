@@ -85,6 +85,14 @@ static uint8_t *upper_filler;
 volatile uint32_t guest_ram_bytes = 0;
 volatile uint32_t guest_vram_ok = 0;
 volatile uint32_t frames_rendered = 0;
+/* The emulated machine's speed, expressed the only way the emulator can: guest
+   instructions per BIOS tick. 20,000 at 18.2 Hz is about 0.36 MIPS -- an
+   8088-class PC. Everything a guest measures about "how fast is this machine"
+   comes out of this one number. */
+#define PIT_SLICE_INSNS   200000u
+#define INSNS_PER_TICK     20000u
+#define TICKS_PER_SLICE   (PIT_SLICE_INSNS / INSNS_PER_TICK)
+
 volatile uint32_t guest_exit_reason = 0;
 volatile uint32_t guest_halted = 0;
 volatile uint32_t fb_addr = 0;        /* the buffer the blit was handed */
@@ -480,10 +488,10 @@ static void guest_reset(void)
     cpu_state_ptr->hle_enabled = 1;
 
     /* A slice of guest instructions per frame. The PIT exit is what ends a
-       slice, so this is the emulator's time base until the real 18.2 Hz tick
-       is wired to it. */
-    cpu_state_ptr->pit_reload = 200000;
-    cpu_state_ptr->pit_counter = 200000;
+       slice, so this is the emulator's time base, and TICKS_PER_SLICE turns it
+       into the 18.2 Hz BIOS tick. */
+    cpu_state_ptr->pit_reload = PIT_SLICE_INSNS;
+    cpu_state_ptr->pit_counter = PIT_SLICE_INSNS;
 }
 
 /*
@@ -557,8 +565,6 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
     guest_reset();
     guest_halted = 0;
 
-    unsigned tick_divider = 0;
-
     abi->audio_ctl(GW_AUDIO_INIT, SAMPLE_RATE);
     uint32_t audio_frames = (uint32_t)abi->audio_ctl(GW_AUDIO_GET_LENGTH, 0);
     abi->audio_ctl(GW_AUDIO_START, audio_frames);
@@ -608,19 +614,21 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
          * The BIOS tick at 0040:006C. Until now it only moved when the guest
          * executed INT 08h, and nothing generates INT 08h -- so for a program
          * that reads the counter directly, which is how essentially every DOS
-         * timing loop works, guest time stood still and the loop never ended.
-         * TOPBENCH clears the screen, starts timing, and spins forever.
+         * timing loop works, guest time stood still.
          *
-         * A frame slice is the emulator's time base (see pit_reload), so the
-         * tick is derived from frames: three panel frames per tick puts it at
-         * about 18.2 Hz, which is what the counter is defined to be. In-guest
-         * INT 08h DELIVERY is still not implemented -- a program that hooks the
-         * vector rather than reading the counter will not see it.
+         * It has to advance with GUEST time, not with panel frames. A
+         * benchmark measures a fixed amount of work against the tick and then
+         * DIVIDES by the elapsed count: too slow a clock reads as zero elapsed
+         * ticks and the program takes a divide-by-zero. Tying it to the
+         * instruction slice fixes the emulated machine at
+         * INSNS_PER_TICK * 18.2 instructions per second -- about 0.36 MIPS,
+         * i.e. an 8088-class PC, which is the era these programs expect.
+         *
+         * In-guest INT 08h DELIVERY is still not implemented, so a program
+         * that hooks the vector rather than polling the counter sees nothing.
          */
-        if (++tick_divider >= 3u) {
-            tick_divider = 0;
+        for (unsigned t = 0; t < TICKS_PER_SLICE; t++)
             x86_bios_tick();
-        }
 
         /* Video. The beam fraction drives the CGA status register, so a guest
            polling for vertical retrace sees it arrive about once per frame. */

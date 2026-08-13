@@ -18,6 +18,7 @@
 
 #include "cutils.h"
 #include "x86_cpu.h"
+#include "font8x8.h"
 
 /* Guest register accessors. The 8086 register file is 16-bit halves of the
    32-bit slots; naming them keeps the service code readable. */
@@ -87,6 +88,7 @@ void x86_hle_set_cf(int set)
 /* Where a PC keeps its ROM identification. A system tool reads these directly
    rather than asking, so they have to exist as memory. */
 #define BIOS_ROM_LIN  0xFF000u
+#define BIOS_FONT_LIN 0xFF000u   /* F000:F000 -- the 8x8 glyphs live here */
 #define BIOS_DATE_OFF 0xFF5u         /* F000:FFF5, "MM/DD/YY" */
 #define BIOS_MODEL_OFF 0xFFEu        /* F000:FFFE, model byte */
 
@@ -146,6 +148,14 @@ int x86_bios_rom_install(void)
     rom[0xFF1] = 0xF0; rom[0xFF2] = 0xFF;
     rom[0xFF3] = 0x00; rom[0xFF4] = 0xF0;
 
+    /* The 8x8 character generator. This page is F000:F000, so that is where
+       the glyphs are. INT 10h AH=11h AL=30h hands
+       a program a pointer to it, and a program that asks then READS through
+       that pointer -- so it has to be real memory with the real glyphs, not a
+       plausible-looking address. 2 KB of the page we already map. */
+    memcpy(rom, font8x8_basic, 128 * 8);
+    memset(rom + 128 * 8, 0, 128 * 8);
+
     memcpy(rom + BIOS_DATE_OFF, "01/01/90", 8);
     rom[BIOS_MODEL_OFF] = 0xFC;      /* AT-class machine */
     rom[0xFFF] = 0x00;
@@ -157,6 +167,8 @@ int x86_bios_rom_install(void)
  * X86_EXIT_HLE_INT; exit_info carries the vector number.
  */
 uint32_t x86_hle_unhandled_vector;
+uint32_t x86_hle_log[32];
+uint32_t x86_hle_log_idx;
 uint32_t x86_hle_unhandled_func;
 
 /*
@@ -177,6 +189,13 @@ static void hle_retry(void)
 
 int x86_hle_dispatch(uint8_t vector)
 {
+    /* Diagnostic: the last 32 services requested, as (vector << 8) | AH, with
+       bit 16 set once the handler reports it did not know the function. One
+       counter per vector was not enough -- what a program does when a probe
+       goes unanswered only makes sense against the whole conversation. */
+    x86_hle_log[x86_hle_log_idx & 31] = ((uint32_t)vector << 8) | AH;
+    x86_hle_log_idx++;
+
     switch (vector) {
     case 0x10:
         return x86_bios_video(AH);
@@ -210,7 +229,10 @@ uint32_t x86_hle_calls;
 int x86_hle_service(void)
 {
     uint8_t vector = (uint8_t)cpu_state_ptr->exit_info;
+    unsigned slot = x86_hle_log_idx & 31;
     int r = x86_hle_dispatch(vector);
+    if (r == 0)
+        x86_hle_log[slot] |= 0x10000u;    /* nobody answered this one */
     x86_hle_calls++;
     if (r == 2)
         hle_retry();

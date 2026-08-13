@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""
+Capture what the display controller is actually scanning out, as a PNG.
+
+gwemu's own headless screendump comes back black -- Retro-Go's menu does too,
+so those images prove nothing either way. Its LTDC registers ARE modelled,
+though, so the real picture can be recovered: read Layer 1's framebuffer
+address, pitch and line count from the controller, read that memory and the
+firmware's active CLUT, and rebuild the frame the panel receives.
+
+    # let the guest run for 20 s, then grab the screen
+    python3 scripts/screenshot.py --wait 20 --out build/artifacts/topbench.png
+
+    # the same on silicon, where the panel can also be believed
+    python3 scripts/screenshot.py --target hardware --wait 20
+
+`tests/test_screen.py` does this too, but only for the built-in CGA mode 4
+demo and only to assert one exact image. This is the general form: any mode,
+any guest, no expected image, and it prints a coarse text map of the frame so
+a black or garbage capture is obvious without opening the file.
+"""
+
+import argparse
+import os
+import struct
+import sys
+import time
+import zlib
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from scripts.common.elf import get_symbols                # noqa: E402
+from scripts.common.target import Image, add_target_args, open_target  # noqa: E402
+
+FW_DIR = "references/game-and-watch-retro-go-sd/build"
+CORE_MAGIC = 0x54494E59
+
+LTDC_BASE = 0x50001000
+LTDC_L1CR = LTDC_BASE + 0x84
+LTDC_L1PFCR = LTDC_BASE + 0x94
+LTDC_L1CFBAR = LTDC_BASE + 0xAC
+LTDC_L1CFBLR = LTDC_BASE + 0xB0
+LTDC_L1CFBLNR = LTDC_BASE + 0xB4
+
+SCREEN_W, SCREEN_H = 320, 240
+
+
+def write_png(path, w, h, rgb):
+    raw = b"".join(b"\x00" + rgb[y * w * 3:(y + 1) * w * 3] for y in range(h))
+
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, 9))
+           + chunk(b"IEND", b""))
+    open(path, "wb").write(png)
+    return len(png)
+
+
+def text_map(indices, w, h, cols=64, rows=24):
+    """A coarse map of which cells contain non-background pixels. Enough to see
+    at a glance whether the capture is black, uniform, or has structure."""
+    out = []
+    for r in range(rows):
+        line = []
+        for c in range(cols):
+            x0, x1 = c * w // cols, (c + 1) * w // cols
+            y0, y1 = r * h // rows, (r + 1) * h // rows
+            hit = any(indices[y * w + x]
+                      for y in range(y0, y1) for x in range(x0, x1))
+            line.append("#" if hit else ".")
+        out.append("".join(line))
+    return out
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_target_args(p)
+    p.add_argument("--firmware-dir", default=FW_DIR)
+    p.add_argument("--sd", default="sdcard_retrogo.img")
+    p.add_argument("--core-elf", default="build/core/dos_core.elf")
+    p.add_argument("--out", default="build/artifacts/screen.png")
+    p.add_argument("--wait", type=float, default=15.0,
+                   help="seconds to let the guest run before capturing")
+    p.add_argument("--clut-entries", type=int, default=16,
+                   help="palette entries to read (4 for CGA graphics, 16 for "
+                        "text mode's attribute colours)")
+    args = p.parse_args()
+
+    fw = args.firmware_dir
+    image = Image(bank1=os.path.join(fw, "qemu_bank1.bin"),
+                  bank2=os.path.join(fw, "qemu_bank2.bin"),
+                  extflash=os.path.join(fw, "extflash.bin"),
+                  sdcard=args.sd,
+                  elf=os.path.join(fw, "gw_retro_go.elf"),
+                  intflash_bank=1)
+    if args.timeline is None:
+        args.timeline = "timelines/start-preselected-game.tl"
+
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    target = open_target(args, image)
+    target.start()
+    try:
+        b = target.backend
+        core = get_symbols(args.core_elf)
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            if b.read_uint32(core["core_magic"]) == CORE_MAGIC and \
+                    b.read_uint32(core["frames_rendered"]) > 2:
+                break
+            time.sleep(0.25)
+        else:
+            print("core never started drawing")
+            return 1
+        print(f"core drawing; letting it run {args.wait:g}s")
+        time.sleep(args.wait)
+
+        b.halt()
+        fb = b.read_uint32(LTDC_L1CFBAR)
+        blr = b.read_uint32(LTDC_L1CFBLR)
+        lnr = b.read_uint32(LTDC_L1CFBLNR)
+        pf = b.read_uint32(LTDC_L1PFCR)
+        frames = b.read_uint32(core["frames_rendered"])
+        if fb == 0:
+            print("this target does not model the LTDC; nothing to recover")
+            return 1
+        pitch = (blr >> 16) & 0x1FFF
+        lines = lnr & 0x7FF
+        print(f"LTDC CFBAR=0x{fb:08x} pitch={pitch} lines={lines} "
+              f"fmt={pf & 7} frames={frames}")
+
+        data = bytes(b.read_memory(fb, pitch * lines))
+        fw_syms = get_symbols(image.elf)
+        sym = fw_syms.get("active_clut") or core["core_clut"]
+        clut = [b.read_uint32(sym + 4 * i) for i in range(args.clut_entries)]
+        b.resume()
+
+        print("CLUT: " + " ".join(f"{c:08x}" for c in clut))
+        w, h = min(pitch, SCREEN_W), min(lines, SCREEN_H)
+        indices = bytearray(w * h)
+        rgb = bytearray(w * h * 3)
+        for y in range(h):
+            for x in range(w):
+                idx = data[y * pitch + x]
+                indices[y * w + x] = idx
+                argb = clut[idx] if idx < len(clut) else 0
+                o = (y * w + x) * 3
+                rgb[o] = (argb >> 16) & 0xFF
+                rgb[o + 1] = (argb >> 8) & 0xFF
+                rgb[o + 2] = argb & 0xFF
+        size = write_png(args.out, w, h, bytes(rgb))
+        nz = sum(1 for v in indices if v)
+        print(f"wrote {args.out} ({w}x{h}, {size} bytes); "
+              f"{nz} of {w * h} pixels non-zero")
+        for line in text_map(indices, w, h):
+            print("  " + line)
+    finally:
+        target.stop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
