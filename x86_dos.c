@@ -342,12 +342,38 @@ int x86_dos_exec(const char *path, const char *cmdline)
     }
     image -= hdr_bytes;
 
-    /* One block for the PSP, the image and whatever the header asks to keep.
-       minalloc is a minimum, not a suggestion: a program that gets less will
-       overwrite whatever follows it. */
+    /*
+     * One block for the PSP, the image and the memory the header asks for.
+     *
+     * BOTH bounds matter. minalloc is a minimum, not a suggestion: a program
+     * that gets less overwrites whatever follows it. maxalloc is what the
+     * program actually WANTS, and honouring only the minimum is not a
+     * conservative choice -- it is a wrong one. A Borland runtime sizes its
+     * heap from the block DOS hands it, and TOPBENCH ships maxalloc=0xFFFF,
+     * i.e. "give me everything". Allocated at minalloc it started, found ~100 KB
+     * where it expected ~600 KB, and died with `Runtime error 203` (heap
+     * overflow) before printing a single result.
+     *
+     * Real DOS tries max first and falls back to the largest free block, which
+     * is why 0xFFFF is the idiom for "all of it" rather than a request that
+     * fails.
+     */
     uint16_t need = (uint16_t)(PARA(256) + PARA(image) + h.minalloc);
+    uint32_t want32 = (uint32_t)PARA(256) + PARA(image) + h.maxalloc;
+    uint16_t want = (want32 > 0xFFFFu) ? 0xFFFFu : (uint16_t)want32;
+    if (want < need)
+        want = need;
+
     uint16_t largest = 0;
-    uint16_t block = mcb_alloc(need, 0, &largest);
+    uint16_t block = mcb_alloc(want, 0, &largest);
+    uint16_t granted = want;
+    if (!block) {
+        uint16_t avail = largest;
+        if (avail >= need) {
+            block = mcb_alloc(avail, 0, &largest);
+            granted = avail;
+        }
+    }
     if (!block) {
         f_close(&f);
         x86_dos_last_error = 0x08;          /* insufficient memory */
@@ -389,7 +415,10 @@ int x86_dos_exec(const char *path, const char *cmdline)
     }
     f_close(&f);
 
-    psp_build(psp, (uint16_t)(psp + need), cmdline);
+    /* Top of memory as the program sees it: the end of what it was GRANTED,
+       not of what it minimally needed. A Borland startup compares its own top
+       against this field and refuses to run if it does not fit. */
+    psp_build(psp, (uint16_t)(psp + granted), cmdline);
 
     /* Entry state, exactly as the header specifies. */
     /* Segment arithmetic wraps at 16 bits; the base must be built from the
@@ -441,6 +470,52 @@ int x86_dos_int21(uint8_t func)
 
     case 0x02:                                  /* character output */
         x86_video_teletype((uint8_t)dx);
+        return 1;
+
+    /*
+     * The console family. AH=06h in particular: a program that wants to write
+     * without DOS interpreting control characters uses it instead of AH=02h or
+     * AH=09h, and TOPBENCH prints its entire report through it. Unanswered, it
+     * printed nothing at all and the screen stayed at 80x25 of spaces.
+     *
+     * DL=0xFF makes AH=06h an INPUT call, and it must NOT block: ZF reports
+     * whether a character was there. The genuinely blocking forms return 2,
+     * which rewinds the INT so it re-executes on the next slice -- blocking
+     * inside the service would stop the frame loop and with it the input that
+     * would satisfy it.
+     */
+    case 0x06: {                                /* direct console I/O */
+        uint16_t key;
+        if ((dx & 0xFFu) != 0xFFu) {
+            x86_video_teletype((uint8_t)dx);
+            return 1;
+        }
+        if (x86_kb_get(&key)) {
+            x86_set_al((uint8_t)key);
+            x86_hle_set_zf(0);
+        } else {
+            x86_set_al(0);
+            x86_hle_set_zf(1);
+        }
+        return 1;
+    }
+    case 0x01:                                  /* input, echoed */
+    case 0x07:                                  /* direct input, no echo */
+    case 0x08: {                                /* input, no echo */
+        uint16_t key;
+        if (!x86_kb_get(&key))
+            return 2;                           /* nothing yet: retry */
+        x86_set_al((uint8_t)key);
+        if (func == 0x01)
+            x86_video_teletype((uint8_t)key);
+        return 1;
+    }
+    case 0x0B: {                                /* input status */
+        uint16_t key;
+        x86_set_al(x86_kb_peek(&key) ? 0xFF : 0x00);
+        return 1;
+    }
+    case 0x0C:                                  /* flush, then input */
         return 1;
 
     case 0x09: {                                /* $-terminated string */

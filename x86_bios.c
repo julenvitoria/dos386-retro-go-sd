@@ -229,6 +229,12 @@ int x86_bios_video(uint8_t func)
  * installs its own INT 09h and never calls INT 16h is unaffected by any of
  * this.
  */
+/* The keyboard ring, for the DOS layer. INT 21h's console input functions read
+   the same buffer INT 16h does -- on a real machine DOS goes through the BIOS,
+   and a program that mixes the two must see one queue, not two. */
+int x86_kb_get(uint16_t *key)  { return kb_pop(key); }
+int x86_kb_peek(uint16_t *key) { return kb_peek(key); }
+
 int x86_bios_keyboard(uint8_t func)
 {
     uint16_t key;

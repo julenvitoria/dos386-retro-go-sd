@@ -85,6 +85,10 @@ def main():
     p.add_argument("--out", default="build/artifacts/screen.png")
     p.add_argument("--wait", type=float, default=15.0,
                    help="seconds to let the guest run before capturing")
+    p.add_argument("--text", action="store_true",
+                   help="also dump the 80x25 character buffer, which is much "
+                        "easier to judge than 8x8 glyphs and shows the 40 "
+                        "columns the panel cannot fit")
     p.add_argument("--clut-entries", type=int, default=16,
                    help="palette entries to read (4 for CGA graphics, 16 for "
                         "text mode's attribute colours)")
@@ -133,6 +137,7 @@ def main():
               f"fmt={pf & 7} frames={frames}")
 
         data = bytes(b.read_memory(fb, pitch * lines))
+        core_syms = core
         fw_syms = get_symbols(image.elf)
         sym = fw_syms.get("active_clut") or core["core_clut"]
         clut = [b.read_uint32(sym + 4 * i) for i in range(args.clut_entries)]
@@ -152,6 +157,21 @@ def main():
                 rgb[o + 1] = (argb >> 8) & 0xFF
                 rgb[o + 2] = argb & 0xFF
         size = write_png(args.out, w, h, bytes(rgb))
+        if args.text:
+            # In text mode the framebuffer is a rendering of an 80x25 character
+            # buffer; reading the characters back is far easier to judge than
+            # looking at 8x8 glyphs, and it shows the 40 columns the panel
+            # cannot fit as well as the 40 it can.
+            vram = b.read_uint32(core["guest_vram"])
+            cells = bytes(b.read_memory(vram, 80 * 25 * 2))
+            print("text buffer (80x25), '.' = space:")
+            for r in range(25):
+                line = "".join(
+                    chr(cells[(r * 80 + c) * 2])
+                    if 32 < cells[(r * 80 + c) * 2] < 127 else "."
+                    for c in range(80))
+                if line.strip("."):
+                    print(f"  {r:2d} |{line}|")
         nz = sum(1 for v in indices if v)
         print(f"wrote {args.out} ({w}x{h}, {size} bytes); "
               f"{nz} of {w * h} pixels non-zero")
