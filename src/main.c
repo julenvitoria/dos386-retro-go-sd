@@ -115,14 +115,58 @@ volatile uint32_t guest_use_cmdtail = 0;
  */
 #define CORE_CLUT_ENTRIES 32
 static uint32_t core_clut[CORE_CLUT_ENTRIES];
+
+/*
+ * THE LCD BONUS POOL, carved by fixed offsets.
+ *
+ * 153,600 bytes of cached AXI that the firmware releases when the LCD runs in
+ * LUT8 (the framebuffers need only 154 KB of the 300 KB pool). It is not an
+ * allocator and does not need to be -- every consumer is known at build time
+ * and none of them is ever freed. Keeping the map in ONE place is the point:
+ * the offsets used to be open-coded 4096/8192 at four call sites, which is how
+ * two of them came to disagree about whether the BIOS page or the sector cache
+ * came first.
+ *
+ *   0    4,096   open-bus filler, aliased over 0xA0000-0xFFFFF
+ *   4K   4,096   BIOS identification page at 0xFF000
+ *   8K  65,536   VGA mode 13h aperture at 0xA0000
+ *  72K   2,048   mode 13h host palette (768 B DAC + 1 KB ARGB CLUT)
+ *  74K  32,768   CGA VRAM at 0xB8000
+ *              ---------
+ *             108,544 used, 45,056 free
+ *
+ * The .dsk sector cache is NOT here any more -- it is a DMA-reachable staging
+ * buffer and lives in the AHB heap. That is what freed the 64 KB this map
+ * spends on the aperture.
+ *
+ * Free space is deliberately left contiguous at the TOP: the next thing that
+ * wants it is a VRAM arena that can balloon for an EGA mode and shrink again.
+ */
+#define BONUS_FILLER_OFF   0u
+#define BONUS_BIOSID_OFF   4096u
+#define BONUS_VGA_OFF      8192u
+#define BONUS_VGAPAL_OFF   (BONUS_VGA_OFF + X86_VGA_APERTURE_BYTES)
+#define BONUS_VRAM_OFF     (BONUS_VGAPAL_OFF + X86_VGA_PALETTE_BYTES)
+#define BONUS_USED         (BONUS_VRAM_OFF + X86_VRAM_BYTES)
+/* Which table the firmware currently holds: NULL = the 32-entry cached path,
+   non-NULL = the core-owned 256-entry one. Compared by POINTER, so entering
+   and leaving a 256-colour mode each push exactly once. */
+static const uint32_t *clut256_pushed;
 static uint8_t *upper_filler;
 static uint8_t *bios_id_page;   /* 0xFF000: real storage, not an alias */
+static uint8_t *vga_aperture;   /* 0xA0000: the mode 13h linear framebuffer */
 
 /* Host-readable so a failure to place either block is visible rather than a
    black screen. */
 volatile uint32_t guest_ram_bytes = 0;
 volatile uint32_t guest_vram_ok = 0;
 volatile uint32_t upper_filler_ok = 0;   /* 0xA0000-0xFFFFF backed at all */
+/* Both allocations that can fail QUIETLY and cost a whole feature. The VGA
+   aperture is 64 KB out of the bonus pool; the sector cache is 64 KB out of
+   the AHB heap, which is shared with the firmware's own newlib allocations
+   and so is the one whose free space cannot be read off a link map. */
+volatile uint32_t vga_aperture_ok = 0;
+volatile uint32_t disk_cache_mem = 0;    /* the AHB pointer itself, or 0 */
 volatile uint32_t frames_rendered = 0;
 /*
  * ===========================================================================
@@ -572,12 +616,31 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
     bonus_pool_base = (uint32_t)bonus;
     bonus_pool_size = (uint32_t)bonus_sz;
 
-    /* VRAM first and from RAM_EMU, not the bonus pool: the bonus region is
-     * uncached, and the blitter reads all 16 KB of VRAM every frame. Both the
-     * interpreter's writes and the blitter's reads are this same core, so
-     * there is no coherency reason to give that up. */
-    guest_vram = (uint8_t *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM,
-                                         1, X86_VRAM_BYTES);
+    /*
+     * VRAM from the BONUS POOL, not RAM_EMU -- and this reversed a decision
+     * that was made on a false premise.
+     *
+     * It used to say "the bonus region is uncached, and the blitter reads all
+     * of VRAM every frame". MEASURED against the firmware source, that is not
+     * true: mpu_set_lcd_pool_uncached_range() covers exactly the framebuffer
+     * footprint (154 KB in LUT8) and its own comment says everything past it
+     * "defaults to Normal cacheable, which is what we want for the LCD bonus
+     * area". The uncached window is the two framebuffers; the bonus area above
+     * them is cached AXI, the same memory class RAM_EMU is.
+     *
+     * So this costs nothing and buys 32,768 bytes of RAM_EMU, which is the
+     * region that is actually scarce -- headroom past __CORE_BSS_END__ went
+     * NEGATIVE (-2,024 B) when mode 13h landed, and the only symptom of that
+     * is core_ready staying 0 with no message.
+     *
+     * Ordering matters: GW_LCD_SETUP_FB above zeroes the pool and rewrites the
+     * MPU regions, so nothing may be placed in the bonus area before it.
+     */
+    if (bonus && bonus_sz >= BONUS_VRAM_OFF + X86_VRAM_BYTES)
+        guest_vram = bonus + BONUS_VRAM_OFF;
+    else
+        guest_vram = (uint8_t *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM,
+                                             1, X86_VRAM_BYTES);
     guest_vram_ok = guest_vram ? 1 : 0;
 
     guest_ram = (uint8_t *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM,
@@ -595,8 +658,8 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
      *
      * ram_malloc() returns NULL rather than overrunning, so a failure here is
      * a missing mapping, not corruption -- but it must still be visible. */
-    if (bonus && bonus_sz >= 4096)
-        upper_filler = bonus;
+    if (bonus && bonus_sz >= BONUS_FILLER_OFF + 4096u)
+        upper_filler = bonus + BONUS_FILLER_OFF;
     else
         upper_filler = (uint8_t *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM,
                                                1, 4096);
@@ -609,8 +672,14 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
      * (x86_mem_pool_init() is called from nowhere), so the request always
      * failed and the page was simply absent. From the bonus pool, like the
      * filler, for the same reasons. */
+    if (bonus && bonus_sz >= BONUS_BIOSID_OFF + 4096u)
+        bios_id_page = bonus + BONUS_BIOSID_OFF;
+    else
+        bios_id_page = (uint8_t *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM,
+                                               1, 4096);
+
     /*
-     * The .dsk sector cache, from the same pool and for the same reasons.
+     * The .dsk sector cache, from the AHB HEAP -- not from the bonus pool.
      *
      * MEASURED (tier 2, TOPBENCH): every disk_read is for ONE sector, and each
      * one costs the firmware an fopen + an fseek that walks the .dsk's cluster
@@ -618,22 +687,52 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
      * guest's data moves. The cost is per-CALL, so the fix is to make fewer,
      * larger calls -- which is what a window of read-ahead is.
      *
-     * 64 KB, after the filler and the BIOS id page, out of a 150 KB pool.
+     * AHB (GW_MEM_AHB) is D2 SRAM. This is a disk staging buffer, and D2 is
+     * the only SRAM DMA1/DMA2 can reach, so it is where the buffer must live
+     * if SPI1's polled transfer ever becomes a DMA one -- which is the
+     * asynchronous-completion fix STATUS lists as the deeper answer to the
+     * stutter. It is also the ONLY ABI pool with a real free(); ITC/RAM/DTC
+     * are bump allocators that can never hand anything back.
+     *
      * x86_disk_cache_ok is the witness: a refused allocation here is not a
      * fault, the reads simply go straight to the card again, and the ONLY
      * symptom is the stutter this was built to remove. That is precisely the
-     * silent-allocation-failure shape this project keeps getting bitten by.
+     * silent-allocation-failure shape this project keeps getting bitten by --
+     * and the AHB heap is SHARED with the firmware's own newlib allocations,
+     * so unlike a bump pool its free space is not knowable from the link map.
      */
-    if (bonus && bonus_sz >= 8192 + X86_DISK_CACHE_BYTES)
-        x86_disk_cache_init(bonus + 8192, X86_DISK_CACHE_BYTES);
-    else
-        x86_disk_cache_init(NULL, 0);   /* off, and x86_disk_cache_ok says so */
+    {
+        void *dc = (void *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_AHB,
+                                        1, X86_DISK_CACHE_BYTES);
+        disk_cache_mem = (uint32_t)(uintptr_t)dc;
+        x86_disk_cache_init(dc, dc ? X86_DISK_CACHE_BYTES : 0);
+    }
 
-    if (bonus && bonus_sz >= 8192)
-        bios_id_page = bonus + 4096;
+    /*
+     * The VGA mode 13h aperture: 64 KB of REAL storage behind guest
+     * 0xA0000-0xAFFFF, from the bonus pool -- the 64 KB the sector cache just
+     * vacated, plus room to spare.
+     *
+     * It must be AXI and it must be CACHED. The blitter reads all 64,000
+     * displayed bytes every frame and the guest writes them a byte at a time,
+     * and references/8086tiny/docs/video/12-vga13-direct-scanout.md prices
+     * emulated VRAM behind a strongly-ordered region at ~5.4-6.5 cycles per
+     * guest byte store -- 4x the blit it would save. The bonus pool qualifies:
+     * the firmware's mpu_set_lcd_pool_uncached_range() covers only the 154 KB
+     * LUT8 framebuffer footprint and leaves the bonus area Normal cacheable,
+     * in those words. (The older comment above about VRAM avoiding the bonus
+     * pool because it is "uncached" was mistaken; it is kept in RAM_EMU only
+     * because it already fits there.)
+     *
+     * 64 KB, not 64,000: 0xA0000-0xAFFFF is sixteen whole 4 KB fold pages, so
+     * the mapping needs no partial page and no special case against the
+     * open-bus filler that aliases the rest of the upper megabyte.
+     */
+    if (bonus && bonus_sz >= BONUS_USED)
+        vga_aperture = bonus + BONUS_VGA_OFF;
     else
-        bios_id_page = (uint8_t *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM,
-                                               1, 4096);
+        vga_aperture = NULL;            /* mode 13h refuses itself; see below */
+    vga_aperture_ok = vga_aperture ? 1 : 0;
 
     if (guest_vram) {
         /* The CLUT the LCD scans out through. LUT8 gives 256 entries; CGA
@@ -655,6 +754,11 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
          * the game to solid black. Pushing 32 also gives the anti-aliased text
          * renderer the eight four-entry blocks it allocates per frame. */
         x86_video_init(guest_vram, core_clut);
+        /* The mode 13h aperture and its palette block, both out of the bonus
+           pool. NULL is legal and means 13h refuses itself loudly rather than
+           the guest drawing into the open-bus filler. */
+        x86_video_set_aperture(vga_aperture,
+                               vga_aperture ? bonus + BONUS_VGAPAL_OFF : NULL);
         abi->lcd_ctl(GW_LCD_SET_CLUT, (uintptr_t)core_clut,
                      CORE_CLUT_ENTRIES, 0);
         cga_clut_dirty = 0;
@@ -1685,11 +1789,42 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         guest_ax = cpu_state_ptr->regs[0] & 0xFFFF;
         x86_video_set_beam(0x0000);
 
-        /* A guest write to 0x3D9 changes the palette; the firmware holds its
-         * own copy, so push ours again when it moves. */
-        if (cga_clut_dirty) {
-            abi->lcd_ctl(GW_LCD_SET_CLUT, (uintptr_t)core_clut,
-                         CORE_CLUT_ENTRIES, 0);
+        /* A guest write to 0x3D9 (or to the VGA DAC) changes the palette; the
+         * firmware holds its own copy, so push ours again when it moves.
+         *
+         * WHICH op is not a count argument, it is a different firmware path.
+         * GW_LCD_SET_CLUT stages into a 68-entry cache and writes a 40%
+         * darkened TWIN of entry i at count+i, which is how retro-go's overlay
+         * dims the screen (it ORs LCD_DARKEN_BIT = 0x20 into every pixel). 256
+         * entries would need 512 hardware slots against the LTDC's 256, so a
+         * 256-colour mode has to own the whole table: GW_LCD_SET_CLUT_EXT
+         * takes a CALLER-OWNED array and bypasses the cache entirely.
+         *
+         * Accepted cost, and it is visible: while a 256-colour mode is up the
+         * darken does nothing useful -- OR-ing 0x20 picks an unrelated guest
+         * colour -- so retro-go's menu backdrop SHIFTS COLOUR instead of
+         * dimming. The menu box and its text are drawn after the darken pass
+         * and stay readable. lcd_pack_color() searches the 256 entries, so
+         * menu colours still resolve to a real nearest match.
+         *
+         * The array must stay valid until we hand the table back, which the
+         * mode change below does by pushing the 32-entry path again. */
+        const uint32_t *ext = x86_video_clut256();
+        if (ext != clut256_pushed) {
+            /* Entering or leaving a 256-colour mode. */
+            if (ext)
+                abi->lcd_ctl(GW_LCD_SET_CLUT_EXT, (uintptr_t)ext, 256, 0);
+            else
+                abi->lcd_ctl(GW_LCD_SET_CLUT, (uintptr_t)core_clut,
+                             CORE_CLUT_ENTRIES, 0);
+            clut256_pushed = ext;
+            cga_clut_dirty = 0;
+        } else if (cga_clut_dirty) {
+            if (ext)
+                abi->lcd_ctl(GW_LCD_SET_CLUT_EXT, (uintptr_t)ext, 256, 0);
+            else
+                abi->lcd_ctl(GW_LCD_SET_CLUT, (uintptr_t)core_clut,
+                             CORE_CLUT_ENTRIES, 0);
             cga_clut_dirty = 0;
         }
 

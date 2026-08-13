@@ -97,6 +97,9 @@ python3 scripts/probe.py --retrogo --wait-magic --set guest_kips=330     # 8088
 | `x86_kb_pushes` / `x86_kb_pops` / `x86_kb_peek_hits` | the BDA ring's producer and its two consumers. "The guest polls INT 16h forever" has two opposite causes -- nothing was queued, or something dequeued it first -- and only these three separate them. `pushes == pops == peek_hits` means every key was queued, seen and taken; `pushes > 0` with `pops == 0` is the reported failure |
 | `x86_dos_file_log` / `x86_dos_path_log` | The last 32 **file-family** INT 21h calls as word pairs -- `(func << 8) \| AL`, then `(CF << 16) \| AX` -- and the last four paths opened. `x86_hle_log` cannot answer a file question: a guest polling the keyboard fills all 32 of its slots between one open and the next, which is exactly what it did while TOPBENCH's real failure (`43h` -> CF=1, AX=1) sat invisible. `--dump x86_dos_file_log:64x4 --dump x86_dos_path_log:32x4` |
 | `x86_disk_reads` / `x86_disk_backend_reads` | guest-side `disk_read()` calls and how many of them reached the SD card. The RATIO is the sector cache's whole point, it is exact under gwemu, and it is the number to quote — TOPBENCH boots on 115 / 7 |
+| `vga_aperture_ok` / `x86_vga13_ok` | is the mode 13h aperture (64 KB, bonus pool) and its palette block backed? A 0 in `x86_vga13_ok` means a guest asking for 13h is REFUSED and logged (event tag 5) rather than drawing into the open-bus filler -- which is the right behaviour, but it is a whole mode silently missing |
+| `x86_vga_dac_writes` | DAC bytes the guest has streamed through 0x3C9. **0 while a screen is black says the guest never got as far as the palette**, which separates "13h is broken" from "the guest never reached video" -- the distinction WOLF3D turned on |
+| `disk_cache_mem` | the AHB pointer the sector cache got. The AHB heap is shared with the firmware's own newlib allocations, so unlike a bump pool its free space is NOT knowable from the link map; this is the only witness |
 | `x86_disk_cache_ok` / `x86_disk_cache_bytes` | is the cache BACKED? A 0 here is a silent-allocation failure and the only symptom is the stutter the cache exists to remove |
 | `x86_disk_cache_hits` / `_misses` / `_fills` / `_evictions` / `_bypass` | sectors served from a resident window, sectors that forced a fetch, window fetches, and requests that went straight through. Rising `_evictions` with a poor hit rate means the working set no longer fits four windows |
 | `x86_disk_us_total` / `x86_disk_us_worst` / `x86_disk_errors` | time in the backend, and the worst single call. **Meaningless under gwemu** (`docs/04`: SD busy state is not modelled) and the reason the timing claim needs silicon |
@@ -392,11 +395,11 @@ standby. Called automatically by `make retrogo_media`.
 |---|---|
 | `cpu_exec*.S`, `opcode*.S` | the Thumb-2 interpreter and its dispatch tables |
 | `x86_profile.c/.h` | per-opcode DWT cycle profiler storage + calibration (`X86_PROFILE=1` only) |
-| `x86_disk.c` | the block device under our FatFs, plus the .dsk sector cache: 4 x 16 KB LRU windows from the bonus pool, which are the read-ahead AND the cache |
+| `x86_disk.c` | the block device under our FatFs, plus the .dsk sector cache: 4 x 16 KB LRU windows from the **AHB heap** (D2 SRAM -- DMA-reachable, and the only ABI pool with a real `free()`), which are the read-ahead AND the cache. Geometry is a build-time tunable (`X86_DISK_WINDOW_SECTORS` / `_COUNT`) |
 | `x86_mem.c` | guest page pool, fold mapping, guest↔host copies |
 | `x86_io.c` | port dispatch, PIT ch2 + speaker, CGA registers |
 | `x86_audio_wave.h` | PC-speaker square-wave generator: PIT divisor -> phase increment -> samples. `<stdint.h>` only, deliberately — that is what lets `tests/host_audio.c` build it natively. Vendored from the author's earlier DOS core |
-| `x86_video.c`, `cga_blit.S` | the mode table and everything it selects: text 0/1 (8x8 cells) and 2/3/7 (4x8, all 80 columns), CGA 4/5 through `cga_blit.S`, CGA 6 decimated 2:1, the BDA-driven per-frame mode detection, the graphics-mode glyph rasteriser, and the one 32-entry CLUT layout they share |
+| `x86_video.c`, `cga_blit.S` | the mode table and everything it selects: text 0/1 (8x8 cells) and 2/3/7 (4x8, all 80 columns), CGA 4/5 through `cga_blit.S`, CGA 6 decimated 2:1, **VGA 13h (320x200x256 linear) with its 256-entry DAC**, the BDA-driven per-frame mode detection, the graphics-mode glyph rasteriser, and the 32-entry CLUT layout the CGA modes share. The 13h aperture, its DAC and its 256-entry CLUT are all **caller-owned** (LCD bonus pool) -- 66 KB of new `.bss` would break the guest allocation silently. See [`docs/08_vga_mode13h.md`](docs/08_vga_mode13h.md) |
 | `x86_osk.c/.h` | on-screen keyboard + the mouse UI shell: layout, navigation, sticky modifiers, echo, the GAME cycle, and the overlay painted into the letterbox bars. Ported UI (`docs/input/03`); the injection under it is our own scancode path |
 | `x86_hle.c` | `0F 0B` stubs, IVT planting, service dispatch |
 | `x86_bios.c` | INT 10h / 16h / 1Ah and the BIOS Data Area, including INT 09h's shift decode (the OSK's shifted cells depend on it) |
@@ -482,6 +485,14 @@ python3 tests/test_screen.py             # what the LTDC actually scans out,
                                          # (checks whichever mode the core is
                                          # in -- text if a guest is running)
 python3 tests/test_disk_cache.py         # .dsk sector cache + read-ahead:
+python3 tests/test_disk_cache.py --sweep # backend calls + hit rate across
+                                         # several cache geometries. The stream
+                                         # win is bought by window SIZE (4x16K
+                                         # and 2x16K both do 248 reads in 9
+                                         # calls; 8K needs 16, 4K needs 32);
+                                         # the COUNT buys residency, which the
+                                         # metadata-vs-stream arm shows by
+                                         # FAILING at --window-count 2
                                          # window alignment, LRU residency
                                          # under a stream, a short window at
                                          # the end of the image, invalidation
@@ -636,6 +647,11 @@ the two only agree when `count` is exactly 32. Indices 64-67 are the overlay's
 own theme (`LCD_OVERLAY_CLUT_BASE`), and the firmware cache is 68 entries.
 
 **So the budget is 32 entries, not 64.** 32-63 are not free; they are the twins.
+(One exception, and it is a different firmware path rather than a bigger count:
+`GW_LCD_SET_CLUT_EXT` takes a caller-owned 256-entry palette and bypasses the
+twin cache entirely, which is what VGA mode 13h uses. The price is that
+`LCD_DARKEN_BIT` stops working while that mode is up --
+[`docs/08_vga_mode13h.md`](docs/08_vga_mode13h.md).)
 The core published 16, which put the twins at 16-31 while the overlay read
 32-47 — zeros — so opening retro-go's menu dimmed the game to solid black. It
 publishes 32 now, in every mode.
@@ -655,7 +671,11 @@ It is **off by default**, and the reason is size, not quality:
 > RAM_EMU spans `0x2404B000`-`0x24100000` (741,376 B). The core ends at
 > `__CORE_BSS_END__` (measure it: `arm-none-eabi-nm build/core/dos_core.elf`),
 > and the guest asks for 32 KB VRAM + 640 KB RAM = 688,128 B from that region.
-> **Measured 2026-08-13: BSS end `0x24057078`, headroom 4,016 bytes.** It was
+> **Measured 2026-08-13, after mode 13h and moving CGA VRAM to the bonus pool:
+> BSS end `0x240587f8`, headroom 30,728 bytes** -- the guest now asks RAM_EMU
+> for 640 KB rather than 672 KB, because its 32 KB of VRAM comes from the bonus
+> pool. Mid-change the same measurement read **-2,024**, which is the state in
+> which `guest_ram` returns NULL and nothing says so. It was
 > 424 bytes before the 4 KB open-bus filler was moved to the bonus pool; the
 > "2,528 bytes" this document used to quote was two commits of growth out of
 > date, which is why the number is now a measurement instruction and not a

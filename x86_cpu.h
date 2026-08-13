@@ -189,6 +189,39 @@ extern X86CPUState *cpu_state_ptr;
    mode 4 uses 16 KB, so text and the other CGA modes fit without remapping. */
 #define X86_VRAM_BYTES 32768u
 
+/* VGA mode 13h: 320x200x256 linear at guest 0xA0000, 64,000 displayed bytes.
+   Backed with the whole 64 KB segment so 0xA0000-0xAFFFF is sixteen entire
+   fold pages and the mapping needs no partial-page case. */
+#define X86_VGA_APERTURE_BYTES 65536u
+#define X86_VGA13_WIDTH        320u
+#define X86_VGA13_HEIGHT       200u
+#define X86_VGA13_BYTES        (X86_VGA13_WIDTH * X86_VGA13_HEIGHT)  /* 64000 */
+/* Host state for the mode: 768 B of DAC (256 x RGB, 6 bits) then 1 KB of
+   ARGB8888 CLUT. From the caller for the same reason as the aperture -- 66 KB
+   of new .bss would break the guest allocation silently. */
+#define X86_VGA_PALETTE_BYTES 2048u
+/* Hand the video layer the aperture and its palette block. Either NULL means
+   mode 13h has no storage, so a guest asking for it is REFUSED and logged
+   like any other unrenderable mode rather than drawing into memory nothing
+   reads. x86_vga13_ok is the witness. */
+void x86_video_set_aperture(void *aperture, void *palette_block);
+extern volatile uint32_t x86_vga13_ok;
+extern volatile uint32_t x86_vga_dac_writes;
+/* 256 ARGB8888 entries built from the guest's DAC. Non-NULL only while a
+   256-colour mode is up; the frame loop pushes it through
+   GW_LCD_SET_CLUT_EXT instead of the 32-entry GW_LCD_SET_CLUT. */
+const uint32_t *x86_video_clut256(void);
+/* VGA DAC, ports 0x3C6-0x3C9. 0x3C9 is a STREAM, not a latch: a guest sets the
+   index once and writes 768 consecutive bytes, so this cannot be modelled as
+   "the last value written". */
+void    x86_vga_dac_set_write_index(uint8_t idx);
+void    x86_vga_dac_set_read_index(uint8_t idx);
+void    x86_vga_dac_set_mask(uint8_t m);
+uint8_t x86_vga_dac_get_mask(void);
+void    x86_vga_dac_write(uint8_t v);
+uint8_t x86_vga_dac_read(void);
+void    x86_vga_dac_set_block(unsigned first, unsigned count, const uint8_t *rgb);
+
 void x86_video_init(void *vram, void *lut8_palette);
 void x86_video_refresh_palette(void);
 extern uint32_t cga_clut_dirty;   /* frame loop re-pushes the CLUT when set */
@@ -313,11 +346,23 @@ extern volatile uint32_t x86_disk_errors;
 extern volatile uint32_t x86_disk_run_hist[8];     /* sectors per call        */
 /*
  * Sector cache + read-ahead. `mem` must be at least x86_disk_cache_bytes and
- * is expected to come from the LCD bonus pool (uncached AXI); RAM_EMU has no
- * room. Returns 0 if it could not be backed, and the caller MUST report that:
+ * comes from the AHB heap (GW_MEM_AHB) -- D2 SRAM, the only SRAM the DMA
+ * controllers can reach and the one ABI pool with a real free(). RAM_EMU has
+ * no room, and the LCD bonus pool is now the mode 13h aperture's.
+ * Returns 0 if it could not be backed, and the caller MUST report that:
  * the cache silently absent is a stutter nobody can explain.
+ *
+ * The geometry is tunable at build time (see x86_disk.c); keep this byte count
+ * derived from it rather than restating 64 KB.
  */
-#define X86_DISK_CACHE_BYTES (64u * 1024u)   /* 4 windows x 16 KB */
+#ifndef X86_DISK_WINDOW_SECTORS
+#define X86_DISK_WINDOW_SECTORS 32u
+#endif
+#ifndef X86_DISK_WINDOW_COUNT
+#define X86_DISK_WINDOW_COUNT   4u
+#endif
+#define X86_DISK_CACHE_BYTES \
+    (X86_DISK_WINDOW_SECTORS * 512u * X86_DISK_WINDOW_COUNT)
 int  x86_disk_cache_init(void *mem, uint32_t bytes);
 void x86_disk_cache_flush(void);
 extern volatile uint32_t x86_disk_cache_ok;        /* 0 = NOT backed          */

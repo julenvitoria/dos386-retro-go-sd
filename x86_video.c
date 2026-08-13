@@ -86,6 +86,7 @@
 #define VM_TEXT   0     /* char+attr pairs at 0xB8000                      */
 #define VM_CGA2   1     /* 320x200 2 bpp, two-bank interleave              */
 #define VM_CGA1   2     /* 640x200 1 bpp, same interleave, decimated 2:1   */
+#define VM_VGA8   3     /* 320x200 8 bpp LINEAR at 0xA0000 -- mode 13h     */
 
 typedef struct {
     uint8_t mode;       /* the BDA 0x449 value                             */
@@ -103,6 +104,7 @@ static const x86_vmode vmodes[] = {
     { 0x04, VM_CGA2, 40 },
     { 0x05, VM_CGA2, 40 },
     { 0x06, VM_CGA1, 80 },
+    { 0x13, VM_VGA8, 40 },
 };
 
 /* The active mode. Not static: the harness reads the byte to know which
@@ -116,6 +118,13 @@ static const x86_vmode *vmode_find(uint8_t mode)
 {
     if (mode == 0x07)                   /* mono text, folded to 3 */
         mode = 0x03;
+    /* Mode 13h without its 64 KB aperture is not a mode we can render, so it
+       is REFUSED here rather than adopted -- otherwise the guest draws into
+       the open-bus filler and the symptom is a frozen screen with no error.
+       This is the same rule as any other unrenderable mode; the only
+       difference is that this one depends on an allocation. */
+    if (mode == 0x13 && !x86_vga13_ok)
+        return 0;
     for (unsigned i = 0; i < sizeof vmodes / sizeof vmodes[0]; i++)
         if (vmodes[i].mode == mode)
             return &vmodes[i];
@@ -136,8 +145,14 @@ void cga_mode4_blit(uint8_t *dst, const uint8_t *even, const uint8_t *odd,
                     const uint32_t *tab, uint32_t dst_advance);
 
 static uint8_t *cga_vram;
+/* Mode 13h storage, all caller-owned (LCD bonus pool). See the mode 13h
+   section below for why none of it is .bss. */
+static uint8_t  *vga_aperture;      /* 64 KB at guest 0xA0000, or NULL       */
+static uint8_t  *vga_dac;           /* 768 B: 256 x (r,g,b), 6 bits each     */
+static uint32_t *vga_clut256;       /* 1 KB: ARGB8888, what the LTDC scans   */
 static void text_render(uint8_t *dst, uint32_t stride);
 static void cga_mode6_blit(uint8_t *dst, uint32_t stride);
+static void vga13_blit(uint8_t *dst, uint32_t stride);
 static void text_render_wide(uint8_t *dst, uint32_t stride);
 #if X86_TEXT_AA
 static void text_alloc_palette(void);
@@ -398,7 +413,15 @@ void x86_video_init(void *vram, void *lut8_palette)
    aperture that happens to be readable memory, and it must not move. */
 int x86_video_map(void)
 {
-    return x86_map_fixed(0xB8000u, cga_vram, X86_VRAM_BYTES);
+    int ok = x86_map_fixed(0xB8000u, cga_vram, X86_VRAM_BYTES);
+    /* The mode 13h aperture, over the top of the open-bus filler that aliases
+       the rest of the upper megabyte. It is mapped ALWAYS, not on the mode
+       set: a guest may (and Wolf3D's setup code does) write pixels before it
+       switches, and a mode set that had to remap memory would lose them. It
+       costs nothing to leave mapped -- no mode but 13h reads it. */
+    if (vga_aperture)
+        ok &= x86_map_fixed(0xA0000u, vga_aperture, X86_VGA_APERTURE_BYTES);
+    return ok;
 }
 
 /* Where the beam is, as a fraction of the frame. The core loop advances this
@@ -476,6 +499,9 @@ void x86_video_render(uint8_t *dst, uint32_t stride)
     case VM_CGA1:
         cga_mode6_blit(top, stride);
         break;
+    case VM_VGA8:
+        vga13_blit(top, stride);
+        break;
     default:
         cga_mode4_blit(top, cga_vram, cga_vram + CGA_PLANE_ODD,
                        cga_expand, stride - CGA_WIDTH);
@@ -505,6 +531,197 @@ static void cga_mode6_blit(uint8_t *dst, uint32_t stride)
             out[x] = cga1_expand[b >> 4] | (cga1_expand[b & 0x0F] << 16);
         }
     }
+}
+
+/* ===========================================================================
+ * VGA mode 13h -- 320x200x256 linear at 0xA0000.
+ *
+ * This is the cheapest 256-colour mode there is, and the reason is that its
+ * aperture is byte-for-byte the format of our LUT8 framebuffer: one byte per
+ * pixel, row y at y*320, 64,000 bytes, no banks, no interleave, no planes.
+ * The blit is 200 memcpys and NOTHING is added to the store path -- which is
+ * the whole reason this mode is buildable here and EGA/Mode X is not. A planar
+ * mode puts a latch/mask/write-mode register file between the CPU and video
+ * memory, so every guest STORE runs through emulated adapter logic, and our
+ * VRAM is deliberately plain mapped RAM with no MMIO path at all.
+ *
+ * Two pieces of state come from the caller rather than from .bss: the 64 KB
+ * aperture and this 2 KB palette block. RAM_EMU headroom is a few KB and
+ * overshooting it is SILENT (STATUS: "running out is QUIET"), so 66 KB of new
+ * static data would not merely be tight, it would break the guest allocation
+ * with no message. Both live in the LCD bonus pool, which is cached AXI.
+ */
+/* (vga_aperture / vga_dac / vga_clut256 are declared up with cga_vram: the
+   memory mapping needs the aperture pointer long before this section.) */
+
+/* DAC port state. 0x3C8 sets the WRITE index, 0x3C7 the READ index; 0x3C9 is
+ * a STREAM against a counter that advances after every third byte.
+ *
+ * The stream is the whole reason this cannot live in a port latch the way
+ * 0x3D8/0x3D9 do. A game writes the index once and then 768 consecutive bytes,
+ * so under a "last value written is the state" model 767 of them are lost and
+ * the screen comes out one colour.
+ */
+static uint16_t vga_dac_wr;         /* byte offset into vga_dac, write side  */
+static uint16_t vga_dac_rd;         /* byte offset into vga_dac, read side   */
+static uint8_t  vga_dac_mask = 0xFF;    /* 0x3C6 PEL mask: latched, applied
+                                           nowhere -- a guest reads it back  */
+static uint8_t  vga_dac_dirty;      /* rebuild vga_clut256 before the push   */
+
+/* Host-visible: mode 13h with no aperture is refused, and this says so. */
+volatile uint32_t x86_vga13_ok;
+volatile uint32_t x86_vga_dac_writes;   /* DAC bytes the guest has streamed  */
+
+void x86_video_set_aperture(void *aperture, void *palette_block)
+{
+    vga_aperture = (uint8_t *)aperture;
+    vga_dac      = (uint8_t *)palette_block;
+    vga_clut256  = palette_block
+                 ? (uint32_t *)((uint8_t *)palette_block + 768) : 0;
+    x86_vga13_ok = (vga_aperture && vga_dac) ? 1 : 0;
+    if (!x86_vga13_ok)
+        return;
+    memset(vga_aperture, 0, X86_VGA_APERTURE_BYTES);
+    /* Power-on DAC: the standard VGA 256-colour default is 16 CGA colours,
+       16 greys and a 6x6x6-ish cube. We plant the 16 CGA colours (so a guest
+       that sets 13h and draws without touching the DAC gets recognisable
+       colours rather than black) and a linear grey ramp over the rest. That
+       is a DEFAULT, not a claim to match IBM's table -- every mode-13h title
+       loads its own palette, and a guest that does not is out of spec. */
+    for (unsigned i = 0; i < 256; i++) {
+        unsigned r, g, b;
+        if (i < 16) {
+            uint32_t c = cga_argb[i];
+            r = ((c >> 16) & 0xFF) >> 2;
+            g = ((c >>  8) & 0xFF) >> 2;
+            b = ( c        & 0xFF) >> 2;
+        } else {
+            r = g = b = ((i - 16) * 63u) / 239u;
+        }
+        vga_dac[i * 3 + 0] = (uint8_t)r;
+        vga_dac[i * 3 + 1] = (uint8_t)g;
+        vga_dac[i * 3 + 2] = (uint8_t)b;
+    }
+    vga_dac_wr = vga_dac_rd = 0;
+    vga_dac_dirty = 1;
+}
+
+/*
+ * DAC 6 bits -> 8. `(v << 2) | (v >> 4)` and not a plain `<< 2`: 63 must map
+ * to 255, not to 252, or every white is 1.2% grey and every fade-to-white
+ * stops short of it.
+ */
+static inline uint32_t dac_expand(unsigned r, unsigned g, unsigned b)
+{
+    return (uint32_t)(((r << 2 | r >> 4) & 0xFF) << 16)
+         | (uint32_t)(((g << 2 | g >> 4) & 0xFF) <<  8)
+         | (uint32_t)( ((b << 2 | b >> 4) & 0xFF)      );
+}
+
+static void vga_clut_rebuild(void)
+{
+    if (!vga_dac_dirty || !vga_clut256)
+        return;
+    for (unsigned i = 0; i < 256; i++)
+        vga_clut256[i] = dac_expand(vga_dac[i * 3 + 0],
+                                    vga_dac[i * 3 + 1],
+                                    vga_dac[i * 3 + 2]);
+    vga_dac_dirty = 0;
+}
+
+/*
+ * The 256-entry CLUT, or NULL if a 256-colour mode is not up.
+ *
+ * The frame loop uses non-NULL to choose GW_LCD_SET_CLUT_EXT over the ordinary
+ * 32-entry GW_LCD_SET_CLUT. They are different firmware paths, not a count
+ * argument: lcd_set_clut() stores a 40%-darkened TWIN of entry i at count+i so
+ * retro-go's overlay can dim the screen by OR-ing LCD_DARKEN_BIT (0x20), and
+ * 256 entries would need 512 hardware slots against the LTDC's 256. A
+ * 256-colour mode therefore has to own the whole table, and the accepted price
+ * is that the darken stops working while it does -- see the caveat in
+ * docs/03 and in gw_lcd.h.
+ */
+const uint32_t *x86_video_clut256(void)
+{
+    if (cur_desc->kind != VM_VGA8 || !vga_clut256)
+        return 0;
+    vga_clut_rebuild();
+    return vga_clut256;
+}
+
+/* --- DAC ports, called from x86_io.c ------------------------------------- */
+
+void x86_vga_dac_set_write_index(uint8_t idx) { vga_dac_wr = (uint16_t)idx * 3u; }
+void x86_vga_dac_set_read_index(uint8_t idx)  { vga_dac_rd = (uint16_t)idx * 3u; }
+void x86_vga_dac_set_mask(uint8_t m)          { vga_dac_mask = m; }
+uint8_t x86_vga_dac_get_mask(void)            { return vga_dac_mask; }
+
+void x86_vga_dac_write(uint8_t v)
+{
+    if (!vga_dac)
+        return;
+    /* Stored AS THE GUEST WROTE IT, 6 bits per channel, because read-modify-
+       write fade loops read the DAC back and must get their own value. The
+       scaling to 8 bits happens in the consumer. */
+    vga_dac[vga_dac_wr] = (uint8_t)(v & 0x3F);
+    if (++vga_dac_wr >= 768u)
+        vga_dac_wr = 0;
+    vga_dac_dirty = 1;
+    x86_vga_dac_writes++;
+    /* A palette change is a CLUT reprogram, not a repaint: the pixels in the
+       aperture do not move, so the frame loop only has to re-push. */
+    if (cur_desc->kind == VM_VGA8)
+        cga_clut_dirty = 1;
+}
+
+uint8_t x86_vga_dac_read(void)
+{
+    uint8_t v;
+    if (!vga_dac)
+        return 0x3F;
+    v = vga_dac[vga_dac_rd];
+    if (++vga_dac_rd >= 768u)
+        vga_dac_rd = 0;
+    return v;
+}
+
+/*
+ * Set a block of DAC entries at once -- INT 10h AH=10h AL=12h. Routed here
+ * rather than reimplemented in the BIOS so there is ONE palette model and not
+ * two that can disagree.
+ */
+void x86_vga_dac_set_block(unsigned first, unsigned count, const uint8_t *rgb)
+{
+    if (!vga_dac || first >= 256u)
+        return;
+    if (count > 256u - first)
+        count = 256u - first;
+    for (unsigned i = 0; i < count * 3u; i++)
+        vga_dac[first * 3u + i] = (uint8_t)(rgb[i] & 0x3F);
+    vga_dac_dirty = 1;
+    x86_vga_dac_writes += count * 3u;
+    if (cur_desc->kind == VM_VGA8)
+        cga_clut_dirty = 1;
+}
+
+/*
+ * The blit. 200 rows of 320 bytes out of the aperture into the letterboxed
+ * framebuffer -- an identity copy, because the guest's format IS the panel's.
+ *
+ * A row loop and not one 64,000-byte memcpy: the framebuffer stride is 320
+ * here so the two happen to be equal, but the stride is the caller's and a
+ * single copy would silently break the moment it is not.
+ */
+static void vga13_blit(uint8_t *dst, uint32_t stride)
+{
+    const uint8_t *src = vga_aperture;
+    if (!src) {                       /* refused at mode-select; belt and braces */
+        for (unsigned y = 0; y < X86_VGA13_HEIGHT; y++)
+            memset(dst + y * stride, 0, X86_VGA13_WIDTH);
+        return;
+    }
+    for (unsigned y = 0; y < X86_VGA13_HEIGHT; y++)
+        memcpy(dst + y * stride, src + y * X86_VGA13_WIDTH, X86_VGA13_WIDTH);
 }
 
 /* ---------------------------------------------------------------------------
@@ -589,6 +806,11 @@ void x86_video_set_mode(uint8_t mode)
     cur_row = cur_col = 0;
     text_scroll_col = 0;
     memset(cga_vram, 0, X86_VRAM_BYTES);
+    /* The 13h aperture is separate storage, so clearing CGA VRAM does not
+       touch it. A guest that sets 13h expects a blank screen, and leaving the
+       previous title's pixels there is the "mode set did nothing" picture. */
+    if (cur_desc->kind == VM_VGA8 && vga_aperture)
+        memset(vga_aperture, 0, X86_VGA_APERTURE_BYTES);
     if (cur_desc->kind == VM_TEXT) {
         /* Text mode: blank cells are space on black, not zero bytes -- a zero
            attribute renders black-on-black and hides everything written

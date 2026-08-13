@@ -103,17 +103,41 @@ volatile uint32_t x86_disk_run_hist[8];
  * one backend call whether it is staged or not, and staging would only add a
  * copy.
  *
- * The storage comes from the LCD bonus pool, which is UNCACHED AXI. That is a
- * real cost -- serving a hit is a memcpy out of uncached memory rather than out
- * of cached AXI -- and it is accepted rather than hidden: a 512-byte uncached
- * copy is on the order of a microsecond, against a backend call that carries a
- * whole FAT chain walk. If the counters ever say otherwise the trade is
- * visible in x86_disk_us_total and can be revisited. It cannot come from
- * RAM_EMU: measured headroom past __CORE_BSS_END__ is a few hundred bytes.
+ * WHERE THE STORAGE COMES FROM: the AHB heap (GW_MEM_AHB), which is D2 SRAM.
+ *
+ * It used to come from the LCD bonus pool, and that was the wrong home on two
+ * counts. This is a DISK STAGING BUFFER, and D2 is the only SRAM DMA1/DMA2 can
+ * reach -- they cannot touch DTCM -- so it is where the buffer has to live the
+ * day SPI1's polled HAL_SPI_TransmitReceive becomes a DMA transfer (docs/03
+ * and STATUS's "asynchronous completion" note). GW_MEM_AHB is also the only
+ * pool in the ABI with a real free(); every other one is a bump allocator.
+ * And it hands the LCD bonus pool its 64 KB back, which is where the mode 13h
+ * aperture now lives.
+ *
+ * The old comment here claimed the bonus pool was UNCACHED and priced a hit as
+ * an uncached memcpy. That was false: the firmware's MPU covers only the
+ * framebuffer footprint (154 KB in LUT8), and
+ * mpu_set_lcd_pool_uncached_range() says in as many words that everything past
+ * it "defaults to Normal cacheable, which is what we want for the LCD bonus
+ * area". Both regions are cached; the move is about DMA reach and free(), not
+ * about cache.
+ *
+ * It cannot come from RAM_EMU: measured headroom past __CORE_BSS_END__ is a
+ * few KB and shrinking.
+ *
+ * The geometry is a build-time tunable so the trade can be MEASURED rather
+ * than argued -- tests/test_disk_cache.py sweeps it. Defaults are the shipped
+ * 4 x 16 KB, which measured 115 -> 7 backend calls on TOPBENCH.
  */
-#define WINDOW_SECTORS 32u                       /* 16 KB per window */
+#ifndef X86_DISK_WINDOW_SECTORS
+#define X86_DISK_WINDOW_SECTORS 32u              /* 16 KB per window */
+#endif
+#ifndef X86_DISK_WINDOW_COUNT
+#define X86_DISK_WINDOW_COUNT   4u               /* 64 KB total      */
+#endif
+#define WINDOW_SECTORS X86_DISK_WINDOW_SECTORS
 #define WINDOW_BYTES   (WINDOW_SECTORS * SECTOR_BYTES)
-#define WINDOW_COUNT   4u                        /* 64 KB total      */
+#define WINDOW_COUNT   X86_DISK_WINDOW_COUNT
 
 volatile uint32_t x86_disk_cache_ok;        /* 0 = NOT backed. Loud, not silent */
 volatile uint32_t x86_disk_cache_bytes;

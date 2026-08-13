@@ -313,6 +313,14 @@ uint32_t x86_port_read(uint32_t port, uint32_t size)
         return x86_io.cga_mode;
     case 0x3D9:
         return x86_io.cga_color_select;
+
+    /* VGA DAC. 0x3C9 is read back by fade loops, which read-modify-write the
+       palette, so this has to return what the guest last wrote and not a
+       constant. */
+    case 0x3C6:
+        return x86_vga_dac_get_mask();
+    case 0x3C9:
+        return x86_vga_dac_read();
     }
     /* An unassigned port floats high, which is what a real bus does and what
        DOS code probing for hardware expects to see. */
@@ -348,6 +356,26 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
     case 0x3D9:
         x86_io.cga_color_select = (uint8_t)value;
         x86_video_refresh_palette();
+        break;
+
+    /*
+     * VGA DAC. A hook on the OUT path and not an io_ports[] latch: 0x3C9 is a
+     * STREAM. The guest writes the index once to 0x3C8 and then 768
+     * consecutive bytes here, three per entry, against a counter that
+     * auto-increments. Modelled as a latch, 767 of those 768 are lost and the
+     * whole screen comes out one colour.
+     */
+    case 0x3C6:
+        x86_vga_dac_set_mask((uint8_t)value);
+        break;
+    case 0x3C7:
+        x86_vga_dac_set_read_index((uint8_t)value);
+        break;
+    case 0x3C8:
+        x86_vga_dac_set_write_index((uint8_t)value);
+        break;
+    case 0x3C9:
+        x86_vga_dac_write((uint8_t)value);
         break;
     default:
         break;

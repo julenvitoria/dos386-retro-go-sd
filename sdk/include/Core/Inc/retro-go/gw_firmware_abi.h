@@ -130,6 +130,16 @@ typedef enum {
     GW_LCD_GET_PIXEL_POS   = 8,  /* → pixel position */
     GW_LCD_IS_SWAP_PENDING = 9,  /* → non-zero if swap pending */
     GW_LCD_BACKLIGHT_SET   = 10, /* a=brightness */
+    /* a=(uintptr_t)clut*, b=count (<=256). Programs the LTDC CLUT from a
+     * CALLER-OWNED palette, bypassing the darkened-twin cache that caps
+     * GW_LCD_SET_CLUT at 32 entries. Required by any 256-colour mode: twins
+     * would need 512 hardware slots against the LTDC's 256, so such a core has
+     * to own the whole table. NULL/0 hands control back to the cached path.
+     * Consequence, accepted: LCD_DARKEN_BIT (an OR of 0x20) no longer selects a
+     * dimmed twin, so a menu's backdrop shifts colour instead of dimming. See
+     * lcd_set_clut_ext() in gw_lcd.h. Appended after GW_LCD_BACKLIGHT_SET, so
+     * cores built against an earlier v2 header are unaffected. */
+    GW_LCD_SET_CLUT_EXT    = 11,
 } gw_lcd_op_t;
 
 /* Hardware audio ops for audio_ctl() below. Replaces the former per-call

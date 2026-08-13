@@ -124,6 +124,18 @@ uint32_t cga_test_palette[32] __attribute__((section(".test_bss")));
    pattern itself is written straight into cga_test_vram, which IS the text
    buffer -- that is the path a real DOS program takes, poking B800:0 rather
    than going through INT 10h. */
+/* VGA mode 13h. The aperture and the host palette block come from the caller
+   in the real core (the LCD bonus pool); here they are just two buffers, which
+   is the whole point of taking them as arguments rather than as .bss.
+   vga_dac_arg is streamed through the DAC PORTS by arm 6, not memcpy'd into
+   the DAC -- 0x3C9 is a stream and a test that bypassed it would not see the
+   failure that models it as a latch. */
+uint8_t  vga_test_aperture[X86_VGA_APERTURE_BYTES] __attribute__((section(".ahb_bss")));
+uint8_t  vga_test_pal[X86_VGA_PALETTE_BYTES] __attribute__((section(".ahb_bss")));
+uint8_t  vga_dac_arg[768] __attribute__((section(".ahb_bss")));
+uint32_t vga_clut_out[256] __attribute__((section(".ahb_bss")));
+volatile uint32_t vga_dac_readback[6];   /* first two entries, read back via 0x3C7/0x3C9 */
+
 volatile uint32_t text_mode_arg = 0x03;
 volatile uint32_t text_scroll_arg = 0;      /* (attr << 8) | lines */
 
@@ -409,6 +421,7 @@ static void modeswitch_test_init(void)
     };
 
     x86_video_init(cga_test_vram, cga_test_palette);
+    x86_video_set_aperture(vga_test_aperture, vga_test_pal);
     x86_bios_init();
     x86_hle_install(hle_vectors, sizeof(hle_vectors));
     memcpy(&test_ram[MSW_CODE_BASE], set_mode_code, sizeof(set_mode_code));
@@ -442,6 +455,7 @@ static void kbd_test_run(void)
     /* x86_bios_init() puts the renderer into mode 3, which needs a VRAM
        pointer -- the real core calls x86_video_init() first and so must this. */
     x86_video_init(cga_test_vram, cga_test_palette);
+    x86_video_set_aperture(vga_test_aperture, vga_test_pal);
     x86_bios_init();
     x86_hle_install(hle_vectors, sizeof(hle_vectors));
 
@@ -547,6 +561,7 @@ static void osk_test_run(void)
         0x08, 0x09, 0x10, 0x16, 0x1A, 0x20, 0x21,
     };
     x86_video_init(cga_test_vram, cga_test_palette);
+    x86_video_set_aperture(vga_test_aperture, vga_test_pal);
     x86_bios_init();
     x86_hle_install(hle_vectors, sizeof(hle_vectors));
     x86_osk_reset();
@@ -849,6 +864,7 @@ static void dosfile_test_run(void)
     memset(&test_ram[DOSF_NAME1], 0, 32);
 
     x86_video_init(cga_test_vram, cga_test_palette);
+    x86_video_set_aperture(vga_test_aperture, vga_test_pal);
     x86_bios_init();
     x86_hle_install(hle_vectors, sizeof(hle_vectors));
 
@@ -908,6 +924,12 @@ void Reset_Handler(void) {
     // zeroing here or a test reads whatever the previous run left.
     extern uint32_t _stestbss, _etestbss;
     for (uint32_t *p = &_stestbss; p < &_etestbss; p++) {
+        *p = 0;
+    }
+    // Same for the mode 13h buffers, which are in AHBRAM for want of room in
+    // either AXI region. AHB SRAM's clock is on -- SystemInit enables it.
+    extern uint32_t _sahbbss, _eahbbss;
+    for (uint32_t *p = &_sahbbss; p < &_eahbbss; p++) {
         *p = 0;
     }
 
@@ -1098,6 +1120,7 @@ void Reset_Handler(void) {
 
         if (run_video_flag == 1) {
             x86_video_init(cga_test_vram, cga_test_palette);
+            x86_video_set_aperture(vga_test_aperture, vga_test_pal);
             /* init clears VRAM; the host's pattern is written after the flag
                is armed, so re-arm ordering matters -- see tests/test_video.py */
             run_video_flag = 2;
@@ -1121,6 +1144,27 @@ void Reset_Handler(void) {
         if (run_video_flag == 5) {
             x86_video_scroll((uint8_t)text_scroll_arg,
                              (uint8_t)(text_scroll_arg >> 8));
+            run_video_flag = 0;
+        }
+        if (run_video_flag == 6) {
+            /* Stream the palette exactly as a guest does: index once to
+               0x3C8, then 768 consecutive bytes to 0x3C9. Then read the first
+               two entries back through 0x3C7/0x3C9, which is what a fade loop
+               does and what a write-only DAC would fail. */
+            unsigned i;
+            x86_port_write(0x3C8, 0, 1);
+            for (i = 0; i < 768; i++)
+                x86_port_write(0x3C9, vga_dac_arg[i], 1);
+            x86_port_write(0x3C7, 0, 1);
+            for (i = 0; i < 6; i++)
+                vga_dac_readback[i] = x86_port_read(0x3C9, 1);
+            run_video_flag = 0;
+        }
+        if (run_video_flag == 7) {
+            const uint32_t *c = x86_video_clut256();
+            unsigned i;
+            for (i = 0; i < 256; i++)
+                vga_clut_out[i] = c ? c[i] : 0xDEADBEEFu;
             run_video_flag = 0;
         }
         if (run_video_flag == 3) {

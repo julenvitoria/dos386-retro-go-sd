@@ -31,7 +31,11 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 SECTOR = 512
-WINDOW_SECTORS = 32            # must match x86_disk.c
+# Defaults must match x86_disk.c. --window-sectors/--window-count rebuild the
+# cache with a different geometry and re-run everything against it, which is
+# what makes "is 64 KB the right size" a MEASUREMENT rather than an opinion --
+# see --sweep.
+WINDOW_SECTORS = 32
 WINDOW_COUNT = 4
 CACHE_BYTES = WINDOW_SECTORS * SECTOR * WINDOW_COUNT
 DISK_SECTORS = 2880            # a 1.44 MB floppy, which is what a .dsk is
@@ -124,13 +128,15 @@ class Fail(Exception):
     pass
 
 
-def build(tmp):
+def build(tmp, tag=""):
     shim_c = os.path.join(tmp, "shim.c")
     with open(shim_c, "w") as f:
         f.write(SHIM)
-    so = os.path.join(tmp, "diskcache.so")
+    so = os.path.join(tmp, f"diskcache{tag}.so")
     cmd = ["cc", "-std=c11", "-O1", "-g", "-fPIC", "-shared", "-Wall",
            "-DX86_DISK_HOST_TEST=1",
+           f"-DX86_DISK_WINDOW_SECTORS={WINDOW_SECTORS}u",
+           f"-DX86_DISK_WINDOW_COUNT={WINDOW_COUNT}u",
            "-I" + ROOT, "-I" + os.path.join(ROOT, "lib", "FatFs"),
            os.path.join(ROOT, "x86_disk.c"), shim_c, "-o", so]
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -200,7 +206,7 @@ def check(cond, msg):
     print(f"  ok   {msg}")
 
 
-def run(so):
+def make_image():
     # Deterministic, and every sector distinguishable from every other one --
     # a cache that returns the wrong window must not be able to hide behind
     # repeated bytes.
@@ -209,7 +215,11 @@ def run(so):
     for s in range(DISK_SECTORS):
         image += s.to_bytes(4, "little") + bytes(rng.getrandbits(8)
                                                  for _ in range(SECTOR - 4))
-    d = Disk(so, bytes(image))
+    return bytes(image)
+
+
+def run(so):
+    d = Disk(so, make_image())
 
     print("allocation")
     d.enable_cache()
@@ -339,21 +349,94 @@ def run(so):
         rc, got = d.read(500 + i, 1)
         if rc != 0 or got != d.expect(500 + i, 1):
             raise Fail(f"streaming read failed at sector {500 + i}")
-    expected_fills = 9                 # 500..747 spans 9 aligned 32-sector windows
+    # 500..747 spans however many aligned windows the geometry gives.
+    first = 500 // WINDOW_SECTORS
+    last = 747 // WINDOW_SECTORS
+    expected_fills = last - first + 1
     check(d.backend_calls == expected_fills,
           f"248 single-sector guest reads -> {d.backend_calls} backend calls "
           f"({248 / d.backend_calls:.0f}x fewer)")
 
 
+def sweep(tmp):
+    """What the cache geometry actually buys, measured on the two access
+    patterns that matter: a stream (a 124 KB file read a sector at a time,
+    which is what INT 21h AH=3Fh's 512-byte bounce buffer turns every read
+    into) and a metadata-ish random walk.
+
+    The point is the SHAPE of the curve, not one number. The stream is served
+    by the WINDOW -- one fetch per window, so bigger windows always win it and
+    the count is irrelevant. Random access is served by the SET -- more windows
+    keep FAT and directory sectors resident while a stream rotates through the
+    others. A single number cannot show that the two pull in opposite
+    directions, so both are printed for every geometry.
+    """
+    global WINDOW_SECTORS, WINDOW_COUNT, CACHE_BYTES
+    saved = (WINDOW_SECTORS, WINDOW_COUNT, CACHE_BYTES)
+    image = make_image()
+
+    rng = random.Random(99)
+    ops = []
+    for _ in range(3000):
+        count = rng.choice([1] * 12 + [2, 3, 4, 8, 17])
+        ops.append((rng.randrange(0, DISK_SECTORS - count), count))
+
+    print(f"{'geometry':>18} {'KB':>5} | {'stream calls':>12} {'x':>5} |"
+          f" {'random calls':>12} {'hit%':>6}")
+    print("-" * 72)
+    rows = []
+    for count, secs in [(4, 32), (2, 32), (4, 16), (2, 16), (4, 8), (1, 32)]:
+        WINDOW_COUNT, WINDOW_SECTORS = count, secs
+        CACHE_BYTES = WINDOW_SECTORS * SECTOR * WINDOW_COUNT
+        so = build(tmp, tag=f"_{count}x{secs}")
+        d = Disk(so, image)
+
+        d.enable_cache()
+        for i in range(248):
+            d.read(500 + i, 1)
+        stream = d.backend_calls
+
+        d.enable_cache()
+        for s_, c_ in ops:
+            d.read(s_, c_)
+        rnd = d.backend_calls
+        hits, misses = d.hits, d.misses
+        rate = 100.0 * hits / (hits + misses) if (hits + misses) else 0.0
+
+        kb = CACHE_BYTES // 1024
+        print(f"{count} x {secs * SECTOR // 1024:>2} KB{'':>7} {kb:>5} |"
+              f" {stream:>12} {248 / stream:>4.0f}x |"
+              f" {rnd:>12} {rate:>5.1f}%")
+        rows.append((count, secs, kb, stream, rnd, rate))
+
+    WINDOW_SECTORS, WINDOW_COUNT, CACHE_BYTES = saved
+    return rows
+
+
 def main():
+    global WINDOW_SECTORS, WINDOW_COUNT, CACHE_BYTES
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--keep-temp", action="store_true",
                     help="keep the compiled shared object for debugging")
+    ap.add_argument("--window-sectors", type=int, default=WINDOW_SECTORS,
+                    help="sectors per window (x86_disk.c default 32 = 16 KB)")
+    ap.add_argument("--window-count", type=int, default=WINDOW_COUNT,
+                    help="number of windows (x86_disk.c default 4)")
+    ap.add_argument("--sweep", action="store_true",
+                    help="measure backend calls and hit rate across several "
+                         "cache geometries instead of running the checks")
     args = ap.parse_args()
+
+    WINDOW_SECTORS = args.window_sectors
+    WINDOW_COUNT = args.window_count
+    CACHE_BYTES = WINDOW_SECTORS * SECTOR * WINDOW_COUNT
 
     tmp = tempfile.mkdtemp(prefix="diskcache-", dir=os.path.join(ROOT, "build"))
     try:
+        if args.sweep:
+            sweep(tmp)
+            return 0
         so = build(tmp)
         run(so)
     except Fail as e:

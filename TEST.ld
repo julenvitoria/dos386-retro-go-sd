@@ -95,4 +95,20 @@ SECTIONS {
     . = ALIGN(4);
     _etestbss = .;
   } > RAM_UC
+
+  /* Mode 13h's 64 KB aperture, its palette block and the DAC scratch. AHBRAM
+     is 128 KB and the bare-metal harness uses none of it, while RAM_UC has
+     ~48 KB free and RAM_EMU ~20 KB -- neither fits 67 KB on its own, and
+     splitting the aperture from its palette to make it fit would be a layout
+     the real core does not have. In the real core these come from the LCD
+     bonus pool; here they only have to exist and be host-readable.
+     Zeroed by Reset_Handler alongside .test_bss. */
+  .ahb_bss (NOLOAD) : {
+    . = ALIGN(4);
+    _sahbbss = .;
+    *(.ahb_bss)
+    *(.ahb_bss*)
+    . = ALIGN(4);
+    _eahbbss = .;
+  } > AHBRAM
 }

@@ -318,6 +318,73 @@ int x86_bios_video(uint8_t func)
     case 0x05:                      /* set active page: single page only */
         return 1;
     /*
+     * AH=10h -- VGA palette / DAC. Implemented as calls into the SAME DAC the
+     * 0x3C8/0x3C9 ports drive, so there is one palette model and not two that
+     * can disagree about what colour an index is. A title that loads its
+     * palette through the BIOS and one that streams it to the ports must end
+     * up in the same place.
+     */
+    case 0x10: {
+        unsigned al = cpu_state_ptr->regs[0] & 0xFF;
+        if (al == 0x10) {           /* set one DAC register: BX=index, DH/CH/CL */
+            uint8_t rgb[3];
+            rgb[0] = (uint8_t)((cpu_state_ptr->regs[2] >> 8) & 0xFF);   /* DH R */
+            rgb[1] = (uint8_t)((cpu_state_ptr->regs[1] >> 8) & 0xFF);   /* CH G */
+            rgb[2] = (uint8_t)( cpu_state_ptr->regs[1]       & 0xFF);   /* CL B */
+            x86_vga_dac_set_block(cpu_state_ptr->regs[3] & 0xFF, 1, rgb);
+            return 1;
+        }
+        if (al == 0x12) {           /* set a BLOCK: BX=first, CX=count, ES:DX */
+            unsigned first = cpu_state_ptr->regs[3] & 0xFFFF;
+            unsigned count = cpu_state_ptr->regs[1] & 0xFFFF;
+            uint32_t lin = cpu_state_ptr->segs[0].base
+                         + (cpu_state_ptr->regs[2] & 0xFFFF);
+            uint8_t *p;
+            if (first > 255u) return 1;
+            if (count > 256u - first) count = 256u - first;
+            p = x86_guest_ptr(lin, count * 3u);
+            if (p)
+                x86_vga_dac_set_block(first, count, p);
+            return 1;
+        }
+        if (al == 0x15 || al == 0x17) {   /* read one / read a block */
+            /* Reads go through the port side's own index+stream so a
+               read-modify-write fade sees exactly what it wrote. */
+            unsigned first = (al == 0x15) ? (cpu_state_ptr->regs[3] & 0xFF)
+                                          : (cpu_state_ptr->regs[3] & 0xFFFF);
+            unsigned count = (al == 0x15) ? 1u
+                                          : (cpu_state_ptr->regs[1] & 0xFFFF);
+            if (first > 255u) return 1;
+            if (count > 256u - first) count = 256u - first;
+            x86_vga_dac_set_read_index((uint8_t)first);
+            if (al == 0x15) {
+                uint8_t r = x86_vga_dac_read();
+                uint8_t g = x86_vga_dac_read();
+                uint8_t b = x86_vga_dac_read();
+                cpu_state_ptr->regs[2] =
+                    (cpu_state_ptr->regs[2] & 0xFFFF00FFu) | ((uint32_t)r << 8);
+                cpu_state_ptr->regs[1] =
+                    (cpu_state_ptr->regs[1] & 0xFFFF0000u)
+                    | ((uint32_t)g << 8) | b;
+            } else {
+                uint32_t lin = cpu_state_ptr->segs[0].base
+                             + (cpu_state_ptr->regs[2] & 0xFFFF);
+                uint8_t *p = x86_guest_ptr(lin, count * 3u);
+                if (p)
+                    for (unsigned i = 0; i < count * 3u; i++)
+                        p[i] = x86_vga_dac_read();
+            }
+            return 1;
+        }
+        /* AL=00/01/02/03 are the EGA 16-colour palette-register calls. Mode
+           13h indexes the DAC directly and does not go through them, and we
+           have no attribute controller, so they are accepted and ignored
+           rather than left unanswered -- an unanswered call in the middle of a
+           sequence is indistinguishable, to the guest, from broken hardware.
+           That is the TOPBENCH AH=43h shape, and it cost a session. */
+        return 1;
+    }
+    /*
      * The EGA/VGA detection cascade. Neither of these exists on a CGA BIOS,
      * where the vector simply IRETs -- and answering them that way is not
      * pedantry, it is the difference between a program deciding "no EGA" and a

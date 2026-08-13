@@ -91,9 +91,7 @@ nibble table) plus the 68-byte event ring; everything else is code. The 8x8 font
 was already linked for the guest's F000:F000 copy, so the rasteriser and the
 40-column renderer add no font data.
 
-**Left out, each for a measured reason, not for effort:** mode 13h and VBE
-(64,000 / 76,800 B, and 256 CLUT entries against a `GW_LCD_SET_CLUT` that clamps
-at 32 — undisplayable, not merely tight); EGA 0Dh/0Eh/10h/12h (planar writes
+**Left out, each for a measured reason, not for effort:** VBE (76,800 B); EGA 0Dh/0Eh/10h/12h (planar writes
 need a store-side hook, and our VRAM is deliberately plain mapped RAM with no
 MMIO path, plus 32-153 KB); Hercules (720x348 needs real resampling). The CRTC
 start address at 0040:004D is also not honoured — we do not model CRTC 12/13 —
@@ -105,6 +103,117 @@ against a host-side raster of the same font, and covers mode 6, mode 0 and the
 refusal path. Tier 2: the prompt and Alley Cat's skill-level menu are readable
 (`build/artifacts/ac_after_t12.png`, `ac_after_game.png`) where they were one
 coloured line before (`ac_t12.png`); no faults, 1,904 frames, no refused modes.
+
+## VGA mode 13h — and the firmware ABI change that made it possible
+
+Mode 13h was listed above as **undisplayable**, and that was right: 256 CLUT
+entries against a `GW_LCD_SET_CLUT` that clamps at 32. The clamp is not
+timidity — `lcd_set_clut()` writes a 40%-darkened TWIN of entry `i` at
+`count+i` so retro-go's overlay can dim by OR-ing `LCD_DARKEN_BIT` (0x20), and
+256 entries would need **512 hardware slots against the LTDC's 256**. Raising
+the cap is impossible, not merely expensive.
+
+So the FIRMWARE changed (branch `external_cores`): `lcd_set_clut_ext()` takes a
+**caller-owned** palette of up to 256 entries and bypasses the twin cache, at a
+cost of 4 bytes of firmware state instead of ~1.8 KB of its DTCM. Exposed as
+one appended ABI op, **`GW_LCD_SET_CLUT_EXT = 11`** — append-only, so existing
+cores are unaffected, and no version bump (v2 is unpublished and already
+appends freely). The `gw_lcd.c`/`gw_lcd.h` half is the user's own commit
+`ba73090b6`, hand-applied; its DOS-core halves were left behind.
+
+**Accepted and not solved: `LCD_DARKEN_BIT` stops working while a 256-colour
+mode is up.** OR-ing 0x20 under a full-range palette picks an unrelated colour,
+so retro-go's menu backdrop SHIFTS COLOUR instead of dimming. The menu box and
+its text are drawn after the darken pass and stay readable, and
+`lcd_pack_color()` searches the 256 entries so menu colours still resolve to a
+real nearest match. `gnw-doom` tried to fix this with a bit-5-invariant
+palette; it collapses the palette to 128 and mangles half the colours. Do not
+repeat it. Full detail: [`docs/08_vga_mode13h.md`](docs/08_vga_mode13h.md).
+
+The core side is small because the mode is: 320x200x256 LINEAR at 0xA0000 is
+byte-for-byte our LUT8 framebuffer, so the blit is 200 `memcpy`s and
+**nothing is added to the store path**. What is not small is the DAC — ports
+0x3C6-0x3C9, with `0x3C9` modelled as a STREAM and not a latch. A guest writes
+the index once and then 768 consecutive bytes; as a latch, 767 are lost and the
+screen comes out one colour **while every pixel index stays perfect**, which is
+a failure a blit test cannot see. `INT 10h AH=10h` routes into the same DAC, so
+there is one palette model rather than two that can disagree.
+
+Tier 1, `tests/test_video.py`: 13h adopted with the BDA agreeing (0x449=0x13,
+0x44A=40); the palette streamed through the real ports and read back 6-bit
+exact through 0x3C7/0x3C9; **all 256 CLUT entries** exact against a host
+expansion (`(v<<2)|(v>>4)`, so 63→255 and not 252); **all 64,000 pixels** exact
+against a host image of bars over diagonals — a stride error slants the bars
+and re-slopes the diagonals, and one wrong stride cannot satisfy both; the
+letterbox untouched; and the 256-entry table WITHDRAWN on leaving 13h, without
+which the firmware keeps a core-owned palette the overlay then draws through.
+The old "13h is refused" arm now uses mode 0x11, or it would test nothing.
+
+**WOLF3D does not reach video, so it neither confirms nor refutes any of this.**
+Measured under gwemu at 30 s: `x86_video_mode_log` holds two events for the
+whole run (mode 3 at boot, the renderer following), `x86_vga_dac_writes` is 0,
+and `x86_dos_file_log` is all 32 slots of **INT 21h AH=42h returning CF=1,
+AX=0x0006 "invalid handle"**, repeating at 3.0 M insn/s after a FindFirst for
+`*.WL1`. A DOS-layer defect in front of everything here, the same shape as
+TOPBENCH's AH=43h. The screen is black before and after, for that reason.
+
+**Mode Y (unchained 13h), which is what Wolf3D actually uses, is scoped and NOT
+built.** The blit would be nearly free — at the standard geometry the correct
+de-interleave IS the linear read. Three other things are not: a store-side hook
+on every VRAM write (our VRAM is deliberately plain mapped RAM with no MMIO
+path), a Sequencer + CRTC register file (we model neither, and CRTC 0x0C/0x0D
+is an existing open gap), and page storage that does not exist — a Mode Y page
+is still 64,000 B and two real pages are 195,072 B against 45,056 B free.
+Three subsystems, correctly separate work.
+
+## Where memory lives now — and a belief that was wrong
+
+`src/main.c` kept VRAM out of the LCD bonus pool because the pool "is
+uncached". **Read out of the firmware source, it is not.**
+`mpu_set_lcd_pool_uncached_range()` covers exactly the framebuffer footprint
+(154 KB in LUT8) and its own comment says everything past it "defaults to
+Normal cacheable, which is what we want for the LCD bonus area". The bonus area
+is cached AXI, the same class as RAM_EMU. That mattered: emulated VRAM behind a
+strongly-ordered region costs ~5.4-6.5 cycles per guest BYTE store, 4x the blit
+it saves.
+
+Three things moved.
+
+1. **The .dsk sector cache → the AHB heap (`GW_MEM_AHB`)**, not for room but on
+   principle: it is a disk staging buffer, AHB is D2 SRAM and D2 is the only
+   SRAM DMA1/DMA2 can reach, so it is where it must live if SPI1's polled
+   transfer ever becomes a DMA one. It is also the **only ABI pool with a real
+   `free()`**. Measured on target: `0x30005DF8` (heap is
+   `0x30005DC0`-`0x3001E000`), `x86_disk_cache_ok=1`, and TOPBENCH's
+   **115 guest reads → 7 backend calls is unchanged by the move**. Its free
+   space is the one number that cannot be read off a link map — the heap is
+   shared with the firmware's own allocations — so `disk_cache_mem` publishes
+   the pointer.
+2. **The 13h aperture → the 64 KB the cache vacated**, at bonus+8 K.
+3. **CGA VRAM (32 KB) → the bonus pool**, which is what saved the build:
+   13h cost 2,896 B of core TEXT and took RAM_EMU headroom from +872 to
+   **-2,024 B** — `guest_ram` returns NULL, `core_ready` stays 0, no message.
+   After the move, **+30,728 B**.
+
+The pool map is now `BONUS_*_OFF` in one place instead of open-coded
+`4096`/`8192` at four call sites: filler 4 K, BIOS page 4 K, aperture 64 K,
+13h palette 2 K, VRAM 32 K = **108,544 used of 153,600**. The 45,056 B free is
+deliberately left contiguous at the TOP, for a VRAM arena that can balloon for
+an EGA mode and shrink again.
+
+**The cache geometry is a build-time tunable now** (`X86_DISK_WINDOW_SECTORS`,
+`X86_DISK_WINDOW_COUNT`), and `tests/test_disk_cache.py --sweep` measures it.
+The stream win is bought **entirely by window SIZE, not by count** — 4x16 KB
+and 2x16 KB both serve 248 single-sector reads in 9 backend calls, while 8 KB
+windows need 16 and 4 KB need 32. The COUNT buys residency: at 2 windows the
+test's own metadata-vs-stream arm fails, because the stream evicts the metadata
+window — which is the property the set exists for, failing exactly as designed.
+Nothing forces a size trade any more, so it stays at 4 x 16 KB.
+
+Tier 2 after all of it: Alley Cat renders its mode 4 screen in full
+(`build/artifacts/alleycat_after_vram_move.png`), `core_ready=1`,
+`vga_aperture_ok=1`, `x86_vga13_ok=1`, bonus pool 153,600, 1,000,001 insns,
+~60 fps.
 
 ## On-screen keyboard — shipped; mouse UI — shell only
 

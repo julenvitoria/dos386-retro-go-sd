@@ -250,15 +250,168 @@ def mode_switch_checks(b, syms):
     print("PASS: mode 0 (40x25 text at the 8x8 cell) pixel-exact")
 
     # ---- a mode we cannot render must be REFUSED, not adopted -------------
+    # 0x11 (640x480x2 VGA) is the stand-in now that 13h IS rendered. It has to
+    # be a mode nothing in vmodes[] claims, or this arm silently tests nothing.
+    r = guest_set_mode(b, syms, 0x11)
+    if r is None:
+        return False
+    if r[0] != 0x00:
+        print(f"FAIL: unsupported mode 11h was adopted ({r[0]:#x}); the "
+              f"previous mode must stay up instead")
+        return False
+    print("PASS: mode 11h refused, mode 0 stays up (nothing renders it)")
+
+    if not vga13_checks(b, syms):
+        return False
+    return ok
+
+
+def expected_vga13(aperture):
+    """Mode 13h is an IDENTITY copy: the guest's 320x200x8bpp aperture already
+    IS the panel's LUT8 format. Computed here anyway rather than asserted as
+    'the same bytes', because the letterbox offset and the stride are exactly
+    what a wrong blit gets wrong."""
+    img = bytearray(FB_STRIDE * 240)
+    for y in range(200):
+        img[FB_TOP + y * FB_STRIDE : FB_TOP + y * FB_STRIDE + 320] = \
+            aperture[y * 320 : y * 320 + 320]
+    return bytes(img)
+
+
+def vga13_checks(b, syms):
+    """VGA mode 13h: 320x200x256 linear at 0xA0000, and its 256-entry DAC.
+
+    Two things are checked and they fail differently. The BLIT is pixel-exact
+    against a host-computed image, so a stride or letterbox error shows up as a
+    slant or an offset. The PALETTE is compared against a host expansion of the
+    same DAC bytes -- and it is streamed through the PORTS (0x3C8 then 768
+    writes to 0x3C9), because a DAC modelled as a latch loses 767 of those 768
+    and the whole screen comes out one colour. That failure is invisible in a
+    blit check: the pixel INDICES would still be perfect.
+    """
+    for n in ("vga_test_aperture", "vga_dac_arg", "vga_clut_out",
+              "vga_dac_readback", "x86_vga13_ok"):
+        if n not in syms:
+            print(f"FAIL: harness has no {n}; mode 13h arm cannot run")
+            return False
+    if b.read_uint32(syms["x86_vga13_ok"]) != 1:
+        print("FAIL: x86_vga13_ok is 0 -- the aperture was never handed over, "
+              "so 13h would be refused rather than rendered")
+        return False
+
     r = guest_set_mode(b, syms, 0x13)
     if r is None:
         return False
-    if r[0] != 0:
-        print(f"FAIL: unsupported mode 13h was adopted ({r[0]:#x}); the "
-              f"previous mode must stay up instead")
+    # (mode, is_text, cols, bda_mode, bda_cols)
+    if r[0] != 0x13:
+        print(f"FAIL: mode 13h not adopted (renderer says {r[0]:#x})")
         return False
-    print("PASS: mode 13h refused, mode 0 stays up (nothing renders it)")
-    return ok
+    if r[1] != 0:
+        print("FAIL: mode 13h reported as a TEXT mode")
+        return False
+    if r[3] != 0x13 or r[4] != 40:
+        print(f"FAIL: BDA disagrees with the renderer: 0x449={r[3]:#x} "
+              f"0x44A={r[4]} (want 0x13 / 40). The BDA is re-read every frame, "
+              f"so a disagreement here undoes the mode set on the next one")
+        return False
+    print("PASS: mode 13h adopted, BDA 0x449=0x13 0x44A=40")
+
+    # ---- the DAC, streamed through the ports ------------------------------
+    # Index readable off the colour: R=i>>2, G=i&0x3F, B=63-(i>>2). No two
+    # indices share a colour, so a wrong entry names itself.
+    dac = bytearray(768)
+    for i in range(256):
+        dac[i * 3 + 0] = i >> 2
+        dac[i * 3 + 1] = i & 0x3F
+        dac[i * 3 + 2] = 63 - (i >> 2)
+    b.write_memory(syms["vga_dac_arg"], bytes(dac))
+    b.write_uint32(syms["run_video_flag"], 6)
+    if not wait_flag(b, syms["run_video_flag"], 0, "DAC stream hung"):
+        return False
+
+    # Read-back: a fade loop read-modify-writes the DAC and must get its own
+    # 6-bit values back, not the 8-bit expansion.
+    got_rb = [b.read_uint32(syms["vga_dac_readback"] + 4 * i) for i in range(6)]
+    if got_rb != [dac[i] for i in range(6)]:
+        print(f"FAIL: DAC read-back {got_rb} != written {[dac[i] for i in range(6)]}"
+              " -- a read-modify-write fade loop would corrupt the palette")
+        return False
+    print("PASS: DAC read-back exact through 0x3C7/0x3C9 (6-bit, as written)")
+
+    b.write_uint32(syms["run_video_flag"], 7)
+    if not wait_flag(b, syms["run_video_flag"], 0, "CLUT snapshot hung"):
+        return False
+    raw = bytes(b.read_memory(syms["vga_clut_out"], 256 * 4))
+    got_clut = [int.from_bytes(raw[i * 4:i * 4 + 4], "little") for i in range(256)]
+
+    def expand(v):
+        # 63 must map to 255, not 252: a plain << 2 leaves every white 1.2%
+        # grey and every fade-to-white short of it.
+        return ((v << 2) | (v >> 4)) & 0xFF
+
+    want_clut = [(expand(dac[i * 3]) << 16) | (expand(dac[i * 3 + 1]) << 8)
+                 | expand(dac[i * 3 + 2]) for i in range(256)]
+    bad = [i for i in range(256) if got_clut[i] != want_clut[i]]
+    if bad:
+        i = bad[0]
+        print(f"FAIL: CLUT entry {i} is {got_clut[i]:#08x}, want {want_clut[i]:#08x}"
+              f" ({len(bad)} of 256 wrong)")
+        if len(bad) > 200:
+            print("  nearly all wrong -- the classic shape of a DAC modelled "
+                  "as a port LATCH, which keeps only the last of 768 bytes")
+        return False
+    print("PASS: 256 CLUT entries exact (6->8 bit as (v<<2)|(v>>4))")
+
+    # ---- the blit ---------------------------------------------------------
+    # Vertical bars over the top half, diagonals over the bottom. A bar is
+    # constant down a column, so a stride error slants it; a diagonal is
+    # constant ALONG a diagonal, so the same error changes its slope instead.
+    # One wrong stride cannot satisfy both.
+    ap = bytearray(320 * 200)
+    for y in range(200):
+        for x in range(320):
+            ap[y * 320 + x] = (x & 0xFF) if y < 100 else ((x + y) & 0xFF)
+    b.write_memory(syms["vga_test_aperture"], bytes(ap))
+    got = render(b, syms)
+    if got is None:
+        return False
+    want = expected_vga13(bytes(ap))
+    if got != want:
+        for i, (g, w) in enumerate(zip(got, want)):
+            if g != w:
+                row, col = divmod(i, FB_STRIDE)
+                print(f"FAIL: mode 13h first mismatch at ({col},{row}) "
+                      f"got {g} expected {w}")
+                break
+        diff = sum(1 for g, w in zip(got, want) if g != w)
+        print(f"  {diff} of {len(want)} bytes differ")
+        return False
+    print(f"PASS: mode 13h {320 * 200} pixels exact (bars + diagonals)")
+
+    # The letterbox must be untouched black -- 200 rows into a 240-row panel.
+    if any(got[:FB_TOP]) or any(got[FB_TOP + 200 * FB_STRIDE:]):
+        print("FAIL: mode 13h wrote outside rows 20..219 (the letterbox bars "
+              "are the OSK's surface and are not the guest's to touch)")
+        return False
+    print("PASS: letterbox bars untouched")
+
+    # Leaving 13h must hand the 32-entry table back, or every later mode draws
+    # through a palette nothing maintains.
+    r = guest_set_mode(b, syms, 0x03)
+    if r is None or r[0] != 0x03:
+        print("FAIL: could not get back out of mode 13h into text mode 3")
+        return False
+    b.write_uint32(syms["run_video_flag"], 7)
+    if not wait_flag(b, syms["run_video_flag"], 0, "CLUT snapshot hung"):
+        return False
+    raw = bytes(b.read_memory(syms["vga_clut_out"], 4))
+    if int.from_bytes(raw, "little") != 0xDEADBEEF:
+        print("FAIL: x86_video_clut256() still returns a palette outside a "
+              "256-colour mode; the firmware would keep the core-owned table "
+              "and retro-go's overlay would draw through it")
+        return False
+    print("PASS: 256-entry CLUT withdrawn on leaving 13h")
+    return True
 
 
 def expected_text40(cells, font):
