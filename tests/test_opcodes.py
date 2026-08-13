@@ -1767,6 +1767,103 @@ def run_test(args):
                 "expected_eip": 5,
             },
 
+            # --- REP: the batched fast path's boundaries ----------------------
+            # .str_exit re-enters the string handler directly for up to
+            # REP_BATCH_MAX (256) elements instead of rewinding EIP to the
+            # prefix. These cases pin the edges of that batch: the fold granule
+            # (the handler must still re-walk per element), the cap itself, and
+            # the data-driven early exit, which must land on exactly the element
+            # the per-element path would have stopped on.
+            {
+                "name": "REP MOVSW ends exactly on a fold granule boundary",
+                # 0x40 words from 0x10F80 to 0x10FFF -- the last word ends on
+                # 0x11000, so the batch finishes flush with the granule.
+                "code": bytes([0xF3, 0xA5, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x10000, "ES": 0x30000},
+                "ram_setup": [(0x30F80, bytes(0x80)),
+                              (0x10F80, bytes(range(0x80)))],
+                "regs_initial": {1: 0x40, 6: 0xF80, 7: 0xF80},
+                "regs_expected": {1: 0, 6: 0x1000, 7: 0x1000},
+                "mem_expected": [(0x30F80, bytes(range(0x80))),
+                                 (0x31000, bytes(4))],
+                "expected_eip": 3,
+            },
+            {
+                "name": "STD + REP MOVSW walks backwards across a granule",
+                # DF=1, starting above 0x11000 and walking down through it. The
+                # batch must re-walk the fold per element in this direction too.
+                "code": bytes([0xFD, 0xF3, 0xA5, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x10000, "ES": 0x30000},
+                "ram_setup": [(0x30FF0, bytes(0x20)),
+                              (0x10FF0, bytes(range(0x20)))],
+                "regs_initial": {1: 0x10, 6: 0x100E, 7: 0x100E},
+                "regs_expected": {1: 0, 6: 0xFEE, 7: 0xFEE},
+                "mem_expected": [(0x30FF0, bytes(range(0x20)))],
+                "expected_eip": 4,
+            },
+            {
+                "name": "REP MOVSB with CX=1 copies exactly one byte",
+                "code": bytes([0xF3, 0xA4, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000, "ES": 0x2000},
+                "ram_setup": [(0x2020, bytes(4)),
+                              (0x1010, bytes([0x5A, 0xA5]))],
+                "regs_initial": {1: 1, 6: 0x10, 7: 0x20},
+                "regs_expected": {1: 0, 6: 0x11, 7: 0x21},
+                "mem_expected": [(0x2020, bytes([0x5A, 0x00]))],
+                "expected_eip": 3,
+            },
+            {
+                "name": "REP MOVSB spans several batches on a non-multiple count",
+                # 300 > 256, so the cap forces a rewind mid-run, and 300 is not
+                # a multiple of it -- an off-by-one in the cap shows up as a
+                # short or long copy rather than as nothing at all.
+                "code": bytes([0xF3, 0xA4, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x10000, "ES": 0x30000},
+                "ram_setup": [(0x30000, bytes(320)),
+                              (0x10000, bytes([(i * 7) & 0xFF
+                                               for i in range(300)]))],
+                "regs_initial": {1: 300, 6: 0, 7: 0},
+                "regs_expected": {1: 0, 6: 300, 7: 300},
+                "mem_expected": [(0x30000, bytes([(i * 7) & 0xFF
+                                                  for i in range(300)])),
+                                 (0x3012C, bytes(4))],   # nothing past the end
+                "expected_eip": 3,
+            },
+            {
+                "name": "REPNE SCASB terminates mid-batch on the match",
+                # CX=512, match at the 300th element -- inside a batch, so the
+                # ZF test between batched elements has to stop it there rather
+                # than at the cap or at CX=0.
+                "code": bytes([0xF2, 0xAE, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"ES": 0x30000},
+                "ram_setup": [(0x30000,
+                               b"\x41" * 299 + b"\x42" + b"\x41" * 212)],
+                "regs_initial": {0: 0x42, 1: 512, 7: 0},
+                "regs_expected": {1: 512 - 300, 7: 300},
+                "flags_expected": {"ZF": 1},
+                "expected_eip": 3,
+            },
+            {
+                "name": "REPE CMPSB stops on the first element after the cap",
+                # The difference is at element 258, the first one that runs
+                # after the 256-element cap has forced a rewind through the
+                # prefix -- the seam between the fast path and the slow one.
+                "code": bytes([0xF3, 0xA6, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x10000, "ES": 0x30000},
+                "ram_setup": [(0x10000, b"A" * 512),
+                              (0x30000, b"A" * 257 + b"B" + b"A" * 254)],
+                "regs_initial": {1: 512, 6: 0, 7: 0},
+                "regs_expected": {1: 512 - 258, 6: 258, 7: 258},
+                "flags_expected": {"ZF": 0},
+                "expected_eip": 3,
+            },
+
             # --- hypercall ----------------------------------------------------
             {
                 "name": "HLE: 0F 0B imm8 exits with reason and selector",

@@ -6,7 +6,7 @@ Last verified 2026-08-13. How to run: [`TOOLING.md`](TOOLING.md). Roadmap: [`PLA
 
 | Tier | State |
 |---|---|
-| 1. gwemu bare-metal | 247/247 `test_opcodes.py`, plus `test_video`/`test_text`/`test_dos`/`test_screen` |
+| 1. gwemu bare-metal | 260/260 `test_opcodes.py`, plus `test_video`/`test_text`/`test_dos`/`test_screen` |
 | 2. gwemu + retro-go | `core_dtcm_ok=1`, bonus pool 153,600 B, 1,000,001 insns — matches tier 1 |
 | 3. Hardware | 50.50 cyc/insn, 5.54 MIPS |
 
@@ -37,6 +37,39 @@ fold mapping; the frame-paced loop; and the DOS layer.
 
 - [ ] DWT per-opcode profile: tool done (`profile_opcodes.py`, `X86_PROFILE=1`),
       clean under gwemu, silicon pending; gate NOR backing on code-vs-data
+
+## String ops: the batched fast path, and what it measured
+
+The silicon profile of TOPBENCH said string ops **plus their prefixes were ~59%
+of all cycles**, and `F3` alone was **17% purely as re-dispatch overhead** — 7 M
+dispatches doing no guest work. That is the price of the rewind design: one
+element per pass through fetch/decode/dispatch, twice (prefix + string opcode).
+
+`.str_exit` now re-enters the string handler **directly** for the next element
+(`rep_handler`, resolved off the live dispatch table by the prefix) instead of
+rewinding EIP. Semantics are untouched — the handler still re-walks the fold per
+element, so granule straddles, DF=1, 16/32-bit index wrap and the ZF early exit
+all behave exactly as on the slow path, which is why CMPS/SCAS batch as safely
+as MOVS/STOS/LODS. The batch is bounded by `rep_batch` (256, reloaded by the
+prefix) and by `pit_counter`, which IS the slice budget: a batched element
+decrements it exactly as a loop trip would, so `guest_kips` pacing and
+`guest_insn_debt` stay honest, and a raised IRQ — which the host signals by
+dropping `pit_counter` to 1 — still lands on the same element boundary.
+
+Measured under gwemu, TOPBENCH, `--settle 0 --window 8` (the whole guest life,
+so both runs execute the identical instruction stream; control opcodes agree to
+a few %). Only the COUNTS mean anything under gwemu:
+
+| | F3 | F2 | A4 | A5 | A6 | AE | AB | AD | string+prefix | all dispatches |
+|---|---|---|---|---|---|---|---|---|---|---|
+| before | 343,238 | 40,980 | 177,391 | 116,043 | 41,276 | 41,300 | 25,080 | 37,108 | 847,492 | 2,534,356 |
+| after | 23,075 | 269 | 55,852 | 1,860 | 802 | 803 | 2,768 | 17,751 | 130,235 | 1,968,543 |
+| | **14.9x** | 152x | 3.2x | 62x | 51x | 51x | 9.1x | 2.1x | **6.5x** | **−22%** |
+
+`AC` LODSB is unchanged (23.0 k → 23.9 k): TOPBENCH runs it unprefixed, so
+there is nothing to batch — the fast path is not silently skipping it.
+`asm_metrics`: `.str_exit` 17 → 37 (+20), `REP_ONE_16/32` +4 each; no string
+handler changed. Silicon numbers not yet taken.
 ## Phase 3 — Wolf3D
 
 - [ ] COW/pool/eviction with dirty tracking, loud exhaustion; pool sizing
@@ -104,6 +137,19 @@ and `AUTOEXEC.BAT`'s command tail is no longer dropped (`TOPBENCH.EXE -l`).
 parses them.
 
 ## Open defects
+
+- **A segment override in front of `REP` survives only the first element.**
+  `rep_resume` is the address of the F2/F3 prefix, not of the whole prefix run,
+  so `26 F3 A4` (`ES: REP MOVSB`) rewinds to the `F3` and every element after
+  the first reads from DS. Pre-existing and independent of the batching, which
+  keeps the override for the elements it runs in-handler (R6 is not reset there)
+  and so is if anything closer to the hardware. The fix is to record the START
+  of the prefix run, not the repeat prefix.
+- **TOPBENCH halts ~3 s in on `INSB` (`6C`)** — `exit_reason=4`,
+  `exit_info=0x6C`, EIP 21695, identical before and after the string work.
+  `INS`/`OUTS` are on the Phase 0/1 list above. It is why a TOPBENCH profile
+  window has to start at `--settle 0`: past ~3 s there is no guest running and
+  the table comes back empty.
 
 - **RAM_EMU headroom is 2,528 bytes, and running out is SILENT.** The core ends
   at `__CORE_BSS_END__ = 0x24056620` in a region ending at `0x24100000` — 694,752

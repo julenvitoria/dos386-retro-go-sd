@@ -89,6 +89,14 @@ struct X86CPUState {
     /* Non-zero enables the 0F 0B hypercall. When 0 it raises a real #UD, so a
        guest can be run with HLE off and still behave like a plain 386. */
     uint32_t hle_enabled;
+    /* String-op fast path. `rep_handler` is the dispatch-table entry the F2/F3
+       prefix resolved for the string opcode that follows it, so `.str_exit` can
+       re-enter that handler directly for the next element instead of rewinding
+       EIP and paying a second trip through fetch/decode/dispatch. `rep_batch`
+       is the remaining hard cap on how many elements one batch may run before
+       it must go back through the fetch loop; the prefix reloads it. */
+    uint32_t rep_handler;
+    uint32_t rep_batch;
 };
 typedef struct X86CPUState X86CPUState;
 
