@@ -267,6 +267,16 @@ uint32_t x86_mode_table(int op32, int addr32)
 uint32_t x86_cs_log[64];   /* 16 entries of 4 words */
 uint32_t x86_cs_log_idx;
 
+/* Diagnostic: the last 16 interrupt VECTORS dispatched through the real-mode
+ * IVT, paired one-for-one with the CS loads x86_cs_log records for them.
+ * x86_cs_log names an interrupt only as "LR was HANDLE_INTERRUPT_16" -- it
+ * cannot say WHICH one, and a guest that derails after installing a handler is
+ * exactly the case where that is the whole question. Each entry is
+ * (vector << 16) | new CS selector, so a vector whose IVT slot has been
+ * clobbered reads as its own diagnosis. */
+uint32_t x86_int_vec_log[16];
+uint32_t x86_int_vec_log_idx;
+
 /* Diagnostic: what the last IRET popped, and the SP it popped from.
  * [0]=IP [1]=CS [2]=FLAGS [3]=SP before the pops. */
 uint32_t x86_iret_log[4];
