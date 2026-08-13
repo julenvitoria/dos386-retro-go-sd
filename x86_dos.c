@@ -463,6 +463,22 @@ static uint8_t dos_find_serial;
 #define DOS_FIND_MAGIC 0xF1
 
 /* Fill the DTA's result half from a directory entry, and return 1. */
+/*
+ * The 8.3 name of a directory entry.
+ *
+ * With LFN enabled FatFs puts the short name in `altname` and leaves it EMPTY
+ * when the long and short names are the same, so the fallback to `fname` is
+ * required either way. With LFN disabled (which is how this FatFs is built --
+ * it mounts FAT12 floppies, see lib/FatFs/ffconf.h) there is no `altname`
+ * member at all and `fname` IS the 8.3 name. DOS only ever sees 8.3, so both
+ * builds must land on the same string.
+ */
+#if FF_USE_LFN
+#define DOS_SHORT_NAME(f)  ((f)->altname[0] ? (f)->altname : (f)->fname)
+#else
+#define DOS_SHORT_NAME(f)  ((f)->fname)
+#endif
+
 static int dos_find_report(const FILINFO *fno)
 {
     uint8_t *d = x86_guest_ptr(dta_lin, 43);
@@ -476,7 +492,7 @@ static int dos_find_report(const FILINFO *fno)
     d[0x1A] = (uint8_t)fno->fsize;       d[0x1B] = (uint8_t)(fno->fsize >> 8);
     d[0x1C] = (uint8_t)(fno->fsize >> 16); d[0x1D] = (uint8_t)(fno->fsize >> 24);
 
-    const char *n = fno->altname[0] ? fno->altname : fno->fname;
+    const char *n = DOS_SHORT_NAME(fno);
     unsigned i = 0;
     for (; n[i] && i < 12; i++)
         d[0x1E + i] = (uint8_t)dos_up(n[i]);
@@ -497,7 +513,7 @@ static int dos_find_step(void)
         if (extra & ~dos_find_attr)
             continue;
         char field[11];
-        const char *n = fno.altname[0] ? fno.altname : fno.fname;
+        const char *n = DOS_SHORT_NAME(&fno);
         dos_83_field(n, field);
         if (dos_83_match(dos_find_pat, field))
             return dos_find_report(&fno);

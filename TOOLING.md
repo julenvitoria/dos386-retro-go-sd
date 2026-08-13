@@ -96,6 +96,11 @@ python3 scripts/probe.py --retrogo --wait-magic --set guest_kips=330     # 8088
 | `x86_kbd_read_log` / `x86_spk_log` | the last 32 bytes off port 0x60, and the last 32 writes that can move the speaker tone. `--dump x86_kbd_read_log:32x8` |
 | `x86_kb_pushes` / `x86_kb_pops` / `x86_kb_peek_hits` | the BDA ring's producer and its two consumers. "The guest polls INT 16h forever" has two opposite causes -- nothing was queued, or something dequeued it first -- and only these three separate them. `pushes == pops == peek_hits` means every key was queued, seen and taken; `pushes > 0` with `pops == 0` is the reported failure |
 | `x86_dos_file_log` / `x86_dos_path_log` | The last 32 **file-family** INT 21h calls as word pairs -- `(func << 8) \| AL`, then `(CF << 16) \| AX` -- and the last four paths opened. `x86_hle_log` cannot answer a file question: a guest polling the keyboard fills all 32 of its slots between one open and the next, which is exactly what it did while TOPBENCH's real failure (`43h` -> CF=1, AX=1) sat invisible. `--dump x86_dos_file_log:64x4 --dump x86_dos_path_log:32x4` |
+| `x86_disk_reads` / `x86_disk_backend_reads` | guest-side `disk_read()` calls and how many of them reached the SD card. The RATIO is the sector cache's whole point, it is exact under gwemu, and it is the number to quote — TOPBENCH boots on 115 / 7 |
+| `x86_disk_cache_ok` / `x86_disk_cache_bytes` | is the cache BACKED? A 0 here is a silent-allocation failure and the only symptom is the stutter the cache exists to remove |
+| `x86_disk_cache_hits` / `_misses` / `_fills` / `_evictions` / `_bypass` | sectors served from a resident window, sectors that forced a fetch, window fetches, and requests that went straight through. Rising `_evictions` with a poor hit rate means the working set no longer fits four windows |
+| `x86_disk_us_total` / `x86_disk_us_worst` / `x86_disk_errors` | time in the backend, and the worst single call. **Meaningless under gwemu** (`docs/04`: SD busy state is not modelled) and the reason the timing claim needs silicon |
+| `frame_hist` / `frame_ms_worst` / `frame_overruns` | the frame-time TAIL, which is what "stutter" means. Buckets are multiples of the learned panel period, so `frame_hist[0]` is on-time and anything else is a missed deadline. A mean or a minimum cannot show a hitch; only this can. Write `frame_stats_reset=1` to open a window around a specific event. `--dump frame_hist:8x4` |
 | `x86_hle_log` | the last 32 services as `(vector << 8) \| AH`, bit 16 set if nobody answered. This is what says whether a guest is polling INT 16h AH=00 or AH=01 -- a distinction the two paths do not share a symptom for. `--dump x86_hle_log:32x8` |
 
 Guest time must not move with render rate. The measurement that proves it is
@@ -359,6 +364,7 @@ standby. Called automatically by `make retrogo_media`.
 |---|---|
 | `cpu_exec*.S`, `opcode*.S` | the Thumb-2 interpreter and its dispatch tables |
 | `x86_profile.c/.h` | per-opcode DWT cycle profiler storage + calibration (`X86_PROFILE=1` only) |
+| `x86_disk.c` | the block device under our FatFs, plus the .dsk sector cache: 4 x 16 KB LRU windows from the bonus pool, which are the read-ahead AND the cache |
 | `x86_mem.c` | guest page pool, fold mapping, guest↔host copies |
 | `x86_io.c` | port dispatch, PIT ch2 + speaker, CGA registers |
 | `x86_video.c`, `cga_blit.S` | mode 4 blitter, mode 3 text renderer (4x8 cells, all 80 columns), palette |
@@ -398,8 +404,25 @@ python3 tests/test_screen.py             # what the LTDC actually scans out,
                                          # reconstructed to build/artifacts/screen.png
                                          # (checks whichever mode the core is
                                          # in -- text if a guest is running)
+python3 tests/test_disk_cache.py         # .dsk sector cache + read-ahead:
+                                         # window alignment, LRU residency
+                                         # under a stream, a short window at
+                                         # the end of the image, invalidation
+                                         # on write, a failed fetch, and 3,000
+                                         # random reads byte-compared against
+                                         # the UNCACHED path
 python3 tests/test_core_retrogo.py       # tier 2
 ```
+
+`test_disk_cache.py` is the one harness that does NOT drive a target. It
+compiles the shipping `x86_disk.c` for the HOST (`-DX86_DISK_HOST_TEST`, which
+only swaps the DWT read for a variable) against a small shim that supplies a
+backend reader, and drives `disk_read`/`disk_write` through ctypes. The cache
+is arithmetic over a callback — alignment, replacement, boundaries — and those
+bugs are found in milliseconds off-target and in ten minutes on one. It caught
+two the design had not: a straddling multi-sector read cost MORE backend calls
+than no cache at all, and an undersized buffer must be refused outright rather
+than half-used.
 
 All accept `--target gwemu|hardware`, `--gui`, `--audio`, `--icount`,
 `--timeline`, `--physical-sdcard`, `--keep-temp`.
@@ -480,7 +503,21 @@ Importable support only — no CLIs.
 
 ## Non-negotiables
 
-- Build flags are **not** dependencies — change one, pass `--clean`.
+- Build flags are **not** dependencies — change one, pass `--clean`. **This
+  includes `lib/FatFs/ffconf.h`**: editing it and rebuilding incrementally links
+  objects compiled against two different configs, and `FF_FS_EXFAT` alone
+  changes the width of `LBA_t`. That produced a hang and a mounted-but-empty
+  directory, both of which read as "the change broke FatFs" and neither of
+  which was real. `rm -f lib/FatFs/*.o build/core/*.o` first.
+- **Our FatFs is not the firmware's.** Ours mounts the FAT12 inside a guest
+  `.dsk` and is built with LFN and exFAT OFF (a floppy has neither, and it buys
+  8 KB of RAM_EMU). The firmware's separate instance reads the `.dsk` off the
+  card and keeps LFN. Code that walks a `FILINFO` must use `DOS_SHORT_NAME()`,
+  because `altname` does not exist without LFN.
+- **Measure `__CORE_BSS_END__` after any change to the core.** The core's TEXT
+  lives in RAM_EMU too, so code growth counts. Overshooting is SILENT: the
+  guest RAM allocation returns NULL, `core_ready` stays 0 and the emulator
+  never starts.
 - Green under gwemu ≠ hardware ready; gwemu does not model peripheral setup.
 - Never use raw GDB subprocesses or `gnwmanager monitor`; use the backends.
 - Never run concurrent builds or tests from one directory.

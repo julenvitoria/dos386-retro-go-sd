@@ -248,6 +248,39 @@ void x86_disk_set_reader(int (*rd)(void *, void *, uint32_t, uint32_t),
 /* Optional: makes the guest floppy writable. Without it disk_write refuses. */
 void x86_disk_set_writer(int (*wr)(void *, const void *, uint32_t, uint32_t));
 int x86_disk_ready(void);
+/*
+ * Disk instrumentation and the sector cache. Counts are exact everywhere;
+ * TIMES are meaningless under gwemu, which does not model SD busy state.
+ */
+void x86_disk_stats_reset(void);
+extern volatile uint32_t x86_disk_reads;           /* disk_read() calls       */
+extern volatile uint32_t x86_disk_read_sectors;
+extern volatile uint32_t x86_disk_backend_reads;   /* reached the SD          */
+extern volatile uint32_t x86_disk_backend_sectors;
+extern volatile uint32_t x86_disk_cycles_last;
+extern volatile uint32_t x86_disk_cycles_worst;
+extern volatile uint32_t x86_disk_us_total;
+extern volatile uint32_t x86_disk_us_worst;
+extern volatile uint32_t x86_disk_cycles_per_us;   /* measured by the core    */
+extern volatile uint32_t x86_disk_errors;
+extern volatile uint32_t x86_disk_run_hist[8];     /* sectors per call        */
+/*
+ * Sector cache + read-ahead. `mem` must be at least x86_disk_cache_bytes and
+ * is expected to come from the LCD bonus pool (uncached AXI); RAM_EMU has no
+ * room. Returns 0 if it could not be backed, and the caller MUST report that:
+ * the cache silently absent is a stutter nobody can explain.
+ */
+#define X86_DISK_CACHE_BYTES (64u * 1024u)   /* 4 windows x 16 KB */
+int  x86_disk_cache_init(void *mem, uint32_t bytes);
+void x86_disk_cache_flush(void);
+extern volatile uint32_t x86_disk_cache_ok;        /* 0 = NOT backed          */
+extern volatile uint32_t x86_disk_cache_bytes;
+extern volatile uint32_t x86_disk_cache_hits;      /* sectors                 */
+extern volatile uint32_t x86_disk_cache_misses;
+extern volatile uint32_t x86_disk_cache_fills;
+extern volatile uint32_t x86_disk_cache_evictions;
+extern volatile uint32_t x86_disk_cache_bypass;
+extern volatile uint32_t x86_disk_cache_invalidates;
 int x86_dos_exec(const char *path, const char *cmdline);
 uint16_t x86_dos_psp(void);
 extern uint32_t x86_dos_last_error;

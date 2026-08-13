@@ -141,6 +141,71 @@ of the INI:
    2 |....Toshiba.Portege.7140CT....
 ```
 
+## The .dsk sector cache, and what the stutter actually was
+
+A device report said TOPBENCH's database listing loads but STUTTERS as entries
+appear (124 KB of `database.ini` in 13 reads of 0x2400). The suggested fix was
+"a sector buffer in AHB". **Measured first, and the measurement changed the
+design.**
+
+What one guest read costs, end to end, measured under gwemu (tier 2) and read
+out of the firmware source:
+
+1. `x86_disk_run_hist` is **115 in slot 0 and zero everywhere else** — every
+   `disk_read()` is for exactly ONE sector. FatFs never asks for a run, because
+   INT 21h AH=3Fh serves the guest through a 512-byte bounce buffer, so
+   `f_read` is handed one sector at a time and its multi-sector direct path is
+   never taken. `FF_FS_TINY 1` is not the cause; the bounce buffer is.
+2. Each of those becomes `rg_storage_copy_file_range_to_ram`, which is stdio
+   and **re-opens the .dsk every call**: `fopen`→`f_open` (a directory walk),
+   `fseek`→`f_lseek` which with `FF_USE_FASTSEEK 0` **walks the cluster chain
+   from byte zero reading FAT sectors**, one `f_read`, `fclose`.
+
+So the cost is **per-CALL, not per-byte** — and that is what picks the
+mechanism. A plain LRU cache would fix the FAT/directory re-reads and do
+nothing for a 124 KB stream; plain read-ahead would fix the stream and thrash
+on the metadata. What shipped is both: **4 windows x 16 KB, LRU-replaced**, out
+of the LCD bonus pool. The window is the read-ahead; the set is the cache.
+
+Measured, same guest, same timeline, gwemu tier 2 (counts are exact there):
+
+| | disk_read calls | backend calls | sectors fetched | hits/misses |
+|---|---|---|---|---|
+| before | 115 | 115 | 115 | — |
+| after | 115 | **7** | 224 | 108 / 7 |
+
+**16.4x fewer SD round trips, 93.9% hit rate**, `x86_disk_errors=0`,
+`x86_disk_cache_ok=1`. 59 fps, `frame_hist` all in bucket 0, `frame_overruns=0`.
+`tests/test_disk_cache.py` streams 248 single-sector reads into **9** backend
+calls (28x) and 3,000 random reads into 2,901 (vs 3,000 uncached).
+
+**gwemu cannot show the stutter and this does not claim to have fixed it.**
+`docs/04` is explicit that SD busy state is not modelled, so the SD is
+effectively free there; the call/sector/hit COUNTS above are exact and the
+TIMING win is unproven until someone reads `x86_disk_us_total`,
+`x86_disk_us_worst` and `frame_hist` off silicon.
+
+Two things the test found that reasoning had not:
+
+- **The cache could be WORSE than no cache.** A multi-sector request that
+  straddles a window boundary with neither half resident costs two fills where
+  a direct read costs one call — the random-access arm measured 3,024 backend
+  calls against 3,000 uncached. That case now goes straight through, so "never
+  more backend calls than the uncached path" is an invariant, not a hope.
+- **RAM_EMU was oversubscribed by 920 bytes** and the only symptom was
+  `core_ready=0`, `frames_rendered=0` — `guest_ram` silently failed to allocate
+  and the emulator never started. Baseline headroom was **480 bytes**, not the
+  4,016 this file used to quote. Dropping LFN and exFAT from OUR FatFs (it
+  mounts FAT12 floppies; the firmware's separate instance keeps LFN) reclaimed
+  **8,296 bytes**, so headroom is now **7,680 B with the cache in**.
+
+Not built, and the honest reason: **asynchronous completion across frames** is
+the deeper fix and it is **not reachable from the core**. The ABI's storage
+entries are all synchronous and blocking, the SPI1 driver uses the polled
+`HAL_SPI_TransmitReceive`, and no DMA stream is wired to SPI1. See
+`docs/03` and the report in this commit's message for the exact ABI additions
+it would take.
+
 ## Guest timing — three clocks, measured
 
 The loop used to derive everything from one constant (`PIT_SLICE_INSNS`), and
@@ -261,8 +326,13 @@ gwemu, where the whole low megabyte is plain RAM.
   window has to start at `--settle 0`: past ~3 s there is no guest running and
   the table comes back empty.
 
-- **RAM_EMU headroom is 4,016 bytes (measured 2026-08-13), and running out is
-  QUIET.** The core ends at `__CORE_BSS_END__ = 0x24057078` in a region ending
+- **RAM_EMU headroom is 7,680 bytes (measured 2026-08-13, after the FatFs
+  reclaim), and running out is QUIET.** It was **480** before that reclaim, and
+  adding the sector cache took it to **-920**, at which point `guest_ram`
+  returned NULL, `core_ready` stayed 0 and the emulator simply never started --
+  no fault, no message. Measure it (`arm-none-eabi-nm build/core/dos_core.elf |
+  grep __CORE_BSS_END__`) before and after any change to the core; the core's
+  TEXT is in this region too, so CODE growth counts, not just data. The core ends at `__CORE_BSS_END__ = 0x24057078` in a region ending
   at `0x24100000` — 692,144 B against the 688,128 B the guest asks for (32 KB
   VRAM + 640 KB RAM). `ram_malloc()` bound-checks and returns NULL rather than
   overrunning, so nothing is corrupted, but a caller that tolerates NULL loses a

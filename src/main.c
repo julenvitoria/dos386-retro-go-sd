@@ -39,7 +39,26 @@
 #include "x86_profile.h"
 
 #define APP_ID       100
-#define SAMPLE_RATE  16000
+
+/* Output rate, and the half-buffer that goes with it.
+ *
+ * 48 kHz because the SAI can be told to run at exactly that
+ * (Core/Src/porting/odroid_audio.c reconfigures it from this number), and
+ * because a PC-speaker square is all edge: at 16 kHz its period is a couple of
+ * dozen samples, every edge is quantised to one of them, and the jitter is
+ * audible as roughness on a tone whose pitch is otherwise correct. 16 kHz also
+ * puts the Nyquist floor at PIT divisor 149 -- everything above 8 kHz aliases.
+ *
+ * SPEAKER_FRAMES is the half-buffer the DMA consumes, and it MUST be about one
+ * frame's worth of audio: we refill the active half once per rendered frame,
+ * and the firmware's default half-buffer is 1077 samples. At 16 kHz that was
+ * 67 ms of audio refilled every ~17 ms, so the writer lapped the DMA reader
+ * three times over and the tone the guest asked for came out as a stitch of
+ * restarts -- present, in tune, and rough. 48000/60 = 800 is one panel period
+ * exactly and is inside the firmware's 1077-sample ceiling
+ * (audiobuffer_dma is not bounds-checked anywhere; see gw_audio.c). */
+#define SAMPLE_RATE    48000
+#define SPEAKER_FRAMES (SAMPLE_RATE / 60)
 
 /* Guest RAM for the spike.
  *
@@ -78,6 +97,9 @@ static char dsk_path[256];
 volatile uint32_t dsk_mounted = 0;
 volatile uint32_t dsk_exec_rc = 0xFFFFFFFF;
 volatile uint32_t dsk_startup_ok = 0;
+/* 1 = honour AUTOEXEC.BAT's arguments, 0 = launch the program with none. */
+volatile uint32_t guest_use_cmdtail = 0;
+#define ODROID_PAD_BITS 13
 /*
  * The LUT8 CLUT we hand the firmware. 32 entries, and the COUNT WE PUSH IS
  * ALWAYS 32, even though CGA graphics uses four of them and text sixteen.
@@ -189,6 +211,53 @@ volatile uint32_t frame_ms_last    = 0;  /* last iteration, host ms           */
 volatile uint32_t panel_ms_min     = 0;  /* shortest iteration seen = the panel*/
 volatile uint32_t frame_10us_avg = 8u * 1667u; /* mean iteration, 8x, 10us units */
 volatile uint32_t guest_exec_ms    = 0;  /* host ms spent RUNNING the guest    */
+
+/*
+ * Frame-time distribution. "Stutter" is a frame-deadline MISS, and neither a
+ * mean (frame_10us_avg) nor a minimum (panel_ms_min) can show one: a run that
+ * drops six frames to a 90 ms hitch and is otherwise perfect has the same mean
+ * as a run that is uniformly 2 ms slow. Only the TAIL separates them, so the
+ * tail is what is recorded -- a histogram plus the two worst iterations ever
+ * seen and a count of iterations that overran the learned panel period.
+ *
+ * Buckets are in units of the panel period (frame_ms_last vs panel_ms_min), so
+ * this stays meaningful if the panel rate changes or the device is overclocked:
+ * 0 = on time (<=1.5x), 1 = <=2x, 2 = <=3x, 3 = <=4x, 4 = <=6x, 5 = <=8x,
+ * 6 = <=16x, 7 = worse.
+ */
+volatile uint32_t frame_hist[8];
+volatile uint32_t frame_ms_worst   = 0;  /* worst iteration ever               */
+volatile uint32_t frame_ms_worst2  = 0;  /* second worst -- one hitch is noise */
+volatile uint32_t frame_overruns   = 0;  /* iterations over 1.5x panel period  */
+volatile uint32_t frame_hist_from  = 0;  /* frames_rendered when last reset    */
+volatile uint32_t frame_stats_reset = 0; /* host writes 1 to zero the tail     */
+
+static void frame_hist_add(uint32_t ms, uint32_t panel)
+{
+    if (!panel)
+        panel = 16u;
+    /* x10 so the 1.5x edge is integer arithmetic, not a float. */
+    uint32_t r = (ms * 10u) / panel;
+    uint32_t b;
+    if      (r <= 15u)  b = 0;
+    else if (r <= 20u)  b = 1;
+    else if (r <= 30u)  b = 2;
+    else if (r <= 40u)  b = 3;
+    else if (r <= 60u)  b = 4;
+    else if (r <= 80u)  b = 5;
+    else if (r <= 160u) b = 6;
+    else                b = 7;
+    frame_hist[b]++;
+    if (b)
+        frame_overruns++;
+    if (ms > frame_ms_worst) {
+        frame_ms_worst2 = frame_ms_worst;
+        frame_ms_worst = ms;
+    } else if (ms > frame_ms_worst2) {
+        frame_ms_worst2 = ms;
+    }
+}
+
 /* Did the last slice end because the GUEST halted? Then guest_exec_ms is short
    because the guest asked to idle, NOT because we had spare capacity. Growing
    the slice on that reading is how the controller inflated to its ceiling and
@@ -474,6 +543,22 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
 
     const gw_firmware_abi_t *abi = gw_firmware_abi();
 
+    /* Calibrate DWT cycles against the firmware's millisecond counter so the
+       disk timers report microseconds without anyone hardcoding a core clock.
+       An overclocked device changes that number and nothing here should have
+       to be rebuilt for it. Measured over a whole tick edge so the ms counter's
+       own granularity does not dominate. */
+    {
+        uint32_t t = abi->HAL_GetTick();
+        while (abi->HAL_GetTick() == t) { }        /* align to a tick edge */
+        uint32_t c0 = DWT_CYCCNT, m0 = abi->HAL_GetTick();
+        while ((uint32_t)(abi->HAL_GetTick() - m0) < 4u) { }
+        uint32_t per_us = (DWT_CYCCNT - c0) / (4u * 1000u);
+        /* A stopped DWT (or a host that does not model it) must not turn every
+           later division into a fault or a nonsense number. */
+        x86_disk_cycles_per_us = per_us ? per_us : 1u;
+    }
+
     /* Run the LCD in LUT8 so the upper half of the 300 KB framebuffer pool is
      * released as a bonus pool. This is where the AXI that docs/01 budgets as
      * "~870 KB" actually comes from -- RAM_EMU alone is only 724 KB. */
@@ -523,6 +608,26 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
      * (x86_mem_pool_init() is called from nowhere), so the request always
      * failed and the page was simply absent. From the bonus pool, like the
      * filler, for the same reasons. */
+    /*
+     * The .dsk sector cache, from the same pool and for the same reasons.
+     *
+     * MEASURED (tier 2, TOPBENCH): every disk_read is for ONE sector, and each
+     * one costs the firmware an fopen + an fseek that walks the .dsk's cluster
+     * chain from byte zero (FF_USE_FASTSEEK is 0) before a single byte of the
+     * guest's data moves. The cost is per-CALL, so the fix is to make fewer,
+     * larger calls -- which is what a window of read-ahead is.
+     *
+     * 64 KB, after the filler and the BIOS id page, out of a 150 KB pool.
+     * x86_disk_cache_ok is the witness: a refused allocation here is not a
+     * fault, the reads simply go straight to the card again, and the ONLY
+     * symptom is the stutter this was built to remove. That is precisely the
+     * silent-allocation-failure shape this project keeps getting bitten by.
+     */
+    if (bonus && bonus_sz >= 8192 + X86_DISK_CACHE_BYTES)
+        x86_disk_cache_init(bonus + 8192, X86_DISK_CACHE_BYTES);
+    else
+        x86_disk_cache_init(NULL, 0);   /* off, and x86_disk_cache_ok says so */
+
     if (bonus && bonus_sz >= 8192)
         bios_id_page = bonus + 4096;
     else
@@ -755,7 +860,12 @@ static void guest_reset(void)
     if (dsk_mounted && find_startup_program(startup, sizeof(startup),
                                             cmdtail, sizeof(cmdtail)) == 0) {
         dsk_startup_ok = 1;
-        dsk_exec_rc = (uint32_t)x86_dos_exec(startup, cmdtail);
+        /* Host-overridable command tail. AUTOEXEC.BAT decides by default --
+           TOPBENCH.dsk asks for "-l", its continuous scoring loop. Clear
+           guest_use_cmdtail (over the debug backend, or here) to launch the
+           program bare, which for TOPBENCH is its interactive menu UI. */
+        dsk_exec_rc = (uint32_t)x86_dos_exec(startup,
+                                             guest_use_cmdtail ? cmdtail : "");
     }
     if (dsk_exec_rc != 0) {
         memcpy(guest_ram + 0x100, demo_guest, sizeof(demo_guest));
@@ -805,15 +915,37 @@ static void guest_reset(void)
  * puts the game on the keyboard we actually emulate. Y is unreachable until
  * the GAME button's on-screen keyboard exists.
  */
-static const uint8_t pad_scancode[8] = {
-    0x48,  /* UP    */
-    0x50,  /* DOWN  */
-    0x4B,  /* LEFT  */
-    0x4D,  /* RIGHT */
-    0x39,  /* A            -> Space  */
-    0x01,  /* B            -> Esc    */
-    0x1C,  /* START = GAME -> Return */
-    0x31,  /* SELECT= TIME -> N      */
+/*
+ * Indexed by the gamepad bit order this firmware actually uses:
+ *   0 UP, 1 DOWN, 2 LEFT, 3 RIGHT, 4 A, 5 B, 6 START(=GAME), 7 SELECT(=TIME)
+ *
+ * DERIVED FROM OBSERVED BEHAVIOUR, not from a header. retro-go-stm32's
+ * odroid_input.h lists UP,RIGHT,DOWN,LEFT,SELECT,START,A,B,... -- reindexing to
+ * that produced: Up worked, Left moved DOWN, Down and Right did nothing, and
+ * A/GAME sent the wrong keys. Those four symptoms only fit the order above, so
+ * that header is not what this build compiles against. Trust the device.
+ *
+ * B_GAME is what odroid calls START (8086tiny's test286/toskmode.c:196 records
+ * the same naming), and B_TIME is SELECT; a stock unit has no other face keys.
+ */
+/* Indexed by the bit numbering poll_input builds below from the ODROID_INPUT_*
+   enum -- the compiler resolves the enum, so this order is ours and is correct
+   by construction. Do NOT "fix" it against odroid_input.h.
+   0 means the button is deliberately bound to nothing. */
+static const uint8_t pad_scancode[10] = {
+    0x48,  /* UP                      -> Up arrow    */
+    0x50,  /* DOWN                    -> Down arrow  */
+    0x4B,  /* LEFT                    -> Left arrow  */
+    0x4D,  /* RIGHT                   -> Right arrow */
+    0x39,  /* A                       -> Space       */
+    0x01,  /* B                       -> Esc         */
+    0x00,  /* ODROID_INPUT_START = GAME button: reserved for the on-screen
+              keyboard toggle (8086tiny docs/input/02 decided this deliberately:
+              PAUSE belongs to retro-go, so GAME is the only usable door) */
+    0x15,  /* ODROID_INPUT_SELECT = TIME button -> Y  */
+    0x1C,  /* ODROID_INPUT_X = physical START   -> Return. Zelda-only in
+              8086tiny's notes, but THIS unit reports it (raw pad bit 11). */
+    0x31,  /* ODROID_INPUT_Y = physical SELECT  -> N   */
 };
 
 /*
@@ -971,6 +1103,8 @@ static void poll_input(const gw_firmware_abi_t *abi)
     if (pad.values[ODROID_INPUT_B])      keys |= 1u << 5;
     if (pad.values[ODROID_INPUT_START])  keys |= 1u << 6;
     if (pad.values[ODROID_INPUT_SELECT]) keys |= 1u << 7;
+    if (pad.values[ODROID_INPUT_X])      keys |= 1u << 8;
+    if (pad.values[ODROID_INPUT_Y])      keys |= 1u << 9;
 
     uint32_t changed = keys ^ x86_io.input_keys;
     x86_io.input_keys = keys;
@@ -978,10 +1112,12 @@ static void poll_input(const gw_firmware_abi_t *abi)
     if (!changed)
         return;
 
-    for (unsigned i = 0; i < 8; i++) {
+    for (unsigned i = 0; i < 10; i++) {
         if (!(changed & (1u << i)))
             continue;
         uint8_t sc = pad_scancode[i];
+        if (!sc)
+            continue;              /* bit deliberately unbound */
         x86_kbd_scancode((keys & (1u << i)) ? sc : (uint8_t)(sc | 0x80));
         input_scancodes++;
     }
@@ -1015,8 +1151,14 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
     rate_window_frames = frames_rendered;
 
     abi->audio_ctl(GW_AUDIO_INIT, SAMPLE_RATE);
+    /* START sets the half-buffer length; GET_LENGTH only reports whatever it
+       was last set to (1077 by default), so asking first and starting with the
+       answer is how the mismatch above stayed invisible. Start with the length
+       we want, then read it back so the number we render is the firmware's. */
+    abi->audio_ctl(GW_AUDIO_START, SPEAKER_FRAMES);
     uint32_t audio_frames = (uint32_t)abi->audio_ctl(GW_AUDIO_GET_LENGTH, 0);
-    abi->audio_ctl(GW_AUDIO_START, audio_frames);
+    if (audio_frames > SPEAKER_FRAMES)
+        audio_frames = SPEAKER_FRAMES;
 
     /*
      * =======================================================================
@@ -1293,10 +1435,19 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
             cga_clut_dirty = 0;
         }
 
-        /* Audio: one buffer of speaker output per frame. */
+        /* Audio: one buffer of speaker output per frame.
+         *
+         * Amplitude follows the launcher's volume (0..255) rather than a fixed
+         * 6000, so the user's volume keys reach the speaker at all. >> 11 is
+         * ~12.5% of full scale at maximum, one binary step below the 25% the
+         * tama core uses for its own square wave -- a PC-speaker square is
+         * full-swing with no envelope, so it carries more energy than that. */
         int16_t *abuf = (int16_t *)abi->audio_ctl(GW_AUDIO_GET_ACTIVE, 0);
-        if (abuf && audio_frames)
-            x86_speaker_render(abuf, audio_frames, SAMPLE_RATE, 6000);
+        if (abuf && audio_frames) {
+            int16_t amp = (int16_t)(((int32_t)abi->common_emu_sound_get_volume()
+                                     * INT16_MAX) >> 11);
+            x86_speaker_render(abuf, audio_frames, SAMPLE_RATE, amp);
+        }
 
         /* Pace the loop. GW_LCD_WAIT_VBLANK is NOT usable here: gwemu does
            not model vblank, so it never returns and the core never draws --
@@ -1339,6 +1490,20 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         /* The display period, learned rather than declared. It creeps upward
            so a panel that slows down (or an overclock that goes away) is
            re-learned instead of pinning us to a number that was true once. */
+        /* The TAIL, which is what "stutter" means. Recorded against the panel
+           period as learned SO FAR, and resettable from the host so a window
+           can be opened around a specific event (the database load) instead of
+           being diluted by everything since boot. */
+        if (frame_stats_reset) {
+            frame_stats_reset = 0;
+            for (unsigned i = 0; i < 8; i++)
+                frame_hist[i] = 0;
+            frame_ms_worst = frame_ms_worst2 = frame_overruns = 0;
+            frame_hist_from = frames_rendered;
+            x86_disk_stats_reset();
+        }
+        frame_hist_add(frame_ms_last, panel_ms_min);
+
         if (!panel_ms_min || frame_ms_last < panel_ms_min)
             panel_ms_min = frame_ms_last;
         else if ((frames_rendered & 511u) == 0u)
