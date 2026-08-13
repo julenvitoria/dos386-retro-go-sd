@@ -174,6 +174,57 @@ frame. It also prints a coarse text map of the result, so a black or garbage
 capture is obvious without opening the file. `tests/test_screen.py` does this
 for one expected image; this is the general form.
 
+### `profile_opcodes.py` — which x86 opcodes burn the cycles
+
+```bash
+make clean && make sdcard X86_PROFILE=1                   # instrumented core
+python3 scripts/profile_opcodes.py --retrogo --settle 20 --window 25
+python3 scripts/profile_opcodes.py --retrogo --target hardware \
+    --settle 20 --window 25 --json build/artifacts/profile_topbench.json
+python3 scripts/profile_opcodes.py --retrogo --sort mean   # expensive handlers
+python3 scripts/profile_opcodes.py --retrogo --sort count  # hot but cheap ones
+python3 scripts/profile_opcodes.py --bench --window 60     # tier 1 self-check
+```
+
+Reads DWT->CYCCNT at every dispatch and charges the delta to the PREVIOUS
+opcode, into a 513-slot DTCM table (256 one-byte + 256 `0F` + one HOST slot for
+time outside the interpreter). Prints count, total cycles, mean, overhead-
+corrected mean and % of all cycles; `--json`/`--csv` make a profile diffable
+across builds the way `tests/asm_baseline.json` already is for static counts.
+Handler names come from the LIVE dispatch tables, resolved with `probe.py`'s
+symbol machinery, so they cannot drift from what ran.
+
+`--settle N` discards the first N seconds and then resets the table, so the
+window is a steady state and not DOS startup. `--bench` (bare-metal only) runs
+the synthetic benchmark, whose answer is known exactly — that is how the
+plumbing is checked, not by trusting the cycles.
+
+**The instrumentation is behind `X86_PROFILE=1` and OFF by default.** It sits in
+the fetch/dispatch tail, the hottest and most register-starved code in the
+project, and it costs ~65 cycles per dispatch on top of a ~50-cycle instruction.
+Flags are not dependencies: build clean or you are profiling the previous core.
+
+Three things the tool says in its own output, because none of them is optional:
+
+- **A gwemu profile is not a profile.** gwemu does not model the pipeline
+  (`docs/06`), so only the COUNTS mean anything there. Run it under gwemu first
+  anyway — the point of that pass is to prove an instrumented dispatch tail does
+  not fault, before it goes anywhere near silicon.
+- **Attribution is approximate.** A delta measured between two dispatches on a
+  superscalar M7 carries part of the previous instruction and of the cache/AXI
+  state this one inherited. Rank hogs with it; do not quote a per-opcode cycle
+  count as truth.
+- **Measurement overhead is calibrated on the target** by `x86_profile_calibrate`
+  (an empty loop against the same macro), stored in the table, and printed as a
+  separate corrected column. Nothing on the target subtracts it, and there is no
+  fudge factor. It is a lower bound — the calibration loop predicts perfectly
+  and stays in cache.
+
+A slot is closed by the NEXT dispatch, so the last instruction before each exit
+from the interpreter is uncounted (one per interp call). Profiling also slows
+the emulator, so anything timing-dependent in the guest is perturbed; that is
+noted, not corrected.
+
 ### `make_font.py` — regenerate `font8x8.h`, `font4x8.h`, `font4x8aa.h`
 
 ```bash
@@ -270,6 +321,7 @@ standby. Called automatically by `make retrogo_media`.
 | File | Role |
 |---|---|
 | `cpu_exec*.S`, `opcode*.S` | the Thumb-2 interpreter and its dispatch tables |
+| `x86_profile.c/.h` | per-opcode DWT cycle profiler storage + calibration (`X86_PROFILE=1` only) |
 | `x86_mem.c` | guest page pool, fold mapping, guest↔host copies |
 | `x86_io.c` | port dispatch, PIT ch2 + speaker, CGA registers |
 | `x86_video.c`, `cga_blit.S` | mode 4 blitter, mode 3 text renderer (4x8 cells, all 80 columns), palette |
@@ -346,6 +398,7 @@ Importable support only — no CLIs.
 | `rglog.py` | Read retro-go's in-memory log ring |
 | `faults.py` | Decode latched CPU faults |
 | `asm_metrics.py` | Instruction counts, DWT capture |
+| `opcode_profile.py` | Host side of the per-opcode DWT profile: locate/reset/read the DTCM table, resolve slots to handler symbols off the live dispatch tables, render table/JSON/CSV. Layout and the on-target half live in `x86_profile.h` / `cpu_exec.S` |
 | `probe.py` | Sample PC, globals, pointer derefs and array dumps on a running target; `read_faults` decodes CFSR/HFSR/BFAR |
 | `watchpoint.py` | Z2/Z3 data watchpoints over the GDB remote protocol, and the unsolicited stop reply that follows a resume |
 | `dosimage.py` | FAT12 reader + MZ loader that mirrors `x86_dos_exec`, so a reference emulator starts from OUR entry state |
