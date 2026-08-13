@@ -97,6 +97,15 @@ struct X86CPUState {
        it must go back through the fetch loop; the prefix reloads it. */
     uint32_t rep_handler;
     uint32_t rep_batch;
+    /* Where the NOR cold-page trap stubs collect their answer.
+     *
+     * It lives in the CPU state, not in a global, for one mechanical reason:
+     * the stub must restore R0-R3 before it can use the resolved pointer (the
+     * destination register may be any of them, or R12), so the value cannot
+     * come back in R0 -- and one LDR off R8 reaches DTCM, whereas a global
+     * would need a literal pool inside the ITCM hot section. Zero means the
+     * page is genuinely absent and the stub takes the .mem_fault exit. */
+    uint32_t nor_ptr;
 };
 typedef struct X86CPUState X86CPUState;
 
@@ -227,6 +236,19 @@ int x86_map_fixed(uint32_t guest, void *host, uint32_t bytes);
    guest region is deliberately absent; the guest then takes a clean
    X86_EXIT_MEM_FAULT instead of hard-faulting the interpreter. */
 extern volatile uint32_t x86_map_failures;
+
+/* NOR cold-page backing (x86_nor.c). x86_nor_attach() takes bytes that are
+   ALREADY durable and byte-verifies them before it moves the fold table, so a
+   failed snapshot leaves the guest running unchanged out of AXI. The two
+   slow_* entries are called from the trap stubs in cpu_exec.S, never from C. */
+int  x86_nor_attach(void *nor, uint32_t nor_bytes, void *ram, uint32_t ram_bytes);
+void x86_nor_slow_r(uint32_t bad);
+void x86_nor_slow_w(uint32_t bad);
+extern volatile uint32_t x86_nor_attached, x86_nor_base_addr, x86_nor_bytes;
+extern volatile uint32_t x86_nor_pages_total, x86_nor_pages_nor, x86_nor_pages_axi;
+extern volatile uint32_t x86_nor_axi_free, x86_nor_reads, x86_nor_writes;
+extern volatile uint32_t x86_nor_cow_pulls, x86_nor_cow_failures;
+extern volatile uint32_t x86_nor_slow_cycles, x86_nor_unmapped, x86_nor_attach_err;
 void x86_unmap_all(void);
 void x86_mem_wrap_1mb(void);
 void *x86_guest_ptr(uint32_t lin, uint32_t bytes);

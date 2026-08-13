@@ -6,7 +6,7 @@ OP .op_0f_0F
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD R10, R10, #1
 #if X86_PROFILE
@@ -23,7 +23,7 @@ OP .op_0f_01
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     BL L(DECODE_MODRM_32)
@@ -56,7 +56,7 @@ L(OP_LIDT_OK):
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
-    BMI .mem_fault
+    MEM_TRAP_R R2
     LDRH R3, [R2, #0]
     STRH.W R3, [R8, #44]
     ADD.W R2, R2, #2
@@ -82,7 +82,7 @@ OP .op_int_imm8_CD
     UBFX R4, R10, #12, #12
     LDR.W R4, [R9, R4, LSL #2]
     ADDS R4, R4, R10
-    BMI .mem_fault
+    MEM_TRAP_R R4
     LDRB R4, [R4, #0]
     ADD.W R10, R10, #1
     B.N L(HANDLE_INTERRUPT)
@@ -130,10 +130,10 @@ L(HANDLE_INTERRUPT):
 
     LDR.W R3, [R8, #CPU_IDTR_BASE]
     ADD.W R3, R3, R4, LSL #2       @ 4-byte IVT entries, not 8-byte gates
-    MEM_GET_PTR R12, R3
+    MEM_GET_PTR_R R12, R3
     LDRH R0, [R12]                 @ new IP
     ADD.W R3, R3, #2
-    MEM_GET_PTR R12, R3
+    MEM_GET_PTR_R R12, R3
     LDRH R5, [R12]                 @ new CS selector
 
     PUSH {R0, LR}
@@ -188,7 +188,7 @@ OP .op_0f_jcc_rel32
     UBFX R4, R10, #12, #12
     LDR.W R4, [R9, R4, LSL #2]
     ADDS R4, R4, R10
-    BMI .mem_fault
+    MEM_TRAP_R R4
     LDS_V R4, R4
     EIP_ADV_V
     BL L(EVAL_COND)
@@ -203,7 +203,7 @@ OP .op_0f_setcc
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R4, R1, #192
@@ -231,7 +231,7 @@ L(OP_0F_SETCC_MEM):
     UBFX R12, R7, #12, #12
     LDR.W R12, [R9, R12, LSL #2]
     ADDS R12, R12, R7
-    BMI .mem_fault
+    MEM_TRAP_W R12
     STRB.W R3, [R12]
     B.W .fetch_decode_loop
 
@@ -257,7 +257,7 @@ L(OP_0F_CR):
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R2, R1, #7               @ the r32
@@ -281,7 +281,7 @@ OP .op_0f_movzx_gv_eb
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R2, R1, #192
@@ -301,7 +301,7 @@ L(OP_0F_MOVZX_GV_EB_MEM):
     UBFX R4, R7, #12, #12
     LDR.W R4, [R9, R4, LSL #2]
     ADDS R4, R4, R7
-    BMI .mem_fault
+    MEM_TRAP_R R4
     LDRB R4, [R4, #0]
 
 L(OP_0F_MOVZX_GV_EB_WRITE):
@@ -315,7 +315,7 @@ OP .op_0f_movzx_gv_ew
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R2, R1, #192
@@ -332,7 +332,7 @@ L(OP_0F_MOVZX_GV_EW_MEM):
     UBFX R4, R7, #12, #12
     LDR.W R4, [R9, R4, LSL #2]
     ADDS R4, R4, R7
-    BMI .mem_fault
+    MEM_TRAP_R R4
     LDRH R4, [R4, #0]
 
 L(OP_0F_MOVZX_GV_EW_WRITE):
@@ -346,7 +346,7 @@ OP .op_0f_movsx_gv_eb
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R2, R1, #192
@@ -366,7 +366,7 @@ L(OP_0F_MOVSX_GV_EB_MEM):
     UBFX R4, R7, #12, #12
     LDR.W R4, [R9, R4, LSL #2]
     ADDS R4, R4, R7
-    BMI .mem_fault
+    MEM_TRAP_R R4
     LDRSB.W R4, [R4]
 
 L(OP_0F_MOVSX_GV_EB_WRITE):
@@ -380,7 +380,7 @@ OP .op_0f_movsx_gv_ew
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R2, R1, #192
@@ -397,7 +397,7 @@ L(OP_0F_MOVSX_GV_EW_MEM):
     UBFX R4, R7, #12, #12
     LDR.W R4, [R9, R4, LSL #2]
     ADDS R4, R4, R7
-    BMI .mem_fault
+    MEM_TRAP_R R4
     LDRSH.W R4, [R4]
 
 L(OP_0F_MOVSX_GV_EW_WRITE):
