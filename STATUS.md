@@ -57,8 +57,7 @@ Capture in `build/artifacts/topbench.png` (`scripts/screenshot.py
 --timeline timelines/run-to-completion.tl --wait 48 --pan 16 --text`).
 
 `scripts/trace_diff.py` agrees with a reference 8086 (Unicorn) for the whole of
-startup and the self-unpacker — 1,532,786 instructions to the first INT 21h,
-no divergence at any stride.
+startup and the unpacker — 1,532,786 instructions to the first INT 21h.
 
 Getting here closed sixteen defect classes, one commit each in `git log`.
 **CPU**: the v-width shift group pass-agnostic; `INC`/`DEC` flags and an AF
