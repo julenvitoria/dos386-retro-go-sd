@@ -27,7 +27,8 @@ x86_dos.c \
 lib/FatFs/ff.c \
 lib/FatFs/ffunicode.c \
 x86_disk.c \
-x86_profile.c
+x86_profile.c \
+x86_zones.c
 
 CORE_ASM_SOURCES := \
 cpu_exec.S \
@@ -58,8 +59,16 @@ endif
 # Per-opcode DWT cycle profiling; see Makefile for why it is off by default.
 X86_PROFILE ?= 0
 
+# Frame-loop phase/zone wall-time accounting (x86_zones.h). Off by default like
+# every other instrument. Unlike X86_PROFILE this one is per-FRAME and
+# per-SERVICE-CALL rather than per guest instruction, so it perturbs far less --
+# but "far less" is a measurement, not a claim: x86_zones_calibrate reports the
+# per-transition cost and scripts/profile_all.py prints it in the report.
+X86_ZONES ?= 0
+
 CORE_C_DEFS := \
 -DX86_PROFILE=$(X86_PROFILE) \
+-DX86_ZONES=$(X86_ZONES) \
 -DX86_TEXT_AA=$(X86_TEXT_AA) \
 -DX86_TEXT_BILEVEL_FONT=$(X86_TEXT_BILEVEL_FONT) \
 -DPROJECT_KIND_CORE=1 \

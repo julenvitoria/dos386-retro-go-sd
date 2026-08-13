@@ -36,6 +36,12 @@ CFLAGS += -DX86_TEXT_AA=1
 X86_PROFILE ?= 0
 CFLAGS += -DX86_PROFILE=$(X86_PROFILE)
 
+# Frame-loop zone accounting (x86_zones.h). The bare-metal harness has no frame
+# loop, so this only ever compiles the storage; it exists here so the two builds
+# agree on the flag. See Makefile.core and scripts/profile_all.py.
+X86_ZONES ?= 0
+CFLAGS += -DX86_ZONES=$(X86_ZONES)
+
 LDFLAGS = -mcpu=cortex-m7 -mthumb -T STM32H7B0VBTx_SDCARD.ld -Wl,--gc-sections --specs=nosys.specs
 
 PROGS = test_core.elf
