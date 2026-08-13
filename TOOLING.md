@@ -804,6 +804,35 @@ Which key each captures is worth knowing: the OSK opens on layer 0 cell 0, so
 `press a` sends the letter `a` (scancode 0x1E) and `x86_kbd_read_log` is where
 it is confirmed to have reached the guest.
 
+### Recording an input timeline
+
+`--record FILE.tl` on any target script captures an interactive gwemu session.
+Needs the window (`--gui`); **quit gwemu normally** -- the file is written on
+exit, so a killed process leaves nothing.
+
+```bash
+python3 scripts/probe.py --retrogo --gui --audio --timeline "" \
+    --record timelines/alleycat-ingame.tl --samples 150 --interval 5
+```
+
+**The `.tl` grammar, confirmed by recording one** (docs/gwemu.md in the firmware
+deliberately refused to guess it):
+
+```
+# comment
+<seconds> down <button>       e.g. 5.567 down start
+<seconds> release <button>
+<seconds> quit
+```
+
+Float seconds from start; button names are lowercase `up down left right a b
+game time start select pause power`. Every press is a `down`/`release` pair --
+a `down` with no `release` leaves the button held. Playback is `--timeline`.
+
+`timelines/alleycat-ingame.tl` is a real session driving Alley Cat from launch
+to gameplay: TIME answers the joystick prompt with N, then the skill menu needs
+a LETTER, which is only reachable through the on-screen keyboard.
+
 ## Modules (`scripts/common/`)
 
 Importable support only — no CLIs.

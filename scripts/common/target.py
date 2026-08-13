@@ -201,12 +201,14 @@ class GwemuTarget(Target):
     """Boot an Image under gwemu."""
 
     def __init__(self, image, display=False, audio=False, icount=None,
-                 timeline=None, port=None, qmp_port=None, keep_temp=False):
+                 timeline=None, record=None, port=None, qmp_port=None,
+                 keep_temp=False):
         super().__init__(image)
         self.display = display
         self.audio = audio
         self.icount = icount
         self.timeline = timeline
+        self.record = record
         self.port = port or _free_port()
         self.qmp_port = qmp_port or _free_port()
         self.proc = None
@@ -272,6 +274,18 @@ class GwemuTarget(Target):
             if not os.path.exists(tl):
                 raise RuntimeError(f"timeline not found: {tl}")
             env["GNW_TIMELINE"] = tl
+        if self.record:
+            # GNW_TIMELINE_RECORD captures an interactive session to a .tl file.
+            # gwemu writes it on exit, so the run must END CLEANLY -- a killed
+            # process leaves nothing. Needs the SDL window: there is no way to
+            # record headlessly, because the whole point is capturing real
+            # button presses. docs/gwemu.md notes the .tl grammar has never been
+            # confirmed by reading the source, so a recorded file is also the
+            # reference for the syntax.
+            rec = os.path.abspath(self.record)
+            os.makedirs(os.path.dirname(rec) or ".", exist_ok=True)
+            env["GNW_TIMELINE_RECORD"] = rec
+            print(f"recording timeline to {rec} -- quit gwemu cleanly to save it")
 
         self.proc = subprocess.Popen(cmd, cwd=self.tmpdir, env=env)
         time.sleep(1.0)
@@ -476,6 +490,10 @@ def add_target_args(parser):
                              "reproducible (see docs/06)")
     parser.add_argument("--timeline", default=None,
                         help="input timeline to replay under gwemu")
+    parser.add_argument("--record", default=None, metavar="FILE.tl",
+                        help="RECORD an input timeline from an interactive "
+                             "session. Implies a window; quit gwemu cleanly or "
+                             "nothing is written")
     parser.add_argument("--physical-sdcard", default=None,
                         help="mounted SD path for bulk hardware copies")
     parser.add_argument("--precise-faults", action="store_true",
@@ -515,4 +533,5 @@ def open_target(args, image):
                        audio=getattr(args, "audio", False),
                        icount=getattr(args, "icount", None),
                        timeline=getattr(args, "timeline", None),
+                       record=getattr(args, "record", None),
                        keep_temp=getattr(args, "keep_temp", False))
