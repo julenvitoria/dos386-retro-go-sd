@@ -2648,6 +2648,22 @@ def run_test(args):
                 "mem_expected": [(0x10450, bytes([0xFE, 0xCA, 0x00, 0x00]))],
                 "expected_eip": 6,
             },
+            {
+                "name": "MOV Ew,Sreg (8C) memory form stores the SELECTOR",
+                # MOV BX,0x460 ; MOV [BX],DS ; HLT. The handler read the
+                # selector into R5 before calling the ModRM decoder, which uses
+                # R4 and R5 as scratch -- so it stored the decoder's leftovers.
+                # Exactly the defect MOV Ev,Gv had.
+                "code": bytes([0xBB, 0x60, 0x04, 0x8C, 0x1F, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x10000},
+                "sels_initial": {"DS": 0x1234},
+                "ram_setup": [(0x10460, bytes(4))],
+                "regs_initial": {},
+                "regs_expected": {3: 0x460},
+                "mem_expected": [(0x10460, bytes([0x34, 0x12, 0x00, 0x00]))],
+                "expected_eip": 6,
+            },
         ])
 
         all_passed = True

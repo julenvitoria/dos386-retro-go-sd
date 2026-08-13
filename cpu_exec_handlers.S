@@ -3536,25 +3536,29 @@ OP_AGNOSTIC .op_mov_Ew_seg_8C
     BMI .mem_fault
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
+    AND.W R3, R1, #192
+    CMP R3, #192
+    BNE.N L(MOV_EW_SREG_MEM)
     UBFX R4, R1, #3, #3
     MOV.W R3, #SEG_STRIDE
     MLA R3, R4, R3, R8
     LDRH.W R5, [R3, #SEG_ES_SEL]
-    AND.W R3, R1, #192
-    CMP R3, #192
-    BNE.N L(MOV_EW_SREG_MEM)
     AND.W R4, R1, #7
     MOV.W R4, R4, LSL #2
     ADD.W R4, R4, #8
     STRH.W R5, [R8, R4]
     B.W .fetch_decode_loop
+/* The selector has to be read AFTER the decoder runs: DECODE_MODRM uses R4 and
+   R5 as scratch, so hoisting the load above the call stored its leftovers
+   instead of the segment register. MOV Ev,Gv had the identical defect. */
 L(MOV_EW_SREG_MEM):
     LDR.W R12, [R2, #REC_MODRM_FN]
     BLX R12
-    UBFX R3, R7, #12, #12
-    LDR.W R3, [R9, R3, LSL #2]
-    ADDS R3, R3, R7
-    BMI .mem_fault
+    UBFX R4, R1, #3, #3
+    MOV.W R3, #SEG_STRIDE
+    MLA R3, R4, R3, R8
+    LDRH.W R5, [R3, #SEG_ES_SEL]
+    MEM_GET_PTR R3, R7
     STRH R5, [R3, #0]
     B.W .fetch_decode_loop
 
