@@ -786,7 +786,7 @@ OP .op_test_ev_gv_85
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
     CMP R3, #192
-    BNE.W .exit_loop
+    BNE.N L(TEST_EV_GV_85_MEM)
     UBFX R4, R1, #3, #3            @ reg operand
     MOV.W R4, R4, LSL #2
     ADD.W R4, R4, #8
@@ -795,9 +795,23 @@ OP .op_test_ev_gv_85
     MOV.W R2, R2, LSL #2
     ADD.W R2, R2, #8
     LDREG_V R3, R2
-    ANDS.W R3, R3, R5              @ TEST sets flags and discards the result
+L(TEST_EV_GV_85_FLAGS):
+    AND.W R3, R3, R5               @ TEST sets flags and discards the result
+    VTEST(R0, R3)
     X86_FLAGS_LOGIC R3, R0, R1
     B.W .fetch_decode_loop
+/* The ModRM decoder uses R4 and R5 as scratch, so the register operand has to
+   be read AFTER the call, not before. R1 (the ModRM byte) does survive it. */
+L(TEST_EV_GV_85_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN]
+    BLX R12
+    MEM_GET_PTR R12, R7
+    LD_V R3, R12
+    UBFX R4, R1, #3, #3
+    MOV.W R4, R4, LSL #2
+    ADD.W R4, R4, #8
+    LDREG_V R5, R4
+    B.N L(TEST_EV_GV_85_FLAGS)
 
 OP_AGNOSTIC .op_xchg_eb_gb_86
     UBFX R1, R10, #12, #12
@@ -808,7 +822,7 @@ OP_AGNOSTIC .op_xchg_eb_gb_86
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
     CMP R3, #192
-    BNE.W .exit_loop
+    BNE.N L(XCHG_EB_GB_86_MEM)
     UBFX R4, R1, #3, #3
     AND.W R5, R4, #3
     MOV.W R5, R5, LSL #2
@@ -826,6 +840,21 @@ OP_AGNOSTIC .op_xchg_eb_gb_86
     STRB.W R5, [R8, R2]
     STRB.W R3, [R8, R4]
     B.W .fetch_decode_loop
+L(XCHG_EB_GB_86_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN]
+    BLX R12
+    UBFX R4, R1, #3, #3            @ Gb, decoded after the call
+    AND.W R5, R4, #3
+    MOV.W R5, R5, LSL #2
+    MOV.W R4, R4, LSR #2
+    ADD R4, R5
+    ADD.W R4, R4, #8
+    LDRB.W R5, [R8, R4]
+    MEM_GET_PTR R12, R7
+    LDRB R3, [R12]
+    STRB R5, [R12]
+    STRB.W R3, [R8, R4]
+    B.W .fetch_decode_loop
 
 OP .op_xchg_ev_gv_87
     UBFX R1, R10, #12, #12
@@ -836,7 +865,7 @@ OP .op_xchg_ev_gv_87
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
     CMP R3, #192
-    BNE.W .exit_loop
+    BNE.N L(XCHG_EV_GV_87_MEM)
     UBFX R4, R1, #3, #3
     MOV.W R4, R4, LSL #2
     ADD.W R4, R4, #8
@@ -846,6 +875,18 @@ OP .op_xchg_ev_gv_87
     ADD.W R2, R2, #8
     LDREG_V R3, R2
     STREG_V R5, R2
+    STREG_V R3, R4
+    B.W .fetch_decode_loop
+L(XCHG_EV_GV_87_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN]
+    BLX R12
+    UBFX R4, R1, #3, #3            @ Gv, decoded after the call
+    MOV.W R4, R4, LSL #2
+    ADD.W R4, R4, #8
+    LDREG_V R5, R4
+    MEM_GET_PTR R12, R7
+    LD_V R3, R12
+    ST_V R5, R12
     STREG_V R3, R4
     B.W .fetch_decode_loop
 
@@ -1055,12 +1096,23 @@ OP .op_pop_ev_8F
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
     CMP R3, #192
-    BNE.W .exit_loop
+    BNE.N L(POP_EV_8F_MEM)
     AND.W R2, R1, #7
     MOV.W R2, R2, LSL #2
     ADD.W R2, R2, #8
     POP_V R3, R4, R12
     STREG_V R3, R2
+    B.W .fetch_decode_loop
+L(POP_EV_8F_MEM):
+    /* Address first, then the pop: on a [BP] or [SP] form the 8086 computes
+       the effective address before SP moves. */
+    LDR.W R12, [R2, #REC_MODRM_FN]
+    BLX R12
+    PUSH {R7}
+    POP_V R3, R4, R12
+    POP {R7}
+    MEM_GET_PTR R12, R7
+    ST_V R3, R12
     B.W .fetch_decode_loop
 
 /* XCHG at the operand size. Both this and 0x87 swapped the full 32 bits in
@@ -1356,7 +1408,7 @@ OP_AGNOSTIC .op_mov_eb_imm8_C6
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
     CMP R3, #192
-    BNE.W .exit_loop
+    BNE.N L(MOV_EB_IMM8_C6_MEM)
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -1371,6 +1423,21 @@ OP_AGNOSTIC .op_mov_eb_imm8_C6
     ADD.W R2, R2, #8
     STRB.W R5, [R8, R2]
     B.W .fetch_decode_loop
+/* The memory form. The decoder has to run FIRST, because the immediate follows
+   the displacement -- reading it before the ModRM is consumed takes bytes out
+   of the middle of the instruction. */
+L(MOV_EB_IMM8_C6_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN]
+    BLX R12
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LDRB R5, [R5, #0]
+    ADD.W R10, R10, #1
+    MEM_GET_PTR R12, R7
+    STRB R5, [R12]
+    B.W .fetch_decode_loop
 
 OP .op_mov_ev_imm32_C7
     UBFX R1, R10, #12, #12
@@ -1381,7 +1448,7 @@ OP .op_mov_ev_imm32_C7
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
     CMP R3, #192
-    BNE.W .exit_loop
+    BNE.N L(MOV_EV_IMM_C7_MEM)
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -1392,6 +1459,18 @@ OP .op_mov_ev_imm32_C7
     MOV.W R2, R2, LSL #2
     ADD.W R2, R2, #8
     STREG_V R5, R2
+    B.W .fetch_decode_loop
+L(MOV_EV_IMM_C7_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN]
+    BLX R12
+    UBFX R5, R10, #12, #12
+    LDR.W R5, [R9, R5, LSL #2]
+    ADDS R5, R5, R10
+    BMI .mem_fault
+    LD_V R5, R5
+    EIP_ADV_V
+    MEM_GET_PTR R12, R7
+    ST_V R5, R12
     B.W .fetch_decode_loop
 
 /* C1 / D1 / D3 shift a v-width operand, so they are NOT pass-agnostic: they

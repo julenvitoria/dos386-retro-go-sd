@@ -2567,6 +2567,87 @@ def run_test(args):
                 "regs_expected": {0: 0x00C7},
                 "expected_eip": 5,
             },
+
+            # ---- the register-form-only handlers ---------------------------
+            # Six handlers decoded a ModRM and then exited if it named memory.
+            # Every case here uses mod=00 rm=111, i.e. [BX], through a DS based
+            # at 0x10000. `MOV WORD PTR [BX],imm` is what stopped TOPBENCH once
+            # it reached its real entry point.
+            {
+                "name": "MOV Ev,imm16 (C7) memory form",
+                # MOV BX,0x400 ; MOV WORD PTR [BX],0x1234 ; HLT
+                "code": bytes([0xBB, 0x00, 0x04, 0xC7, 0x07, 0x34, 0x12, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x10000},
+                "ram_setup": [(0x10400, bytes(4))],
+                "regs_initial": {},
+                "regs_expected": {3: 0x400},
+                "mem_expected": [(0x10400, bytes([0x34, 0x12, 0x00, 0x00]))],
+                "expected_eip": 8,
+            },
+            {
+                "name": "MOV Eb,imm8 (C6) memory form",
+                "code": bytes([0xBB, 0x10, 0x04, 0xC6, 0x07, 0x5A, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x10000},
+                "ram_setup": [(0x10410, bytes(4))],
+                "regs_initial": {},
+                "regs_expected": {3: 0x410},
+                "mem_expected": [(0x10410, bytes([0x5A, 0x00]))],
+                "expected_eip": 7,
+            },
+            {
+                "name": "TEST Ev,Gv (85) memory form sets ZF",
+                # MOV BX,0x420 ; MOV AX,0xF0F0 ; TEST [BX],AX ; HLT
+                "code": bytes([0xBB, 0x20, 0x04, 0xB8, 0xF0, 0xF0,
+                               0x85, 0x07, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x10000},
+                "ram_setup": [(0x10420, bytes([0x0F, 0x0F]))],
+                "regs_initial": {},
+                "regs_expected": {0: 0xF0F0, 3: 0x420},
+                "flags_expected": {"ZF": 1, "CF": 0, "OF": 0},
+                "mem_expected": [(0x10420, bytes([0x0F, 0x0F]))],
+                "expected_eip": 9,
+            },
+            {
+                "name": "XCHG Ev,Gv (87) memory form",
+                "code": bytes([0xBB, 0x30, 0x04, 0xB8, 0xEF, 0xBE,
+                               0x87, 0x07, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x10000},
+                "ram_setup": [(0x10430, bytes([0x11, 0x22]))],
+                "regs_initial": {},
+                "regs_expected": {0: 0x2211, 3: 0x430},
+                "mem_expected": [(0x10430, bytes([0xEF, 0xBE]))],
+                "expected_eip": 9,
+            },
+            {
+                "name": "XCHG Eb,Gb (86) memory form",
+                "code": bytes([0xBB, 0x40, 0x04, 0xB0, 0x99,
+                               0x86, 0x07, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x10000},
+                "ram_setup": [(0x10440, bytes([0x77, 0x00]))],
+                "regs_initial": {},
+                "regs_expected": {0: 0x0077, 3: 0x440},
+                "mem_expected": [(0x10440, bytes([0x99, 0x00]))],
+                "expected_eip": 8,
+            },
+            {
+                "name": "POP Ev (8F) memory form",
+                # MOV BX,0x450 ; POP WORD PTR [BX] ; HLT, with 0xCAFE on a
+                # stack based at 0x20000.
+                "code": bytes([0xBB, 0x50, 0x04, 0x8F, 0x07, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x10000, "SS": 0x20000},
+                "ram_setup": [(0x10450, bytes(4)),
+                              (0x20010, bytes([0xFE, 0xCA]))],
+                "regs_initial": {4: 0x0010},
+                "regs_expected": {3: 0x450, 4: 0x0012},
+                "mem_expected": [(0x10450, bytes([0xFE, 0xCA, 0x00, 0x00]))],
+                "expected_eip": 6,
+            },
         ])
 
         all_passed = True
