@@ -74,6 +74,12 @@ volatile uint32_t load_guest_flag = 0;
 volatile uint32_t run_dos_flag = 0;
 volatile uint32_t dos_r[16];
 
+/* HLE stub planting. The stubs and the bare-IRET default sit in guest memory;
+   the host checks they land BELOW the DOS arena, because anything at or above
+   it is handed to a program and overwritten. */
+volatile uint32_t run_hle_flag = 0;
+volatile int32_t hle_r = -99;
+
 volatile uint32_t run_video_flag = 0;
 volatile uint32_t video_blit_cycles = 0;
 uint8_t cga_test_vram[X86_VRAM_BYTES];
@@ -396,6 +402,16 @@ void Reset_Handler(void) {
             dos_r[8] = largest;                    /* must report a real size */
             dos_r[9] = dos_test_walk();            /* chain still consistent */
             run_dos_flag = 0;
+        }
+
+        if (run_hle_flag == 1) {
+            /* Plant the same vector set the real core does, so the host can
+               check every IVT entry lands in memory DOS will never hand out. */
+            static const uint8_t hle_vectors[] = {
+                0x08, 0x09, 0x10, 0x16, 0x1A, 0x20, 0x21,
+            };
+            hle_r = x86_hle_install(hle_vectors, sizeof(hle_vectors));
+            run_hle_flag = 0;
         }
 
         if (run_video_flag == 1) {

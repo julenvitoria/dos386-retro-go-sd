@@ -83,15 +83,15 @@ void x86_hle_set_cf(int set)
 #define STUB_SEG      0x0060u        /* linear 0x600: above the IVT and the
                                         BIOS data area, below the DOS arena */
 #define STUB_BYTES    4u
-#define IRET_OFF      0x0F0u         /* a bare IRET, clear of the served stubs
-                                        (vector 0x21 ends at 0x87) and below
-                                        the arena at 0x700 */
+/* The stub block must fit between STUB_SEG and the first MCB of the DOS arena
+   at segment 0x0070 -- 0x600..0x6FF, 256 bytes. It used to be sized to the
+   4 KB page instead, which put the bare IRET at linear 0x900: inside the arena,
+   so the first program loaded overwrote it, and the next interrupt to an
+   unserved vector executed the program's data as code. */
+#define STUB_LIMIT    0x0100u        /* 0x600..0x6FF; 0x700 is the arena */
+#define IRET_OFF      0x00FCu        /* a bare IRET, last dword of the block */
 
-/* The stub area has to end below the DOS arena. It did not: the default IRET
-   sat at linear 0x900 while the first MCB is at 0x700, so the first program
-   loaded wrote straight over it, and after that any interrupt we do not serve
-   -- a divide error, say -- vectored into the program's own data and ran it.
-   A compile-time check because both sides are compile-time constants: a test
+/* A compile-time check because both sides are compile-time constants: a test
    can only catch this after someone has already shipped it. */
 _Static_assert((STUB_SEG << 4) + IRET_OFF < (X86_DOS_ARENA_SEG << 4),
                "HLE stubs must sit below the DOS arena");
@@ -106,7 +106,10 @@ _Static_assert((STUB_SEG << 4) + IRET_OFF < (X86_DOS_ARENA_SEG << 4),
 int x86_hle_install(const uint8_t *vectors, unsigned count)
 {
     uint32_t base = (uint32_t)STUB_SEG << 4;
-    uint8_t *stubs = (uint8_t *)x86_guest_ptr(base, count * STUB_BYTES);
+    uint8_t *stubs;
+    if (count * STUB_BYTES > IRET_OFF)
+        return -1;                   /* would run into the bare IRET */
+    stubs = (uint8_t *)x86_guest_ptr(base, STUB_LIMIT);
     uint8_t *ivt = (uint8_t *)x86_guest_ptr(0, 1024);
     if (!stubs || !ivt)
         return -1;
@@ -214,8 +217,10 @@ int x86_hle_dispatch(uint8_t vector)
         return x86_bios_keyboard(AH);
     case 0x1A:
         return x86_bios_time(AH);
-    case 0x08:                       /* PIT tick: keep the BDA count moving */
-        x86_bios_tick();
+    case 0x08:
+        /* Nothing to do. The BDA tick count is advanced by the frame loop,
+           not here: a guest that hooks INT 08h never reaches this stub, and
+           the count has to keep moving anyway. */
         return 1;
     case 0x09:
         return x86_bios_kbd_irq();

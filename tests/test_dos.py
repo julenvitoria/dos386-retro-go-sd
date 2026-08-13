@@ -119,6 +119,41 @@ def main(args):
             print(f"FAIL: chain runs past conventional memory to 0x{end:04x}")
             ok = False
 
+        # The HLE stubs and their bare-IRET default live in guest memory. DOS
+        # hands out everything from ARENA_FIRST_MCB up, so any IVT entry that
+        # points at or above it is aimed at memory a program will overwrite --
+        # and then an interrupt executes the program's data as code.
+        if "run_hle_flag" in syms and "hle_r" in syms:
+            b.write_uint32(syms["run_hle_flag"], 1)
+            for _ in range(100):
+                if b.read_uint32(syms["run_hle_flag"]) == 0:
+                    break
+                time.sleep(0.05)
+            else:
+                print("FAIL: HLE install never completed")
+                return False
+            if b.read_uint32(syms["hle_r"]) != 0:
+                print("FAIL: x86_hle_install reported failure")
+                ok = False
+            ivt = bytes(b.read_memory(ram, 1024))
+            arena_lin = ARENA_FIRST_MCB * 16
+            bad = []
+            for v in range(256):
+                off = ivt[v * 4] | (ivt[v * 4 + 1] << 8)
+                seg = ivt[v * 4 + 2] | (ivt[v * 4 + 3] << 8)
+                lin = seg * 16 + off
+                if lin >= arena_lin:
+                    bad.append((v, seg, off, lin))
+            if bad:
+                v, seg, off, lin = bad[0]
+                print(f"FAIL: {len(bad)} IVT entries point into the DOS arena, "
+                      f"e.g. INT {v:02X}h -> {seg:04x}:{off:04x} "
+                      f"(linear 0x{lin:05x} >= 0x{arena_lin:05x})")
+                ok = False
+            else:
+                print(f"\nall 256 IVT entries land below the arena "
+                      f"(0x{arena_lin:05x})")
+
         print("\nPASS" if ok else "\nFAIL")
         return ok
     finally:
