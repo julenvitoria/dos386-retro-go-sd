@@ -18,6 +18,7 @@
 
 #include "cutils.h"
 #include "x86_cpu.h"
+#include "x86_probe.h"
 #include "font8x8.h"
 
 /* Guest register accessors. The 8086 register file is 16-bit halves of the
@@ -254,9 +255,32 @@ int x86_hle_service(void)
 {
     uint8_t vector = (uint8_t)cpu_state_ptr->exit_info;
     unsigned slot = x86_hle_log_idx & 31;
+#if X86_PROBE
+    /* Captured BEFORE dispatch: a handler is free to overwrite AX, and AH is
+       the key. The unhandled-marker snapshot is what lets the probe report
+       distinguish "a subfunction fell through" from "the whole service is
+       missing" without an annotation macro in x86_bios.c / x86_dos.c -- those
+       six default arms already set these two words, and comparing them across
+       the call is free. */
+    uint8_t p_ah = AH;
+    uint8_t p_sub = x86_probe_sub(vector, AH, AL,
+                                  (uint8_t)(GR(3) & 0xFFu));
+    uint32_t p_mark_v = x86_hle_unhandled_vector;
+    uint32_t p_mark_f = x86_hle_unhandled_func;
+#endif
     int r = x86_hle_dispatch(vector);
     if (r == 0)
         x86_hle_log[slot] |= 0x10000u;    /* nobody answered this one */
+#if X86_PROBE
+    {
+        uint16_t *fl = x86_hle_flags_on_stack();
+        X86_PROBE_INT(vector, p_ah, p_sub, r,
+                      (x86_hle_unhandled_vector != p_mark_v
+                       || x86_hle_unhandled_func != p_mark_f),
+                      AX, BX, ((uint32_t)CX << 16) | DX,
+                      fl ? (*fl & 1u) : 0);
+    }
+#endif
     x86_hle_calls++;
     if (r == 2)
         hle_retry();

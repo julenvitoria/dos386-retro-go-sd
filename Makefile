@@ -42,11 +42,19 @@ CFLAGS += -DX86_PROFILE=$(X86_PROFILE)
 X86_ZONES ?= 0
 CFLAGS += -DX86_ZONES=$(X86_ZONES)
 
+# Probe accumulator (x86_probe.h): what the guest asked for and how we answered.
+# OFF by default -- it emits ~2.8 KB of RAM_EMU storage, and RAM_EMU headroom in
+# this tree is small enough to have gone negative unnoticed. Not on the guest
+# dispatch path; see x86_probe.h for the cost and scripts/probe_report.py for
+# the measured link delta.
+X86_PROBE ?= 0
+CFLAGS += -DX86_PROBE=$(X86_PROBE)
+
 LDFLAGS = -mcpu=cortex-m7 -mthumb -T STM32H7B0VBTx_SDCARD.ld -Wl,--gc-sections --specs=nosys.specs
 
 PROGS = test_core.elf
 
-TEST_OBJS = x86_cpu.o x86_nor.o x86_profile.o x86_io.o x86_mem.o x86_video.o x86_osk.o x86_hle.o x86_bios.o x86_dos.o cga_blit.o cpu_exec.o tests/main.o hw_accel.o x86_disk.o lib/FatFs/ff.o lib/FatFs/ffunicode.o
+TEST_OBJS = x86_cpu.o x86_nor.o x86_profile.o x86_probe.o x86_io.o x86_mem.o x86_video.o x86_osk.o x86_hle.o x86_bios.o x86_dos.o cga_blit.o cpu_exec.o tests/main.o hw_accel.o x86_disk.o lib/FatFs/ff.o lib/FatFs/ffunicode.o
 
 all: $(PROGS)
 

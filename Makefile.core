@@ -29,6 +29,7 @@ lib/FatFs/ff.c \
 lib/FatFs/ffunicode.c \
 x86_disk.c \
 x86_profile.c \
+x86_probe.c \
 x86_zones.c
 
 CORE_ASM_SOURCES := \
@@ -67,9 +68,17 @@ X86_PROFILE ?= 0
 # per-transition cost and scripts/profile_all.py prints it in the report.
 X86_ZONES ?= 0
 
+# Probe accumulator (x86_probe.h): every service and port the guest touched, and
+# HOW we answered -- implemented, stubbed, defaulted or never modelled. Off by
+# default because it emits ~2.8 KB of RAM_EMU storage; it is per-SERVICE-CALL
+# and per-PORT-ACCESS, never per guest instruction. scripts/probe_report.py
+# builds with it and prints the measured link delta in every report.
+X86_PROBE ?= 0
+
 CORE_C_DEFS := \
 -DX86_PROFILE=$(X86_PROFILE) \
 -DX86_ZONES=$(X86_ZONES) \
+-DX86_PROBE=$(X86_PROBE) \
 -DX86_TEXT_AA=$(X86_TEXT_AA) \
 -DX86_TEXT_BILEVEL_FONT=$(X86_TEXT_BILEVEL_FONT) \
 -DPROJECT_KIND_CORE=1 \
