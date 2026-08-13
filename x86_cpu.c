@@ -260,13 +260,19 @@ uint32_t x86_mode_table(int op32, int addr32)
                       + X86_MODE_REC_TABLE_OFF);
 }
 
-/* Diagnostic: the last few CS loads, oldest-first modulo 8.
+/* Diagnostic: the last 16 CS loads, oldest-first modulo 16.
  * Each entry is (linear EIP at the moment of the load, new CS selector), which
  * names whatever transferred control -- far jump, far call, RETF or interrupt,
  * since all of them install CS through the same path. */
-uint32_t x86_cs_log[16];
+uint32_t x86_cs_log[64];   /* 16 entries of 4 words */
 uint32_t x86_cs_log_idx;
 
 /* Diagnostic: what the last IRET popped, and the SP it popped from.
  * [0]=IP [1]=CS [2]=FLAGS [3]=SP before the pops. */
 uint32_t x86_iret_log[4];
+
+/* Diagnostic sampler backing store; written only when the interpreter is built
+   with X86_TRACE_EIP (see x86_trace.inc). 256 bytes, always present so the
+   symbol exists for probe.py whether or not the sampler is compiled in. */
+uint32_t x86_eip_log[64];
+uint32_t x86_eip_log_idx;

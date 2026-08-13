@@ -3478,7 +3478,7 @@ L(SET_SREG):
     LDR R0, [R3]
     ADD.W R12, R0, #1
     STR R12, [R3]
-    AND.W R0, R0, #3               @ 4 entries of 4 words
+    AND.W R0, R0, #15              @ 16 entries of 4 words
     MOVW R3, #:lower16:x86_cs_log
     MOVT R3, #:upper16:x86_cs_log
     ADD.W R3, R3, R0, LSL #4
