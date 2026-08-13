@@ -91,24 +91,28 @@ def check_input(runner, syms, out=print):
         out("FAIL: the scancode never reached the controller queue")
         ok = False
     out("input: PASS" if ok else "input: FAIL")
-    return ok and check_game_is_return(runner, syms, out)
+    return ok and check_game_opens_osk(runner, syms, out)
 
 
 ODROID_INPUT_START = 5        # odroid_input.h; the firmware maps B_GAME here
-PAD_SCANCODE_ENTER = 0x1C     # src/main.c pad_scancode[6]
+PAD_SCANCODE_ENTER = 0x1C     # src/main.c pad_scancode[8] -- the X button now
+OSK_KEY_A = 0x1E              # layer 0, cell 0: the letter 'a'
 
 
-def check_game_is_return(runner, syms, out=print):
-    """The GAME button must put 0x1C (Return) in front of the guest.
+def check_game_opens_osk(runner, syms, out=print):
+    """GAME opens the on-screen keyboard, and the keyboard reaches the guest.
 
-    This exists because "START sends Return" was believed working while the
-    device said otherwise, and the reason was the TEST: gwemu's "start" key is
-    B_START, a button the stock Game & Watch does not have, which the firmware
-    reports as ODROID_INPUT_X -- a bit nothing in the core reads. The physical
-    GAME button is ODROID_INPUT_START. Press GAME to test GAME.
+    GAME USED TO SEND RETURN AND DELIBERATELY NO LONGER DOES. It is the OSK's
+    only door, on every unit -- docs/input/02-button-mapping.md -- so
+    pad_scancode[6] is 0 and this test changed with it. Return moved to the
+    physical START button (ODROID_INPUT_X), which is what gwemu's "start" key
+    drives, so both halves are checked here: GAME must produce NO scancode and
+    open the keyboard, and the A button must then send the selected cell's key
+    ('a', 0x1E) rather than its game-mode Space.
 
-    It also asserts the BYTE, not just that something happened: the counters
-    upstream prove a code was queued, but the whole question is WHICH.
+    The trap this function was originally written for still applies: gwemu's
+    "start" key is B_START, which the firmware reports as ODROID_INPUT_X, and
+    the physical GAME button is ODROID_INPUT_START. Press GAME to test GAME.
     """
     b = runner.backend
     if not hasattr(runner, "press"):
@@ -118,39 +122,83 @@ def check_game_is_return(runner, syms, out=print):
         base = syms["x86_kbd_read_log"]
         return [b.read_uint32(base + 4 * i) for i in range(32)]
 
-    idx_before = b.read_uint32(syms["x86_kbd_read_log_idx"])
-    ht_before = b.read_uint32(syms["input_kbd_ht"])
+    def fresh_since(idx0):
+        idx1 = b.read_uint32(syms["x86_kbd_read_log_idx"])
+        log = read_log()
+        return idx1, [log[i & 31] for i in range(idx0, idx1)]
+
+    out("\n--- GAME opens the OSK ---")
+    ok = True
+
+    # Close it first if an earlier phase left it open, so this measures the
+    # OPENING press and not whatever state the run had drifted into.
+    for _ in range(3):
+        if b.read_uint32(syms["x86_osk_mode"]) == 0:
+            break
+        runner.press("GAME", delay=0.0)
+        time.sleep(1.0)
+
+    idx = b.read_uint32(syms["x86_kbd_read_log_idx"])
+    # The PAD's own counter, not the port log: the guest drains that log one
+    # code per interrupt, so bytes from an EARLIER press are still arriving
+    # inside this window and would read as GAME's. input_scancodes counts what
+    # we pushed, which is the actual claim being made here.
+    codes = b.read_uint32(syms["input_scancodes"])
     runner.press("GAME", delay=0.0)
     time.sleep(2.0)
-    idx_after = b.read_uint32(syms["x86_kbd_read_log_idx"])
     seen = b.read_uint32(syms["input_pad_seen"])
+    mode = b.read_uint32(syms["x86_osk_mode"])
+    codes_after = b.read_uint32(syms["input_scancodes"])
+    idx, fresh = fresh_since(idx)
 
-    out("\n--- GAME -> Return ---")
     out(f"pad_seen bit {ODROID_INPUT_START} (START/GAME): "
         f"{'set' if seen & (1 << ODROID_INPUT_START) else 'CLEAR'}")
-    out(f"port 0x60 reads logged: {idx_before} -> {idx_after}")
-
-    ok = True
+    out(f"x86_osk_mode after GAME: {mode}   (expect 1 = keyboard)")
+    out(f"input_scancodes {codes} -> {codes_after}   (expect no change)")
     if not (seen & (1 << ODROID_INPUT_START)):
         out("FAIL: GAME never reached the core's gamepad read")
         ok = False
-
-    if idx_after > idx_before:
-        log = read_log()
-        fresh = [log[i & 31] for i in range(idx_before, idx_after)]
-        out("bytes the guest read: " + " ".join(f"0x{v:02X}" for v in fresh))
-        if PAD_SCANCODE_ENTER not in fresh:
-            out(f"FAIL: 0x{PAD_SCANCODE_ENTER:02X} (Return) was not among them")
-            ok = False
-    elif b.read_uint32(syms["input_kbd_ht"]) == ht_before:
-        # The guest reads port 0x60 itself only if it wants to; but the code
-        # must at least have reached the controller.
-        out("FAIL: nothing reached the controller queue for GAME")
+    if mode != 1:
+        out("FAIL: GAME did not open the keyboard")
         ok = False
-    else:
-        out("(guest has not drained the queue; code is still buffered)")
+    if codes_after != codes:
+        out("FAIL: GAME pushed a pad scancode; it must push none")
+        ok = False
 
-    out("GAME->Return: PASS" if ok else "GAME->Return: FAIL")
+    # A presses the selected cell. The counters say a key was pressed; the port
+    # log says WHICH, which is the only thing that answers "did the character
+    # reach the guest".
+    presses = b.read_uint32(syms["x86_osk_presses"])
+    runner.press("A", delay=0.0)
+    time.sleep(2.0)
+    idx, fresh = fresh_since(idx)
+    presses_after = b.read_uint32(syms["x86_osk_presses"])
+    last = b.read_uint32(syms["x86_osk_last_key"])
+    out(f"x86_osk_presses {presses} -> {presses_after}, "
+        f"last key 0x{last:04X}   (expect 0x1E61, 'a')")
+    out("bytes the guest read: " + (" ".join(f"0x{v:02X}" for v in fresh)
+                                    or "(none)"))
+    if presses_after <= presses:
+        out("FAIL: A did not press a grid key")
+        ok = False
+    if OSK_KEY_A not in fresh:
+        out(f"FAIL: 0x{OSK_KEY_A:02X} ('a') never reached port 0x60")
+        ok = False
+
+    # Two more GAMEs walk mouse mode and come back to OFF, which is what makes
+    # the cycle safe: there is always a way back to the game.
+    runner.press("GAME", delay=0.0)
+    time.sleep(1.0)
+    mid = b.read_uint32(syms["x86_osk_mode"])
+    runner.press("GAME", delay=0.0)
+    time.sleep(1.0)
+    end = b.read_uint32(syms["x86_osk_mode"])
+    out(f"cycle: 1 -> {mid} -> {end}   (expect 1 -> 2 -> 0)")
+    if (mid, end) != (2, 0):
+        out("FAIL: the GAME cycle did not return to OFF")
+        ok = False
+
+    out("GAME/OSK: PASS" if ok else "GAME/OSK: FAIL")
     return ok
 
 

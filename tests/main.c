@@ -5,6 +5,7 @@
 #include "../cutils.h"
 #include "../x86_cpu.h"
 #include "../x86_profile.h"
+#include "../x86_osk.h"
 
 // Address-translation fold. Entries are OFFSETS (host = guest_linear + k), and
 // every index the 12-bit lookup can produce must exist -- a short table meant
@@ -86,6 +87,13 @@ volatile int32_t hle_r = -99;
    the real path from a scancode on port 0x60 to a key in AX. */
 volatile uint32_t run_kbd_flag = 0;
 volatile uint32_t kbd_r[20];
+
+/* On-screen keyboard self-test. The OSK is a front end over the SAME injection
+   path the buttons use, so what has to be proved is that a grid press turns
+   into the right SCANCODES and that the BIOS decodes them into the right BDA
+   entry -- shift included, which is the part with no other witness. */
+volatile uint32_t run_osk_flag = 0;
+volatile uint32_t osk_r[16];
 
 /* DOS file I/O self-test: INT 21h 3Dh/3Fh/42h/3Eh/43h/4Eh/4Fh, driven from
    GUEST code against a FAT12 volume the HOST built in dosfile_img.
@@ -418,6 +426,136 @@ static void kbd_test_run(void)
 
 
 /* --------------------------------------------------------------------------
+ * On-screen keyboard.
+ *
+ * Driven exactly as src/main.c drives it: a button BITMASK per frame, then the
+ * BIOS keyboard interrupt for every code the controller holds -- so this covers
+ * the OSK, x86_kbd_scancode(), the 8042 queue and INT 09h's shift decode in one
+ * chain. Nothing is asserted against the OSK's own state; the answers come out
+ * of the guest's BDA ring, which is where a program looks.
+ */
+static void osk_drain_irqs(void)
+{
+    /* Bounded: a controller that never empties must fail, not hang. */
+    for (int guard = 0; guard < 32 && x86_kbd_pending(); guard++)
+        x86_bios_kbd_irq();
+}
+
+static uint16_t osk_ring_pop(void)
+{
+    uint16_t head = kbd_bda_r16(0x1A);
+    if (head == kbd_bda_r16(0x1C))
+        return 0xFFFF;                  /* empty */
+    uint16_t w = (uint16_t)(test_ram[0x400 + head] |
+                            (test_ram[0x401 + head] << 8));
+    head = (uint16_t)(head + 2);
+    if (head >= 0x3E)
+        head = 0x1E;
+    kbd_bda_w16(0x1A, head);
+    return w;
+}
+
+/* One frame of buttons, then whatever the controller produced. */
+static uint16_t osk_frame(uint32_t buttons)
+{
+    x86_osk_input(buttons);
+    osk_drain_irqs();
+    return osk_ring_pop();
+}
+
+static void osk_test_run(void)
+{
+    static const uint8_t hle_vectors[] = {
+        0x08, 0x09, 0x10, 0x16, 0x1A, 0x20, 0x21,
+    };
+    x86_video_init(cga_test_vram, cga_test_palette);
+    x86_bios_init();
+    x86_hle_install(hle_vectors, sizeof(hle_vectors));
+    x86_osk_reset();
+
+    /* The layout's own arithmetic. draw_glyph() clips silently, so an
+       over-long row loses its OFF key with no fault to notice. */
+    osk_r[0] = x86_osk_row_cells_max;
+    osk_r[1] = x86_osk_row_overflow;
+
+    /* GAME opens it. The press is consumed by the transition -- the frame the
+       OSK opens on emits nothing. */
+    osk_r[2] = (uint32_t)x86_osk_visible();      /* expect 0 */
+    x86_osk_cycle();
+    osk_r[3] = (uint32_t)x86_osk_visible();      /* expect 1 */
+
+    /* Layer 0, row 0, column 0 is 'a'. A presses it. Two frames: the release
+       of the buttons has to be seen or the next press is not an edge. */
+    (void)osk_frame(0);
+    osk_r[4] = osk_frame(X86_OSK_A);             /* expect 0x1E1E ('a')      */
+    (void)osk_frame(0);
+
+    /* RIGHT then A is 'b' -- navigation, not just the first cell. */
+    (void)osk_frame(X86_OSK_RIGHT);
+    (void)osk_frame(0);
+    osk_r[5] = osk_frame(X86_OSK_A);             /* expect 0x3062 ('b')      */
+    (void)osk_frame(0);
+
+    /* B is Backspace wherever the cursor is. */
+    osk_r[6] = osk_frame(X86_OSK_B);             /* expect 0x0E08            */
+    (void)osk_frame(0);
+
+    /* TIME cycles the layer and DOWN flips the row, neither of which moves the
+       column -- so the cursor is still on column 1 from the 'b' press above,
+       and NINE more RIGHTs reach column 10. That cell is '!', a SHIFTED one:
+       the BDA must show the shifted ASCII, which is only possible if a real
+       Left Shift make reached INT 09h ahead of the key. (Ten RIGHTs lands on
+       '@' -- also shifted, and it passed, which is exactly why the column is
+       spelled out here rather than counted from zero in a comment.) */
+    (void)osk_frame(X86_OSK_TIME);
+    (void)osk_frame(0);
+    (void)osk_frame(X86_OSK_DOWN);
+    (void)osk_frame(0);
+    for (int i = 0; i < 9; i++) {
+        (void)osk_frame(X86_OSK_RIGHT);
+        (void)osk_frame(0);
+    }
+    osk_r[7] = osk_frame(X86_OSK_A);             /* expect 0x0221 ('!')      */
+    osk_r[8] = (uint32_t)test_ram[0x400 + 0x17]; /* BDA shift flags: 0 again */
+    (void)osk_frame(0);
+
+    /* Drawing must not touch the guest's framebuffer, in either mode, and must
+       put ink in the bars. Rendered into the harness's own output buffer. */
+    memset(cga_test_out, 0, 320 * 240);
+    {
+        uint32_t vram_before = 0, vram_after = 0;
+        for (unsigned i = 0; i < X86_VRAM_BYTES; i += 64)
+            vram_before += cga_test_vram[i];
+        x86_video_render(cga_test_out, 320);
+        x86_osk_draw(cga_test_out, 320);
+        for (unsigned i = 0; i < X86_VRAM_BYTES; i += 64)
+            vram_after += cga_test_vram[i];
+        osk_r[9] = (vram_before == vram_after) ? 1 : 0;
+
+        uint32_t top = 0, bottom = 0, picture = 0;
+        for (unsigned y = 0; y < 20; y++)
+            for (unsigned x = 0; x < 320; x++)
+                top += cga_test_out[y * 320 + x] ? 1 : 0;
+        for (unsigned y = 220; y < 240; y++)
+            for (unsigned x = 0; x < 320; x++)
+                bottom += cga_test_out[y * 320 + x] ? 1 : 0;
+        for (unsigned y = 20; y < 220; y++)
+            for (unsigned x = 0; x < 320; x++)
+                picture += cga_test_out[y * 320 + x] ? 1 : 0;
+        osk_r[10] = top;
+        osk_r[11] = bottom;
+        osk_r[12] = picture;
+    }
+
+    /* GAME again: mouse mode still owns the buttons; a third closes it. */
+    x86_osk_cycle();
+    osk_r[13] = x86_osk_mode;                    /* expect 2 (mouse)         */
+    osk_r[14] = (uint32_t)x86_osk_visible();     /* expect 1                 */
+    x86_osk_cycle();
+    osk_r[15] = (uint32_t)x86_osk_visible();     /* expect 0                 */
+}
+
+/* --------------------------------------------------------------------------
  * DOS file I/O, from guest code.
  *
  * Every call goes through INT 21h the way a DOS program issues it, so the CF
@@ -727,6 +865,11 @@ void Reset_Handler(void) {
         if (run_kbd_flag == 1) {
             kbd_test_run();
             run_kbd_flag = 0;
+        }
+
+        if (run_osk_flag == 1) {
+            osk_test_run();
+            run_osk_flag = 0;
         }
 
         if (run_dosfile_flag == 1) {
