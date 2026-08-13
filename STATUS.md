@@ -6,11 +6,7 @@ Last verified 2026-08-13. How to run: [`TOOLING.md`](TOOLING.md). Roadmap: [`PLA
 
 | Tier | State |
 |---|---|
-<<<<<<< HEAD
-| 1. gwemu bare-metal | 268/268 `test_opcodes.py`, plus `test_video`/`test_text`/`test_dos`/`test_keyboard`/`test_screen`; `test_audio` runs natively, no target |
-=======
-| 1. gwemu bare-metal | 268/268 `test_opcodes.py`, plus `test_video`/`test_text`/`test_dos`/`test_keyboard`/`test_osk`/`test_screen` |
->>>>>>> worktree-agent-af6ed0df80835aae3
+| 1. gwemu bare-metal | 268/268 `test_opcodes.py`, plus `test_video`/`test_text`/`test_dos`/`test_keyboard`/`test_osk`/`test_screen`/`test_disk_cache`; `test_audio` runs natively, no target |
 | 2. gwemu + retro-go | `core_dtcm_ok=1`, bonus pool 153,600 B, 1,000,001 insns — matches tier 1 |
 | 3. Hardware | 50.50 cyc/insn, 5.54 MIPS |
 
