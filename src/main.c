@@ -93,6 +93,7 @@ volatile uint32_t dsk_startup_ok = 0;
 #define CORE_CLUT_ENTRIES 32
 static uint32_t core_clut[CORE_CLUT_ENTRIES];
 static uint8_t *upper_filler;
+static uint8_t *bios_id_page;   /* 0xFF000: real storage, not an alias */
 
 /* Host-readable so a failure to place either block is visible rather than a
    black screen. */
@@ -188,6 +189,11 @@ volatile uint32_t frame_ms_last    = 0;  /* last iteration, host ms           */
 volatile uint32_t panel_ms_min     = 0;  /* shortest iteration seen = the panel*/
 volatile uint32_t frame_10us_avg = 8u * 1667u; /* mean iteration, 8x, 10us units */
 volatile uint32_t guest_exec_ms    = 0;  /* host ms spent RUNNING the guest    */
+/* Did the last slice end because the GUEST halted? Then guest_exec_ms is short
+   because the guest asked to idle, NOT because we had spare capacity. Growing
+   the slice on that reading is how the controller inflated to its ceiling and
+   then ran a multi-second slice that tripped the watchdog. */
+static uint32_t   last_slice_halted = 0;
 static uint32_t   max_slice = 20000u;    /* unthrottled mode's working slice  */
 static uint32_t   rate_window_ms;        /* start of the achieved-rate window */
 static uint32_t   rate_window_insns;
@@ -198,7 +204,14 @@ static uint32_t   rate_window_frames;
 #define GUEST_SLICE_MAX_MS  33u
 #define GUEST_DEBT_MAX_MS  100u
 #define MAX_SLICE_FLOOR   1000u
-#define MAX_SLICE_CEIL 4000000u
+/* A TIME bound expressed in instructions. 50k at ~2 M ips is ~25 ms, inside
+   the watchdog window, and still allows 3 M ips at 60 iterations/s. It was
+   4,000,000 -- two SECONDS in a single slice with no return to the frame loop,
+   which is exactly what tripped the watchdog once the controller had inflated
+   to it. Do NOT derive this from measured throughput: the slice limits
+   throughput, so a cap computed from throughput ratchets both down to the
+   floor (measured: 59,642 ips, pinned there). */
+#define MAX_SLICE_CEIL   50000u
 
 /*
  * The guest's clock, and the fact that it is REAL time.
@@ -503,6 +516,19 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
                                                1, 4096);
     upper_filler_ok = upper_filler ? 1 : 0;
 
+    /* The BIOS identification page at 0xFF000 needs REAL, PERSISTENT storage:
+     * it is written once and read by every program that identifies the
+     * machine, so it cannot alias the open-bus filler. It used to come from
+     * x86_map_range()'s page pool -- but that pool is never initialised
+     * (x86_mem_pool_init() is called from nowhere), so the request always
+     * failed and the page was simply absent. From the bonus pool, like the
+     * filler, for the same reasons. */
+    if (bonus && bonus_sz >= 8192)
+        bios_id_page = bonus + 4096;
+    else
+        bios_id_page = (uint8_t *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM,
+                                               1, 4096);
+
     if (guest_vram) {
         /* The CLUT the LCD scans out through. LUT8 gives 256 entries; CGA
          * mode 4 uses four and the palette registers pick which. */
@@ -708,7 +734,10 @@ static void guest_reset(void)
 
     /* The identification bytes need their own page: they must persist, and
        everything else in the region is a shared alias. */
-    x86_map_range(0xFF000u, 4096u);
+    if (bios_id_page) {
+        memset(bios_id_page, 0xFF, 4096);
+        x86_map_fixed(0xFF000u, bios_id_page, 4096u);
+    }
     x86_bios_rom_install();
 
     /* Everything above 1 MB wraps to the bottom, as it does with A20 masked. */
@@ -1102,7 +1131,9 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
             {
                 uint32_t panel = panel_ms_min ? panel_ms_min : 16u;
                 uint32_t target4 = panel * 3u;          /* 4 * (3/4 * panel) */
-                if (guest_exec_ms * 4u < target4) {
+                if (last_slice_halted) {
+                    /* Idle is not headroom: leave max_slice alone. */
+                } else if (guest_exec_ms * 4u < target4) {
                     max_slice += max_slice / 8u;
                     if (max_slice > MAX_SLICE_CEIL)
                         max_slice = MAX_SLICE_CEIL;
@@ -1187,6 +1218,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         while (!guest_halted) {
             x86_cpu_interp_asm();
             uint32_t reason = cpu_state_ptr->exit_reason;
+            last_slice_halted = (reason == X86_EXIT_HALT);
             guest_exit_reason = reason;
             if (reason == X86_EXIT_TIMER) {
                 cpu_state_ptr->exit_reason = 0;

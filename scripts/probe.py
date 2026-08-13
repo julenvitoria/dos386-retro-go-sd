@@ -30,6 +30,7 @@ from scripts.common.probe import (                       # noqa: E402
     parse_watch,
     sample, wait_for_value,
 )
+from scripts.common.rglog import LogDrainer                # noqa: E402
 from scripts.common.target import Image, add_target_args, open_target  # noqa: E402
 
 FW_DIR = "references/game-and-watch-retro-go-sd/build"
@@ -59,6 +60,14 @@ def main():
     p.add_argument("--set", action="append", default=[], metavar="SYM=VALUE",
                    help="write a uint32 before sampling, e.g. to trigger work "
                         "on the target; repeatable")
+    p.add_argument("--zero", action="append", default=[], metavar="ADDR:BYTES",
+                   help="write zeros over a memory range before sampling, e.g. "
+                        "--zero 0x30000000:0x48000. Repeatable. For clearing "
+                        "RETAINED state: retro-go keeps persistent_config_ram "
+                        "in D2 AHB SRAM (0x30000000), which survives every "
+                        "reset and reflash and is only lost on real power "
+                        "removal -- so a bad value there outlives every "
+                        "recovery step short of this")
     p.add_argument("--faults", action="store_true",
                    help="also dump ARMv7-M fault/exception state")
     p.add_argument("--samples", type=int, default=10)
@@ -107,6 +116,19 @@ def main():
                 print("core never started; sampling anyway")
             else:
                 print("core running")
+        for spec in args.zero:
+            addr_s, _, len_s = spec.partition(":")
+            addr, nbytes = int(addr_s, 0), int(len_s, 0)
+            target.backend.halt()
+            chunk = bytes(4096)
+            done = 0
+            while done < nbytes:
+                n = min(len(chunk), nbytes - done)
+                target.backend.write_memory(addr + done, chunk[:n])
+                done += n
+            target.backend.resume()
+            print(f"zeroed 0x{addr:08x}..0x{addr + nbytes:08x} ({nbytes} bytes)")
+
         for spec in args.set:
             name, _, val = spec.partition("=")
             name = name.strip()
@@ -115,8 +137,13 @@ def main():
             target.backend.write_uint32(syms[name], int(val, 0))
             print(f"set {name} = {int(val, 0)}")
 
+        drainer = LogDrainer(fw_elf) if fw_elf else None
+        if drainer and not drainer.available:
+            drainer = None
+
         sample(target, syms, watches=watches, derefs=derefs,
-               count=args.samples, interval=args.interval, symbol_maps=maps)
+               count=args.samples, interval=args.interval, symbol_maps=maps,
+               on_sample=(drainer.drain if drainer else None))
 
         # After sampling, not before: an array read at t=0 shows the state
         # before the target has done anything, which is how a full log reads

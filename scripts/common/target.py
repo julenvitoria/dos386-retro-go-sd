@@ -333,11 +333,13 @@ class HardwareTarget(Target):
     """Boot an Image on the real device over a debug probe."""
 
     def __init__(self, image, physical_sdcard=None, no_flash=False,
-                 hard_reset=False):
+                 hard_reset=False, erase_first=False, precise_faults=False):
         super().__init__(image)
         self.physical_sdcard = physical_sdcard
         self.no_flash = no_flash
         self.hard_reset = hard_reset
+        self.erase_first = erase_first
+        self.precise_faults = precise_faults
         self.gnw = None
 
     def start(self):
@@ -355,6 +357,18 @@ class HardwareTarget(Target):
         # Starting it unconditionally is why reading a benchmark's result used
         # to restart the benchmark.
         if getattr(self, "no_flash", False):
+            # --no-flash --hard-reset = reboot what is already on the device,
+            # touching no flash at all. Needed because REPROGRAMMING is itself
+            # destructive on this part (see erase_first): once a good image is
+            # on there, the way to boot it is a reset, not another flash.
+            if self.hard_reset:
+                print("--no-flash --hard-reset: resetting the device, "
+                      "leaving flash untouched")
+                self.backend.reset_and_halt()
+                if self.precise_faults:
+                    self._enable_precise_faults()
+                self.backend.resume()
+                return
             print("--no-flash: observing the device WITHOUT reset "
                   "(no gnwmanager, no flash, no SD)")
             return
@@ -366,6 +380,19 @@ class HardwareTarget(Target):
         # bank 1 boots nothing, and this used to be hardcoded to bank 1.
         bank = self.image.intflash_bank
         src = self.image.hw_primary
+        # ERASE BEFORE PROGRAM. On STM32H7 the flash is ECC-protected in
+        # 128-bit words: programming a word that was not erased first leaves an
+        # UNCORRECTABLE ECC error, and reading that word raises a BUS FAULT --
+        # imprecise, so it reports no address, and it survives reflashing
+        # because the bad word is simply reprogrammed over again. A debugger
+        # read-back can still compare equal while an instruction fetch faults,
+        # which makes it look like the image is fine.
+        if self.erase_first:
+            with open(src, "rb") as fh:
+                nbytes = len(fh.read())
+            print(f"Erasing bank {bank} ({nbytes} bytes) before programming...")
+            self.gnw.erase(bank, 0, nbytes)
+
         print(f"Flashing {src} to internal flash bank {bank}...")
         with open(src, "rb") as fh:
             self.gnw.flash(bank, 0, fh.read())
@@ -375,6 +402,23 @@ class HardwareTarget(Target):
                        else HardwareProbeSDCardManager(self.gnw))
 
         self._start_firmware()
+
+
+    # SCB->CCR bit 1 (DISDEFWBUF) turns off the write buffer, which makes bus
+    # faults PRECISE: BFAR and the stacked PC then point at the instruction
+    # that actually faulted. Without it an imprecise fault reports no address
+    # at all -- which is why a boot fault here could not be localised. Costs
+    # performance, so it is a diagnostic switch, not a default. Must be set
+    # while halted BEFORE the faulting code runs.
+    CCR_ADDR = 0xE000ED14
+    DISDEFWBUF = 1 << 1
+
+    def _enable_precise_faults(self):
+        ccr = self.backend.read_uint32(self.CCR_ADDR)
+        self.backend.write_uint32(self.CCR_ADDR, ccr | self.DISDEFWBUF)
+        got = self.backend.read_uint32(self.CCR_ADDR)
+        print(f"precise faults: SCB->CCR 0x{ccr:08x} -> 0x{got:08x} "
+              f"(DISDEFWBUF {'set' if got & self.DISDEFWBUF else 'FAILED'})")
 
     def _start_firmware(self):
         """Boot the flashed firmware, the way `gnwmanager start` does it.
@@ -399,6 +443,8 @@ class HardwareTarget(Target):
         if self.hard_reset:
             print("hard reset: resetting the CPU and every peripheral")
             self.gnw.reset_and_halt()
+            if self.precise_faults:
+                self._enable_precise_faults()
             self.backend.resume()
             return
 
@@ -432,6 +478,16 @@ def add_target_args(parser):
                         help="input timeline to replay under gwemu")
     parser.add_argument("--physical-sdcard", default=None,
                         help="mounted SD path for bulk hardware copies")
+    parser.add_argument("--precise-faults", action="store_true",
+                        help="disable the write buffer (SCB->CCR DISDEFWBUF) "
+                             "at reset so bus faults are PRECISE and BFAR/PC "
+                             "identify the faulting instruction. Slower; use "
+                             "it to localise an imprecise fault")
+    parser.add_argument("--erase-first", action="store_true",
+                        help="erase internal flash before programming it. "
+                             "Programming H7 flash that was not erased leaves "
+                             "an uncorrectable ECC error whose READ raises a "
+                             "bus fault -- and which survives reflashing")
     parser.add_argument("--hard-reset", action="store_true",
                         help="start the device with a REAL reset (CPU and "
                              "peripherals) instead of jumping to the reset "
@@ -451,7 +507,10 @@ def open_target(args, image):
     if getattr(args, "target", "gwemu") == "hardware":
         return HardwareTarget(image, physical_sdcard=args.physical_sdcard,
                               no_flash=getattr(args, "no_flash", False),
-                              hard_reset=getattr(args, "hard_reset", False))
+                              hard_reset=getattr(args, "hard_reset", False),
+                              erase_first=getattr(args, "erase_first", False),
+                              precise_faults=getattr(args, "precise_faults",
+                                                     False))
     return GwemuTarget(image, display=getattr(args, "gui", False),
                        audio=getattr(args, "audio", False),
                        icount=getattr(args, "icount", None),

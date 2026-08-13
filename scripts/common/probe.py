@@ -209,7 +209,7 @@ def dump_arrays(target, syms, dumps, out=print, symbol_maps=()):
 
 
 def sample(target, syms, watches=(), derefs=(), count=10, interval=1.0,
-           symbol_maps=(), out=print):
+           symbol_maps=(), out=print, on_sample=None):
     """Halt/read/resume `count` times. Returns the rows it printed.
 
     watches: symbol names read as uint32.
@@ -237,6 +237,11 @@ def sample(target, syms, watches=(), derefs=(), count=10, interval=1.0,
                 if region_of(ptr) != "?":
                     val = target.backend.read_uint32(ptr + off)
             row[label] = val
+
+        # While still halted: anything reading target memory (the log
+        # drainer) must run before the resume.
+        if on_sample is not None:
+            on_sample(target.backend)
 
         target.backend.resume()
         rows.append(row)

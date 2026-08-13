@@ -23,6 +23,10 @@
 
 #define PAGE_SIZE 4096u
 
+/* Host-readable: any mapping we refused. Non-zero means some region is
+   deliberately absent, which is a far better thing to read than a hardfault. */
+volatile uint32_t x86_map_failures = 0;
+
 static uint8_t *pool_base;
 static uint32_t pool_bytes;
 static uint32_t pool_used;
@@ -71,6 +75,7 @@ int x86_map_range(uint32_t guest, uint32_t bytes)
         uint8_t *page = pool_alloc_page();
         if (!page) {
             failed++;
+            x86_map_failures++;
             continue;
         }
         memset(page, 0, PAGE_SIZE);
@@ -85,6 +90,20 @@ int x86_map_fixed(uint32_t guest, void *host, uint32_t bytes)
 {
     uint32_t first = guest >> FOLD_SHIFT;
     uint32_t count = (bytes + PAGE_SIZE - 1u) / PAGE_SIZE;
+
+    /* REFUSE A NULL BACKING. A fold entry built from NULL is worse than no
+     * entry at all: FOLD_K(NULL, idx) yields a small positive host address, so
+     * the sentinel check (ADDS/BMI) PASSES and the handler dereferences it --
+     * a HARD FAULT inside the interpreter instead of a clean X86_EXIT_MEM_FAULT
+     * the emulator can report. That is how a failed VRAM/filler allocation
+     * surfaced as a hardfault at GRP5_MEM_16's `ldrh r3,[r2]`, with nothing
+     * anywhere saying an allocation had failed.
+     * Leaving the range unmapped keeps FOLD_INVALID, so the guest takes a
+     * clean fault and x86_map_failures says why. */
+    if (!host) {
+        x86_map_failures++;
+        return -1;
+    }
 
     for (uint32_t i = 0; i < count; i++) {
         uint32_t idx = first + i;

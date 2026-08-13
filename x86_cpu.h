@@ -211,6 +211,10 @@ void x86_mem_pool_init(void *base, uint32_t bytes);
 uint32_t x86_mem_pool_free(void);
 int x86_map_range(uint32_t guest, uint32_t bytes);
 int x86_map_fixed(uint32_t guest, void *host, uint32_t bytes);
+/* Mappings REFUSED (NULL backing, or the page pool ran dry). Non-zero means a
+   guest region is deliberately absent; the guest then takes a clean
+   X86_EXIT_MEM_FAULT instead of hard-faulting the interpreter. */
+extern volatile uint32_t x86_map_failures;
 void x86_unmap_all(void);
 void x86_mem_wrap_1mb(void);
 void *x86_guest_ptr(uint32_t lin, uint32_t bytes);
