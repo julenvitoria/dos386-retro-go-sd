@@ -557,6 +557,8 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
     guest_reset();
     guest_halted = 0;
 
+    unsigned tick_divider = 0;
+
     abi->audio_ctl(GW_AUDIO_INIT, SAMPLE_RATE);
     uint32_t audio_frames = (uint32_t)abi->audio_ctl(GW_AUDIO_GET_LENGTH, 0);
     abi->audio_ctl(GW_AUDIO_START, audio_frames);
@@ -600,6 +602,24 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                thousands of times a second and telling us nothing new. */
             guest_halted = 1;
             break;
+        }
+
+        /*
+         * The BIOS tick at 0040:006C. Until now it only moved when the guest
+         * executed INT 08h, and nothing generates INT 08h -- so for a program
+         * that reads the counter directly, which is how essentially every DOS
+         * timing loop works, guest time stood still and the loop never ended.
+         * TOPBENCH clears the screen, starts timing, and spins forever.
+         *
+         * A frame slice is the emulator's time base (see pit_reload), so the
+         * tick is derived from frames: three panel frames per tick puts it at
+         * about 18.2 Hz, which is what the counter is defined to be. In-guest
+         * INT 08h DELIVERY is still not implemented -- a program that hooks the
+         * vector rather than reading the counter will not see it.
+         */
+        if (++tick_divider >= 3u) {
+            tick_divider = 0;
+            x86_bios_tick();
         }
 
         /* Video. The beam fraction drives the CGA status register, so a guest

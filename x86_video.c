@@ -222,6 +222,15 @@ static uint16_t *text_cell(unsigned row, unsigned col)
     return (uint16_t *)cga_vram + row * TEXT_COLS + col;
 }
 
+/* The cell under the cursor, character in the low byte and attribute in the
+   high byte -- the layout INT 10h AH=08 returns in AX. */
+uint16_t x86_video_read_cell(void)
+{
+    if (!cga_vram)
+        return 0x0720;
+    return *text_cell(cur_row, cur_col);
+}
+
 void x86_video_scroll(uint8_t lines, uint8_t attr)
 {
     if (lines == 0 || lines >= TEXT_ROWS) {

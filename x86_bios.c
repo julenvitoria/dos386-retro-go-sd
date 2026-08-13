@@ -170,6 +170,13 @@ int x86_bios_video(uint8_t func)
         x86_video_scroll((uint8_t)((cpu_state_ptr->regs[0]) & 0xFF),
                          (uint8_t)((cpu_state_ptr->regs[3] >> 8) & 0xFF));
         return 1;
+    case 0x08:                      /* read char + attribute at cursor */
+        /* Unimplemented, this returned nothing and left AX holding whatever
+           the caller had -- and a program that probes the display this way
+           then believes the garbage. */
+        cpu_state_ptr->regs[0] = (cpu_state_ptr->regs[0] & 0xFFFF0000u)
+                               | x86_video_read_cell();
+        return 1;
     case 0x09:                      /* write char + attribute at cursor */
     case 0x0A:
         x86_video_putc_attr((uint8_t)(cpu_state_ptr->regs[0] & 0xFF),
