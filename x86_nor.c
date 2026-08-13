@@ -84,6 +84,7 @@ static uint8_t  *pool_free_head;    /* singly linked through the pages themselve
 
 static uint8_t  *nor_base;
 static uint32_t  nor_len;
+static uint32_t  nor_first_page;    /* fold index the snapshot starts at */
 
 #define DWT_CYCCNT (*(volatile uint32_t *)0xE0001004)
 
@@ -147,7 +148,8 @@ static void fold_repoint(uint32_t idx, uint8_t *host, const uint8_t *was)
  * Returns 0 on success; on failure nothing has changed and x86_nor_attach_err
  * says which check refused it.
  */
-int x86_nor_attach(void *nor, uint32_t nor_bytes, void *ram, uint32_t ram_bytes)
+int x86_nor_attach(void *nor, uint32_t nor_bytes, void *ram, uint32_t ram_bytes,
+                   uint32_t first_page)
 {
     uint8_t *n = (uint8_t *)nor;
     uint8_t *r = (uint8_t *)ram;
@@ -163,7 +165,7 @@ int x86_nor_attach(void *nor, uint32_t nor_bytes, void *ram, uint32_t ram_bytes)
        only works if the snapshot is page-aligned. flash_alloc places files on
        an erase block, so this holds -- but it is load-bearing, so check it. */
     if ((uint32_t)n & (PAGE_SIZE - 1u)) { x86_nor_attach_err = 5; return -1; }
-    if ((ram_bytes >> FOLD_SHIFT) > FOLD_ENTRIES)
+    if (first_page + (ram_bytes >> FOLD_SHIFT) > FOLD_ENTRIES)
                                        { x86_nor_attach_err = 6; return -1; }
     /* Readback. Under gwemu this is exact; on silicon it is the only thing
        that distinguishes a good program from an OCTOSPI that came back in the
@@ -178,13 +180,15 @@ int x86_nor_attach(void *nor, uint32_t nor_bytes, void *ram, uint32_t ram_bytes)
     for (uint32_t i = 0; i < pages; i++) {
         uint8_t *axi = r + i * PAGE_SIZE;
         uint8_t *nor_page = n + i * PAGE_SIZE;
-        if (guest_page_table_ptr[i] != FOLD_K(axi, i))
+        uint32_t idx = first_page + i;
+        if (guest_page_table_ptr[idx] != FOLD_K(axi, idx))
             continue;               /* not ours to move */
-        fold_repoint(i, nor_page, axi);
+        fold_repoint(idx, nor_page, axi);
     }
 
     nor_base = n;
     nor_len  = ram_bytes;
+    nor_first_page = first_page;
     pool_reset(r, ram_bytes);
 
     x86_nor_base_addr   = (uint32_t)n;
@@ -244,11 +248,12 @@ void x86_nor_slow_w(uint32_t bad)
     }
     x86_nor_writes++;
 
-    uint32_t idx = off >> FOLD_SHIFT;
-    uint8_t *nor_page = nor_base + (idx << FOLD_SHIFT);
+    uint32_t pg = off >> FOLD_SHIFT;
+    uint32_t idx = nor_first_page + pg;
+    uint8_t *nor_page = nor_base + (pg << FOLD_SHIFT);
 
-    uint8_t *page = pool_take();
-    if (!page) {
+    uint8_t *axi = pool_take();
+    if (!axi) {
         /* Structurally impossible -- the pool is exactly as large as the
          * snapshot, so it cannot empty before every page is back in AXI. It is
          * checked anyway, and it is LOUD: a silent NULL here would be a store
@@ -258,13 +263,13 @@ void x86_nor_slow_w(uint32_t bad)
         cpu_state_ptr->nor_ptr = 0;
         return;
     }
-    memcpy(page, nor_page, PAGE_SIZE);
-    fold_repoint(idx, page, nor_page);
+    memcpy(axi, nor_page, PAGE_SIZE);
+    fold_repoint(idx, axi, nor_page);
 
     x86_nor_cow_pulls++;
     x86_nor_pages_nor--;
     x86_nor_pages_axi++;
 
-    cpu_state_ptr->nor_ptr = (uint32_t)page + (off & (PAGE_SIZE - 1u));
+    cpu_state_ptr->nor_ptr = (uint32_t)axi + (off & (PAGE_SIZE - 1u));
     x86_nor_slow_cycles += DWT_CYCCNT - t0;
 }

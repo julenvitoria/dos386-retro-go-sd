@@ -241,7 +241,8 @@ extern volatile uint32_t x86_map_failures;
    ALREADY durable and byte-verifies them before it moves the fold table, so a
    failed snapshot leaves the guest running unchanged out of AXI. The two
    slow_* entries are called from the trap stubs in cpu_exec.S, never from C. */
-int  x86_nor_attach(void *nor, uint32_t nor_bytes, void *ram, uint32_t ram_bytes);
+int  x86_nor_attach(void *nor, uint32_t nor_bytes, void *ram, uint32_t ram_bytes,
+                    uint32_t first_page);
 void x86_nor_slow_r(uint32_t bad);
 void x86_nor_slow_w(uint32_t bad);
 extern volatile uint32_t x86_nor_attached, x86_nor_base_addr, x86_nor_bytes;
