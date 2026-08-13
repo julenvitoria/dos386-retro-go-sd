@@ -719,10 +719,22 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
      * so unlike a bump pool its free space is not knowable from the link map.
      */
     {
-        void *dc = (void *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_AHB,
-                                        1, X86_DISK_CACHE_BYTES);
+        /* DEGRADE, do not vanish. The full size failed on the device -- the AHB
+           heap is shared with the firmware's newlib, so 64 KB was simply not
+           there -- and a NULL here disables the cache entirely, which is SLOWER
+           than before it existed: every read goes to the backend and re-walks
+           the file. Halve until something fits; a 16 KB cache is worth far more
+           than none. x86_disk_cache_bytes says what we actually got. */
+        void *dc = NULL;
+        uint32_t want = X86_DISK_CACHE_BYTES;
+        while (!dc && want >= 8192u) {
+            dc = (void *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_AHB, 1, want);
+            if (!dc)
+                want /= 2u;
+        }
         disk_cache_mem = (uint32_t)(uintptr_t)dc;
-        x86_disk_cache_init(dc, dc ? X86_DISK_CACHE_BYTES : 0);
+        x86_disk_cache_bytes = dc ? want : 0;
+        x86_disk_cache_init(dc, dc ? want : 0);
     }
 
     /*
