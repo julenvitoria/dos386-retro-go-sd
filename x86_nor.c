@@ -72,6 +72,7 @@ volatile uint32_t x86_nor_cow_failures  = 0;  /* COW pool empty: loud, not silen
 volatile uint32_t x86_nor_slow_cycles   = 0;  /* DWT cycles spent in here       */
 volatile uint32_t x86_nor_unmapped      = 0;  /* traps that were a real fault   */
 volatile uint32_t x86_nor_attach_err    = 0;  /* why the last attach was refused */
+volatile uint32_t x86_nor_host_cow      = 0;  /* pull-backs forced by HOST writes */
 
 /* The COW pool. It IS the block that used to be guest RAM: once every page is
  * in NOR that 640 KB is free, and the only useful thing to do with it is hand
@@ -219,6 +220,34 @@ static inline uint32_t nor_offset(uint32_t bad)
     return (uint32_t)(bad - (uint32_t)nor_base);
 }
 
+/* The copy-on-write itself. `off` is an offset into the snapshot and has
+   already been range-checked. Returns the host address of that byte in the
+   fresh AXI page, or 0 if the pool is empty. */
+static uint32_t nor_cow_locked(uint32_t off)
+{
+    uint32_t pg = off >> FOLD_SHIFT;
+    uint32_t idx = nor_first_page + pg;
+    uint8_t *nor_page = nor_base + (pg << FOLD_SHIFT);
+
+    uint8_t *axi = pool_take();
+    if (!axi) {
+        /* Structurally impossible -- the pool is exactly as large as the
+         * snapshot, so it cannot empty before every page is back in AXI. It is
+         * checked anyway, and it is LOUD: a silent NULL here would be a store
+         * through address 0, which is ITCM, i.e. the interpreter overwriting
+         * its own code. That exact shape has cost this project days. */
+        x86_nor_cow_failures++;
+        return 0;
+    }
+    memcpy(axi, nor_page, PAGE_SIZE);
+    fold_repoint(idx, axi, nor_page);
+
+    x86_nor_cow_pulls++;
+    x86_nor_pages_nor--;
+    x86_nor_pages_axi++;
+    return (uint32_t)axi + (off & (PAGE_SIZE - 1u));
+}
+
 void x86_nor_slow_r(uint32_t bad)
 {
     uint32_t t0 = DWT_CYCCNT;
@@ -236,6 +265,31 @@ void x86_nor_slow_r(uint32_t bad)
     x86_nor_slow_cycles += DWT_CYCCNT - t0;
 }
 
+/*
+ * Pull one page back into AXI and return the host address of `bad` within it.
+ * Returns 0 if `bad` is not a NOR-backed address at all.
+ *
+ * Shared by the interpreter's write trap and by the HOST side. The host side
+ * matters more than it looks: every HLE service that writes into guest memory
+ * -- the BDA tick, INT 21h filling a DTA, a disk read landing in a buffer --
+ * goes through x86_guest_ptr(), which resolves the fold ITSELF and never
+ * touches the trap stubs. Without this those stores would go straight at the
+ * XIP window. Under gwemu that silently appears to work, because its OCTOSPI
+ * model backs the region with ordinary memory; on silicon the store is dropped
+ * or faults, and the guest would diverge with nothing anywhere saying why.
+ * This is the exact class of bug the counters exist to expose, and it was
+ * found by reading x86_nor_pages_axi = 1 after 25 s of a real title.
+ */
+uint32_t x86_nor_cow(uint32_t bad)
+{
+    uint32_t off = nor_offset(bad);
+
+    if (!x86_nor_attached || off >= nor_len)
+        return 0;
+    x86_nor_host_cow++;
+    return nor_cow_locked(off);
+}
+
 void x86_nor_slow_w(uint32_t bad)
 {
     uint32_t t0 = DWT_CYCCNT;
@@ -247,29 +301,6 @@ void x86_nor_slow_w(uint32_t bad)
         return;
     }
     x86_nor_writes++;
-
-    uint32_t pg = off >> FOLD_SHIFT;
-    uint32_t idx = nor_first_page + pg;
-    uint8_t *nor_page = nor_base + (pg << FOLD_SHIFT);
-
-    uint8_t *axi = pool_take();
-    if (!axi) {
-        /* Structurally impossible -- the pool is exactly as large as the
-         * snapshot, so it cannot empty before every page is back in AXI. It is
-         * checked anyway, and it is LOUD: a silent NULL here would be a store
-         * through address 0, which is ITCM, i.e. the interpreter overwriting
-         * its own code. That exact shape has cost this project days. */
-        x86_nor_cow_failures++;
-        cpu_state_ptr->nor_ptr = 0;
-        return;
-    }
-    memcpy(axi, nor_page, PAGE_SIZE);
-    fold_repoint(idx, axi, nor_page);
-
-    x86_nor_cow_pulls++;
-    x86_nor_pages_nor--;
-    x86_nor_pages_axi++;
-
-    cpu_state_ptr->nor_ptr = (uint32_t)axi + (off & (PAGE_SIZE - 1u));
+    cpu_state_ptr->nor_ptr = nor_cow_locked(off);
     x86_nor_slow_cycles += DWT_CYCCNT - t0;
 }

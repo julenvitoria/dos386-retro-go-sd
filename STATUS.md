@@ -370,6 +370,75 @@ is not writable there: every `bda_w*` does `if (p) ... ;` and drops the write
 in silence, which produces exactly the reported symptom and is invisible under
 gwemu, where the whole low megabyte is plain RAM.
 
+## Cold guest RAM in NOR — shipped read-only-first, and what it measured
+
+**Cold RAM->NOR** is a Retro-Go game-options entry next to CPU Speed. Pressing
+A freezes the guest, snapshots all 640 KB of guest RAM into memory-mapped NOR,
+points every page at it and frees the AXI; pages the guest writes pull
+themselves back into AXI by copy-on-write. No selection heuristic, no sampler,
+no pagefile, no eviction — demand-driven, which is what makes the fraction of
+genuinely read-only memory a MEASUREMENT rather than a guess.
+
+Two facts about the firmware decided the shape, both read out of its source:
+
+1. **There is exactly one flash-write door**,
+   `odroid_overlay_cache_file_in_flash_relocate()` — the ROM cache. It takes a
+   PATH. No buffer-to-flash call, no `OSPI_Erase`/`OSPI_Program`, no way to
+   query flash size or invalidate the cache. So the snapshot goes in through
+   the RELOCATE CALLBACK, which gets each 16 KB chunk in RAM before it is
+   programmed and may modify it: the SD file only has to be the right SIZE, and
+   guest memory is never dumped to the card.
+2. **A cache HIT programs nothing and never calls the callback**, while still
+   returning a valid-looking address into an older snapshot. Three independent
+   guards: a fresh filename per snapshot, the callback's coverage is counted
+   (`nor_snap_cb_bytes` must be 655,360), and `x86_nor_attach()` reads the
+   flash back and byte-compares it against guest RAM before it moves a single
+   fold entry. A half-applied remap is impossible by ordering, not by care.
+
+**gwemu models OCTOSPI erase and page-program, and its XIP window shares the
+backing store** (`hw/misc/gnw_h7b0_ospi.c`, `hw/arm/gnw_h7b0_soc.c:491`). So
+the FULL chain is exercised at tier 2, not just the read side — this is a
+stronger gwemu result than `CLAUDE.md`'s "extflash is plain memory there"
+suggests, and that bullet is now too pessimistic about this one peripheral.
+
+Measured, Alley Cat, tier 2, `timelines/nor-snapshot.tl` (counts exact):
+
+| | before snapshot | after |
+|---|---|---|
+| guest RAM in AXI | 655,360 B | **4,096 B** |
+| pages NOR / AXI | 0 / 160 | **159 / 1** |
+| guest rate | 2.98 M insn/s | **0.36–0.52 M insn/s** |
+| fps | 60 | 60 |
+
+**99.4% of guest RAM was reclaimed and the guest kept running** —
+`x86_nor_attach_err=0`, `x86_nor_cow_failures=0`, `x86_nor_unmapped=0`,
+`x86_disk_errors=0`. The snapshot itself took 1,614 ms end to end.
+
+And the price, which is the other half of the answer: **~6–8x slower**, with
+~1.0 M slow-path reads per second. Every INSTRUCTION FETCH from a NOR-backed
+code page traps, and demand-driven means code pages never leave NOR. That is
+the accepted trade stated plainly rather than the sentinel being weakened — but
+it is why v2 wants code pages kept in AXI, which the DWT per-opcode profile was
+always going to gate.
+
+Caveats that are not negotiable: **the 99.4% is an IDLE title.** Alley Cat sat
+at its skill menu polling INT 16h, so `x86_nor_writes` was 0 and the one COW
+came from the HOST (the BDA tick). A playing guest will write far more. And
+**erase/program latency, XIP read latency versus AXI, and the real chip's erase
+granularity are silicon-only** — gwemu's flash is free.
+
+One defect the counters found on their own: `x86_nor_pages_axi = 1` after 25 s
+was implausibly small, and the reason was that **every host-side write bypassed
+the trap**. `x86_guest_ptr()` resolves the fold itself, so the BDA tick, INT
+21h filling a DTA and a disk read landing in a guest buffer were all storing
+straight at the XIP window. gwemu makes that look like it works, because its
+model backs the region with ordinary memory; on silicon the store is dropped
+and the guest diverges silently. `x86_guest_ptr()` now COWs first.
+
+Cost: ITCM 36,416 → 48,208 B of 65,536 (~360 trap stubs — handlers are emitted
+twice). **RAM_EMU headroom 7,680 → 4,576 B** (`__CORE_BSS_END__` 0x24057078 →
+0x24057c98). That is the number to watch before anything else lands.
+
 ## Open defects
 
 - **A segment override in front of `REP` survives only the first element.**

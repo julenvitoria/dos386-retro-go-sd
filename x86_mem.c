@@ -135,7 +135,32 @@ void *x86_guest_ptr(uint32_t lin, uint32_t bytes)
         return NULL;
     if (((lin + bytes - 1u) >> FOLD_SHIFT) != idx)
         return NULL;                 /* would cross a granule */
-    return (void *)(lin + k);
+
+    /* A NOR-backed page must be pulled back into AXI BEFORE the pointer
+     * escapes, because the caller may write through it.
+     *
+     * This resolves the fold itself and so never goes near the interpreter's
+     * trap stubs. Every HLE service that writes into guest memory arrives here
+     * -- the BDA tick, INT 21h filling a DTA, a disk read landing in a guest
+     * buffer -- and without this those stores would go straight at the XIP
+     * window. Under gwemu that appears to work, because its OCTOSPI model
+     * backs the region with ordinary memory; on silicon the store is dropped
+     * and the guest diverges with nothing anywhere saying why. It was found by
+     * reading x86_nor_pages_axi = 1 after 25 s of a real title, which is far
+     * fewer written pages than any DOS guest can plausibly have.
+     *
+     * It COWs on read as well as on write, deliberately: this is the same
+     * conservative rule the unqualified MEM_GET_PTR follows, and for the same
+     * reason -- pessimistic is a cost, wrong is a corrupted guest. The host
+     * side is a few thousand calls per second, not millions. */
+    uint32_t host = lin + k;
+    if (x86_nor_attached && (host & 0x80000000u)) {
+        uint32_t axi = x86_nor_cow(host);
+        if (!axi)
+            return NULL;
+        return (void *)axi;
+    }
+    return (void *)host;
 }
 
 /* Copy across granules, one page at a time. Returns bytes actually moved, so

@@ -243,6 +243,7 @@ extern volatile uint32_t x86_map_failures;
    slow_* entries are called from the trap stubs in cpu_exec.S, never from C. */
 int  x86_nor_attach(void *nor, uint32_t nor_bytes, void *ram, uint32_t ram_bytes,
                     uint32_t first_page);
+uint32_t x86_nor_cow(uint32_t bad);   /* host-side pull-back; 0 = not NOR */
 void x86_nor_slow_r(uint32_t bad);
 void x86_nor_slow_w(uint32_t bad);
 extern volatile uint32_t x86_nor_attached, x86_nor_base_addr, x86_nor_bytes;
@@ -250,6 +251,7 @@ extern volatile uint32_t x86_nor_pages_total, x86_nor_pages_nor, x86_nor_pages_a
 extern volatile uint32_t x86_nor_axi_free, x86_nor_reads, x86_nor_writes;
 extern volatile uint32_t x86_nor_cow_pulls, x86_nor_cow_failures;
 extern volatile uint32_t x86_nor_slow_cycles, x86_nor_unmapped, x86_nor_attach_err;
+extern volatile uint32_t x86_nor_host_cow;
 void x86_unmap_all(void);
 void x86_mem_wrap_1mb(void);
 void *x86_guest_ptr(uint32_t lin, uint32_t bytes);
