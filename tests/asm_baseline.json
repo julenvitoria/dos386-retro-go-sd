@@ -327,6 +327,18 @@
    "bytes": 76,
    "insns": 20
   },
+  ".op_insb_6C": {
+   "bytes": 130,
+   "insns": 37
+  },
+  ".op_insv_6D": {
+   "bytes": 268,
+   "insns": 77
+  },
+  ".op_insv_6D_32": {
+   "bytes": 134,
+   "insns": 38
+  },
   ".op_int3_CC": {
    "bytes": 6,
    "insns": 2
@@ -571,6 +583,18 @@
    "bytes": 22,
    "insns": 6
   },
+  ".op_outsb_6E": {
+   "bytes": 134,
+   "insns": 39
+  },
+  ".op_outsv_6F": {
+   "bytes": 190,
+   "insns": 54
+  },
+  ".op_outsv_6F_32": {
+   "bytes": 138,
+   "insns": 40
+  },
   ".op_pfx_66": {
    "bytes": 8,
    "insns": 2
@@ -760,8 +784,8 @@
    "insns": 42
   },
   ".op_scasd_AF": {
-   "bytes": 214,
-   "insns": 57
+   "bytes": 292,
+   "insns": 80
   },
   ".op_scasd_AF_32": {
    "bytes": 150,
@@ -904,8 +928,8 @@
    "insns": 3
   },
   ".save_state_and_exit": {
-   "bytes": 11788,
-   "insns": 3343
+   "bytes": 12080,
+   "insns": 3423
   },
   ".str_exit": {
    "bytes": 120,
@@ -1776,12 +1800,12 @@
    "insns": 11
   },
   "HANDLE_INTERRUPT_16": {
-   "bytes": 232,
-   "insns": 61
+   "bytes": 298,
+   "insns": 78
   },
   "HANDLE_INTERRUPT_32": {
-   "bytes": 226,
-   "insns": 58
+   "bytes": 292,
+   "insns": 75
   },
   "HLT_IDLE_16": {
    "bytes": 64,
@@ -2012,12 +2036,12 @@
    "insns": 6
   },
   "OP_0F_MOVSX_GV_EW_WRITE_16": {
-   "bytes": 20,
-   "insns": 5
-  },
-  "OP_0F_MOVSX_GV_EW_WRITE_32": {
    "bytes": 22,
    "insns": 6
+  },
+  "OP_0F_MOVSX_GV_EW_WRITE_32": {
+   "bytes": 20,
+   "insns": 5
   },
   "OP_0F_MOVZX_GV_EB_MEM_16": {
    "bytes": 20,
@@ -2132,12 +2156,12 @@
    "insns": 7
   },
   "REP_ENTER_16": {
-   "bytes": 44,
-   "insns": 15
+   "bytes": 56,
+   "insns": 20
   },
   "REP_ENTER_32": {
-   "bytes": 44,
-   "insns": 15
+   "bytes": 56,
+   "insns": 20
   },
   "REP_ONE_16": {
    "bytes": 100,
@@ -2589,8 +2613,8 @@
   }
  },
  "totals": {
-  "bytes": 48206,
-  "insns": 13379,
-  "symbols": 646
+  "bytes": 49726,
+  "insns": 13811,
+  "symbols": 652
  }
 }
