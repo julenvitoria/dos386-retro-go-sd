@@ -6,7 +6,7 @@ Last verified 2026-08-13. How to run: [`TOOLING.md`](TOOLING.md). Roadmap: [`PLA
 
 | Tier | State |
 |---|---|
-| 1. gwemu bare-metal | 236/236 `test_opcodes.py`, plus `test_video`/`test_dos`/`test_screen` |
+| 1. gwemu bare-metal | 248/248 `test_opcodes.py`, plus `test_video`/`test_dos`/`test_screen` |
 | 2. gwemu + retro-go | `core_dtcm_ok=1`, bonus pool 153,600 B, 1,000,001 insns — matches tier 1 |
 | 3. Hardware | 50.50 cyc/insn, 5.54 MIPS |
 
@@ -20,15 +20,16 @@ Complete except where listed below. The interpreter does 16/32-bit with the
 `66`/`67` axes per instruction, segmentation on a descriptor pointer, real-mode
 interrupts, string ops with `REP`, far transfers and segment loads.
 
-- [ ] `XLAT`, BCD (`27`/`2F`/`37`/`3F`), `WAIT`, `INS`/`OUTS`, `BOUND`/`ARPL`
+- [ ] `XLAT` (no segment base), `WAIT`, `INS`/`OUTS`, `BOUND`/`ARPL`
+- [ ] Five handlers call `DECODE_MODRM` by symbol, so they ignore a `0x67` prefix
 - [ ] Limit checks off the R6 descriptor; lazy PF/AF; software TLB above 16 MB
 - [ ] Size-aware `MEM_R*`/`MEM_W*` macros + CI grep banning raw `[R9,`
 - [ ] Assertions in `test_game.py`/`test_benchmark.py`; realign `docs/01`–`03`, `05`
 
 ## Phase 2 — Alley Cat
 
-21 opcode slots still reach `.exit_loop`: x87 (`D8`-`DF`), BCD
-(`27`/`2F`/`37`/`3F`), `BOUND`/`ARPL`, `INS`/`OUTS`, `XLAT`, `WAIT`, `INT1`.
+17 opcode slots still reach `.exit_loop`: x87 (`D8`-`DF`), `BOUND`/`ARPL`,
+`INS`/`OUTS`, `XLAT`, `WAIT`, `INT1`.
 
 Done: real-mode interrupt dispatch and `IRET`; the `0F 0B` hypercall and its
 HLE service table with stubs planted per vector; BIOS INT 10h/16h/1Ah over a
@@ -39,8 +40,6 @@ PIT ch2; port I/O on a C dispatch; the guest page pool and fold mapping; the
 frame-paced emulator loop; and the DOS layer -- MCB arena, PSP, MZ loader with
 relocations, INT 21h on FatFs -- fed by the guest `.dsk` streamed from SD.
 
-- [ ] Input into a BIOS keyboard buffer (state captured; INT 16h will consume it)
-- [ ] Real 18.2 Hz PIT tick driving INT 08h
 - [ ] DWT per-opcode-class profile; gate NOR backing on a code-vs-data measurement
 
 ## Phase 3 — Wolf3D
@@ -50,32 +49,39 @@ relocations, INT 21h on FatFs -- fed by the guest `.dsk` streamed from SD.
 - [ ] Protected mode: descriptors, far transfers, IRET privilege change, paging
 - [ ] Profile-directed tuning against a Wolf3D DWT profile
 
-## TOPBENCH (the current 16-bit correctness driver)
+## TOPBENCH — running, scoring, screenshotted
 
-**Verified**: `scripts/trace_diff.py` now agrees with a reference 8086
-(Unicorn) for the whole of TOPBENCH's startup and self-unpacker -- 1,532,786
-instructions, to the first INT 21h, with no divergence at any stride. The CPU
-core is clean over everything the reference can reach.
+`TOPBENCH.EXE -l` boots from its `.dsk`, unpacks, benchmarks and prints
+**"This system's TOPBENCH Score: 236"**, iterating continuously as `-l` asks.
+Capture: `build/artifacts/topbench.png`, via
 
-Getting there closed ten defect classes, one commit each in `git log`: the
-v-width shift group pass-agnostic; `INC`/`DEC` setting no flags (r/m8, Ev) and
-computing AF from `~a` (register); thirteen stack handlers ignoring `SS.base`;
-the shift operand fetch and `XCHG` running 32-bit; `TEST` setting no flags and
-16-bit `CBW`/`CWD` running `CWDE`/`CDQ`; near `Jcc` taking a rel32 and
-`LOOP`/`JCXZ` counting ECX; **`LEA` returning the linear address** instead of
-the offset; **`MOV moffs` reading a 32-bit offset with no DS base**, which
-indexed past the fold table into a HardFault; and six handlers with no memory
-form. The last four were found by the trace diff, not by reading code.
+```bash
+python3 scripts/screenshot.py --timeline timelines/run-to-completion.tl \
+    --wait 48 --pan 16 --text --out build/artifacts/topbench.png
+```
 
-The guest now unpacks fully, reaches its real entry at CS=0x2822, and makes 29
-BIOS/DOS calls, all of them answered. It then takes an `FF /3` far indirect
-transfer at linear 0x29973 through a pointer holding 0x9E40:0x1C03 and executes
-open-bus filler. No screenshot yet: nothing has been printed.
+`scripts/trace_diff.py` agrees with a reference 8086 (Unicorn) for the whole of
+startup and the self-unpacker — 1,532,786 instructions to the first INT 21h,
+no divergence at any stride.
 
-The reference cannot follow it past that point -- `refdos.py` has no port I/O,
-and TOPBENCH times itself against the CGA retrace, so under the reference it
-divides by a zero count at 26EA:0117. Extending the shim with port I/O is what
-would make the oracle reach the end.
+Getting here closed sixteen defect classes, one commit each in `git log`.
+**CPU**: the v-width shift group pass-agnostic; `INC`/`DEC` flags and an AF
+built from `~a`; thirteen stack handlers ignoring `SS.base`; the shift operand
+fetch and `XCHG` at 32 bits; `TEST` flags; 16-bit `CBW`/`CWD` running
+`CWDE`/`CDQ`; near `Jcc` on rel32 and `LOOP`/`JCXZ` on ECX; `LEA` returning a
+linear address; `MOV moffs` with a 32-bit offset and no DS base; eight handlers
+with no memory form; `MOV Ew,Sreg` storing decoder scratch; `MOV CRn`; the BCD
+group. **Platform**: `maxalloc` ignored (Borland sized its heap from it and died
+with `Runtime error 203`); the IRET stub planted inside the DOS arena; a BIOS
+tick that never advanced; `HLT` as a stop rather than an idle, with INT 08h
+never delivered; INT 21h AH=06h/44h and INT 10h AH=08h/11h unanswered.
+
+One shape accounts for four of them: reading a register operand BEFORE calling
+`DECODE_MODRM`, which uses R4 and R5 as scratch.
+
+Still open on this path: `refdos.py` has no port I/O, so the oracle stops at the
+first thing TOPBENCH times against the CGA retrace. Extending it there is what
+would let the comparison run to the score.
 
 ## Open defects
 
