@@ -31,7 +31,7 @@
  *   0700  first memory control block -- the arena starts here
  *   9FFF  end of conventional memory
  */
-#define ARENA_FIRST_MCB 0x0070u
+#define ARENA_FIRST_MCB X86_DOS_ARENA_SEG
 #define ARENA_END_SEG   0x9FFFu
 
 #define MCB_MEMBER      0x4Du       /* 'M': another block follows */

@@ -154,6 +154,12 @@ void x86_video_set_mode(uint8_t mode);
 uint8_t x86_video_mode(void);
 int x86_video_is_text(void);
 void x86_video_set_cursor(uint8_t col, uint8_t row);
+/* The first MCB, i.e. where memory becomes the guest's to allocate. Anything
+   the emulator plants for its own use has to live BELOW this, because a loaded
+   program writes over whatever it finds above it. Shared so the HLE layer can
+   check its stub placement against it at compile time. */
+#define X86_DOS_ARENA_SEG 0x0070u
+
 uint16_t x86_video_get_cursor(void);
 uint16_t x86_video_read_cell(void);
 void x86_video_scroll(uint8_t lines, uint8_t attr);

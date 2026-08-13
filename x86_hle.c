@@ -80,10 +80,21 @@ void x86_hle_set_cf(int set)
  * Three bytes of code per vector plus the IRET; laid out contiguously so one
  * page covers every service we take over.
  */
-#define STUB_SEG      0x0060u        /* linear 0x600: below the 640 KB arena,
-                                        above the IVT and the BIOS data area */
+#define STUB_SEG      0x0060u        /* linear 0x600: above the IVT and the
+                                        BIOS data area, below the DOS arena */
 #define STUB_BYTES    4u
-#define IRET_OFF      0x300u         /* a bare IRET, inside the same page */
+#define IRET_OFF      0x0F0u         /* a bare IRET, clear of the served stubs
+                                        (vector 0x21 ends at 0x87) and below
+                                        the arena at 0x700 */
+
+/* The stub area has to end below the DOS arena. It did not: the default IRET
+   sat at linear 0x900 while the first MCB is at 0x700, so the first program
+   loaded wrote straight over it, and after that any interrupt we do not serve
+   -- a divide error, say -- vectored into the program's own data and ran it.
+   A compile-time check because both sides are compile-time constants: a test
+   can only catch this after someone has already shipped it. */
+_Static_assert((STUB_SEG << 4) + IRET_OFF < (X86_DOS_ARENA_SEG << 4),
+               "HLE stubs must sit below the DOS arena");
 
 /* Where a PC keeps its ROM identification. A system tool reads these directly
    rather than asking, so they have to exist as memory. */
