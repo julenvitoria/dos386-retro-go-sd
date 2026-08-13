@@ -152,8 +152,11 @@ python3 scripts/screenshot.py --timeline timelines/run-to-completion.tl \
 python3 scripts/screenshot.py --target hardware --wait 20
 ```
 
-`--text` dumps the 80x25 character buffer alongside the image; judging 8x8
-glyphs by eye is how a `Runtime error 203` went unread through two captures.
+`--text` dumps the 80x25 character buffer alongside the image, decoded as
+**CP437**; judging 8x8 glyphs by eye is how a `Runtime error 203` went unread
+through two captures, and printing only 0x20-0x7E hid every box-drawing and
+shading code behind a `.`, which made a correctly drawn full-screen UI read as
+four rows of stray letters on an empty screen.
 `--pan N` pins the text window's leftmost column: the panel shows 40 of the 80
 columns and normally follows the cursor, so anything further right -- a score at
 the end of a wide line -- is invisible until you pin it.
@@ -164,6 +167,23 @@ and line count, reads that memory and the firmware's CLUT, and rebuilds the
 frame. It also prints a coarse text map of the result, so a black or garbage
 capture is obvious without opening the file. `tests/test_screen.py` does this
 for one expected image; this is the general form.
+
+### `make_font.py` — regenerate `font8x8.h`
+
+```bash
+python3 scripts/make_font.py                  # rewrite font8x8.h
+python3 scripts/make_font.py --check          # fail if it is out of date
+```
+
+Assembles a full 256-glyph **CP437** table from Daniel Hepper's public-domain
+`font8x8` blocks, which are indexed by Unicode, plus 42 glyphs (card suits,
+arrows, the maths operators at 0xEC-0xFE) drawn in the generator. Run it only
+when the font changes; the result is committed.
+
+DOS text is CP437, so the renderer indexes the font with the whole character
+byte. The tree used to carry Hepper's 128 ASCII glyphs only, which forced a
+`& 0x7F` in `text_render` and turned every box-drawing rule and shading block of
+a full-screen UI into an unrelated letter.
 
 ### `sdcard.py` — compose the SD card
 
@@ -225,8 +245,12 @@ python3 tests/test_benchmark.py
 python3 tests/test_game.py
 python3 tests/test_dos.py                # MCB arena, walked from the host
 python3 tests/test_video.py              # CGA mode 4 blitter, pixel-exact
+python3 tests/test_text.py               # CGA text mode 3, pixel-exact:
+                                         # CP437, attributes, pan, scroll
 python3 tests/test_screen.py             # what the LTDC actually scans out,
                                          # reconstructed to build/artifacts/screen.png
+                                         # (checks whichever mode the core is
+                                         # in -- text if a guest is running)
 python3 tests/test_core_retrogo.py       # tier 2
 ```
 
@@ -279,6 +303,7 @@ Importable support only — no CLIs.
 | `dosimage.py` | FAT12 reader + MZ loader that mirrors `x86_dos_exec`, so a reference emulator starts from OUR entry state |
 | `refx86.py` | Unicorn run of that image, sampled like the target's own sampler |
 | `refdos.py` | A minimal DOS/BIOS for the reference, so it can run PAST the first INT 21h and say what the program should do. Deliberately not modelled on our x86_dos.c -- mirroring it would make the two agree on the same mistake. It has no port I/O, so it cannot follow a program that times against the CGA retrace |
+| `textmode.py` | Host-side model of the CGA text renderer: CP437 font load, the 80x25 -> palette-index render including the 40-column window, AH=06 scrolling, and a readable CP437 dump. Shared by `test_text.py` (seeded pattern) and `test_screen.py` (the live guest) |
 | `verify.py` | Symbol-region checks and ELF-vs-target section comparison |
 | `builder.py`, `runner.py` | Tier-1 build convenience |
 

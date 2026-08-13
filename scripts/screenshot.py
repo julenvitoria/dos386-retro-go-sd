@@ -182,12 +182,16 @@ def main():
             # cannot fit as well as the 40 it can.
             vram = b.read_uint32(core["guest_vram"])
             cells = bytes(b.read_memory(vram, 80 * 25 * 2))
-            print("text buffer (80x25), '.' = space:")
+            # Decode as CP437, not ASCII. Printing only 0x20-0x7E hid every
+            # box-drawing and shading code behind a '.', which made a
+            # perfectly good full-screen UI read as four rows of stray
+            # letters on an otherwise empty screen.
+            print("text buffer (80x25), CP437, '.' = space:")
             for r in range(25):
-                line = "".join(
-                    chr(cells[(r * 80 + c) * 2])
-                    if 32 < cells[(r * 80 + c) * 2] < 127 else "."
-                    for c in range(80))
+                raw = bytes(cells[(r * 80 + c) * 2] for c in range(80))
+                line = "".join("." if ch == 0x20 else
+                               bytes([ch]).decode("cp437") if ch else "."
+                               for ch in raw)
                 if line.strip("."):
                     print(f"  {r:2d} |{line}|")
         nz = sum(1 for v in indices if v)

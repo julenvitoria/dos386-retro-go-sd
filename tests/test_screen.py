@@ -13,6 +13,13 @@ Under gwemu this proves everything up to the LTDC registers. gwemu's headless
 display renders nothing at all (Retro-Go's own menu screenshots come back
 black), so the panel itself can only be confirmed on hardware -- run with
 --target hardware for that.
+
+It checks whichever mode the core is actually in. With no bootable guest that
+is the built-in mode 4 demo; with one on the card the guest has usually taken
+the screen into text mode 3 by now, and the expected image is then recomputed
+from the live 80x25 buffer. Asserting the demo unconditionally is what made
+this test go red the moment a DOS program got far enough to draw its own UI --
+a pass would have meant the guest had failed to start.
 """
 import argparse
 import os
@@ -24,6 +31,7 @@ import zlib
 sys.path.insert(0, ".")
 from scripts.common.target import Image, add_target_args, open_target
 from scripts.common.elf import get_symbols
+from scripts.common import textmode
 
 LTDC_BASE = 0x50001000
 LTDC_L1CR     = LTDC_BASE + 0x84    # layer enable
@@ -93,6 +101,21 @@ def main(args):
             print("FAIL: core never started drawing")
             return False
 
+        # Pin the 40-column window. Left free it follows the cursor, and the
+        # host cannot know where that is, so the comparison would be against a
+        # window the renderer did not use.
+        if b.read_memory(core["x86_video_mode_byte"], 1)[0] in (0, 1, 2, 3):
+            b.write_uint32(core["x86_video_pan"], 0)
+            start = b.read_uint32(core["frames_rendered"])
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if b.read_uint32(core["frames_rendered"]) > start + 2:
+                    break
+                time.sleep(0.05)
+
+        # Halt for the reads: the framebuffer and the text buffer behind it
+        # must be sampled from the same instant or the comparison is a race.
+        b.halt()
         cr = b.read_uint32(LTDC_L1CR)
         pf = b.read_uint32(LTDC_L1PFCR)
         fb = b.read_uint32(LTDC_L1CFBAR)
@@ -121,25 +144,45 @@ def main(args):
         fw_syms = get_symbols(image.elf)
         clut_sym = fw_syms.get("active_clut")
         if clut_sym:
-            clut = [b.read_uint32(clut_sym + 4 * i) for i in range(4)]
+            clut = [b.read_uint32(clut_sym + 4 * i) for i in range(16)]
             src = "firmware active_clut"
         else:
-            clut = [b.read_uint32(core["core_clut"] + 4 * i) for i in range(4)]
+            clut = [b.read_uint32(core["core_clut"] + 4 * i) for i in range(16)]
             src = "core copy (firmware symbol not found)"
-        print(f"  CLUT via {src}: " + " ".join(f"0x{c:08x}" for c in clut))
+        print(f"  CLUT via {src}: " + " ".join(f"0x{c:08x}" for c in clut[:8]))
 
-        want_clut = [0xFF000000, 0xFF55FFFF, 0xFFFF55FF, 0xFFFFFFFF]
-        if clut != want_clut:
-            print("FAIL: CLUT is not the CGA palette the guest selected; "
-                  "expected " + " ".join(f"0x{c:08x}" for c in want_clut))
-            return False
+        # Which renderer is on the screen? A bootable guest normally has the
+        # display in text mode by now; without one the core draws its mode 4
+        # demo. Checking the wrong one is not a stricter test, it is a false
+        # failure.
+        mode = b.read_memory(core["x86_video_mode_byte"], 1)[0]
+        is_text = mode in (0x00, 0x01, 0x02, 0x03)
+        print(f"  video mode 0x{mode:02x} ({'text' if is_text else 'graphics'})")
+
+        if is_text:
+            # Text attributes index the whole 16-colour CGA palette, so all 16
+            # entries must have reached the firmware -- pushing only the four
+            # mode 4 needs left every bright attribute drawing in a stale
+            # colour from retro-go's menu.
+            if clut != textmode.CGA_ARGB:
+                print("FAIL: text mode but the CLUT is not the 16 CGA colours")
+                for i, (g, w) in enumerate(zip(clut, textmode.CGA_ARGB)):
+                    if g != w:
+                        print(f"  entry {i}: 0x{g:08x} expected 0x{w:08x}")
+                return False
+        else:
+            want_clut = [0xFF000000, 0xFF55FFFF, 0xFFFF55FF, 0xFFFFFFFF]
+            if clut[:4] != want_clut:
+                print("FAIL: CLUT is not the CGA palette the guest selected; "
+                      "expected " + " ".join(f"0x{c:08x}" for c in want_clut))
+                return False
 
         # Reconstruct exactly what the panel receives.
         rgb = bytearray(SCREEN_W * SCREEN_H * 3)
         for y in range(min(lines, SCREEN_H)):
             for x in range(SCREEN_W):
                 idx = fb_bytes[y * pitch + x]
-                argb = clut[idx] if idx < 4 else 0
+                argb = clut[idx] if idx < len(clut) else 0
                 o = (y * SCREEN_W + x) * 3
                 rgb[o] = (argb >> 16) & 0xFF
                 rgb[o + 1] = (argb >> 8) & 0xFF
@@ -147,7 +190,20 @@ def main(args):
         write_png(args.out, SCREEN_W, SCREEN_H, bytes(rgb))
         print(f"  wrote {args.out}")
 
-        want = expected_indices()
+        if is_text:
+            # The expectation comes from the guest's OWN text buffer, read
+            # back here and rendered in Python: this is the end-to-end check
+            # that what the panel scans out is what the guest wrote.
+            vram = b.read_uint32(core["guest_vram"])
+            cells = bytes(b.read_memory(vram, 80 * 25 * 2))
+            b.resume()
+            for r, line in textmode.dump(cells):
+                print(f"  {r:2d} |{line}|")
+            want = textmode.render(cells, textmode.load_font(), 0,
+                                   SCREEN_W, SCREEN_H)
+        else:
+            b.resume()
+            want = expected_indices()
         got = bytes(fb_bytes[y * pitch + x]
                     for y in range(SCREEN_H) for x in range(SCREEN_W))
         if got != want:
