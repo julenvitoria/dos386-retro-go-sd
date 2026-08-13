@@ -86,6 +86,39 @@ watchpoint on a completion flag into a clean snapshot of what a load produced.
 Caveat: a stop can repeat on the same access without advancing. Treat repeated
 identical hits as one event, not as several.
 
+### `trace_diff.py` — bisect our trace against a reference, automatically
+
+```bash
+python3 scripts/trace_diff.py --dsk references/.../TOPBENCH.dsk --args=-l --bisect
+python3 scripts/trace_diff.py --dsk ... --args=-l --shift 0 --skip 43648
+python3 scripts/trace_diff.py --dsk ... --args=-l --shift 0 --skip 1032768 --reg CX
+```
+
+Rebuilds the core with the sampler in `cpu_exec.S` switched on (parameters in
+`x86_trace.inc`, rewritten by this script and restored on exit), runs it under
+gwemu, runs the identical image under Unicorn, and reports the first sample
+where the two disagree. `--bisect` walks 16384 → 256 → 1 by itself.
+
+It exists as a script because every part of it is a trap, and each one cost
+real time here:
+
+- A failed build followed by `&&`-chained steps leaves a **stale image** on the
+  SD card and the probe reports the previous build's trace as the new one.
+- The sampler must **saturate, not wrap**. A ring spans only its own length and
+  silently shows the end of the run wherever you point it.
+- A long `REP` makes thousands of consecutive EIP samples identical, so an
+  index-by-index diff reports a match where there is only coincidence. Confirm
+  with `--reg CX`.
+- `--reg FL` samples R11, not `cpu_state.eflags`: EFLAGS is cached in a register
+  and only written back on exit. AF is excluded from the comparison because x86
+  leaves it undefined after shifts, rotates, logic and MUL/DIV.
+- Unicorn fires its code hook once per `REP` element **and once more** with CX
+  already zero. `refx86` drops that phantom firing; without it every index after
+  a REP is off by one and it reads as "the target left the loop early".
+- Anything we execute that the reference cannot know about — HLE stub
+  instructions after an interrupt — shifts our index against theirs.
+  `x86_cs_log_idx` says whether any interrupt was taken at all.
+
 ### `ref_trace.py` — run the same guest under a reference x86
 
 ```bash
@@ -109,6 +142,20 @@ the HLE stub page are ours alone and desynchronise the counters. A long `REP`
 also makes thousands of consecutive samples identical, so a naive index-by-index
 diff reports a match where there is only coincidence — confirm a suspected
 divergence by comparing a register (CX, DX) over the same window, not just EIP.
+
+### `screenshot.py` — capture what the panel is being sent
+
+```bash
+python3 scripts/screenshot.py --wait 20 --out build/artifacts/topbench.png
+python3 scripts/screenshot.py --target hardware --wait 20
+```
+
+gwemu's own headless screendump comes back black, so it proves nothing. The
+LTDC registers ARE modelled: this reads Layer 1's framebuffer address, pitch
+and line count, reads that memory and the firmware's CLUT, and rebuilds the
+frame. It also prints a coarse text map of the result, so a black or garbage
+capture is obvious without opening the file. `tests/test_screen.py` does this
+for one expected image; this is the general form.
 
 ### `sdcard.py` — compose the SD card
 
@@ -219,6 +266,8 @@ Importable support only — no CLIs.
 | `probe.py` | Sample PC, globals, pointer derefs and array dumps on a running target; `read_faults` decodes CFSR/HFSR/BFAR |
 | `watchpoint.py` | Z2/Z3 data watchpoints over the GDB remote protocol, and the unsolicited stop reply that follows a resume |
 | `dosimage.py` | FAT12 reader + MZ loader that mirrors `x86_dos_exec`, so a reference emulator starts from OUR entry state |
+| `refx86.py` | Unicorn run of that image, sampled like the target's own sampler |
+| `refdos.py` | A minimal DOS/BIOS for the reference, so it can run PAST the first INT 21h and say what the program should do. Deliberately not modelled on our x86_dos.c -- mirroring it would make the two agree on the same mistake. It has no port I/O, so it cannot follow a program that times against the CGA retrace |
 | `verify.py` | Symbol-region checks and ELF-vs-target section comparison |
 | `builder.py`, `runner.py` | Tier-1 build convenience |
 
