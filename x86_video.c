@@ -107,6 +107,10 @@ void x86_video_refresh_palette(void)
     /* Brown is the odd one out: index 6 brightens to 14 (yellow); white (7)
        brightens to 15, which the mask already gives. */
     cga_clut[3] = cga_argb[(c3 | bright) & 15];
+    /* Mode 4 pixels only ever index 0-3, but the whole 16-entry table is
+       pushed to the panel, so leave nothing undefined behind them. */
+    for (unsigned i = 4; i < 16; i++)
+        cga_clut[i] = cga_argb[i];
     cga_clut_dirty = 1;
 }
 
@@ -180,7 +184,10 @@ void x86_video_render(uint8_t *dst, uint32_t stride)
 /* ---------------------------------------------------------------------------
  * Mode and cursor state.
  */
-static uint8_t  video_mode = 0x04;
+/* Not static: the harness reads it to know which renderer to check against.
+   `x86_video_mode()` is the call for C callers; this is the storage. */
+uint8_t  x86_video_mode_byte = 0x04;
+#define video_mode x86_video_mode_byte
 static uint8_t  cur_row, cur_col;
 static uint16_t text_scroll_col;    /* leftmost visible column */
 
@@ -326,7 +333,12 @@ static void text_render(uint8_t *dst, uint32_t stride)
         for (unsigned vc = 0; vc < TEXT_VIS_COLS; vc++) {
             unsigned col = left + vc;
             uint16_t cell = (col < TEXT_COLS) ? *text_cell(row, col) : 0x0720;
-            const unsigned char *glyph = font8x8_basic[cell & 0x7F];
+            /* CP437, so the WHOLE byte indexes the font. Masking to 7 bits
+               turned every box-drawing rule, shade and block of a full-screen
+               DOS UI into an unrelated letter -- correct-looking text next to
+               interleaved gibberish, which reads like a stride bug and is not
+               one. */
+            const unsigned char *glyph = font8x8_basic[cell & 0xFF];
             uint8_t fg = (uint8_t)((cell >> 8) & 0x0F);
             uint8_t bg = (uint8_t)((cell >> 12) & 0x07);
 

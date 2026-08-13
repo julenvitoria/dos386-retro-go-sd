@@ -81,6 +81,13 @@ uint8_t cga_test_out[320 * 240];
 /* 32-bit ARGB entries, matching lcd_set_clut(). Sized 16 so a palette
    change can never write past it. */
 uint32_t cga_test_palette[16];
+/* Text-mode arms. run_video_flag 4 selects a mode (so the host can put the
+   renderer into mode 3 and get the CLUT reloaded), 5 runs a scroll. The cell
+   pattern itself is written straight into cga_test_vram, which IS the text
+   buffer -- that is the path a real DOS program takes, poking B800:0 rather
+   than going through INT 10h. */
+volatile uint32_t text_mode_arg = 0x03;
+volatile uint32_t text_scroll_arg = 0;      /* (attr << 8) | lines */
 
 // Latched fault state, for the host to read over the debug backend.
 volatile uint32_t fault_active = 0;   // 0 = none, else VECTACTIVE
@@ -394,6 +401,15 @@ void Reset_Handler(void) {
             /* init clears VRAM; the host's pattern is written after the flag
                is armed, so re-arm ordering matters -- see tests/test_video.py */
             run_video_flag = 2;
+        }
+        if (run_video_flag == 4) {
+            x86_video_set_mode((uint8_t)text_mode_arg);
+            run_video_flag = 0;
+        }
+        if (run_video_flag == 5) {
+            x86_video_scroll((uint8_t)text_scroll_arg,
+                             (uint8_t)(text_scroll_arg >> 8));
+            run_video_flag = 0;
         }
         if (run_video_flag == 3) {
             uint32_t t0 = DWT_CYCCNT;
