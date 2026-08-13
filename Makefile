@@ -29,11 +29,18 @@ CFLAGS += -DIS_LITTLE_ENDIAN -Ilib/FatFs
 # both renderers. The packed core defaults it OFF; see Makefile.core.
 CFLAGS += -DX86_TEXT_AA=1
 
+# Per-opcode DWT cycle profiling. OFF by default: the instrumentation sits in
+# the fetch/dispatch tail, the hottest code in the project, and perturbs every
+# timing-dependent thing in the emulator. Flags are not dependencies -- rebuild
+# from clean when this changes. See x86_profile.h and scripts/profile_opcodes.py.
+X86_PROFILE ?= 0
+CFLAGS += -DX86_PROFILE=$(X86_PROFILE)
+
 LDFLAGS = -mcpu=cortex-m7 -mthumb -T STM32H7B0VBTx_SDCARD.ld -Wl,--gc-sections --specs=nosys.specs
 
 PROGS = test_core.elf
 
-TEST_OBJS = x86_cpu.o x86_io.o x86_mem.o x86_video.o x86_hle.o x86_bios.o x86_dos.o cga_blit.o cpu_exec.o tests/main.o hw_accel.o x86_disk.o lib/FatFs/ff.o lib/FatFs/ffunicode.o
+TEST_OBJS = x86_cpu.o x86_profile.o x86_io.o x86_mem.o x86_video.o x86_hle.o x86_bios.o x86_dos.o cga_blit.o cpu_exec.o tests/main.o hw_accel.o x86_disk.o lib/FatFs/ff.o lib/FatFs/ffunicode.o
 
 all: $(PROGS)
 

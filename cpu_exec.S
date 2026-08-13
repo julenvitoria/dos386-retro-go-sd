@@ -84,6 +84,62 @@
         STR \src, [\scratch]
     .endm
 
+/* ------------------------------------------------------------------ *
+ * Per-opcode DWT cycle profiling. OFF unless built with X86_PROFILE=1.
+ *
+ * Read x86_profile.h first: it owns the block layout, the slot numbering and
+ * the "ranking, not truth" caveat. What lives here is the dispatch-tail
+ * insert, which is the part with a register contract to respect.
+ *
+ * Registers: this macro takes every register it touches as a parameter and
+ * uses NOTHING else. R2/R6/R8/R9/R10/R11 are reserved (CLAUDE.md) and are
+ * never passed to it -- the callers hand it only registers that are dead at
+ * that exact point. The ARM PSR is clobbered (ADDS/ADC for the 64-bit
+ * accumulate), which is safe because the fetch's own `ADDS Rd,Rd,R10` already
+ * destroys the flags two instructions earlier: nothing consumes the host PSR
+ * across a dispatch, x86 flags live in R11.
+ *
+ * CYCCNT is 32-bit and WRAPS every ~15 s at 280 MHz. `SUB new, old` is exact
+ * modulo 2^32 and a dispatch-to-dispatch delta is tiny, so the wrap needs no
+ * handling. Do not "fix" this with a comparison -- that would be the bug.
+ * ------------------------------------------------------------------ */
+#if X86_PROFILE
+    .equ PROF_HDR,       16          @ header words before entry[0]
+    .equ PROF_ENTRY_LOG2, 4          @ 16 bytes per entry
+    .equ DWT_CYCCNT_ADDR, 0xE0001004
+    .equ PROF_HOST_SLOT, 512     @ must match X86_PROFILE_HOST_SLOT
+
+    /* base/a/b/c are scratch; \idx holds the slot number and SURVIVES. */
+    .macro PROF_DISPATCH idx, base, a, b, c, bias=0
+        MOVW \base, #:lower16:x86_profile_ptr
+        MOVT \base, #:upper16:x86_profile_ptr
+        LDR  \base, [\base]
+        MOVW \c, #:lower16:DWT_CYCCNT_ADDR
+        MOVT \c, #:upper16:DWT_CYCCNT_ADDR
+        LDR  \a, [\c]                    @ t0
+        LDR  \c, [\base, #4]             @ prev_ts
+        LDR  \b, [\base]                 @ prev_idx
+        SUB  \a, \a, \c                  @ delta, wrap-exact
+        ADD  \b, \base, \b, LSL #PROF_ENTRY_LOG2
+        ADD  \b, \b, #PROF_HDR
+        LDR  \c, [\b, #0]
+        ADDS \c, \c, \a
+        STR  \c, [\b, #0]
+        LDR  \c, [\b, #4]
+        ADC  \c, \c, #0
+        STR  \c, [\b, #4]
+        LDR  \c, [\b, #8]
+        ADD  \c, \c, #1
+        STR  \c, [\b, #8]
+        ADD  \a, \idx, #\bias
+        STR  \a, [\base]                 @ this dispatch's slot
+        MOVW \c, #:lower16:DWT_CYCCNT_ADDR
+        MOVT \c, #:upper16:DWT_CYCCNT_ADDR
+        LDR  \c, [\c]                    @ t1: bookkeeping is NOT charged to
+        STR  \c, [\base, #4]             @ the opcode about to run
+    .endm
+#endif
+
     // Helper macro for checking IOPL
     .macro CHECK_IOPL scratch1, scratch2
         LDR \scratch1, [R8, #CPU_EFLAGS]  // EFLAGS
@@ -103,6 +159,22 @@
 x86_cpu_interp_asm:
     // PROLOGUE: Save ARM host state
     PUSH {R4-R11, LR}
+
+#if X86_PROFILE
+    /* Open the HOST slot. Without this the first dispatch of every call would
+       charge the whole host frame -- blit, audio, HLE -- to whichever opcode
+       happened to run last before the previous exit, which is a made-up
+       number attached to a real opcode. Slot 512 says "not in the guest". */
+    MOVW R0, #:lower16:x86_profile_ptr
+    MOVT R0, #:upper16:x86_profile_ptr
+    LDR  R0, [R0]
+    MOVW R1, #512
+    STR  R1, [R0]
+    MOVW R1, #:lower16:DWT_CYCCNT_ADDR
+    MOVT R1, #:upper16:DWT_CYCCNT_ADDR
+    LDR  R1, [R1]
+    STR  R1, [R0, #4]
+#endif
 
     // Load state pointers into the high registers, INDIRECTLY.
     //
@@ -237,6 +309,11 @@ x86_cpu_interp_asm:
     BMI .mem_fault
     LDRB R0, [R0]
     ADD R10, R10, #1
+#if X86_PROFILE
+    /* R1/R3/R4/R12 are all dead here: R1 last held the PIT counter, R0 is the
+       opcode a handler receives, R2 the mode record. Nothing else is touched. */
+    PROF_DISPATCH R0, R12, R1, R3, R4
+#endif
     LDR.W PC, [R2, R0, LSL #2]
 
 
@@ -464,3 +541,50 @@ x86_cpu_interp_asm:
     STR R10, [R8, #EIP_OFFSET]
     STR R11, [R8, #EFLAGS_OFFSET]
     POP {R4-R11, PC}
+
+#if X86_PROFILE
+/* uint32_t x86_profile_calibrate(uint32_t iterations)
+ *
+ * Measure the measurement, on the target, with the SAME macro the dispatch
+ * tail uses -- no fudge factor, and nothing on the target ever subtracts it.
+ * Two loops: an empty one and an instrumented one. The difference divided by
+ * the iteration count is the cycles per instrumented dispatch.
+ *
+ * It is a LOWER BOUND, deliberately: this loop is tiny, its branch predicts
+ * perfectly and its DTCM block is hot, so the real cost inside a 3,000-handler
+ * interpreter is at least this. It accumulates into the HOST slot, which
+ * x86_profile_init clears immediately afterwards.
+ */
+    .global x86_profile_calibrate
+    .type x86_profile_calibrate, %function
+x86_profile_calibrate:
+    PUSH {R4-R7, LR}
+    MOV  R6, R0
+    CMP  R6, #0
+    BEQ  9f
+
+    MOVW R12, #:lower16:DWT_CYCCNT_ADDR
+    MOVT R12, #:upper16:DWT_CYCCNT_ADDR
+    LDR  R4, [R12]
+    MOV  R3, R6
+1:  SUBS R3, R3, #1
+    BNE  1b
+    LDR  R5, [R12]
+    SUB  R5, R5, R4                  @ empty-loop cost
+
+    MOVW R7, #PROF_HOST_SLOT
+    MOVW R12, #:lower16:DWT_CYCCNT_ADDR
+    MOVT R12, #:upper16:DWT_CYCCNT_ADDR
+    LDR  R4, [R12]
+    MOV  R3, R6
+2:  PROF_DISPATCH R7, R12, R0, R1, R2
+    SUBS R3, R3, #1
+    BNE  2b
+    MOVW R12, #:lower16:DWT_CYCCNT_ADDR
+    MOVT R12, #:upper16:DWT_CYCCNT_ADDR
+    LDR  R0, [R12]
+    SUB  R0, R0, R4
+    SUB  R0, R0, R5
+    UDIV R0, R0, R6
+9:  POP {R4-R7, PC}
+#endif
