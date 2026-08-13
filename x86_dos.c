@@ -363,6 +363,147 @@ static void guest_str(uint32_t lin, char *out, unsigned max)
     out[i] = 0;
 }
 
+/*
+ * A DOS path is not a FatFs path.
+ *
+ * FatFs is built FF_STR_VOLUME_ID=0, so the only drive prefix it understands is
+ * a DIGIT ("0:"). A guest naming its own file the way DOS programs habitually
+ * do -- "A:DATABASE.INI", "C:\TB\DATABASE.INI" -- hands it a LETTER, which
+ * f_open rejects outright with FR_INVALID_DRIVE. We have exactly one volume
+ * (the mounted .dsk), so every drive letter means the same disk: strip it.
+ *
+ * FF_FS_RPATH is 0 too, so there is no current directory to be relative to and
+ * a leading separator is meaningless -- but harmless -- to strip as well; what
+ * matters is that "A:FOO.INI" and "\FOO.INI" and "FOO.INI" all reach the same
+ * root-directory entry, which is where a single-floppy DOS title keeps its
+ * files.
+ */
+static void dos_path_from_guest(uint32_t lin, char *out, unsigned max)
+{
+    char raw[64];
+    guest_str(lin, raw, sizeof(raw));
+
+    const char *s = raw;
+    if (s[0] && s[1] == ':')                    /* drop any "X:" */
+        s += 2;
+    while (*s == '\\' || *s == '/')             /* and any leading separator */
+        s++;
+
+    unsigned i = 0;
+    while (s[i] && i < max - 1) {
+        out[i] = s[i];
+        i++;
+    }
+    out[i] = 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Directory search (AH=4Eh / 4Fh).
+ *
+ * FatFs is built FF_USE_FIND=0, so the pattern matching is ours. That is not a
+ * loss: DOS wildcard rules are not FatFs's. A DOS name is a fixed 8+3 field,
+ * '?' matches one padding-included position and '*' fills the REST OF THAT
+ * FIELD -- so "*.INI" matches "DATABASE.INI" and "*" alone matches everything,
+ * which is what a program enumerating a floppy actually sends.
+ */
+static char dos_up(char c) { return (c >= 'a' && c <= 'z') ? (char)(c - 32) : c; }
+
+/* Expand "NAME.EXT" into the 11-character padded field DOS compares in. */
+static void dos_83_field(const char *s, char out[11])
+{
+    unsigned i = 0;
+    memset(out, ' ', 11);
+    for (; *s && *s != '.' && i < 8; s++, i++)
+        out[i] = dos_up(*s);
+    while (*s && *s != '.')
+        s++;
+    if (*s == '.') {
+        s++;
+        for (i = 0; *s && i < 3; s++, i++)
+            out[8 + i] = dos_up(*s);
+    }
+}
+
+/* Same, but '*' fills the remainder of its own field with '?'. */
+static void dos_83_pattern(const char *s, char out[11])
+{
+    unsigned i = 0;
+    memset(out, ' ', 11);
+    for (; *s && *s != '.' && i < 8; s++) {
+        if (*s == '*') { while (i < 8) out[i++] = '?'; break; }
+        out[i++] = dos_up(*s);
+    }
+    while (*s && *s != '.')
+        s++;
+    if (*s == '.') {
+        s++;
+        for (i = 0; *s && i < 3; s++) {
+            if (*s == '*') { while (i < 3) out[8 + i++] = '?'; break; }
+            out[8 + i++] = dos_up(*s);
+        }
+    }
+}
+
+static int dos_83_match(const char pat[11], const char name[11])
+{
+    for (unsigned i = 0; i < 11; i++)
+        if (pat[i] != '?' && pat[i] != name[i])
+            return 0;
+    return 1;
+}
+
+/* One live search. DOS keeps its state in the first 21 bytes of the DTA; we
+   keep ours here and stamp a serial into the DTA so a FindNext against a stale
+   or foreign DTA fails cleanly instead of walking someone else's directory. */
+static DIR dos_find_dir;
+static char dos_find_pat[11];
+static uint8_t dos_find_attr;
+static uint8_t dos_find_open;
+static uint8_t dos_find_serial;
+#define DOS_FIND_MAGIC 0xF1
+
+/* Fill the DTA's result half from a directory entry, and return 1. */
+static int dos_find_report(const FILINFO *fno)
+{
+    uint8_t *d = x86_guest_ptr(dta_lin, 43);
+    if (!d)
+        return 0;
+    d[0] = DOS_FIND_MAGIC;
+    d[1] = dos_find_serial;
+    d[0x15] = fno->fattrib;
+    d[0x16] = (uint8_t)fno->ftime;       d[0x17] = (uint8_t)(fno->ftime >> 8);
+    d[0x18] = (uint8_t)fno->fdate;       d[0x19] = (uint8_t)(fno->fdate >> 8);
+    d[0x1A] = (uint8_t)fno->fsize;       d[0x1B] = (uint8_t)(fno->fsize >> 8);
+    d[0x1C] = (uint8_t)(fno->fsize >> 16); d[0x1D] = (uint8_t)(fno->fsize >> 24);
+
+    const char *n = fno->altname[0] ? fno->altname : fno->fname;
+    unsigned i = 0;
+    for (; n[i] && i < 12; i++)
+        d[0x1E + i] = (uint8_t)dos_up(n[i]);
+    d[0x1E + i] = 0;
+    return 1;
+}
+
+/* Walk until an entry matches, or the directory ends. */
+static int dos_find_step(void)
+{
+    FILINFO fno;
+    for (;;) {
+        if (f_readdir(&dos_find_dir, &fno) != FR_OK || fno.fname[0] == 0)
+            return 0;
+        /* A DOS search returns normal files always, and hidden/system/dir
+           entries only if the caller asked for them in CX. */
+        uint8_t extra = (uint8_t)(fno.fattrib & (AM_HID | AM_SYS | AM_DIR));
+        if (extra & ~dos_find_attr)
+            continue;
+        char field[11];
+        const char *n = fno.altname[0] ? fno.altname : fno.fname;
+        dos_83_field(n, field);
+        if (dos_83_match(dos_find_pat, field))
+            return dos_find_report(&fno);
+    }
+}
+
 /* --------------------------------------------------------------------------
  * MZ loader.
  */
@@ -525,7 +666,55 @@ int x86_dos_terminate(void)
 static void ok_clear_cf(void)   { x86_hle_set_cf(0); }
 static void fail(uint16_t code) { x86_set_ax(code); x86_hle_set_cf(1); }
 
+uint32_t x86_dos_file_log[64];
+uint32_t x86_dos_file_log_idx;
+char x86_dos_path_log[4][32];
+static uint32_t dos_path_log_idx;
+
+static int dos_func_is_file(uint8_t f)
+{
+    switch (f) {
+    case 0x0F: case 0x10: case 0x11: case 0x12: case 0x13: case 0x14:
+    case 0x15: case 0x16: case 0x17: case 0x1A: case 0x21: case 0x22:
+    case 0x23: case 0x27: case 0x28: case 0x29: case 0x2F:
+    case 0x39: case 0x3A: case 0x3B: case 0x3C: case 0x3D: case 0x3E:
+    case 0x3F: case 0x40: case 0x41: case 0x42: case 0x43: case 0x45:
+    case 0x46: case 0x47: case 0x4E: case 0x4F: case 0x56: case 0x57:
+    case 0x5A: case 0x5B: case 0x68: case 0x6C:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static void dos_log_path(const char *p)
+{
+    unsigned slot = dos_path_log_idx & 3;
+    strncpy(x86_dos_path_log[slot], p, sizeof(x86_dos_path_log[0]) - 1);
+    x86_dos_path_log[slot][sizeof(x86_dos_path_log[0]) - 1] = 0;
+    dos_path_log_idx++;
+}
+
+static int dos_int21_dispatch(uint8_t func);
+
 int x86_dos_int21(uint8_t func)
+{
+    if (!dos_func_is_file(func))
+        return dos_int21_dispatch(func);
+
+    unsigned slot = (x86_dos_file_log_idx & 31) * 2;
+    x86_dos_file_log[slot] =
+        ((uint32_t)func << 8) | (uint8_t)(cpu_state_ptr->regs[0] & 0xFF);
+    int rc = dos_int21_dispatch(func);
+    uint16_t *fl = x86_hle_flags_on_stack();
+    x86_dos_file_log[slot + 1] =
+        (uint32_t)((fl && (*fl & 1u)) ? 0x10000u : 0u) |
+        (uint16_t)(cpu_state_ptr->regs[0] & 0xFFFF);
+    x86_dos_file_log_idx++;
+    return rc;
+}
+
+static int dos_int21_dispatch(uint8_t func)
 {
     uint32_t *r = cpu_state_ptr->regs;
     uint16_t dx = (uint16_t)r[2];
@@ -602,7 +791,14 @@ int x86_dos_int21(uint8_t func)
         dta_lin = cpu_state_ptr->segs[3].base + dx;
         return 1;
     case 0x2F:                                  /* get DTA */
+        /* ES:BX, not BX alone. The old form returned the bottom NIBBLE of the
+           linear address and nothing else, so a program that saved the DTA and
+           restored it later pointed at ES:000x -- the interrupt vector table
+           of whatever segment ES held. */
         x86_set_bx((uint16_t)(dta_lin & 0x0F));
+        uint16_t dseg = (uint16_t)((dta_lin >> 4) & 0xFFFFu);
+        cpu_state_ptr->segs[0].sel = dseg;      /* ES */
+        cpu_state_ptr->segs[0].base = SEG(dseg);
         return 1;
 
     case 0x25: {                                /* set interrupt vector */
@@ -684,8 +880,10 @@ int x86_dos_int21(uint8_t func)
      */
     case 0x3C: {                                /* create / truncate */
         char path[64];
-        guest_str(cpu_state_ptr->segs[3].base + dx, path, sizeof(path));
+        dos_path_from_guest(cpu_state_ptr->segs[3].base + dx, path,
+                            sizeof(path));
         strncpy(x86_dos_last_path, path, sizeof(x86_dos_last_path) - 1);
+        dos_log_path(path);
         int dev = dos_name_is_device(path);
         if (dev) {
             x86_set_ax(DOS_DEV_HANDLE(dev));
@@ -706,8 +904,10 @@ int x86_dos_int21(uint8_t func)
     }
     case 0x3D: {                                /* open */
         char path[64];
-        guest_str(cpu_state_ptr->segs[3].base + dx, path, sizeof(path));
+        dos_path_from_guest(cpu_state_ptr->segs[3].base + dx, path,
+                            sizeof(path));
         strncpy(x86_dos_last_path, path, sizeof(x86_dos_last_path) - 1);
+        dos_log_path(path);
         int dev = dos_name_is_device(path);
         if (dev) {
             x86_set_ax(DOS_DEV_HANDLE(dev));
@@ -848,6 +1048,126 @@ int x86_dos_int21(uint8_t func)
         ok_clear_cf();
         return 1;
     }
+    /*
+     * AH=43h, get/set file attributes -- MEASURED as what stopped TOPBENCH.
+     * Its file log read 3Ch/40h/3Eh (create, write, close its own log) and then
+     * 43h AL=00 on DATABASE.INI, which the default arm answered with CF set and
+     * AX=1 "invalid function". A program cannot tell that from "no such file",
+     * so it reported its data file as unreadable and never issued the 3Dh that
+     * would have opened it. The open path was never reached, let alone broken.
+     *
+     * FatFs is FF_USE_CHMOD=0, so SET is accepted for a file that exists and
+     * changes nothing: refusing it would break a program that merely clears the
+     * archive bit, and the attribute has no meaning on a read-back of the .dsk.
+     */
+    case 0x43: {                                /* get / set file attributes */
+        char path[64];
+        dos_path_from_guest(cpu_state_ptr->segs[3].base + dx, path,
+                            sizeof(path));
+        dos_log_path(path);
+        strncpy(x86_dos_last_path, path, sizeof(x86_dos_last_path) - 1);
+        if (dos_name_is_device(path)) {         /* devices have no directory */
+            x86_set_cx(0x0040);                 /* AM_ARC-ish: "just a file" */
+            ok_clear_cf();
+            return 1;
+        }
+        FILINFO fno;
+        if (f_stat(path, &fno) != FR_OK) { fail(0x02); return 1; }
+        if (((uint8_t)r[0] & 0xFF) == 0x00)
+            x86_set_cx(fno.fattrib);
+        ok_clear_cf();
+        return 1;
+    }
+
+    case 0x41: {                                /* delete file */
+        char path[64];
+        dos_path_from_guest(cpu_state_ptr->segs[3].base + dx, path,
+                            sizeof(path));
+        dos_log_path(path);
+        if (f_unlink(path) != FR_OK) { fail(0x02); return 1; }
+        ok_clear_cf();
+        return 1;
+    }
+    case 0x56: {                                /* rename */
+        char from[64], to[64];
+        dos_path_from_guest(cpu_state_ptr->segs[3].base + dx, from,
+                            sizeof(from));
+        dos_path_from_guest(cpu_state_ptr->segs[0].base +
+                            (uint16_t)cpu_state_ptr->regs[7], to, sizeof(to));
+        if (f_rename(from, to) != FR_OK) { fail(0x02); return 1; }
+        ok_clear_cf();
+        return 1;
+    }
+
+    /*
+     * FindFirst / FindNext. Old tools reach their data files through these as
+     * often as through 3Dh -- a wildcard is how a program discovers what is on
+     * the disk at all -- and unanswered they look exactly like an empty floppy.
+     */
+    case 0x4E: {                                /* find first */
+        char path[64];
+        dos_path_from_guest(cpu_state_ptr->segs[3].base + dx, path,
+                            sizeof(path));
+        dos_log_path(path);
+        strncpy(x86_dos_last_path, path, sizeof(x86_dos_last_path) - 1);
+
+        /* Split the directory off the pattern. One volume, root only. */
+        char *stem = path;
+        for (char *q = path; *q; q++)
+            if (*q == '\\' || *q == '/')
+                stem = q + 1;
+
+        if (dos_find_open) { f_closedir(&dos_find_dir); dos_find_open = 0; }
+        if (f_opendir(&dos_find_dir, "") != FR_OK) { fail(0x03); return 1; }
+        dos_find_open = 1;
+        dos_find_serial++;
+        dos_find_attr = (uint8_t)(cx & (AM_HID | AM_SYS | AM_DIR));
+        dos_83_pattern(stem, dos_find_pat);
+        if (!dos_find_step()) {
+            f_closedir(&dos_find_dir);
+            dos_find_open = 0;
+            fail(0x12);                         /* no more files */
+            return 1;
+        }
+        x86_set_ax(0);
+        ok_clear_cf();
+        return 1;
+    }
+    case 0x4F: {                                /* find next */
+        uint8_t *d = x86_guest_ptr(dta_lin, 2);
+        if (!dos_find_open || !d || d[0] != DOS_FIND_MAGIC ||
+            d[1] != dos_find_serial) {
+            fail(0x12);
+            return 1;
+        }
+        if (!dos_find_step()) {
+            f_closedir(&dos_find_dir);
+            dos_find_open = 0;
+            fail(0x12);
+            return 1;
+        }
+        x86_set_ax(0);
+        ok_clear_cf();
+        return 1;
+    }
+
+    case 0x19:                                  /* current drive */
+        x86_set_al(0);                          /* A: -- the only one there is */
+        return 1;
+    case 0x0E:                                  /* select drive */
+        x86_set_al(1);                          /* one drive in the system */
+        return 1;
+    case 0x47: {                                /* get current directory */
+        /* Root, always: FF_FS_RPATH is 0, so there is no other answer to give
+           and an empty string IS the correct encoding of "\". */
+        uint32_t lin = cpu_state_ptr->segs[3].base + (uint16_t)r[6];
+        uint8_t z = 0;
+        x86_guest_copy_in(lin, &z, 1);
+        x86_set_ax(0x0100);
+        ok_clear_cf();
+        return 1;
+    }
+
     case 0x42: {                                /* seek */
         FIL *f = handle_get(bx);
         if (!f) { fail(0x06); return 1; }

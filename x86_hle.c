@@ -62,6 +62,8 @@ void x86_hle_set_zf(int set)
         *f &= (uint16_t)~(1u << 6);
 }
 
+uint16_t *x86_hle_flags_on_stack(void) { return guest_flags_on_stack(); }
+
 void x86_hle_set_cf(int set)
 {
     uint16_t *f = guest_flags_on_stack();

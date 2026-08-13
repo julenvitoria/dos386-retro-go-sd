@@ -95,6 +95,7 @@ python3 scripts/probe.py --retrogo --wait-magic --set guest_kips=330     # 8088
 | `panel_ms_min` | the display period, **learned** from the shortest iteration ever completed. Nothing assumes 60 fps |
 | `x86_kbd_read_log` / `x86_spk_log` | the last 32 bytes off port 0x60, and the last 32 writes that can move the speaker tone. `--dump x86_kbd_read_log:32x8` |
 | `x86_kb_pushes` / `x86_kb_pops` / `x86_kb_peek_hits` | the BDA ring's producer and its two consumers. "The guest polls INT 16h forever" has two opposite causes -- nothing was queued, or something dequeued it first -- and only these three separate them. `pushes == pops == peek_hits` means every key was queued, seen and taken; `pushes > 0` with `pops == 0` is the reported failure |
+| `x86_dos_file_log` / `x86_dos_path_log` | The last 32 **file-family** INT 21h calls as word pairs -- `(func << 8) \| AL`, then `(CF << 16) \| AX` -- and the last four paths opened. `x86_hle_log` cannot answer a file question: a guest polling the keyboard fills all 32 of its slots between one open and the next, which is exactly what it did while TOPBENCH's real failure (`43h` -> CF=1, AX=1) sat invisible. `--dump x86_dos_file_log:64x4 --dump x86_dos_path_log:32x4` |
 | `x86_hle_log` | the last 32 services as `(vector << 8) \| AH`, bit 16 set if nobody answered. This is what says whether a guest is polling INT 16h AH=00 or AH=01 -- a distinction the two paths do not share a symptom for. `--dump x86_hle_log:32x8` |
 
 Guest time must not move with render rate. The measurement that proves it is
@@ -375,7 +376,12 @@ python3 tests/test_opcodes.py            # 162 cases: EFLAGS, segmentation,
                                          # 16-bit, 66/67, interrupts, speaker
 python3 tests/test_benchmark.py
 python3 tests/test_game.py
-python3 tests/test_dos.py                # MCB arena, walked from the host
+python3 tests/test_dos.py                # MCB arena, walked from the host, plus
+                                         # FILE I/O from guest code against a
+                                         # FAT12 volume the test builds itself:
+                                         # 3Dh/3Fh/42h/3Eh/43h/4Eh/4Fh, the
+                                         # not-found path, a drive-letter
+                                         # prefix and a lower-case name
 python3 tests/test_keyboard.py           # BDA ring -> INT 16h, consumed by
                                          # GUEST code: AH=01 peek + its ZF on
                                          # the IRET frame, AH=00 dequeue, the
@@ -464,6 +470,7 @@ Importable support only — no CLIs.
 | `opcode_profile.py` | Host side of the per-opcode DWT profile: locate/reset/read the DTCM table, resolve slots to handler symbols off the live dispatch tables, render table/JSON/CSV. Layout and the on-target half live in `x86_profile.h` / `cpu_exec.S` |
 | `probe.py` | Sample PC, globals, pointer derefs and array dumps on a running target; `read_faults` decodes CFSR/HFSR/BFAR |
 | `watchpoint.py` | Z2/Z3 data watchpoints over the GDB remote protocol, and the unsolicited stop reply that follows a resume |
+| `fat12.py` | Builds a 64 KB FAT12 volume in memory with named files and known contents. A test that asserts on a shipped `.dsk` is asserting on someone else's data; this lets `test_dos.py` write the bytes it then expects to read back |
 | `dosimage.py` | FAT12 reader + MZ loader that mirrors `x86_dos_exec`, so a reference emulator starts from OUR entry state |
 | `refx86.py` | Unicorn run of that image, sampled like the target's own sampler |
 | `refdos.py` | A minimal DOS/BIOS for the reference, so it can run PAST the first INT 21h and say what the program should do. Deliberately not modelled on our x86_dos.c -- mirroring it would make the two agree on the same mistake. It has no port I/O, so it cannot follow a program that times against the CGA retrace |

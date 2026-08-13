@@ -87,6 +87,17 @@ volatile int32_t hle_r = -99;
 volatile uint32_t run_kbd_flag = 0;
 volatile uint32_t kbd_r[20];
 
+/* DOS file I/O self-test: INT 21h 3Dh/3Fh/42h/3Eh/43h/4Eh/4Fh, driven from
+   GUEST code against a FAT12 volume the HOST built in dosfile_img.
+
+   It needs its own disk rather than the shipped .dsk: the expected bytes have
+   to be written by the test, not read out of a title's data file. 64 KB is the
+   smallest valid FAT12 geometry (see scripts/common/fat12.py). */
+#define DOSFILE_IMG_BYTES (128u * 512u)
+uint8_t dosfile_img[DOSFILE_IMG_BYTES] __attribute__((aligned(4)));
+volatile uint32_t run_dosfile_flag = 0;
+volatile uint32_t dosfile_r[32];
+
 volatile uint32_t run_video_flag = 0;
 volatile uint32_t video_blit_cycles = 0;
 uint8_t cga_test_vram[X86_VRAM_BYTES] __attribute__((section(".test_bss")));
@@ -405,6 +416,110 @@ static void kbd_test_run(void)
                               (test_ram[KBD_RES_BASE + i * 2 + 1] << 8));
 }
 
+
+/* --------------------------------------------------------------------------
+ * DOS file I/O, from guest code.
+ *
+ * Every call goes through INT 21h the way a DOS program issues it, so the CF
+ * and AX the test reads are the ones the guest's IRET actually delivered --
+ * calling x86_dos_int21() from the host would miss the whole flags-on-stack
+ * half of the contract, which is where "file not found" lives.
+ */
+#define DOSF_CODE   0x3000u
+#define DOSF_STR    0x4000u
+#define DOSF_RES    0x4100u     /* 24 result words                          */
+#define DOSF_NAME1  0x4900u     /* FindFirst's name, copied out of the DTA   */
+#define DOSF_NAME2  0x4910u     /* FindNext's                                */
+#define DOSF_DTA    0x4800u
+#define DOSF_BUF    0x5000u     /* whole-file read                           */
+#define DOSF_BUF3   0x6100u     /* 16 bytes read after a seek                */
+
+static const uint8_t dosfile_guest_code[] = {
+    /* open TEST.INI, AL=0 read-only */
+    0xB8, 0x00, 0x3D,  0xBA, 0x00, 0x40,  0xCD, 0x21,
+    0x89, 0xC3,                       /* handle -> BX, before FLAGS eats AX */
+    0xA3, 0x00, 0x41,  0x9C, 0x58, 0xA3, 0x02, 0x41,
+    /* read 0x400 bytes: the file is shorter, so this is the EOF short read */
+    0xB4, 0x3F,  0xB9, 0x00, 0x04,  0xBA, 0x00, 0x50,  0xCD, 0x21,
+    0xA3, 0x04, 0x41,  0x9C, 0x58, 0xA3, 0x06, 0x41,
+    /* read again, now AT eof: 0 bytes and CF CLEAR, not an error */
+    0xB4, 0x3F,  0xB9, 0x00, 0x04,  0xBA, 0x00, 0x60,  0xCD, 0x21,
+    0xA3, 0x08, 0x41,  0x9C, 0x58, 0xA3, 0x0A, 0x41,
+    /* seek to 0x0100 from the start */
+    0xB8, 0x00, 0x42,  0xB9, 0x00, 0x00,  0xBA, 0x00, 0x01,  0xCD, 0x21,
+    0xA3, 0x0C, 0x41,  0x89, 0x16, 0x0E, 0x41,
+    /* 16 bytes from there */
+    0xB4, 0x3F,  0xB9, 0x10, 0x00,  0xBA, 0x00, 0x61,  0xCD, 0x21,
+    0xA3, 0x10, 0x41,
+    /* seek to end: DX:AX is the file size */
+    0xB8, 0x02, 0x42,  0xB9, 0x00, 0x00,  0xBA, 0x00, 0x00,  0xCD, 0x21,
+    0xA3, 0x12, 0x41,  0x89, 0x16, 0x14, 0x41,
+    /* close */
+    0xB4, 0x3E,  0xCD, 0x21,  0x9C, 0x58, 0xA3, 0x16, 0x41,
+    /* open a file that is not there: CF set, AX = 02 */
+    0xB8, 0x00, 0x3D,  0xBA, 0x10, 0x40,  0xCD, 0x21,
+    0xA3, 0x18, 0x41,  0x9C, 0x58, 0xA3, 0x1A, 0x41,
+    /* AH=43h get attributes */
+    0xB8, 0x00, 0x43,  0xBA, 0x00, 0x40,  0xCD, 0x21,
+    0x89, 0x0E, 0x1C, 0x41,  0x9C, 0x58, 0xA3, 0x1E, 0x41,
+    /* DTA, then FindFirst "*.INI" */
+    0xB4, 0x1A,  0xBA, 0x00, 0x48,  0xCD, 0x21,
+    0xB8, 0x00, 0x4E,  0xB9, 0x00, 0x00,  0xBA, 0x20, 0x40,  0xCD, 0x21,
+    0xA3, 0x20, 0x41,  0x9C, 0x58, 0xA3, 0x22, 0x41,
+    0xBE, 0x1E, 0x48,  0xBF, 0x00, 0x49,  0xB9, 0x0D, 0x00, 0xFC, 0xF3, 0xA4,
+    /* FindNext */
+    0xB4, 0x4F,  0xCD, 0x21,
+    0xA3, 0x24, 0x41,  0x9C, 0x58, 0xA3, 0x26, 0x41,
+    0xBE, 0x1E, 0x48,  0xBF, 0x10, 0x49,  0xB9, 0x0D, 0x00, 0xFC, 0xF3, 0xA4,
+    /* the same file behind a drive letter: "A:TEST.INI" */
+    0xB8, 0x00, 0x3D,  0xBA, 0x30, 0x40,  0xCD, 0x21,
+    0x89, 0xC3,  0xA3, 0x28, 0x41,  0x9C, 0x58, 0xA3, 0x2A, 0x41,
+    0xB4, 0x3E,  0xCD, 0x21,
+    /* and in lower case: "test.ini" */
+    0xB8, 0x00, 0x3D,  0xBA, 0x40, 0x40,  0xCD, 0x21,
+    0x89, 0xC3,  0xA3, 0x2C, 0x41,  0x9C, 0x58, 0xA3, 0x2E, 0x41,
+    0xB4, 0x3E,  0xCD, 0x21,
+    0xF4,                                                       /* HLT */
+};
+
+static FATFS dosfile_fs;
+
+static void dosfile_test_run(void)
+{
+    static const uint8_t hle_vectors[] = {
+        0x08, 0x09, 0x10, 0x16, 0x1A, 0x20, 0x21,
+    };
+
+    for (int i = 0; i < 32; i++)
+        dosfile_r[i] = 0;
+    memset(&test_ram[DOSF_RES], 0, 64);
+    memset(&test_ram[DOSF_BUF], 0, 1024);
+    memset(&test_ram[DOSF_NAME1], 0, 32);
+
+    x86_video_init(cga_test_vram, cga_test_palette);
+    x86_bios_init();
+    x86_hle_install(hle_vectors, sizeof(hle_vectors));
+
+    /* The image the host wrote into dosfile_img IS the guest's floppy. */
+    x86_disk_set_memory(dosfile_img, DOSFILE_IMG_BYTES);
+    dosfile_r[24] = (uint32_t)f_mount(&dosfile_fs, "", 1);
+
+    memcpy(&test_ram[DOSF_STR + 0x00], "TEST.INI", 9);
+    memcpy(&test_ram[DOSF_STR + 0x10], "NOPE.INI", 9);
+    memcpy(&test_ram[DOSF_STR + 0x20], "*.INI", 6);
+    memcpy(&test_ram[DOSF_STR + 0x30], "A:TEST.INI", 11);
+    memcpy(&test_ram[DOSF_STR + 0x40], "test.ini", 9);
+    memcpy(&test_ram[DOSF_CODE], dosfile_guest_code,
+           sizeof(dosfile_guest_code));
+
+    kbd_test_reset_cpu(DOSF_CODE);
+    dosfile_r[25] = kbd_test_run_to_halt();
+
+    for (int i = 0; i < 24; i++)
+        dosfile_r[i] = (uint16_t)(test_ram[DOSF_RES + i * 2] |
+                                  (test_ram[DOSF_RES + i * 2 + 1] << 8));
+}
+
 // External arrays from x86_cpu.c
 extern uint32_t (*io_port_read_table[1024])(void *opaque, uint32_t offset, int size_log2);
 extern void *io_port_opaque_table[1024];
@@ -612,6 +727,11 @@ void Reset_Handler(void) {
         if (run_kbd_flag == 1) {
             kbd_test_run();
             run_kbd_flag = 0;
+        }
+
+        if (run_dosfile_flag == 1) {
+            dosfile_test_run();
+            run_dosfile_flag = 0;
         }
 
         if (run_video_flag == 1) {

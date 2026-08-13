@@ -254,6 +254,19 @@ extern uint32_t x86_dos_last_error;
 /* Last path the guest opened or created. Diagnostic only: an unserviced file
    request is far easier to place with the name in hand. */
 extern char x86_dos_last_path[32];
+/*
+ * File-family INT 21h trace. x86_hle_log is useless for a file bug: a guest
+ * polling the keyboard fills all 32 slots between one open and the next. This
+ * ring records ONLY the file calls, as pairs of words --
+ *   [2i]   (func << 8) | AL
+ *   [2i+1] (CF << 16) | AX-returned
+ * -- plus the path of the last four opens, so "which call, on which name, with
+ * what answer" is one dump instead of a rebuild.
+ */
+extern uint32_t x86_dos_file_log[64];
+extern uint32_t x86_dos_file_log_idx;
+extern char x86_dos_path_log[4][32];
+uint16_t *x86_hle_flags_on_stack(void);
 uint16_t dos_test_alloc(uint16_t paras, uint16_t *largest);
 uint16_t dos_test_free(uint16_t seg);
 uint16_t dos_test_resize(uint16_t seg, uint16_t paras, uint16_t *largest);

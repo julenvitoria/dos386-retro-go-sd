@@ -99,6 +99,48 @@ closed, one commit each; one shape accounts for four — reading a register
 operand BEFORE `DECODE_MODRM`, which uses R4/R5 as scratch. `refdos.py` still
 has no port I/O, so the oracle stops at the first CGA-retrace timing loop.
 
+## TOPBENCH's INI, and the INT 21h calls that were not there
+
+The device report was "the menu runs but it cannot read its files". **Measured**,
+with a new file-only trace ring (`x86_dos_file_log`, because `x86_hle_log` is
+100% 0x1601 keyboard polls between one file call and the next): TOPBENCH does
+`3Ch`/`40h`/`3Eh` on its own `topbench.log`, then **`43h AL=00` on
+`database.ini`, which the default arm answered CF=1, AX=0x0001 "invalid
+function"**. It never issued the `3Dh` that would have opened the file. The open
+and read paths were never reached, let alone broken -- an unimplemented call in
+the MIDDLE of the sequence is indistinguishable, to the guest, from a missing
+file.
+
+Implemented: `43h` get/set attributes (`f_stat`; SET is accepted and changes
+nothing, FatFs is `FF_USE_CHMOD=0`), `4Eh`/`4Fh` FindFirst/FindNext with our own
+DOS 8.3 wildcard matcher over `f_opendir`/`f_readdir` (`FF_USE_FIND=0`) and a
+serial stamped into the DTA, `41h` delete, `56h` rename, `19h`/`0Eh`/`47h`. Two
+more defects the tier-1 test caught on its own: **a drive-letter prefix was
+fatal** -- FatFs is `FF_STR_VOLUME_ID=0`, so `"A:TEST.INI"` returns
+FR_INVALID_DRIVE and every program that names its own drive got "file not
+found"; and `2Fh` get-DTA returned the bottom NIBBLE of the linear address with
+no segment, so a program that saved and restored its DTA pointed into the IVT.
+
+Tier 1: `tests/test_dos.py` now drives all of it from GUEST code against a
+64 KB FAT12 volume the test builds (`scripts/common/fat12.py`), so the expected
+bytes are the test's own -- open, a short read at EOF (partial count, CF CLEAR),
+the zero read after it, seek from start and from end, close, the not-found path
+(CF set, AX=02), attributes, FindFirst/FindNext through the DTA, and both
+`A:TEST.INI` and lower-case `test.ini`. It fails on the pre-fix core on exactly
+three of those and passes after.
+
+Tier 2, TOPBENCH under gwemu: the file log now reads `43h` OK, `3Dh` -> handle
+5 on `database.ini`, thirteen `3Fh` reads of 0x2400 bytes each (the file is
+124,054 B) and `3Eh`; `x86_dos_last_error` is 0. The screen says it too --
+before, rows 0-2 were empty backdrop; after, they are database records read out
+of the INI:
+
+```
+   0 |....Celeron.Tualatin.clone....
+   1 |....Athlon.4400+.@.2.2GHz.clone
+   2 |....Toshiba.Portege.7140CT....
+```
+
 ## Guest timing — three clocks, measured
 
 The loop used to derive everything from one constant (`PIT_SLICE_INSNS`), and
