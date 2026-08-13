@@ -53,12 +53,8 @@ relocations, INT 21h on FatFs -- fed by the guest `.dsk` streamed from SD.
 
 `TOPBENCH.EXE -l` boots from its `.dsk`, unpacks, benchmarks and prints
 **"This system's TOPBENCH Score: 236"**, iterating continuously as `-l` asks.
-Capture: `build/artifacts/topbench.png`, via
-
-```bash
-python3 scripts/screenshot.py --timeline timelines/run-to-completion.tl \
-    --wait 48 --pan 16 --text --out build/artifacts/topbench.png
-```
+Capture in `build/artifacts/topbench.png` (`scripts/screenshot.py
+--timeline timelines/run-to-completion.tl --wait 48 --pan 16 --text`).
 
 `scripts/trace_diff.py` agrees with a reference 8086 (Unicorn) for the whole of
 startup and the self-unpacker — 1,532,786 instructions to the first INT 21h,
