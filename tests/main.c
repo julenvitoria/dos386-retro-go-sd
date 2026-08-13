@@ -4,6 +4,7 @@
 
 #include "../cutils.h"
 #include "../x86_cpu.h"
+#include "../x86_arena.h"
 #include "../x86_profile.h"
 #include "../x86_osk.h"
 
@@ -111,6 +112,20 @@ volatile uint32_t nor_r[24];
 
 volatile uint32_t run_a20_flag = 0;
 volatile uint32_t a20_r[24];
+
+/* The arena runs against a region of the harness's OWN choosing -- 40 pages,
+   so every expected number below is arithmetic this test can state, not
+   whatever the LCD bonus pool happened to release.
+   It is carved out of the TOP of test_ram rather than declared: 160 KB of new
+   .bss does not fit in any region of this harness (RAM_EMU, RAM_UC and AHBRAM
+   were each tried and each overflowed), and the arena arm runs no guest code,
+   so the guest's memory is idle while it does. test_ram is 4096-aligned, so
+   the offset keeps the region page-aligned. */
+#define ARENA_TEST_PAGES 40u
+#define ARENA_TEST_OFF   (512u * 1024u)
+#define arena_test_mem   (test_ram + ARENA_TEST_OFF)
+volatile uint32_t run_arena_flag = 0;
+volatile uint32_t arena_r[32];
 
 volatile uint32_t run_video_flag = 0;
 volatile uint32_t video_blit_cycles = 0;
@@ -926,7 +941,7 @@ static FATFS dosfile_fs;
 #define NOR_FAKE_BASE   ((uint8_t *)0x90000000u)
 
 static uint8_t nor_test_ram[NOR_TEST_BYTES]
-    __attribute__((aligned(4096), section(".test_bss")));
+    __attribute__((aligned(4096)));
 
 static uint8_t nor_pattern_byte(uint32_t off)
 {
@@ -1199,6 +1214,107 @@ static void a20_test_run(void)
     a20_r[23] = x86_a20_state;
 }
 
+/*
+ * The VRAM arena, its all-or-nothing rule, and the pin state the pager will
+ * consult.
+ *
+ * The rule under test is the one that unblocks EGA: a claim that cannot be
+ * fully placed must change NOTHING and must say by how much it missed. The
+ * previous port measured a partial EGA card as producing worse output than no
+ * EGA at all -- 8 KB per plane truncates cleanly, but 16 KB and 32 KB alias
+ * the floating pages onto each other and fill the screen with noise that
+ * reads as a rendering defect rather than a memory shortage. So "refused, and
+ * here is the deficit" is the behaviour, and a half-placed claim is the bug.
+ */
+#define KB(n) ((n) * 1024u)
+static void arena_test_run(void)
+{
+    for (uint32_t i = 0; i < 32; i++)
+        arena_r[i] = 0;
+
+    void *cga = NULL, *v13 = NULL, *ega[4] = { NULL, NULL, NULL, NULL };
+
+    x86_arena_reset();
+    arena_r[0] = (x86_arena_add_region(arena_test_mem,
+                                       ARENA_TEST_PAGES * 4096u) == 0);
+    arena_r[1] = x86_arena_bytes;                       /* 163,840 */
+    arena_r[2] = x86_arena_free;
+
+    /* ---- the two claims a real core makes at boot */
+    arena_r[3] = (x86_arena_claim(X86_ARENA_ID_CGA, 1, KB(32), &cga) == 0);
+    arena_r[4] = x86_arena_used;                        /* 32,768 */
+    arena_r[5] = (x86_arena_claim(X86_ARENA_ID_VGA13, 1, KB(64), &v13) == 0);
+    arena_r[6] = x86_arena_used;                        /* 98,304 */
+    arena_r[7] = x86_arena_free;                        /* 65,536 */
+    /* The two blocks must not overlap, which is the one way a bitmap
+       allocator fails silently: both callers write and each sees the other's
+       bytes appear in its own buffer. */
+    arena_r[8] = (((uint8_t *)v13 >= (uint8_t *)cga + KB(32))
+                  || ((uint8_t *)cga >= (uint8_t *)v13 + KB(64)));
+
+    /* ---- EGA: four planes of 64 KB against 64 KB free. REFUSED. */
+    uint32_t used_before = x86_arena_used;
+    arena_r[9] = (x86_arena_claim(X86_ARENA_ID_EGA, 4, KB(64), ega) != 0);
+    arena_r[10] = x86_arena_deficit;                    /* 3 planes: 196,608 */
+    arena_r[11] = (x86_arena_used == used_before);      /* nothing moved */
+    arena_r[12] = (ega[0] == NULL);                     /* out untouched */
+    /* And the arena still WORKS after a refusal -- a failed claim that left
+       the bitmap half-marked would show up here and nowhere else. */
+    void *probe = NULL;
+    arena_r[13] = (x86_arena_claim(X86_ARENA_ID_SPARE, 1, KB(64), &probe) == 0);
+    x86_arena_release(X86_ARENA_ID_SPARE);
+
+    /* ---- release the display claims and try again. Still refused: 163,840
+       bytes cannot hold 262,144, and the deficit says so exactly. */
+    x86_arena_release(X86_ARENA_ID_CGA);
+    x86_arena_release(X86_ARENA_ID_VGA13);
+    arena_r[14] = x86_arena_free;                       /* the whole region */
+    arena_r[15] = (x86_arena_claim(X86_ARENA_ID_EGA, 4, KB(64), ega) != 0);
+    arena_r[16] = x86_arena_deficit;                    /* 2 planes: 131,072 */
+
+    /* ---- would_fit agrees with claim and does not change anything. Two
+       answers that can disagree is how a mode gets ADOPTED and then fails to
+       allocate, which is the exact failure the refusal rule exists to stop. */
+    arena_r[17] = (x86_arena_would_fit(X86_ARENA_ID_EGA, 4, KB(64)) == 0);
+    arena_r[18] = (x86_arena_would_fit(X86_ARENA_ID_EGA, 2, KB(64)) == 1);
+    arena_r[19] = x86_arena_used;                       /* still 0 */
+
+    /* ---- a re-claim releases the old one rather than leaking it */
+    arena_r[20] = (x86_arena_claim(X86_ARENA_ID_CGA, 1, KB(32), &cga) == 0);
+    arena_r[21] = (x86_arena_claim(X86_ARENA_ID_CGA, 1, KB(32), &cga) == 0);
+    arena_r[22] = x86_arena_used;                       /* 32,768, not 65,536 */
+
+    /* ---- pins, which is what the victim picker will test */
+    uint32_t pinned0 = x86_pinned_pages;
+    x86_pin_pages(0xB8000u >> 12, 8);
+    arena_r[23] = (x86_pinned_pages - pinned0);         /* 8 */
+    arena_r[24] = x86_page_is_pinned(0xB8000u >> 12);
+    arena_r[25] = x86_page_is_pinned((0xB8000u >> 12) - 1u);   /* 0 */
+    x86_pin_pages(0xB8000u >> 12, 8);                   /* idempotent */
+    arena_r[26] = (x86_pinned_pages - pinned0);         /* still 8 */
+    x86_unpin_pages(0xB8000u >> 12, 8);
+    arena_r[27] = (x86_pinned_pages - pinned0);         /* 0 */
+
+    /* ---- the live-pointer ring.
+     *
+     * The first check is the one that matters and it is not obvious: the ring
+     * is .bss, so it starts as a row of zeroes, and page 0 is a real and
+     * constantly used page. Without an armed flag every eviction of page 0
+     * would be vetoed from boot by a pointer that was never handed out. */
+    x86_livemap_clear();
+    arena_r[28] = (x86_livemap_holds(0) == 0);
+    x86_livemap_note(0x42);
+    x86_livemap_note(0x43);
+    arena_r[29] = (x86_livemap_holds(0x42) && x86_livemap_holds(0x43)
+                   && !x86_livemap_holds(0x44));
+    x86_livemap_clear();
+    arena_r[30] = (x86_livemap_holds(0x42) == 0);
+
+    /* Leave the arena empty so nothing downstream inherits a claim. */
+    x86_arena_reset();
+    arena_r[31] = x86_arena_used;
+}
+
 static void dosfile_test_run(void)
 {
     static const uint8_t hle_vectors[] = {
@@ -1422,6 +1538,11 @@ void Reset_Handler(void) {
         if (run_a20_flag == 1) {
             a20_test_run();
             run_a20_flag = 0;
+        }
+
+        if (run_arena_flag == 1) {
+            arena_test_run();
+            run_arena_flag = 0;
         }
 
         if (run_dos_flag == 1) {

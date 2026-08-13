@@ -39,6 +39,7 @@
 #include "x86_profile.h"
 #include "x86_zones.h"   /* ZONES: frame-loop phase accounting, X86_ZONES=1 */
 #include "x86_osk.h"
+#include "x86_arena.h"
 
 #define APP_ID       100
 
@@ -159,19 +160,46 @@ static uint32_t core_clut[CORE_CLUT_ENTRIES];
  * footprint, one more page of resident set.
  */
 #define BONUS_POOL_BYTES   153600u      /* what LUT8 releases; checked at runtime */
-#define BONUS_FILLER_OFF   0u
-#define BONUS_BIOSID_OFF   4096u
-#define BONUS_VGA_OFF      8192u
-#define BONUS_VRAM_OFF     (BONUS_VGA_OFF + X86_VGA_APERTURE_BYTES)
-/* The page-aligned hole: the VRAM arena and, behind it, resident guest pages. */
-#define BONUS_ARENA_OFF    (BONUS_VRAM_OFF + X86_VRAM_BYTES)
-#define BONUS_VGAPAL_OFF   (BONUS_POOL_BYTES - X86_VGA_PALETTE_BYTES)
-#define BONUS_ARENA_BYTES  (BONUS_VGAPAL_OFF - BONUS_ARENA_OFF)
+
+/*
+ * The map is computed at RUNTIME, and that is worth a page.
+ *
+ * MEASURED on target: the bonus pool comes back at 0x24025800 -- 2048-aligned,
+ * NOT 4096-aligned -- while its END, 0x2404B000, is. A compile-time map that
+ * starts the arena at a fixed offset therefore hands x86_arena_add_region() a
+ * misaligned base, it rounds inward as it must, and a whole page disappears:
+ * 139,264 bytes of arena where the pool has room for 143,360.
+ *
+ * So the 2 KB palette -- the one block whose size is not a page multiple --
+ * goes FIRST and absorbs whatever the misalignment is. The two fixed 4 KB
+ * pages follow on the first page boundary at or after it, and the arena takes
+ * everything from there to the top of the pool. Nothing here assumes the base
+ * is aligned any particular way, so a firmware that changes the LUT8 split
+ * cannot silently cost a page again.
+ *
+ * Everything that is NOT one of those three fixed blocks is the ARENA. CGA
+ * VRAM and the mode 13h aperture used to be fixed blocks too, 96 KB spent
+ * permanently to serve one mode at a time -- which is why EGA 0Dh has never
+ * been reachable. They are claims now, and the modes are mutually exclusive,
+ * so the peak demand is the LARGEST mode rather than the sum. See x86_arena.h.
+ */
+#define BONUS_VGAPAL_OFF   0u           /* absorbs the base's misalignment */
 #define BONUS_USED         BONUS_POOL_BYTES
-_Static_assert(BONUS_ARENA_OFF % 4096u == 0u,
-               "the bonus arena must start on a 4 KB page");
-_Static_assert(BONUS_ARENA_BYTES % 4096u == 0u,
-               "the bonus arena must be a whole number of 4 KB pages");
+/* Offsets of the two fixed pages and of the arena, filled in at startup from
+   the pool's ACTUAL base so each lands on a page boundary. */
+static uint32_t bonus_filler_off, bonus_biosid_off;
+static uint32_t bonus_arena_off,  bonus_arena_bytes;
+
+static void bonus_layout(const uint8_t *base, uint32_t size)
+{
+    uint32_t b = (uint32_t)(uintptr_t)base;
+    /* The first page boundary at or after the palette. */
+    uint32_t head = (((b + X86_VGA_PALETTE_BYTES) + 4095u) & ~4095u) - b;
+    bonus_filler_off = head;
+    bonus_biosid_off = head + 4096u;
+    bonus_arena_off  = head + 8192u;
+    bonus_arena_bytes = (size > bonus_arena_off) ? size - bonus_arena_off : 0u;
+}
 /* Which table the firmware currently holds: NULL = the 32-entry cached path,
    non-NULL = the core-owned 256-entry one. Compared by POINTER, so entering
    and leaving a 256-colour mode each push exactly once. */
@@ -707,11 +735,28 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
      * Ordering matters: GW_LCD_SETUP_FB above zeroes the pool and rewrites the
      * MPU regions, so nothing may be placed in the bonus area before it.
      */
-    if (bonus && bonus_sz >= BONUS_VRAM_OFF + X86_VRAM_BYTES)
-        guest_vram = bonus + BONUS_VRAM_OFF;
-    else
-        guest_vram = (uint8_t *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM,
-                                             1, X86_VRAM_BYTES);
+    /* The arena gets the whole bonus pool between the two fixed 4 KB pages and
+       the palette at the top: 143,360 bytes, 35 whole pages. Both ends are
+       page-aligned because bonus_layout() derived them from the pool's real
+       base rather than from a compile-time offset -- which is what recovers
+       the page a 2048-aligned base would otherwise cost. */
+    bonus_layout(bonus, (uint32_t)bonus_sz);
+    x86_arena_reset();
+    if (bonus && bonus_arena_bytes)
+        x86_arena_add_region(bonus + bonus_arena_off, bonus_arena_bytes);
+
+    /* CGA VRAM is a CLAIM now, one block of 32 KB. The fallback is unchanged
+       in spirit -- a core with no bonus pool still gets VRAM out of RAM_EMU --
+       but it goes through the arena so there is one accounting of display
+       storage rather than two that can disagree. */
+    {
+        void *blk = NULL;
+        if (x86_arena_claim(X86_ARENA_ID_CGA, 1, X86_VRAM_BYTES, &blk) == 0)
+            guest_vram = (uint8_t *)blk;
+        else
+            guest_vram = (uint8_t *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM,
+                                                 1, X86_VRAM_BYTES);
+    }
     guest_vram_ok = guest_vram ? 1 : 0;
 
     guest_ram = (uint8_t *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM,
@@ -729,8 +774,8 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
      *
      * ram_malloc() returns NULL rather than overrunning, so a failure here is
      * a missing mapping, not corruption -- but it must still be visible. */
-    if (bonus && bonus_sz >= BONUS_FILLER_OFF + 4096u)
-        upper_filler = bonus + BONUS_FILLER_OFF;
+    if (bonus && bonus_sz >= bonus_filler_off + 4096u)
+        upper_filler = bonus + bonus_filler_off;
     else
         upper_filler = (uint8_t *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM,
                                                1, 4096);
@@ -743,8 +788,8 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
      * (x86_mem_pool_init() is called from nowhere), so the request always
      * failed and the page was simply absent. From the bonus pool, like the
      * filler, for the same reasons. */
-    if (bonus && bonus_sz >= BONUS_BIOSID_OFF + 4096u)
-        bios_id_page = bonus + BONUS_BIOSID_OFF;
+    if (bonus && bonus_sz >= bonus_biosid_off + 4096u)
+        bios_id_page = bonus + bonus_biosid_off;
     else
         bios_id_page = (uint8_t *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM,
                                                1, 4096);
@@ -815,11 +860,13 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
        at the top of the pool, so testing against BONUS_USED would refuse the
        aperture on any firmware whose bonus pool came back a byte short. Each
        block is placed if its own extent fits and reported if it does not. */
-    if (bonus && bonus_sz >= BONUS_VGA_OFF + X86_VGA_APERTURE_BYTES
-              && bonus_sz >= BONUS_POOL_BYTES)
-        vga_aperture = bonus + BONUS_VGA_OFF;
-    else
-        vga_aperture = NULL;            /* mode 13h refuses itself; see below */
+    {
+        void *blk = NULL;
+        vga_aperture = (x86_arena_claim(X86_ARENA_ID_VGA13, 1,
+                                        X86_VGA_APERTURE_BYTES, &blk) == 0)
+                       ? (uint8_t *)blk
+                       : NULL;          /* mode 13h refuses itself; see below */
+    }
     vga_aperture_ok = vga_aperture ? 1 : 0;
 
     if (guest_vram) {
@@ -1830,6 +1877,11 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
              * 8259A's whole model of one.
              */
             input_irqs += (uint32_t)x86_kbd_raise_irq(cpu_state_ptr);
+            /* Re-entering the guest is the one moment at which no host pointer
+               into guest memory can still be live: every HLE service that took
+               one has returned. Clearing the ring here is what keeps it from
+               growing stale and vetoing evictions forever. */
+            x86_livemap_clear();
             X86_ZONE_ENTER(X86_ZONE_GUEST);         /* ZONES */
             x86_cpu_interp_asm();
             X86_ZONE_EXIT();                        /* ZONES */

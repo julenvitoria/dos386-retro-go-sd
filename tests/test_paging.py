@@ -98,6 +98,62 @@ def main(args):
             ("host-readable mirror agrees",             r[23], 0),
         ]
 
+        # ---- the VRAM arena, its all-or-nothing rule, and the pin state ----
+        a = run_arm(b, syms, "run_arena_flag", "arena_r", 32)
+        if a is None:
+            print("FAIL: target never ran the arena test")
+            return False
+
+        KB = 1024
+        REGION = 40 * 4096          # 163,840 -- the harness picks this, not the
+                                    # bonus pool, so every figure below is the
+                                    # test's own arithmetic
+        checks += [
+            ("arena took the region",               a[0], 1),
+            ("arena size",                          a[1], REGION),
+            ("all of it free",                      a[2], REGION),
+
+            ("CGA claim (32 KB)",                   a[3], 1),
+            ("  ... used",                          a[4], 32 * KB),
+            ("mode 13h claim (64 KB)",              a[5], 1),
+            ("  ... used",                          a[6], 96 * KB),
+            ("  ... free",                          a[7], REGION - 96 * KB),
+            ("the two blocks do not overlap",       a[8], 1),
+
+            # The rule that unblocks EGA. 4 planes of 64 KB against 64 KB free.
+            ("EGA refused",                         a[9], 1),
+            ("  ... deficit is 3 planes",           a[10], 3 * 64 * KB),
+            ("  ... and NOTHING was allocated",     a[11], 1),
+            ("  ... out[] untouched",               a[12], 1),
+            ("the arena still works after it",      a[13], 1),
+
+            ("display claims released",             a[14], REGION),
+            ("EGA still refused on an empty arena", a[15], 1),
+            ("  ... deficit is 2 planes",           a[16], 2 * 64 * KB),
+
+            ("would_fit agrees: 4 planes no",       a[17], 1),
+            ("would_fit agrees: 2 planes yes",      a[18], 1),
+            ("  ... and allocated nothing",         a[19], 0),
+
+            ("re-claim: first",                     a[20], 1),
+            ("re-claim: second",                    a[21], 1),
+            ("  ... released the old one",          a[22], 32 * KB),
+
+            ("pinning 8 pages",                     a[23], 8),
+            ("  ... the page is pinned",            a[24], 1),
+            ("  ... its neighbour is not",          a[25], 0),
+            ("  ... pinning is idempotent",         a[26], 8),
+            ("  ... and unpins",                    a[27], 0),
+
+            # .bss zeroes make page 0 look live from boot unless the ring is
+            # armed. Page 0 is real and constantly used, so this is not
+            # hypothetical -- it would veto its eviction forever.
+            ("empty ring holds nothing (page 0)",   a[28], 1),
+            ("the ring holds what it was told",     a[29], 1),
+            ("  ... and clears",                    a[30], 1),
+            ("arena left empty",                    a[31], 0),
+        ]
+
         bad = 0
         for name, got, want in checks:
             ok = got == want

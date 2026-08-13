@@ -17,6 +17,7 @@
 
 #include "cutils.h"
 #include "x86_cpu.h"
+#include "x86_arena.h"
 /* The 8x8 table is still the BIOS INT 1Fh/43h font (x86_hle.c hands it to the
    guest); the renderer draws from the narrow tables. */
 /*
@@ -421,6 +422,16 @@ int x86_video_map(void)
        costs nothing to leave mapped -- no mode but 13h reads it. */
     if (vga_aperture)
         ok &= x86_map_fixed(0xA0000u, vga_aperture, X86_VGA_APERTURE_BYTES);
+
+    /* PIN the guest pages these occupy. They are display storage the blitter
+       reads every frame; evicting one would be visible in the next frame, and
+       the pager must be able to reject them in a single test rather than by
+       knowing what they are. Pinning is by GUEST page number, so it survives
+       the page being re-pointed at different host memory. */
+    x86_pin_pages(0xB8000u >> FOLD_SHIFT, X86_VRAM_BYTES >> FOLD_SHIFT);
+    if (vga_aperture)
+        x86_pin_pages(0xA0000u >> FOLD_SHIFT,
+                      X86_VGA_APERTURE_BYTES >> FOLD_SHIFT);
     return ok;
 }
 

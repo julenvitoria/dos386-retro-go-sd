@@ -20,6 +20,7 @@
 
 #include "cutils.h"
 #include "x86_cpu.h"
+#include "x86_arena.h"
 
 #define PAGE_SIZE 4096u
 
@@ -153,6 +154,14 @@ void *x86_guest_ptr(uint32_t lin, uint32_t bytes)
      * conservative rule the unqualified MEM_GET_PTR follows, and for the same
      * reason -- pessimistic is a cost, wrong is a corrupted guest. The host
      * side is a few thousand calls per second, not millions. */
+    /* This pointer is about to escape into host code that may hold it across
+       another call that can fault -- x86_guest_copy_in() walks granules and
+       each step can pull a page in. Note the page so the pager's victim picker
+       cannot choose it. See the live-pointer hazard in x86_arena.h: the
+       previous project measured five such evictions producing 26,329 wrong
+       bytes, and `cow_lost == 0` was green throughout. */
+    x86_livemap_note(idx);
+
     uint32_t host = lin + k;
     if (x86_nor_attached && (host & 0x80000000u)) {
         uint32_t axi = x86_nor_cow(host);

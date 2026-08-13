@@ -140,6 +140,25 @@ than pasting seventeen symbols that go stale the moment a counter is added.
 | `x86_nor_cow_failures` / `x86_nor_unmapped` | the loud failures: the COW pool empty (structurally impossible — it is exactly as large as the snapshot) and traps that were a genuine unmapped access. Both should be 0 |
 | `x86_nor_slow_cycles` | DWT cycles inside the slow path. Ranking only under gwemu |
 
+#### The VRAM arena, A20, and the pin state
+
+```bash
+python3 scripts/probe.py --retrogo --wait-magic \
+    --timeline timelines/start-preselected-game.tl --samples 2 \
+    --watch x86_arena_bytes,x86_arena_used,x86_arena_free,x86_arena_largest,\
+x86_arena_refusals,x86_arena_deficit,x86_pinned_pages,x86_a20_state
+```
+
+| Symbol | Meaning |
+|---|---|
+| `x86_arena_bytes` / `_used` / `_free` / `_largest` | the display's AXI, as one pool instead of three permanent blocks. **`_largest` is the number that decides whether a mode fits**, not `_free`: a claim's block must be contiguous, so a fragmented arena can have room for an EGA plane and no run to put it in |
+| `x86_arena_deficit` | bytes the LAST refused claim could not place. This is what a refusal message quotes -- "EGA needs 118,784 bytes more than exist" is actionable and "EGA failed" is not |
+| `x86_arena_refusals` / `_claims_ok` | claims refused outright and claims satisfied. A claim is **all or nothing**: the previous port measured a partial EGA card as producing worse output than no EGA (8 KB/plane truncates cleanly; 16 KB and 32 KB alias the floating pages onto each other and fill the screen with noise that reads as a rendering defect). A rising `_refusals` with a black screen is the system working |
+| `x86_pinned_pages` | guest pages the pager may never evict. 24 with CGA VRAM and the 13h aperture mapped (8 + 16); a 0 here while a mode is up means the display's storage is evictable, which is a defect the picture would show a frame later |
+| `x86_livemap_hits` | evictions vetoed because a host pointer into the page might still be live. `cow_lost == 0` does NOT cover this -- the previous project measured 5 such evictions producing 26,329 wrong bytes with that invariant green throughout |
+| `x86_a20_state` / `x86_a20_changes` | the A20 gate, and how many times a guest has actually MOVED it (a probe that writes an already-open gate is not a transition). While it is masked the HMA aliases the bottom of memory; while it is open there is memory above 1 MB at all |
+| `core_dtcm_next` / `core_dtcm_headroom_max` | where the firmware's DTCM bump pool got to after the core's allocations, and an UPPER BOUND on what is left. `GW_MEM_OP_FREE_SIZE` is "RAM only today", so the ABI cannot be asked; this is the only witness. Measured 96,068 B free above a bump at `0x200088BC` |
+
 ### `probe_report.py` — what did this title ask for, and how did we answer
 
 ```bash
@@ -586,7 +605,8 @@ standby. Called automatically by `make retrogo_media`.
 | `x86_zones.c/.h` | frame-loop PHASE accounting (`X86_ZONES=1` only): a push/pop zone stack over the emulator loop, exclusive self-time per zone, and the root zone as an honest unaccounted residual. The instrumentation points are in `src/main.c` |
 | `x86_disk.c` | the block device under our FatFs, plus the .dsk sector cache: 4 x 16 KB LRU windows from the bonus pool, which are the read-ahead AND the cache |
 | `x86_probe.c/.h` | the probe ACCUMULATOR (`X86_PROBE=1` only): every service and port the guest touched, keyed and never evicted, with the flags that say how each was answered. Hooked at exactly two funnels — `x86_hle_service()` and `x86_port_read`/`x86_port_write` — so no handler needs an annotation macro. Read it with `scripts/probe_report.py` |
-| `x86_mem.c` | guest page pool, fold mapping, guest↔host copies |
+| `x86_mem.c` | guest page pool, fold mapping, guest↔host copies, the A20 gate and the HMA-scoped real-mode wrap |
+| `x86_arena.c/.h` | the VRAM arena -- AXI claimed at top priority and never evicted -- plus the pin state the pager's victim picker consults. Claims are `count` blocks of `block_bytes`, each block contiguous, **all or nothing**; an EGA claim is four independent 64 KB planes, which is why a claim is blocks and not bytes. Also the live-pointer ring: `x86_guest_ptr()` hands out raw host pointers and no caller releases them, so a refcount cannot work, and the ring is cleared at guest re-entry -- the one moment nothing can still hold one |
 | `x86_io.c` | port dispatch, PIT ch2 + speaker, CGA registers |
 | `x86_audio_wave.h` | PC-speaker square-wave generator: PIT divisor -> phase increment -> samples. `<stdint.h>` only, deliberately — that is what lets `tests/host_audio.c` build it natively. Vendored from the author's earlier DOS core |
 | `x86_video.c`, `cga_blit.S` | the mode table and everything it selects: text 0/1 (8x8 cells) and 2/3/7 (4x8, all 80 columns), CGA 4/5 through `cga_blit.S`, CGA 6 decimated 2:1, **VGA 13h (320x200x256 linear) with its 256-entry DAC**, the BDA-driven per-frame mode detection, the graphics-mode glyph rasteriser, and the 32-entry CLUT layout the CGA modes share. The 13h aperture, its DAC and its 256-entry CLUT are all **caller-owned** (LCD bonus pool) -- 66 KB of new `.bss` would break the guest allocation silently. See [`docs/08_vga_mode13h.md`](docs/08_vga_mode13h.md) |
@@ -708,6 +728,21 @@ python3 tests/test_sysinfo.py            # the machine DESCRIPTION services,
                                          # host-side symptom for that at all
 python3 tests/test_timeline.py --offline # the .tl parser and event schedule,
                                          # no target at all
+python3 tests/test_paging.py             # the guest memory ARCHITECTURE, as
+                                         # opposed to one backing tier:
+                                         # A20 through all three doors (the
+                                         # 8042 output port, 0xDD/0xDF, and
+                                         # port 0x92) with the wrap arms driven
+                                         # by GUEST code through a segment
+                                         # override -- the only way an address
+                                         # above 0xFFFF is formed in real mode;
+                                         # and the VRAM arena, whose load-
+                                         # bearing arm is that a claim which
+                                         # cannot be fully placed changes
+                                         # NOTHING and reports its exact
+                                         # deficit. Two arms (0x110000 and
+                                         # 0x200000 not aliased) fail on the
+                                         # pre-fix whole-space wrap
 python3 tests/test_core_retrogo.py       # tier 2
 python3 tests/test_timeline.py           # tier 2: replays a timeline through
                                          # the HARDWARE player (shadow word at
