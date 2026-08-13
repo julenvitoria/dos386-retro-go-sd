@@ -302,6 +302,83 @@ insn/s. `x86_spk_log` shows the real sequence — `43h=B6` (ch2, lo/hi, mode 3),
 `42h=FB`, `42h=11`, `61h=03` — i.e. divisor **0x11FB = 4603 = 259.2 Hz**.
 gwemu cannot judge audio quality; the listening test is the user's.
 
+## Where the frame time goes — one command, one report
+
+`python3 scripts/profile_all.py --workload <name>` builds, boots, settles,
+measures and writes ONE report (markdown + JSON) to `build/artifacts/`. How to
+run it and what each zone means: [`TOOLING.md`](TOOLING.md).
+
+The gap it closes: the project could already say which OPCODE burns cycles,
+which HANDLER is long and what a dozen counters read — and could not say **how
+one frame's wall time divides**. `x86_zones.h` is that instrument: a push/pop
+zone stack over the emulator loop, exclusive self-time per zone, and **the
+frame as the ROOT zone, so the unaccounted residual is measured rather than
+inferred**. `X86_ZONES=1`, off by default, +752 B of core text.
+
+Measured under gwemu, 10 s windows, 595 frames each. **Only the COUNTS mean
+anything here** — no pipeline model, and the SD is free, so `disk` cannot read
+as anything but ~0:
+
+| zone | Alley Cat (playing) | TOPBENCH menu |
+|---|---|---|
+| `swap` (idle headroom) | 86.38% | 80.12% |
+| `guest` | 13.14% | 16.57% |
+| **`residual` (unaccounted)** | **0.06%** | **1.29%** |
+| `hle` | 0.00%, 0.31 calls/frame | 1.40%, **359 calls/frame** |
+| `video` | 0.32% | 0.51% |
+| `input` / `audio` / `fwloop` | 0.06 / 0.03 / 0.01% | 0.06 / 0.03 / 0.02% |
+| `disk` | 0 (nothing read in the window) | 0 (9 reads, all cache hits) |
+
+Four things it measured that were not known before:
+
+1. **86% of the frame is idle**, on both workloads, at 59 fps and ~3.0 M
+   insn/s. There is a lot of headroom on this workload and it is in the panel
+   wait — which is also why `swap` had to be its own zone rather than part of
+   the residual: idle time is not a cost and must not read as one.
+2. **TOPBENCH's menu makes ~359 HLE service calls per frame** — its INT 16h
+   AH=01 poll — and each is a full exit from and re-entry into the interpreter.
+   `hle` self-time is only 1.34% of the frame, so the calls are individually
+   cheap; the cost is the 362 exec-loop trips around them.
+3. **That is exactly what the residual found.** 0.06% on Alley Cat against
+   1.29% on TOPBENCH (1.36% on a repeat run — the shape is stable), and the
+   difference is not noise: it is the
+   `while (!guest_halted)` loop body — the exit-reason test and the keyboard
+   re-raise, between two bracketed zones — running 362 times a frame instead of
+   1.3. Roughly 163 cycles a trip, which reconciles to the measured figure. **A
+   residual that tracks a workload is the accounting working**: it named a
+   phase nobody had bracketed, which is the whole reason the root zone is the
+   residual rather than a subtraction.
+4. **The instrument's own cost, calibrated on the target: ~89-91 cycles per
+   enter/exit pair.** 0.11% of the WORK on Alley Cat (4.5 k transitions) and
+   7.1% on TOPBENCH (431 k transitions). Reported against work, not against a
+   mostly-idle frame, because measuring against idle flatters it. Compare
+   `X86_PROFILE`'s ~67 cycles at *every dispatch* — which is why the driver
+   runs the two in SEPARATE passes with separate clean builds and quotes the
+   shares from one and the ranking from the other.
+
+The opcode pass on a RUNNING Alley Cat says something worth acting on: **18%
+`NOP`, 16% `IN AL,Ib` and 10% `OUT Ib,AL`** — a quarter of guest cycles are the
+game's own busy-wait on the CGA status register, not work it wants done.
+
+Two traps the work walked into, both now closed:
+
+- **Profiling Alley Cat before it starts is profiling a spin loop.** The game
+  has TWO gates: the joystick prompt (answer N = gwemu `press select`) and a
+  skill-level menu wanting a LETTER, which **only the on-screen keyboard can
+  send**. Unanswered, the opcode pass reads 56% `CMP Gv,Ev` + 44% `JZ Jb` — an
+  exact measurement of a game that never started, and one that looks like a
+  result. `timelines/profile-alleycat.tl` drives both gates and was verified
+  with `screenshot.py --text` at each stage, not assumed.
+- `frame_overruns` counts 456 of 596 nominally on-time frames, because
+  `panel_ms_min` learns downward to 11 ms while the real period is ~16.7 ms.
+  Pre-existing, and it makes the overrun count read alarmist; the histogram is
+  the honest view. Not fixed here.
+
+RAM_EMU headroom with `X86_ZONES=1` in: **2,352 B** (`__CORE_BSS_END__`
+0x240576d0). The flag is off by default, so a shipping core is unaffected.
+
+Silicon is where the CYCLES become real. Nothing above claims otherwise.
+
 ## Phase 3 — Wolf3D
 
 - [ ] COW/pool/eviction with dirty tracking, loud exhaustion; pool sizing

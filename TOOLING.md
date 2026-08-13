@@ -298,6 +298,91 @@ from the interpreter is uncounted (one per interp call). Profiling also slows
 the emulator, so anything timing-dependent in the guest is perturbed; that is
 noted, not corrected.
 
+### `profile_all.py` — ONE command, one workload, one full report
+
+```bash
+python3 scripts/profile_all.py --workload alleycat
+python3 scripts/profile_all.py --workload topbench-menu --window 15
+python3 scripts/profile_all.py --workload alleycat --passes zones   # quick
+python3 scripts/profile_all.py --rom .../GAME.dsk --name mygame
+python3 scripts/profile_all.py --compare before.json after.json
+```
+
+Builds the cores, boots a named workload, settles it, opens a window, collects
+**everything**, and writes ONE report to `build/artifacts/profile_<workload>_
+<target>.md` plus the same content as JSON so runs diff across builds. The
+report LEADS WITH THE ANSWER — a "where the time went" paragraph — and puts the
+tables under it.
+
+It does not reimplement any instrument. It drives the ones that exist
+(`x86_zones.h`, `x86_profile.h`, `probe.py`'s counter reads, the frame
+histogram, the link's headroom numbers) and adds the thing that was missing:
+**how one frame's wall time divides**.
+
+**Several passes, not one, and that is deliberate.** `X86_PROFILE` costs ~65
+cycles at every dispatch — it more than doubles guest execution, so a zone
+breakdown taken from that build would say "guest execution is everything",
+which is true of the instrumented core and false of the real one. So each
+instrument gets its own clean build and the report says which pass every number
+came from. Take the wall-clock SHARES from the zone pass and the opcode RANKING
+from the profile pass. `--passes zones` skips the second build when only the
+breakdown is wanted.
+
+Presets pair a `.dsk` with the timeline and settle time that agree with it:
+`alleycat` (graphics + speaker steady state), `alleycat-boot` (DOS startup and
+the unpacker — disk-heavy, not a steady state), `topbench-menu` (CGA text, a
+database read, an INT 16h poll loop), `topbench-score` (`-l`, `--settle 0`
+because it halts on `INSB` a few seconds in).
+
+#### The zones, and what each one contains
+
+`X86_ZONES=1`, off by default like every other instrument. The design, the
+nesting scheme and the arithmetic are in `x86_zones.h`; the short version:
+
+| zone | contains |
+|---|---|
+| `guest` | `x86_cpu_interp_asm()` — emulated instructions |
+| `hle` | INT 10h/16h/1Ah/21h service, **minus** the disk I/O nested under it |
+| `disk` | the SD backend round trip only. FatFs's own cluster-chain walk is CPU work and stays in `hle` |
+| `video` | CGA render + OSK draw + CLUT push |
+| `audio` | PC-speaker render into the DMA half-buffer |
+| `input` | gamepad poll, retro-go's PAUSE menu, the on-screen keyboard |
+| `fwloop` | the firmware's `common_emu_frame_loop()` bookkeeping |
+| `swap` | **idle**, waiting for the panel. A big number here is HEADROOM, not cost |
+| `residual` | **UNACCOUNTED** — see below |
+
+**Nesting is an explicit push/pop stack and every zone accumulates EXCLUSIVE
+SELF-TIME.** While a child is open its parent accumulates nothing, so nothing
+is ever counted twice and a parent's *total* cost is its own row plus its
+children's. The frame is the ROOT zone, which is what makes the residual honest:
+`residual` is the root's own self-time — measured frame-loop time that fell
+through every named zone — not a subtraction of one total from another. It is
+printed even when small, and flagged above 2%. **A large residual is the report
+saying a phase exists that nothing brackets**, which is the finding this
+instrument exists to produce.
+
+Per zone the report gives total cycles, occurrences, occurrences per frame,
+mean, and **the worst single occurrence** — worst-case is what stutter is made
+of and a mean cannot contain one. The frame-time histogram and `frame_overruns`
+come from the counters that already existed.
+
+Measured under gwemu (see STATUS.md for the numbers): the instrument costs
+**~91 cycles per enter/exit pair**, calibrated on the target by
+`x86_zones_calibrate` and printed in the report as both a share of frame time
+and a share of WORK. It is a lower bound and says so. It is per-FRAME and
+per-SERVICE-CALL, never per guest instruction — that is what keeps it two
+orders of magnitude cheaper than `X86_PROFILE`.
+
+#### What is trustworthy, per tier — and the report says so itself
+
+| tier | counts | cycles |
+|---|---|---|
+| gwemu | **exact and reproducible** | **not meaningful.** No M7 pipeline model (`docs/06`) and no SD busy state (`docs/04`), so `disk` reads as nearly free and *cannot* read as anything else |
+| hardware | exact | real, including stalls |
+
+That table is printed **in the report**, not only here, so a gwemu report can
+never be mistaken for a silicon one.
+
 ### `make_font.py` — regenerate `font8x8.h`, `font4x8.h`, `font4x8aa.h`
 
 ```bash
@@ -396,6 +481,8 @@ standby. Called automatically by `make retrogo_media`.
 | `cpu_exec*.S`, `opcode*.S` | the Thumb-2 interpreter and its dispatch tables |
 | `x86_profile.c/.h` | per-opcode DWT cycle profiler storage + calibration (`X86_PROFILE=1` only) |
 | `x86_disk.c` | the block device under our FatFs, plus the .dsk sector cache: 4 x 16 KB LRU windows from the **AHB heap** (D2 SRAM -- DMA-reachable, and the only ABI pool with a real `free()`), which are the read-ahead AND the cache. Geometry is a build-time tunable (`X86_DISK_WINDOW_SECTORS` / `_COUNT`) |
+| `x86_zones.c/.h` | frame-loop PHASE accounting (`X86_ZONES=1` only): a push/pop zone stack over the emulator loop, exclusive self-time per zone, and the root zone as an honest unaccounted residual. The instrumentation points are in `src/main.c` |
+| `x86_disk.c` | the block device under our FatFs, plus the .dsk sector cache: 4 x 16 KB LRU windows from the bonus pool, which are the read-ahead AND the cache |
 | `x86_mem.c` | guest page pool, fold mapping, guest↔host copies |
 | `x86_io.c` | port dispatch, PIT ch2 + speaker, CGA registers |
 | `x86_audio_wave.h` | PC-speaker square-wave generator: PIT divisor -> phase increment -> samples. `<stdint.h>` only, deliberately — that is what lets `tests/host_audio.c` build it natively. Vendored from the author's earlier DOS core |
@@ -559,6 +646,17 @@ then GAME (Return) -- with a screenshot between each press. A keyboard chain is
 only proven when the guest's PICTURE changes: counters can all look right while
 the key goes to a program that ignores it. Capture with
 `screenshot.py --timeline ... --wait N --text` at two different `N`.
+`timelines/profile-alleycat.tl` gets Alley Cat actually RUNNING and then stops
+touching it, which is what a profile window needs and what no other timeline
+did. Alley Cat has **two** gates: the joystick prompt (answer N, which is
+gwemu's `press select` -- `press time` sends Y and lands on "Game Control
+Adapter is not present") and then a skill-level menu wanting K/H/T/A, a LETTER
+**no button can send**. The on-screen keyboard is the only door: GAME opens it
+on layer 0 cell 0, which is `a`, and two more GAME presses close it again.
+Verified with `screenshot.py --text` at each stage. This matters because
+profiling the unanswered prompt returns 56% `CMP Gv,Ev` + 44% `JZ Jb` -- an
+exact measurement of a game that never started, and one that looks like a
+result.
 `timelines/run-to-completion.tl` is the same launch with a 58 s window, for a
 guest doing real work whose result only appears at the end -- the one case where
 the wait IS the result rather than a symptom to chase with `probe.py`.
@@ -601,6 +699,7 @@ Importable support only — no CLIs.
 | `rglog.py` | Read retro-go's in-memory log ring |
 | `faults.py` | Decode latched CPU faults |
 | `asm_metrics.py` | Instruction counts, DWT capture |
+| `zones.py` | Host side of the frame-loop zone accounting: locate the block, ask the TARGET to reset it at its own frame boundary (a host-side memset would race the stack marks), read it back, and derive the shares, the residual and the instrument's own overhead. Layout mirrors `x86_zones.h` |
 | `opcode_profile.py` | Host side of the per-opcode DWT profile: locate/reset/read the DTCM table, resolve slots to handler symbols off the live dispatch tables, render table/JSON/CSV. Layout and the on-target half live in `x86_profile.h` / `cpu_exec.S` |
 | `probe.py` | Sample PC, globals, pointer derefs and array dumps on a running target; `read_faults` decodes CFSR/HFSR/BFAR |
 | `watchpoint.py` | Z2/Z3 data watchpoints over the GDB remote protocol, and the unsolicited stop reply that follows a resume |

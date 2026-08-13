@@ -37,6 +37,7 @@
 #include "cutils.h"   /* BOOL/TRUE, needed by iomem.h via x86_cpu.h */
 #include "x86_cpu.h"
 #include "x86_profile.h"
+#include "x86_zones.h"   /* ZONES: frame-loop phase accounting, X86_ZONES=1 */
 #include "x86_osk.h"
 
 #define APP_ID       100
@@ -276,6 +277,13 @@ volatile uint32_t frame_ms_worst2  = 0;  /* second worst -- one hitch is noise *
 volatile uint32_t frame_overruns   = 0;  /* iterations over 1.5x panel period  */
 volatile uint32_t frame_hist_from  = 0;  /* frames_rendered when last reset    */
 volatile uint32_t frame_stats_reset = 0; /* host writes 1 to zero the tail     */
+
+/* ======================= ZONES: begin (host witness) =======================
+   Is the phase/zone block backed? Read by scripts/profile_all.py, which
+   otherwise cannot tell "this core has no zone instrumentation compiled in"
+   from "the DTCM allocation failed". Always present so the host does not have
+   to know which build it is talking to. ZONES: end ========================= */
+volatile uint32_t zones_block_ok = 0;
 
 static void frame_hist_add(uint32_t ms, uint32_t panel)
 {
@@ -523,6 +531,15 @@ static bool dtcm_state_init(void)
                                                X86_PROFILE_BYTES))) {
         return false;
     }
+#endif
+#if X86_ZONES
+    /* ---- ZONES ---- Same pattern, same reason: DTCM is a firmware bump pool
+       in a core, so the block is allocated rather than placed. A failure here
+       is NOT fatal -- x86_zones_ptr stays NULL and every macro turns into a
+       null test -- but it is reported, because an instrument that silently
+       measures nothing is worse than one that is absent. */
+    zones_block_ok = x86_zones_init((void *)abi->mem_ctl(
+        GW_MEM_OP_ALLOC, GW_MEM_DTC, 1, sizeof(x86_zones_t))) ? 1 : 0;
 #endif
     return true;
 }
@@ -793,8 +810,13 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
 static int sd_sector_read(void *ctx, void *dst, uint32_t offset, uint32_t len)
 {
     const gw_firmware_abi_t *abi = gw_firmware_abi();
+    /* ZONES: the DISK zone is the SD ROUND TRIP and nothing else. It nests
+       inside whatever asked for it (normally HLE), so FatFs's own cluster-chain
+       walk stays charged to HLE -- which is correct, that walk is CPU work. */
+    X86_ZONE_ENTER(X86_ZONE_DISK);
     size_t got = abi->rg_storage_copy_file_range_to_ram(
         (char *)ctx, (uint8_t *)dst, offset, len, NULL);
+    X86_ZONE_EXIT();
     return (got == len) ? 0 : -1;
 }
 
@@ -813,14 +835,16 @@ static int sd_sector_write(void *ctx, const void *src, uint32_t offset,
                            uint32_t len)
 {
     const gw_firmware_abi_t *abi = gw_firmware_abi();
+    X86_ZONE_ENTER(X86_ZONE_DISK);          /* ZONES: see sd_sector_read */
     FILE *f = abi->fopen((char *)ctx, "r+b");
-    if (!f)
-        return -1;
     int rc = -1;
-    if (abi->fseek(f, (long)offset, SEEK_SET) == 0 &&
-        abi->fwrite(src, 1, len, f) == len)
-        rc = 0;
-    abi->fclose(f);
+    if (f) {
+        if (abi->fseek(f, (long)offset, SEEK_SET) == 0 &&
+            abi->fwrite(src, 1, len, f) == len)
+            rc = 0;
+        abi->fclose(f);
+    }
+    X86_ZONE_EXIT();
     return rc;
 }
 
@@ -1536,6 +1560,11 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
     abi->common_emu_frame_loop_reset();
 
     while (1) {
+        /* ZONES: open the frame. The root zone IS the unaccounted residual --
+           see x86_zones.h. Everything from here to X86_ZONE_FRAME_END() that
+           is not inside a named zone lands there, on purpose. */
+        X86_ZONE_FRAME_BEGIN();
+
         /* Feed the observer the period we are ACTUALLY running at, smoothed.
            NOT panel_ms_min: that is the shortest iteration ever completed, and
            handing the firmware a period shorter than the real one makes its
@@ -1544,7 +1573,9 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
            fiction (measured: 768 "skipped" of 1032 drawn). */
         common_emu_state.frame_time_10us = (int16_t)(frame_10us_avg / 8u);
         /* Bookkeeping only -- see above. The verdict is deliberately unused. */
+        X86_ZONE_ENTER(X86_ZONE_FWLOOP);            /* ZONES */
         (void)abi->common_emu_frame_loop();
+        X86_ZONE_EXIT();                            /* ZONES */
 
         /* The host can still ask for the CPU benchmark: it is how tiers 2 and
          * 3 stay comparable with tier 1, and it must not disappear just
@@ -1564,7 +1595,9 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
 
         uint32_t frame_start_ms = abi->HAL_GetTick();
 
+        X86_ZONE_ENTER(X86_ZONE_INPUT);             /* ZONES */
         poll_input(abi);
+        X86_ZONE_EXIT();                            /* ZONES */
 
         /*
          * CLOCKS 2 AND 3, both off the same reading of the host millisecond
@@ -1719,7 +1752,9 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                 cpu_state_ptr->pit_counter = 1;
                 input_irqs++;
             }
+            X86_ZONE_ENTER(X86_ZONE_GUEST);         /* ZONES */
             x86_cpu_interp_asm();
+            X86_ZONE_EXIT();                        /* ZONES */
             uint32_t reason = cpu_state_ptr->exit_reason;
             last_slice_halted = (reason == X86_EXIT_HALT);
             guest_exit_reason = reason;
@@ -1732,7 +1767,9 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
             }
             if (reason == X86_EXIT_HLE_INT) {
                 cpu_state_ptr->exit_reason = 0;
+                X86_ZONE_ENTER(X86_ZONE_HLE);       /* ZONES */
                 x86_hle_service();
+                X86_ZONE_EXIT();                    /* ZONES */
                 continue;
             }
             /*
@@ -1773,6 +1810,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
 
         /* Video. The beam fraction drives the CGA status register, so a guest
            polling for vertical retrace sees it arrive about once per frame. */
+        X86_ZONE_ENTER(X86_ZONE_VIDEO);             /* ZONES */
         x86_video_set_beam(0xE000);
         uint8_t *fb = (uint8_t *)abi->lcd_ctl(GW_LCD_BUFFER,
                                               GW_LCD_BUF_ACTIVE, 0, 0);
@@ -1827,6 +1865,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                              CORE_CLUT_ENTRIES, 0);
             cga_clut_dirty = 0;
         }
+        X86_ZONE_EXIT();                            /* ZONES: end VIDEO */
 
         /* Audio: one buffer of speaker output per frame.
          *
@@ -1835,12 +1874,14 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
          * ~12.5% of full scale at maximum, one binary step below the 25% the
          * tama core uses for its own square wave -- a PC-speaker square is
          * full-swing with no envelope, so it carries more energy than that. */
+        X86_ZONE_ENTER(X86_ZONE_AUDIO);             /* ZONES */
         int16_t *abuf = (int16_t *)abi->audio_ctl(GW_AUDIO_GET_ACTIVE, 0);
         if (abuf && audio_frames) {
             int16_t amp = (int16_t)(((int32_t)abi->common_emu_sound_get_volume()
                                      * INT16_MAX) >> 11);
             x86_speaker_render(abuf, audio_frames, SAMPLE_RATE, amp);
         }
+        X86_ZONE_EXIT();                            /* ZONES: end AUDIO */
 
         /* Pace the loop. GW_LCD_WAIT_VBLANK is NOT usable here: gwemu does
            not model vblank, so it never returns and the core never draws --
@@ -1850,6 +1891,10 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         /* CLOCK 1: the DISPLAY rate, and it is the panel's, not a constant.
            Whether we had to wait here is also the only honest measure of
            headroom, so it is what sizes the unthrottled slice. */
+        /* ZONES: SWAP is the loop's only genuine IDLE. A big number here is
+           HEADROOM, not a cost -- which is why it must be its own zone and not
+           part of the residual. */
+        X86_ZONE_ENTER(X86_ZONE_SWAP);
         abi->lcd_ctl(GW_LCD_SWAP, 0, 0, 0);
         {
             /* This wait is the loop's ONLY idle, so it is where the CPU
@@ -1865,6 +1910,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                 abi->cpumon_sleep();
             }
         }
+        X86_ZONE_EXIT();                            /* ZONES: end SWAP */
         frames_rendered++;
         guest_insns_total += slice;
         abi->wdog_refresh();
@@ -1916,5 +1962,9 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
             rate_window_insns = guest_insns_total;
             rate_window_frames = frames_rendered;
         }
+
+        /* ZONES: close the frame. Charges the last stretch to the root, which
+           is the residual, and closes the frame occurrence. */
+        X86_ZONE_FRAME_END();
     }
 }
