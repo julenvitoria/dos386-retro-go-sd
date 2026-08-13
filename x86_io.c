@@ -381,8 +381,51 @@ static uint32_t port_read_inner(uint32_t port)
         /* Status: bit 0 = output buffer full, bit 2 = self-test passed. Polled
            by code that reads the port without using the interrupt. */
         return (uint32_t)((x86_kbd_pending() ? 1u : 0u) | 4u);
-    case 0x61:
-        return x86_io.port61;
+    case 0x61: {
+        /*
+         * The two bits of 0x61 that a real machine DRIVES rather than stores.
+         * Returning the stored byte made both of them constants, and each
+         * constant is its own hang:
+         *
+         *   bit 5, PIT channel 2 OUT. This is how a program CONFIRMS there is
+         *   a speaker: program ch2 with a short count, ungate it, and watch
+         *   bit 5 toggle. A bit that never moves means either "no timer" or an
+         *   unbounded wait, and neither is what this machine is -- the PIT ch2
+         *   divisor is modelled, it drives the audio generator, and its output
+         *   is the one thing we were not exposing.
+         *
+         *   bit 4, the DRAM refresh toggle. Used as a cheap microsecond clock
+         *   by a great deal of DOS code ("read 0x61, wait for bit 4 to flip").
+         *   Stuck, that loop never leaves.
+         *
+         * Both are derived from the SAME slice counter the 0x3DA retrace bit
+         * comes from, for the same reason: the frame loop only advances while
+         * the guest is stopped, so anything it pokes reads as a constant from
+         * inside the guest. Bit 5 is gated on the speaker actually being
+         * enabled and programmed -- an ungated channel 2 holds its output
+         * high, which is what a real 8253 does in mode 3.
+         */
+        uint32_t v = x86_io.port61 & (uint32_t)~0x30u;
+        uint32_t reload = cpu_state_ptr->pit_reload;
+        uint32_t elapsed = reload ? (reload - cpu_state_ptr->pit_counter)
+                                  : ++x86_io.cga_status_reads;
+        if (elapsed & 0x10u)
+            v |= 0x10u;                    /* refresh toggle */
+        if ((x86_io.port61 & 1u) && x86_io.pit2_reload) {
+            /* Half the programmed period high, half low -- mode 3, which is
+               what every speaker routine programs. The divisor is in PIT ticks
+               and `elapsed` is in guest instructions, so this is a SHAPE, not a
+               frequency; the audible tone comes from x86_speaker_divisor() and
+               is unaffected. What matters to a prober is that it moves, and
+               that it moves at a rate that follows the divisor it wrote. */
+            uint32_t half = x86_io.pit2_reload >> 1;
+            if (half && ((elapsed / half) & 1u))
+                v |= 0x20u;
+        } else {
+            v |= 0x20u;                    /* gate low: OUT idles high */
+        }
+        return v;
+    }
 
     /*
      * CGA status (0x3DA). A program polls this to sync to the display, and a

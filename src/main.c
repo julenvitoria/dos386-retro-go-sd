@@ -940,11 +940,18 @@ static void guest_reset(void)
         guest_page_table_ptr[i] = FOLD_K((uint32_t)guest_ram + i * 4096, i);
     x86_video_map();
 
+    /* What INT 12h and 0040:0013 will report, taken from the allocation that
+       actually happened rather than from a constant that can drift away from
+       it. */
+    x86_bios_conv_kb = GUEST_RAM_SIZE / 1024u;
     x86_bios_init();
     /* Take over the vectors we serve. The guest reaches us through a planted
-       0F 0B stub, so a program that hooks or chains one still works. */
+       0F 0B stub, so a program that hooks or chains one still works.
+       0x11/0x12/0x15 are the machine-description calls: they were reaching the
+       bare IRET, which hands the guest back its own AX and reads as a
+       successful answer -- see x86_bios.c and tests/test_sysinfo.py. */
     static const uint8_t hle_vectors[] = {
-        0x08, 0x09, 0x10, 0x16, 0x1A, 0x20, 0x21,
+        0x08, 0x09, 0x10, 0x11, 0x12, 0x15, 0x16, 0x1A, 0x20, 0x21,
     };
     x86_hle_install(hle_vectors, sizeof(hle_vectors));
 

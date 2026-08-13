@@ -21,6 +21,47 @@
 #define BDA_MODE     (BDA + 0x49)
 #define BDA_COLS     (BDA + 0x4A)
 #define BDA_TICKS    (BDA + 0x6C)
+#define BDA_EQUIP    (BDA + 0x10)   /* equipment word (INT 11h)      */
+#define BDA_MEMSIZE  (BDA + 0x13)   /* conventional memory in KB     */
+#define BDA_CRTC     (BDA + 0x63)   /* CRTC base port, 3D4h or 3B4h  */
+#define BDA_KB_LO    (BDA + 0x80)   /* ring bounds, offsets in seg 40 */
+#define BDA_KB_HI    (BDA + 0x82)
+
+/*
+ * What machine we are, in one place.
+ *
+ * Every route a program can take to this fact -- INT 11h, INT 12h, INT 15h,
+ * a direct peek at the BDA -- reads the SAME bytes, so no two of them can
+ * disagree. The alternative was measured on the shipping core: the tier-1
+ * harness wrote 0040:0013 itself and the real core never wrote it at all, so
+ * the number a guest peeked was 640 under test and 0 in the product.
+ *
+ * The equipment word describes this machine honestly and not a generic PC:
+ *
+ *   bit 0      one .dsk is mounted, so an IPL diskette IS installed
+ *   bit 1      no coprocessor -- D8-DF still exit the interpreter
+ *   bits 4-5   10b, initial video mode 80x25 COLOUR. This is where "CGA-class
+ *              colour adapter" is actually reported; 11b would claim mono,
+ *              and we deliberately do not decode the 3B4h mono alias
+ *   bits 6-7   00b, one floppy drive
+ *   bit 12     no game adapter -- port 0x201 floats high and there is no
+ *              joystick behind it, and a program told otherwise waits on an
+ *              axis timer that never fires
+ *   rest       no serial, no parallel, no DMA claims
+ */
+#define EQUIP_WORD   0x0021u
+
+/* Conventional memory in KB. Set by the core from the SIZE IT ACTUALLY
+   ALLOCATED, so INT 12h cannot outlive a change to GUEST_RAM_SIZE. 640 is the
+   default because that is what a DOS game expects and what the bare-metal
+   harness gives it. */
+uint32_t x86_bios_conv_kb = 640;
+
+/* Extended memory (above 1 MB) in KB. There is none: the fold table maps 640 KB
+   of guest RAM plus VRAM plus an open-bus filler, and nothing above the first
+   megabyte is backed. INT 15h AH=88h reports it as zero SUCCESSFULLY, which is
+   a different statement from refusing the call. */
+#define EXT_MEM_KB   0u
 
 static uint8_t bda_r8(uint32_t lin)
 {
@@ -138,6 +179,33 @@ void x86_bios_init(void)
     bda_w16(BDA_COLS, 80);
     kbd_flags = 0;
     bda_w8(BDA + 0x17, 0);
+    bda_w8(BDA + 0x18, 0);
+
+    /*
+     * The machine description. None of these were written before, and a zero
+     * here is not "unknown" to a DOS program -- it is an ANSWER, and a wrong
+     * one: 0 KB of conventional memory, no floppy, no display adapter, and a
+     * keyboard ring that wraps at offset 0 (i.e. over the interrupt vector
+     * table). Every field below is read back by tests/test_sysinfo.py through
+     * both routes a program has to it.
+     */
+    bda_w16(BDA_EQUIP, EQUIP_WORD);
+    bda_w16(BDA_MEMSIZE, (uint16_t)x86_bios_conv_kb);
+    /* Where the display adapter lives. 3D4h is the colour pair, which is the
+       one we decode -- vga_mono_decoded() deliberately keeps 3B4h silent, and
+       a program that finds the base port here must not be sent to the alias
+       that answers 0xFF (that overshoot cost Wolf3D 32,000 polls of 0x3BA). */
+    bda_w16(BDA_CRTC, 0x3D4);
+    /* The keyboard ring's own bounds. INT 16h and INT 09h wrap on the
+       compile-time 0x1E/0x3E, but DOS and a program that manipulates the ring
+       directly compute the wrap from THESE words -- reading 0 for both makes
+       every offset in the ring look out of range. */
+    bda_w16(BDA_KB_LO, BDA_KB_BUF - BDA);
+    bda_w16(BDA_KB_HI, BDA_KB_END - BDA);
+    /* Video page geometry, for the same class of reader. */
+    bda_w16(BDA + 0x4C, 0x1000);        /* bytes per page */
+    bda_w16(BDA + 0x4E, 0);             /* current page start */
+    bda_w8(BDA + 0x62, 0);              /* active page */
     /* Keep the renderer and the BDA agreeing. They did not: the BDA said mode
        3 (text, what a PC boots into) while the renderer stayed on mode 4, so a
        guest that never calls INT 10h AH=00 had its text cells drawn as 2bpp
@@ -410,7 +478,17 @@ int x86_bios_video(uint8_t func)
      * answer, kept whatever ES:DI it had, read through it and took a memory
      * fault on an unmapped page. Exactly the shape AH=11h above was fixed for.
      */
-    case 0x12:
+    case 0x12: {
+        unsigned bl = cpu_state_ptr->regs[3] & 0xFF;
+        if (bl == 0x32) {
+            /* Video addressing enable/disable. There is nothing to disable --
+               our VRAM is plain mapped RAM -- but the call is a plain "did you
+               hear me" and AL=12h is the acknowledgement. Silence here is the
+               TOPBENCH AH=43h shape: a call in the MIDDLE of a sequence that
+               goes unanswered is indistinguishable from broken hardware. */
+            x86_set_al(0x12);
+            return 1;
+        }
         /* AH=12h/BL=10h asks for EGA configuration; a machine without EGA
            returns BL UNCHANGED, which is precisely "do nothing".
          *
@@ -424,9 +502,30 @@ int x86_bios_video(uint8_t func)
          * this needs is a subsystem, not a BIOS return value -- see STATUS.md.
          */
         return 1;
+    }
     case 0x1A:
-        /* AH=1Ah is VGA's display-combination call. It reports support by
-           returning AL=1Ah, so AL=0 is the documented "not supported". */
+        /*
+         * AH=1Ah is VGA's display-combination call. It reports support by
+         * returning AL=1Ah, so AL=0 is the documented "not supported" -- which
+         * is what a pre-VGA BIOS is, and what this one deliberately stays.
+         *
+         * This looks like the obvious thing to "fix", because we DO have a
+         * working 256-entry DAC on 0x3C6-0x3C9 and a pixel-exact mode 13h. It
+         * is not. AH=1Ah does not have a return code for "VGA, except the
+         * planar modes": a program told AL=1Ah/BL=08h has been told VGA, and
+         * VGA is a strict SUPERSET of EGA, so it is free to ask for 0Dh, 0Eh,
+         * 10h or 12h -- every one of which x86_video refuses. That converts a
+         * clean stop into a program running forever against a black screen,
+         * which is the exact failure the AH=12h comment above records having
+         * been measured and reverted.
+         *
+         * The honest description of this machine is the CGA-class colour
+         * adapter the equipment word at 0040:0010 reports (bits 4-5 = 10b) and
+         * the CRTC base port at 0040:0063 confirms, with mode 13h available to
+         * a program that simply ASKS for it -- which is how Wolf3D reaches it,
+         * measured: it never calls AH=1Ah at all. Nothing is lost by staying
+         * silent here that answering could safely give back.
+         */
         x86_set_al(0);
         return 1;
     default:
@@ -481,10 +580,102 @@ int x86_bios_keyboard(uint8_t func)
            amount of correctness elsewhere. */
         x86_set_al(bda_r8(BDA + 0x17));
         return 1;
+    case 0x12:                      /* extended shift flags */
+        /* AL is the same byte AH=02 returns; AH is the extended set at
+           0040:0018, which we keep at zero because we model no right-Alt or
+           right-Ctrl distinction. Answering the call matters more than the
+           extended half: a program that gets no answer keeps its own AX. */
+        x86_set_al(bda_r8(BDA + 0x17));
+        x86_set_ah(bda_r8(BDA + 0x18));
+        return 1;
+    case 0x03:                      /* set typematic rate */
+        /* Nothing to model -- key repeat here comes from the host's own input
+           layer, not from an 8042 that we could reprogram. Accepted rather
+           than left unanswered: a startup sequence that sets the repeat rate
+           and is told "unknown function" is the TOPBENCH AH=43h shape. */
+        return 1;
+    case 0x05:                      /* push a keystroke into the ring */
+        /* CH = scancode, CL = ASCII. AL = 0 on success, 1 if the ring is full;
+           this is how a program injects its own keys, and an on-screen
+           keyboard in the guest's own software would use it. */
+        {
+            uint32_t before = x86_kb_pushes;
+            x86_kb_push((uint8_t)((cpu_state_ptr->regs[1] >> 8) & 0xFF),
+                        (uint8_t)(cpu_state_ptr->regs[1] & 0xFF));
+            x86_set_al(x86_kb_pushes != before ? 0 : 1);
+        }
+        return 1;
     default:
         x86_hle_unhandled_vector = 0x16;
         x86_hle_unhandled_func = func;
         return 0;
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * INT 11h / INT 12h / INT 15h -- what machine is this?
+ *
+ * All three used to reach the bare IRET stub, and that is a far worse answer
+ * than "absent". An IRET does not clear a register: the guest gets its OWN
+ * value back and believes it. Measured on the pre-fix core with guest code
+ * that poisons AX first (tests/test_sysinfo.py): INT 11h answered 0xFFFF --
+ * every device on the machine present at once, including a coprocessor we do
+ * not have -- INT 12h answered 65,535 KB of conventional memory, and INT 15h
+ * AH=88h answered 34,816 KB of extended memory WITH CF SET. A program sizing
+ * its heap off those numbers is not degraded, it is lied to, and nothing on
+ * the host moves to say so.
+ */
+int x86_bios_equipment(void)
+{
+    /* From the BDA, not from the constant: a guest may write 0040:0010 itself
+       (a driver announcing a serial port does exactly that) and INT 11h must
+       then report what the machine now claims, which is what a real BIOS does
+       -- its INT 11h is literally `MOV AX,[0040:0010]`. */
+    x86_set_ax(bda_r16(BDA_EQUIP));
+    return 1;
+}
+
+int x86_bios_memsize(void)
+{
+    x86_set_ax(bda_r16(BDA_MEMSIZE));
+    return 1;
+}
+
+int x86_bios_system(uint8_t func)
+{
+    switch (func) {
+    case 0x88:                      /* extended memory size in KB */
+        /* Zero, reported successfully. CF must be CLEARED explicitly -- the
+           caller's CF arrives on the IRET frame untouched otherwise, and a
+           program that sets CF before the call (many do, precisely so an
+           unimplemented BIOS shows up as a failure) reads our honest zero as
+           an error and falls back to code we would rather it did not run. */
+        x86_set_ax(EXT_MEM_KB);
+        x86_hle_set_cf(0);
+        return 1;
+    case 0xC0:                      /* get system configuration table */
+    case 0x87:                      /* move block to extended memory */
+    case 0x89:                      /* switch to protected mode */
+    case 0x24:                      /* A20 gate control */
+    case 0x86:                      /* wait, microseconds */
+    case 0x83:                      /* event wait */
+        /* A PC/XT-class BIOS does not have these, and it says so the way the
+           interface provides for: CF set, AH=86h. That is an ANSWER. Leaving
+           the vector on the bare IRET instead returned the caller's own AH
+           with the caller's own CF, which a program reads as success -- and
+           for AH=87h "success" means it believes a block it never moved is
+           now in extended memory that does not exist. */
+        x86_set_ah(0x86);
+        x86_hle_set_cf(1);
+        return 1;
+    default:
+        /* Same answer, but counted, so an unknown INT 15h function is visible
+           in x86_hle_log rather than silently absorbed. */
+        x86_hle_unhandled_vector = 0x15;
+        x86_hle_unhandled_func = func;
+        x86_set_ah(0x86);
+        x86_hle_set_cf(1);
+        return 1;
     }
 }
 

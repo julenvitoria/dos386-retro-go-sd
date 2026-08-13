@@ -765,6 +765,147 @@ Cost: ITCM 36,416 → 48,208 B of 65,536 (~360 trap stubs — handlers are emitt
 twice). **RAM_EMU headroom 7,680 → 4,576 B** (`__CORE_BSS_END__` 0x24057078 →
 0x24057c98). That is the number to watch before anything else lands.
 
+## Keen 4's detection screen — the shading was the answer, and `--text` cannot see it
+
+The previous section read Keen 4's startup banner off a `--text` dump and
+called the BIOS surface under it clean. **That dump was the wrong instrument.**
+On that screen the CHARACTERS are a static block copied out of the EXE and the
+DETECTION RESULT is carried entirely by the ATTRIBUTE byte — Keen brightens the
+line for each device it found. A character dump of a machine that detected
+nothing is byte-identical to one that detected everything, so the banner
+rendering was never evidence that anything was detected.
+
+`screenshot.py --attr` is that instrument now: the attribute of every cell, plus
+a census of the distinct attributes. Measured on the pre-fix core:
+
+```
+dominant 0x5d (1115 of 2000 cells); 0x5f x159   <- 0x5d dim, 0x5f bright
+row  7 |....5f x11 ("Video Modes")......|  "CGA" and "EGA/VGA" both 0x5d
+row 14 |....5f x14 ("Detected Sound")...|  "PC Speaker", "AdLib" both 0x5d
+row 15 |....5f x24 ("Memory Available")...|  "Standard xxxxx Kbytes" still xxxxx
+```
+
+**Every 0x5f run is a LABEL. Not one VALUE is bright, and the memory box still
+holds the EXE's literal `xxxxx` placeholders.** The user's report is exact:
+nothing is detected. What it is NOT is four broken probes — it is one program
+that never reached its own reporting code.
+
+### What Keen actually asks, in order
+
+`x86_hle_log` decoded (32 slots, oldest first): `21/30` DOS version, four
+`21/35` + `21/25` vector hooks, `21/4A` resize, `1A/00`, two `21/44` IOCTLs,
+`10/0F`+`10/12` twice, `10/08`, `21/3D` on `EGAGRAPH.CK4`, `21/3E`, **`10/00`
+set mode + `10/02` set cursor — this is the banner being drawn** — then `21/4A`
+twice and `21/3D` on `EMMXXXX0` (MM_Startup and its EMS probe, correctly
+answered CF=1/AX=2), and finally **`10/1A` then `10/12`**. Nothing after that.
+
+So the banner is drawn BEFORE the hardware detection, and the highlight pass
+that would brighten "PC Speaker" or fill in "640 Kbytes" runs AFTER it. Keen
+dies in the video probe, upstream of all four families. `x86_io_log` confirms it
+never gets as far as the input or sound hardware: the last 17 coalesced runs are
+`OUT 3D4,0F / OUT 3D5,66 / IN 3D5 -> 0x66` (our CRTC file answering correctly),
+the mono alias at 3B4/3B5 correctly staying silent at 0xFF, then `OUT 3CE,0205`
+and `OUT 3C4,0F02` — Graphics Controller write mode 2 and Sequencer map mask
+0x0F, i.e. **the EGA planar clear** — and then 0x3DA forever. **Port 0x60, 0x64,
+0x61, 0x201, 0x388 and 0x220 are never touched at all.**
+
+### The machine-description services were not "absent", they were lying
+
+Four calls a program uses to size itself were **not in the served vector set**,
+so each reached the bare IRET stub. An IRET does not clear a register: the guest
+gets its OWN value back and believes it. Measured with guest code that poisons
+AX first (`tests/test_sysinfo.py`, written failing):
+
+| call | pre-fix answer | now |
+|---|---|---|
+| INT 11h equipment | **0xFFFF** — every device at once, incl. a coprocessor | 0x0021 |
+| INT 12h conventional | **65,535 KB** | 640 |
+| INT 15h AH=88h extended | **34,816 KB, CF SET** | 0, CF clear |
+| INT 15h AH=C0h | caller's own AH, caller's own CF | AH=86h, CF set |
+| 0040:0010 equipment | 0 | 0x0021 |
+| 0040:0013 memory size | **0 in the product** | 640 |
+| 0040:0063 CRTC base | 0 | 0x3D4 |
+| 0040:0080/0082 ring bounds | 0 / 0 | 0x1E / 0x3E |
+
+0040:0013 is the one worth staring at: **`tests/main.c` wrote it and `src/main.c`
+never did**, so it read 640 under test and 0 in the shipping core. It is written
+by `x86_bios_init()` now, from `x86_bios_conv_kb`, which `src/main.c` sets from
+the allocation that actually happened — one place, both tiers, and INT 12h reads
+the same word rather than a constant that can drift away from it.
+
+The equipment word describes THIS machine and not a generic PC: one floppy
+(bit 0), **no** coprocessor (D8-DF still exit the interpreter), **no** game
+adapter (0x201 floats high and there is nothing behind it), and bits 4-5 = 10b,
+**initial video mode 80x25 COLOUR**. That field, plus 0040:0063 = 0x3D4, is
+where "CGA-class colour adapter" is honestly reported — it had no channel at all
+before.
+
+### The PC speaker: two bits of 0x61 that were constants
+
+Port 0x61 returned the byte the guest last wrote, so **bit 5 (PIT channel 2 OUT)
+and bit 4 (the DRAM refresh toggle) never moved**. That is not a wrong value, it
+is a hang: both bits exist to be polled until they flip, and bit 5 is precisely
+how a program CONFIRMS a speaker is there. Both are derived from the slice
+counter now, the same source the 0x3DA retrace bit uses and for the same reason
+(the frame loop only advances while the guest is stopped, so anything it pokes
+reads as a constant from inside the guest). Bit 5 follows the programmed ch2
+divisor and idles high when the gate is low, as an 8253 in mode 3 does. The
+audible path is untouched — `x86_speaker_divisor()` is unchanged.
+
+Measured, guest code taking 1024 samples of 0x61 and accumulating OR and AND:
+pre-fix, bits 4 and 5 were **never high**; after, both are seen high and low.
+
+"Detected Sound Hardware: PC Speaker" is, to answer the question directly, **a
+DEFAULT and not a detection** — the ID engine assumes a speaker and probes only
+for AdLib (0x388) and Sound Blaster (0x220). Both float 0xFF here, which is the
+correct "absent", and both stay dim on a working machine too. Keen never reaches
+either probe.
+
+### Where it stops now, and it is a different place
+
+`guest_halted=1, exit_reason=4, exit_info=0xFF` — executing open-bus filler
+after a wild far transfer — is **gone**. With the honest answers in, Keen 4 runs:
+`guest_halted=0`, `exit_reason=3` (timer), `guest_insns_total` climbing
+14.6M → 29.5M → 53.2M across a 12 s window where it previously froze at
+**1,730,515**. `x86_int_vec_log`'s `0x00080000` (INT 08h dispatched into CS=0,
+which named the derailment) is replaced by `0x00080060` — the timer landing in
+the stub segment, as it should. The low 64 KB is no longer wiped.
+
+What it does instead is spin: 15,228 port accesses and rising, essentially all
+0x3DA, with occasional `OUT 3CE` — Keen inside its EGA planar clear, waiting on
+a retrace it gets, clearing a screen segment it does not have. Disk reads frozen
+at 418, no mode ever set beyond the boot mode 3, `x86_vga_dac_writes = 0`.
+
+**A silent wander became a live spin. That is strictly better and it is not
+progress toward the picture.**
+
+### EGA is the wall, and this stops here
+
+The screen is byte-identical before and after — same 8 attributes, same 1115
+dim cells, same 159 bright label cells, same `xxxxx`. Nothing in the four probe
+families was answerable in a way that changes it, because **all four are
+downstream of a video gate Keen 4 cannot pass**: it is EGA-only, its detection
+concludes correctly that there is no EGA, and it has no CGA fallback to take.
+
+Claiming EGA is the one move that gets past the gate, and it is measured as
+worse — the AH=12h comment records it landing straight in mode 0Dh, which
+`x86_video` refuses, leaving a black screen forever. **Claiming VGA through
+AH=1Ah is the same move wearing a different hat**: AH=1Ah has no return code for
+"VGA except the planar modes", and VGA is a strict superset of EGA, so AL=1Ah
+licences 0Dh/0Eh/10h/12h. AH=1Ah therefore stays AL=0, with that reasoning at
+the call site. Mode 13h stays reachable by simply ASKING for it, which is how
+Wolf3D gets there — measured: Wolf3D never calls AH=1Ah at all.
+
+Mode 0Dh needs a store-side hook on every VRAM write, a Sequencer + Graphics
+Controller that DECODE rather than store, and 32 KB of page storage. Three
+subsystems. **Not started, and not started deliberately.**
+
+Cost of all of the above: **400 bytes** of core (`__CORE_BSS_END__` 0x240593d0
+→ 0x24059560), RAM_EMU headroom **27,696 → 27,296 B**. Tier 1 green:
+`test_opcodes` 273/273, `test_sysinfo` (new), `test_dos`, `test_video`,
+`test_text`, `test_keyboard`, `test_osk`, `test_audio`, `test_disk_cache`,
+`test_nor`.
+
 ## Commander Keen 4 — reaches its startup screen, dies on the EGA gate
 
 First run of `KEEN4.dsk`, measured under gwemu (tier 2). It gets **further than

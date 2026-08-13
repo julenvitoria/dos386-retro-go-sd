@@ -215,6 +215,12 @@ int x86_hle_dispatch(uint8_t vector)
     switch (vector) {
     case 0x10:
         return x86_bios_video(AH);
+    case 0x11:
+        return x86_bios_equipment();
+    case 0x12:
+        return x86_bios_memsize();
+    case 0x15:
+        return x86_bios_system(AH);
     case 0x16:
         return x86_bios_keyboard(AH);
     case 0x1A:

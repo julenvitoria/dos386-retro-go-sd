@@ -121,6 +121,16 @@ def main():
     p.add_argument("--text", action="store_true",
                    help="also dump the 80x25 character buffer as CP437, which "
                         "is much easier to judge than condensed glyphs")
+    p.add_argument("--attr", action="store_true",
+                   help="dump the ATTRIBUTE byte of each cell alongside the "
+                        "characters, as two hex nibbles (bg,fg) per column. "
+                        "A --text dump alone is a trap on any screen where "
+                        "the SHADING carries the meaning: Commander Keen's "
+                        "startup screen lists every video mode, input device "
+                        "and sound card it knows about and marks which ones "
+                        "it DETECTED purely by brightening the attribute, so "
+                        "a character dump of a screen detecting nothing is "
+                        "byte-identical to one detecting everything")
     p.add_argument("--text-aa", type=int, choices=(0, 1), default=None,
                    help="select the text renderer before capturing: 0 is the "
                         "1-bit Everex font, 1 the anti-aliased one. Both live "
@@ -216,7 +226,7 @@ def main():
                 rgb[o + 1] = (argb >> 8) & 0xFF
                 rgb[o + 2] = argb & 0xFF
         size = write_png(args.out, w, h, bytes(rgb))
-        if args.text or args.pairs:
+        if args.text or args.pairs or args.attr:
             # In text mode the framebuffer is a rendering of an 80x25 character
             # buffer; reading the characters back is far easier to judge than
             # looking at 8x8 glyphs, and it shows the 40 columns the panel
@@ -236,7 +246,7 @@ def main():
                       f"pixels, not characters, so there is no text buffer to "
                       f"dump (text printed in this mode is rasterised into the "
                       f"pixels by the BIOS)")
-                args.text = args.pairs = False
+                args.text = args.pairs = args.attr = False
             # Decode as CP437, not ASCII. Printing only 0x20-0x7E hid every
             # box-drawing and shading code behind a '.', which made a
             # perfectly good full-screen UI read as four rows of stray
@@ -250,6 +260,26 @@ def main():
                                    for ch in raw)
                     if line.strip("."):
                         print(f"  {r:2d} |{line}|")
+            if args.attr:
+                print("attribute buffer (80x25), one hex digit pair per cell "
+                      "(bg,fg); rows with only the dominant attribute omitted:")
+                counts = {}
+                for i in range(80 * 25):
+                    a = cells[i * 2 + 1]
+                    counts[a] = counts.get(a, 0) + 1
+                dom = max(counts, key=counts.get)
+                print(f"  dominant attribute {dom:#04x} "
+                      f"({counts[dom]} of 2000 cells); "
+                      f"{len(counts)} distinct attributes: "
+                      + " ".join(f"{a:#04x}x{n}" for a, n in
+                                 sorted(counts.items(), key=lambda kv: -kv[1])))
+                for r in range(25):
+                    row = [cells[(r * 80 + c) * 2 + 1] for c in range(80)]
+                    if all(a == dom for a in row):
+                        continue
+                    print(f"  {r:2d} |" + "".join("--" if a == dom
+                                                  else f"{a:02x}" for a in row)
+                          + "|")
             if args.pairs:
                 report_pairs(cells)
         nz = sum(1 for v in indices if v)

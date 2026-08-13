@@ -316,6 +316,12 @@ void x86_set_al(uint8_t v);
 void x86_set_ah(uint8_t v);
 int x86_bios_video(uint8_t func);
 int x86_bios_keyboard(uint8_t func);
+int x86_bios_equipment(void);
+int x86_bios_memsize(void);
+int x86_bios_system(uint8_t func);
+/* Conventional memory in KB, published through INT 12h and 0040:0013. The core
+   sets it from the size it really allocated; see x86_bios.c. */
+extern uint32_t x86_bios_conv_kb;
 int x86_kb_get(uint16_t *key);
 int x86_kb_peek(uint16_t *key);
 int x86_bios_time(uint8_t func);

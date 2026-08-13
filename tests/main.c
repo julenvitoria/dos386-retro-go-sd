@@ -446,6 +446,120 @@ static void modeswitch_test_tty(void)
     msw_snapshot();
 }
 
+/* ---------------------------------------------------------------------------
+ * The machine DESCRIPTION services, driven by guest code.
+ *
+ * INT 11h (equipment), INT 12h (conventional KB) and INT 15h AH=88h (extended
+ * KB) are how a DOS program asks what machine it is on, and every one of them
+ * was reaching the bare IRET stub -- which does not clear a register, so the
+ * guest read back its OWN poison value and believed it. That failure has no
+ * symptom the host can see: the call "returns", the counters all move, and the
+ * program simply configures itself for a machine that does not exist.
+ *
+ * So the arm POISONS AX before every call and sets CF the wrong way round
+ * before the two that carry one. An unserviced vector then reads back the
+ * poison, which is the only way to tell "answered 0xFFFF" from "answered
+ * nothing" -- and 0xFFFF KB of conventional memory is exactly the shape of
+ * answer a program cannot survive.
+ *
+ * CF comes off the IRET FRAME (PUSHF after the INT), not from a live register,
+ * for the same reason the INT 16h arm reads ZF that way.
+ */
+#define SYS_CODE_BASE   0x2700u
+#define SYS_RES_BASE    0x4C00u
+
+volatile uint32_t run_sysinfo_flag = 0;
+volatile uint32_t sys_r[16];
+
+static const uint8_t sys_guest_code[] = {
+    /* INT 11h -- equipment list. AX poisoned; a bare IRET returns the poison. */
+    0xB8, 0xFF, 0xFF,                   /* MOV AX,FFFF                     */
+    0xCD, 0x11,                         /* INT 11h                         */
+    0xA3, 0x00, 0x4C,                   /* MOV [4C00],AX                   */
+
+    /* INT 12h -- conventional memory in KB. */
+    0xB8, 0xFF, 0xFF,                   /* MOV AX,FFFF                     */
+    0xCD, 0x12,                         /* INT 12h                         */
+    0xA3, 0x02, 0x4C,                   /* MOV [4C02],AX                   */
+
+    /* INT 15h AH=88h -- extended memory in KB. CF poisoned SET; a machine
+       with no extended memory answers AX=0 with CF CLEAR. */
+    0xB8, 0x00, 0x88,                   /* MOV AX,8800                     */
+    0xF9,                               /* STC                             */
+    0xCD, 0x15,                         /* INT 15h                         */
+    0xA3, 0x04, 0x4C,                   /* MOV [4C04],AX                   */
+    0x9C,                               /* PUSHF                           */
+    0x58,                               /* POP AX                          */
+    0xA3, 0x06, 0x4C,                   /* MOV [4C06],AX                   */
+
+    /* INT 15h AH=C0h -- get system configuration. We have no configuration
+       table, and the honest answer is the one a PC/XT BIOS gives: CF SET,
+       AH=86h "unsupported function". CF poisoned CLEAR. */
+    0xB8, 0x00, 0xC0,                   /* MOV AX,C000                     */
+    0xF8,                               /* CLC                             */
+    0xCD, 0x15,                         /* INT 15h                         */
+    0xA3, 0x08, 0x4C,                   /* MOV [4C08],AX                   */
+    0x9C,                               /* PUSHF                           */
+    0x58,                               /* POP AX                          */
+    0xA3, 0x0A, 0x4C,                   /* MOV [4C0A],AX                   */
+
+    /*
+     * The PC speaker, probed the way a program CONFIRMS one is there: program
+     * PIT channel 2, ungate it, and watch port 0x61 report back. Bit 5 is the
+     * channel's OUT line and bit 4 the DRAM refresh toggle, and both used to
+     * be whatever the guest last WROTE to 0x61 -- so both were constants, and
+     * a constant is not a wrong value here, it is a hang: the standard idiom
+     * is "read 0x61 until the bit flips".
+     *
+     * BL accumulates OR of every sample and BH accumulates AND, so one word
+     * says whether each bit was ever high AND ever low. A stuck bit fails
+     * whichever way it is stuck; a single sample could not tell.
+     */
+    0xB0, 0xB6, 0xE6, 0x43,             /* MOV AL,B6 / OUT 43,AL (ch2 mode3)*/
+    0xB0, 0xFB, 0xE6, 0x42,             /* MOV AL,FB / OUT 42,AL (lo)       */
+    0xB0, 0x11, 0xE6, 0x42,             /* MOV AL,11 / OUT 42,AL (hi)       */
+    0xE4, 0x61, 0x0C, 0x03, 0xE6, 0x61, /* IN 61 / OR AL,3 / OUT 61 (ungate)*/
+    0xBB, 0x00, 0xFF,                   /* MOV BX,FF00  BL=OR 0, BH=AND FF  */
+    0xB9, 0x00, 0x04,                   /* MOV CX,0400                      */
+    0xE4, 0x61,                         /* .loop: IN AL,61                  */
+    0x08, 0xC3,                         /*        OR BL,AL                  */
+    0x20, 0xC7,                         /*        AND BH,AL                 */
+    0xE2, 0xF8,                         /*        LOOP .loop                */
+    0x89, 0x1E, 0x0C, 0x4C,             /* MOV [4C0C],BX                    */
+    0xE4, 0x61, 0x24, 0xFC, 0xE6, 0x61, /* gate the speaker back off        */
+
+    0xF4,                               /* HLT                             */
+};
+
+static void sysinfo_test_run(void)
+{
+    static const uint8_t hle_vectors[] = {
+        0x08, 0x09, 0x10, 0x11, 0x12, 0x15, 0x16, 0x1A, 0x20, 0x21,
+    };
+    memset(&test_ram[SYS_RES_BASE], 0, 16);
+    x86_video_init(cga_test_vram, cga_test_palette);
+    x86_video_set_aperture(vga_test_aperture, vga_test_pal);
+    x86_bios_init();
+    x86_hle_install(hle_vectors, sizeof(hle_vectors));
+    memcpy(&test_ram[SYS_CODE_BASE], sys_guest_code, sizeof(sys_guest_code));
+
+    kbd_test_reset_cpu(SYS_CODE_BASE);
+    sys_r[8] = kbd_test_run_to_halt();
+
+    for (unsigned i = 0; i < 7; i++)
+        sys_r[i] = (uint16_t)(test_ram[SYS_RES_BASE + i * 2] |
+                              (test_ram[SYS_RES_BASE + i * 2 + 1] << 8));
+
+    /* The same facts as MEMORY, which is the other half of the contract: a
+       program is free to peek the BDA instead of calling, and the two must not
+       be able to disagree. */
+    sys_r[9]  = kbd_bda_r16(0x10);     /* equipment word            */
+    sys_r[10] = kbd_bda_r16(0x13);     /* conventional memory in KB */
+    sys_r[11] = kbd_bda_r16(0x63);     /* CRTC base port            */
+    sys_r[12] = kbd_bda_r16(0x80);     /* keyboard ring start       */
+    sys_r[13] = kbd_bda_r16(0x82);     /* keyboard ring end         */
+}
+
 static void kbd_test_run(void)
 {
     static const uint8_t hle_vectors[] = {
@@ -1136,6 +1250,11 @@ void Reset_Handler(void) {
         if (run_kbd_flag == 1) {
             kbd_test_run();
             run_kbd_flag = 0;
+        }
+
+        if (run_sysinfo_flag == 1) {
+            sysinfo_test_run();
+            run_sysinfo_flag = 0;
         }
 
         if (run_osk_flag == 1) {

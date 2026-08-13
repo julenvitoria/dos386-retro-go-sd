@@ -238,6 +238,14 @@ where the guest got to. `--pairs` counts the DISTINCT (fg,bg) attribute pairs a
 text screen uses — the number that decides whether anti-aliasing fits, since
 each pair costs a contiguous block of four CLUT entries.
 
+`--attr` dumps the ATTRIBUTE byte of every cell (two hex nibbles, bg then fg)
+with a census of the distinct attributes, and it is not optional on any screen
+where the SHADING carries the meaning. Commander Keen's startup screen lists
+every video mode, input device and sound card it knows about and marks the ones
+it DETECTED purely by brightening the attribute — so a `--text` dump of a
+machine that detected nothing is byte-identical to one that detected
+everything, and a whole session was spent believing the first was the second.
+
 `--pan N` pins the text window's leftmost column. It is now a no-op: the text
 cell is 4 px wide, so all 80 columns land on the 320 px panel and there is
 nothing off-screen to pan to. It is kept for a mode wider than the panel.
@@ -588,6 +596,23 @@ python3 tests/test_disk_cache.py --sweep # backend calls + hit rate across
                                          # on write, a failed fetch, and 3,000
                                          # random reads byte-compared against
                                          # the UNCACHED path
+python3 tests/test_sysinfo.py            # the machine DESCRIPTION services,
+                                         # from guest code: INT 11h equipment,
+                                         # INT 12h conventional KB, INT 15h
+                                         # AH=88h extended KB and AH=C0h, the
+                                         # BDA fields that must agree with
+                                         # them (0040:0010/0013/0063/0080/
+                                         # 0082), and the PC-speaker feedback
+                                         # bits on port 0x61. Every call
+                                         # POISONS AX first and sets CF the
+                                         # wrong way round, because these three
+                                         # vectors used to reach the bare IRET
+                                         # stub -- which does not clear a
+                                         # register, so the guest read back its
+                                         # own value and believed it. Measured
+                                         # pre-fix: INT 12h answered 65,535 KB
+                                         # of conventional memory. There is no
+                                         # host-side symptom for that at all
 python3 tests/test_core_retrogo.py       # tier 2
 ```
 
