@@ -22,10 +22,8 @@ Complete except where listed below. The interpreter does 16/32-bit with the
 interrupts, string ops with `REP`, far transfers and segment loads.
 
 - [ ] `XLAT`, BCD (`27`/`2F`/`37`/`3F`), `WAIT`, `INS`/`OUTS`, `BOUND`/`ARPL`
-- [ ] Limit checks off the R6 descriptor, incl. real-mode 64 KB wrap
-- [ ] Lazy PF/AF (currently eager, ~9 of ~16 insns per ALU op)
+- [ ] Limit checks off the R6 descriptor; lazy PF/AF; software TLB above 16 MB
 - [ ] Size-aware `MEM_R*`/`MEM_W*` macros + CI grep banning raw `[R9,`
-- [ ] Software TLB above the 16 MB direct window
 - [ ] Assertions in `test_game.py`/`test_benchmark.py`; realign `docs/01`–`03`, `05`
 
 ## Phase 2 — Alley Cat
