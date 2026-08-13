@@ -60,21 +60,15 @@ relocations, INT 21h on FatFs -- fed by the guest `.dsk` streamed from SD.
 instructions, to the first INT 21h, with no divergence at any stride. The CPU
 core is clean over everything the reference can reach.
 
-Getting there closed nine bug classes; `git log` has one commit each. The last
-four were found by the trace diff rather than by reading code:
-
-| Defect | Symptom |
-|---|---|
-| v-width shift group pass-agnostic | `SHL SI,CL` overflowed into ESI |
-| `INC`/`DEC` r/m8 and Ev set no flags | `DEC DH ; JNE` never terminated |
-| 13 stack handlers ignored `SS.base` | read and wrote near address 0 |
-| shift operand fetch and `XCHG` 32-bit | garbage in a register's high half |
-| `TEST` set no flags; 16-bit `CBW`/`CWD` ran `CWDE`/`CDQ` | branches on stale flags |
-| near `Jcc` rel32 at 16 bits; `LOOP`/`JCXZ` on ECX | left loops at the wrong time |
-| `INC`/`DEC` reg AF from `~a` | AF exactly inverted |
-| **`LEA` returned the linear address** | unpacker's segment bump off by 0x969 |
-| **`MOV moffs` 32-bit offset, no DS base** | indexed past the fold table, HardFault |
-| six handlers had no memory form | `MOV WORD PTR [mem],imm` stopped it dead |
+Getting there closed ten defect classes, one commit each in `git log`: the
+v-width shift group pass-agnostic; `INC`/`DEC` setting no flags (r/m8, Ev) and
+computing AF from `~a` (register); thirteen stack handlers ignoring `SS.base`;
+the shift operand fetch and `XCHG` running 32-bit; `TEST` setting no flags and
+16-bit `CBW`/`CWD` running `CWDE`/`CDQ`; near `Jcc` taking a rel32 and
+`LOOP`/`JCXZ` counting ECX; **`LEA` returning the linear address** instead of
+the offset; **`MOV moffs` reading a 32-bit offset with no DS base**, which
+indexed past the fold table into a HardFault; and six handlers with no memory
+form. The last four were found by the trace diff, not by reading code.
 
 The guest now unpacks fully, reaches its real entry at CS=0x2822, and makes 29
 BIOS/DOS calls, all of them answered. It then takes an `FF /3` far indirect

@@ -23,6 +23,7 @@
        CS lived at segs[1] (offset 60) in x86_cpu.h while five assembly sites
        read offset 48, which is ES. */
 #include "x86_offsets.inc"
+#include "x86_trace.inc"
 
     .equ EIP_OFFSET, CPU_EIP
     .equ EFLAGS_OFFSET, CPU_EFLAGS
@@ -175,6 +176,51 @@ x86_cpu_interp_asm:
     BEQ .handle_pit_or_irq
 
 .resume_fetch:
+#ifdef X86_TRACE_EIP
+    /* Diagnostic sampler, off unless x86_trace.inc turns it on. See
+       scripts/trace_diff.py and the alignment traps in TOOLING.md.
+       R1 becomes the 0-BASED index of the instruction about to run, rebased on
+       X86_TRACE_SKIP -- sampling the post-increment counter instead put every
+       slot one instruction ahead of the reference's.
+
+       Position matters as much as the arithmetic. This sits BELOW the PIT
+       check, so an instruction the interpreter samples and then does not
+       execute (the slice expired) is not counted, and is not counted a second
+       time when the host re-enters. Above the check, each frame boundary added
+       one to our index and the diff against the reference drifted by one per
+       slice. It is also below the prefix re-entry point, so a prefixed
+       instruction counts once. */
+    PUSH {R0, R1, R2}
+    MOVW R0, #:lower16:x86_eip_log_idx
+    MOVT R0, #:upper16:x86_eip_log_idx
+    LDR R1, [R0]
+    ADD.W R2, R1, #1
+    STR R2, [R0]
+    MOVW R2, #(X86_TRACE_SKIP & 0xFFFF)
+    MOVT R2, #(X86_TRACE_SKIP >> 16)
+    SUBS R1, R1, R2
+    BLO.N 1f
+#if X86_TRACE_SHIFT
+    LSLS R2, R1, #(32 - X86_TRACE_SHIFT)
+    BNE.N 1f
+    LSR.W R1, R1, #X86_TRACE_SHIFT
+#endif
+    CMP R1, #64                    @ saturating window, NOT a ring
+    BHS.N 1f
+    MOVW R0, #:lower16:x86_eip_log
+    MOVT R0, #:upper16:x86_eip_log
+#ifdef X86_TRACE_FLAGS
+    /* EFLAGS is CACHED IN R11 and only written back to the struct on exit, so
+       reading CPU_EFLAGS here returns whatever the last exit stored. */
+    STR.W R11, [R0, R1, LSL #2]
+#elif defined(X86_TRACE_REG)
+    LDR.W R2, [R8, #X86_TRACE_REG]   @ a guest register instead of the EIP
+    STR.W R2, [R0, R1, LSL #2]
+#else
+    STR.W R10, [R0, R1, LSL #2]
+#endif
+1:  POP {R0, R1, R2}
+#endif
 .fetch_next_byte_no_reset:
     // Interleaved Fetch & Decode. The table base is issued first so its DTCM
     // load retires under the page-table walk.

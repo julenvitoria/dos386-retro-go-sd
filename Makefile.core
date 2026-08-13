@@ -85,7 +85,7 @@ include $(GNW_CORE_SDK)/Makefile
 # cpu_exec.S #includes the handler and table sources, and the compiler's
 # generated .d files do not see through that -- so editing a handler left
 # the object stale and packaged a core that did not contain the fix.
-$(BUILD_DIR)/cpu_exec.o: x86_offsets.inc cpu_exec_handlers.S \
+$(BUILD_DIR)/cpu_exec.o: x86_offsets.inc x86_trace.inc cpu_exec_handlers.S \
                          cpu_exec_handlers_0f.S opcode_table.S \
                          opcode_0f_table.S
 
