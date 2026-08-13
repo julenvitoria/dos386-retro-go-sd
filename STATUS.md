@@ -7,21 +7,19 @@ Roadmap and phase definitions: [`PLAN.md`](PLAN.md).
 
 | Tier | State |
 |---|---|
-| 1. gwemu bare-metal | 215/215 `test_opcodes.py`, plus `test_video`/`test_dos`/`test_screen` |
+| 1. gwemu bare-metal | 236/236 `test_opcodes.py`, plus `test_video`/`test_dos`/`test_screen` |
 | 2. gwemu + retro-go | `core_dtcm_ok=1`, bonus pool 153,600 B, 1,000,001 insns — matches tier 1 |
 | 3. Hardware | 50.50 cyc/insn, 5.54 MIPS |
 
-Cycles/insn: 57.50 pre-fold → 50.00 fold + absolute dispatch → 50.50 segmentation
-→ 50.50 unchanged through 16-bit, the 66/67 axes, segment loads, far transfers
-and REP: the width macros vanish at NSH=0 and none of it sits on the 32-bit hot
-path. The fold and dispatch were measured together and are not separable.
+Cycles/insn: 57.50 pre-fold → 50.00 fold + absolute dispatch → 50.50 with
+segmentation, and unchanged through 16-bit, the 66/67 axes, segment loads, far
+transfers and REP — the width macros vanish at NSH=0.
 
 ## Phase 0/1 — baseline and CPU foundations
 
 Complete except where listed below. The interpreter does 16/32-bit with the
-`66`/`67` axes switching per instruction, segmentation on a descriptor pointer,
-real-mode interrupts, string ops with `REP`, far transfers and segment loads.
-Details are in the git history; `git log --oneline` is the index.
+`66`/`67` axes per instruction, segmentation on a descriptor pointer, real-mode
+interrupts, string ops with `REP`, far transfers and segment loads.
 
 - [ ] `XLAT`, BCD (`27`/`2F`/`37`/`3F`), `WAIT`, `INS`/`OUTS`, `BOUND`/`ARPL`
 - [ ] Limit checks off the R6 descriptor, incl. real-mode 64 KB wrap
@@ -57,25 +55,36 @@ relocations, INT 21h on FatFs -- fed by the guest `.dsk` streamed from SD.
 
 ## TOPBENCH (the current 16-bit correctness driver)
 
-The .dsk streams, AUTOEXEC.BAT names the program, the MZ loader places it and
-its Borland relocator runs. Five bug classes found and fixed against it so far
-(see `git log`): the v-width shift group was pass-agnostic; `INC`/`DEC r/m8` and
-`INC`/`DEC Ev` set no flags; thirteen stack handlers ignored `SS.base` and used a
-4-byte slot; the shift operand FETCH and `XCHG` were 32-bit in 16-bit mode; and
-all three `TEST` forms set no flags while 16-bit `CBW`/`CWD` ran `CWDE`/`CDQ`.
+**Verified**: `scripts/trace_diff.py` now agrees with a reference 8086
+(Unicorn) for the whole of TOPBENCH's startup and self-unpacker -- 1,532,786
+instructions, to the first INT 21h, with no divergence at any stride. The CPU
+core is clean over everything the reference can reach.
 
-It now runs ~1.34 M instructions and dies inside the self-unpacker.
-`scripts/ref_trace.py` says a real 8086 takes 1,553,044 to reach INT 21h, so
-roughly one bug remains between here and the first DOS call. The failure is that
-our machine leaves the relocation copy loop sooner than the reference does; the
-copy itself, its direction, large counts, granule crossing and the 16-bit index
-wrap are all covered by passing tier-1 cases, so the cause is elsewhere. No
-screenshot yet: `hle_calls_seen` is still 0, meaning nothing has been printed.
+Getting there closed nine bug classes; `git log` has one commit each. The last
+four were found by the trace diff rather than by reading code:
 
-Next step is `scripts/ref_trace.py` against a fresh trace: the divergence is
-between the relocation copy and the first INT 21h, and the alignment traps in
-TOOLING have to be respected or the diff points at the wrong instruction --
-they cost most of a session here.
+| Defect | Symptom |
+|---|---|
+| v-width shift group pass-agnostic | `SHL SI,CL` overflowed into ESI |
+| `INC`/`DEC` r/m8 and Ev set no flags | `DEC DH ; JNE` never terminated |
+| 13 stack handlers ignored `SS.base` | read and wrote near address 0 |
+| shift operand fetch and `XCHG` 32-bit | garbage in a register's high half |
+| `TEST` set no flags; 16-bit `CBW`/`CWD` ran `CWDE`/`CDQ` | branches on stale flags |
+| near `Jcc` rel32 at 16 bits; `LOOP`/`JCXZ` on ECX | left loops at the wrong time |
+| `INC`/`DEC` reg AF from `~a` | AF exactly inverted |
+| **`LEA` returned the linear address** | unpacker's segment bump off by 0x969 |
+| **`MOV moffs` 32-bit offset, no DS base** | indexed past the fold table, HardFault |
+| six handlers had no memory form | `MOV WORD PTR [mem],imm` stopped it dead |
+
+The guest now unpacks fully, reaches its real entry at CS=0x2822, and makes 29
+BIOS/DOS calls, all of them answered. It then takes an `FF /3` far indirect
+transfer at linear 0x29973 through a pointer holding 0x9E40:0x1C03 and executes
+open-bus filler. No screenshot yet: nothing has been printed.
+
+The reference cannot follow it past that point -- `refdos.py` has no port I/O,
+and TOPBENCH times itself against the CGA retrace, so under the reference it
+divides by a zero count at 26EA:0117. Extending the shim with port I/O is what
+would make the oracle reach the end.
 
 ## Open defects
 
