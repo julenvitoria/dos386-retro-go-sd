@@ -6,7 +6,11 @@ Last verified 2026-08-13. How to run: [`TOOLING.md`](TOOLING.md). Roadmap: [`PLA
 
 | Tier | State |
 |---|---|
+<<<<<<< HEAD
 | 1. gwemu bare-metal | 268/268 `test_opcodes.py`, plus `test_video`/`test_text`/`test_dos`/`test_keyboard`/`test_screen`; `test_audio` runs natively, no target |
+=======
+| 1. gwemu bare-metal | 268/268 `test_opcodes.py`, plus `test_video`/`test_text`/`test_dos`/`test_keyboard`/`test_osk`/`test_screen` |
+>>>>>>> worktree-agent-af6ed0df80835aae3
 | 2. gwemu + retro-go | `core_dtcm_ok=1`, bonus pool 153,600 B, 1,000,001 insns — matches tier 1 |
 | 3. Hardware | 50.50 cyc/insn, 5.54 MIPS |
 
@@ -37,6 +41,25 @@ fold mapping; the frame-paced loop; and the DOS layer.
 
 - [ ] DWT per-opcode profile: tool done (`profile_opcodes.py`, `X86_PROFILE=1`),
       clean under gwemu, silicon pending; gate NOR backing on code-vs-data
+
+## On-screen keyboard — shipped; mouse UI — shell only
+
+`x86_osk.c`, wired from `poll_input()`/`core_repaint()` in `src/main.c`. The UI
+is a port of the author's previous DOS port; the injection under it is ours —
+XT make/break codes through `x86_kbd_scancode()` plus IRQ 1. **GAME cycles
+OFF -> keyboard -> mouse -> OFF**, so `pad_scancode[6]` is deliberately 0 and
+GAME no longer sends Return (the physical START button does).
+
+Measured under gwemu: `tests/test_osk.py` 12/12 (including a shifted cell
+reaching the BDA ring as `!`), tier 2's `check_game_opens_osk` (A puts 0x1E on
+port 0x60 inside the guest), no fault with retro-go's PAUSE menu over it, and
+screenshots over both a text-mode and a graphics-mode screen. Cost 3,331 B
+text; RAM_EMU headroom after it 4,960 B.
+
+**Mouse mode is a UI shell with nothing listening: there is no INT 33h driver.**
+What one would take, and why half-building it would be worse than none, is in
+[`docs/input/05-osk-port.md`](docs/input/05-osk-port.md) with the rest of the
+detail.
 
 ## String ops: the batched fast path, and what it measured
 

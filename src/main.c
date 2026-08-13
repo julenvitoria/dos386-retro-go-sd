@@ -37,6 +37,7 @@
 #include "cutils.h"   /* BOOL/TRUE, needed by iomem.h via x86_cpu.h */
 #include "x86_cpu.h"
 #include "x86_profile.h"
+#include "x86_osk.h"
 
 #define APP_ID       100
 
@@ -881,6 +882,7 @@ static void guest_reset(void)
        often we come up for air to render, poll and feed audio. The CGA
        retrace bit is derived from how far this counter has run down, so a
        slice is also the emulated machine's notion of a display frame. */
+    x86_osk_reset();
     cpu_state_ptr->pit_reload = guest_slice_now ? guest_slice_now : 20000u;
     cpu_state_ptr->pit_counter = cpu_state_ptr->pit_reload;
 }
@@ -914,19 +916,6 @@ static void guest_reset(void)
  * N, not Y, on the shared TIME/SELECT button: answering "no joystick" is what
  * puts the game on the keyboard we actually emulate. Y is unreachable until
  * the GAME button's on-screen keyboard exists.
- */
-/*
- * Indexed by the gamepad bit order this firmware actually uses:
- *   0 UP, 1 DOWN, 2 LEFT, 3 RIGHT, 4 A, 5 B, 6 START(=GAME), 7 SELECT(=TIME)
- *
- * DERIVED FROM OBSERVED BEHAVIOUR, not from a header. retro-go-stm32's
- * odroid_input.h lists UP,RIGHT,DOWN,LEFT,SELECT,START,A,B,... -- reindexing to
- * that produced: Up worked, Left moved DOWN, Down and Right did nothing, and
- * A/GAME sent the wrong keys. Those four symptoms only fit the order above, so
- * that header is not what this build compiles against. Trust the device.
- *
- * B_GAME is what odroid calls START (8086tiny's test286/toskmode.c:196 records
- * the same naming), and B_TIME is SELECT; a stock unit has no other face keys.
  */
 /* Indexed by the bit numbering poll_input builds below from the ODROID_INPUT_*
    enum -- the compiler resolves the enum, so this order is ours and is correct
@@ -1061,8 +1050,14 @@ static void core_repaint(void)
 {
     const gw_firmware_abi_t *abi = gw_firmware_abi();
     uint8_t *fb = (uint8_t *)abi->lcd_ctl(GW_LCD_BUFFER, GW_LCD_BUF_ACTIVE, 0, 0);
-    if (fb)
+    if (fb) {
         x86_video_render(fb, FRAME_W);
+        /* The OSK coexists with retro-go's overlay rather than fighting it:
+           the overlay draws ON TOP of whatever we leave in the active buffer
+           and asks us for the picture back underneath, so the keyboard is part
+           of that picture. */
+        x86_osk_draw(fb, FRAME_W);
+    }
 }
 
 static void poll_input(const gw_firmware_abi_t *abi)
@@ -1106,9 +1101,52 @@ static void poll_input(const gw_firmware_abi_t *abi)
     if (pad.values[ODROID_INPUT_X])      keys |= 1u << 8;
     if (pad.values[ODROID_INPUT_Y])      keys |= 1u << 9;
 
-    uint32_t changed = keys ^ x86_io.input_keys;
+    uint32_t prev = x86_io.input_keys;
+    uint32_t changed = keys ^ prev;
     x86_io.input_keys = keys;
     input_keys_now = keys;
+
+    /*
+     * ---- The on-screen keyboard's door -------------------------------------
+     *
+     * GAME cycles OFF -> keyboard -> mouse -> OFF (x86_osk.c). This function
+     * does not know that: it asks x86_osk_visible() whether the OSK owns the
+     * buttons and routes on that alone, so growing the cycle changes nothing
+     * here. GAME is bound to nothing in pad_scancode[] for exactly this.
+     *
+     * The frame the OSK OPENS on and the frame it CLOSES on both belong to the
+     * OSK, and neither emits a guest key: a button still held across the
+     * transition must not read as a fresh press on either side of it.
+     *
+     * Anything the guest still has DOWN is released first. Our controller is
+     * edge-driven from this table, so a key whose button is "let go" by a mode
+     * switch rather than by the user would stay down inside the guest forever
+     * -- a break code is the only thing that can clear it.
+     */
+    {
+        const uint32_t game = 1u << 6;
+        const int was_up = x86_osk_visible();
+
+        if ((changed & game) && (keys & game)) {
+            if (!was_up) {
+                for (unsigned i = 0; i < 10; i++) {
+                    uint8_t sc = pad_scancode[i];
+                    if (sc && (prev & (1u << i))) {
+                        x86_kbd_scancode((uint8_t)(sc | 0x80));
+                        input_scancodes++;
+                    }
+                }
+            }
+            x86_osk_cycle();
+        }
+
+        if (x86_osk_visible() || was_up) {
+            if (x86_osk_visible() && was_up)
+                x86_osk_input(keys);
+            goto deliver;
+        }
+    }
+
     if (!changed)
         return;
 
@@ -1121,10 +1159,13 @@ static void poll_input(const gw_firmware_abi_t *abi)
         x86_kbd_scancode((keys & (1u << i)) ? sc : (uint8_t)(sc | 0x80));
         input_scancodes++;
     }
+deliver:
     input_kbd_ht = (uint32_t)x86_io.kbd_head | ((uint32_t)x86_io.kbd_tail << 8);
 
     /* Raise IRQ 1 and pull the next instruction boundary forward, so it is
-       delivered now instead of at the end of the slice. */
+       delivered now instead of at the end of the slice. The OSK reaches the
+       guest through this SAME path a button does -- x86_kbd_scancode() then
+       IRQ 1 -- which is the whole point of porting only the front end. */
     if (x86_kbd_pending()) {
         cpu_state_ptr->hard_int_pending = 0x09;
         cpu_state_ptr->pit_counter = 1;
@@ -1358,6 +1399,24 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
          */
         uint32_t exec_start_ms = abi->HAL_GetTick();
         while (!guest_halted) {
+            /*
+             * Keep the controller draining. A BUTTON produces at most two
+             * codes, so one IRQ per frame was enough; an OSK keypress produces
+             * up to six (Ctrl/Alt/Shift makes, the key, and their breaks) and
+             * the BIOS handler takes exactly ONE code per interrupt. At one
+             * IRQ per frame a shifted keystroke would take 100 ms to arrive.
+             *
+             * Re-raising here costs nothing: delivery happens IN-GUEST at the
+             * next boundary (cpu_exec.S .handle_pit_or_irq reloads the PIT and
+             * dispatches without exiting), so it does not shorten the slice. A
+             * pending tick keeps priority -- the one-deep slot is the emulated
+             * 8259A's whole model of one.
+             */
+            if (x86_kbd_pending() && !cpu_state_ptr->hard_int_pending) {
+                cpu_state_ptr->hard_int_pending = 0x09;
+                cpu_state_ptr->pit_counter = 1;
+                input_irqs++;
+            }
             x86_cpu_interp_asm();
             uint32_t reason = cpu_state_ptr->exit_reason;
             last_slice_halted = (reason == X86_EXIT_HALT);
@@ -1418,6 +1477,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         fb_addr = (uint32_t)fb;
         if (fb) {
             x86_video_render(fb, FRAME_W);
+            x86_osk_draw(fb, FRAME_W);
             fb_sample = *(volatile uint32_t *)(fb + 20 * FRAME_W);
         }
         clut_sample = core_clut[1];

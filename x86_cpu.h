@@ -208,6 +208,12 @@ void x86_kb_push(uint8_t scancode, uint8_t ascii);
 void x86_kbd_scancode(uint8_t code);
 int x86_kbd_pending(void);
 int x86_bios_kbd_irq(void);
+/* Scancode -> ASCII, the same decode INT 09h uses. Shared with the on-screen
+   keyboard, whose echo line must show what the guest was actually sent. */
+uint8_t x86_kbd_ascii(uint8_t sc, int shift);
+/* The 8x8 CP437 glyphs handed to the guest at F000:F000. One copy, borrowed by
+   the OSK renderer -- see the accessor's comment in x86_hle.c. */
+const unsigned char (*x86_font8x8(void))[8];
 void x86_hle_set_zf(int set);
 int x86_video_map(void);
 uint8_t *x86_video_vram(void);

@@ -256,3 +256,17 @@ int x86_hle_service(void)
         hle_retry();
     return 1;
 }
+
+/*
+ * The 8x8 CP437 font, borrowed rather than duplicated.
+ *
+ * The on-screen keyboard draws with the same glyphs the guest is handed at
+ * F000:F000 (x86_bios_rom_install, above). It lives in another translation
+ * unit, and #including font8x8.h there would link a SECOND 2 KB copy -- against
+ * the ~4 KB of RAM_EMU headroom the whole core has left (TOOLING.md). One
+ * accessor costs nothing and cannot drift from what the guest sees.
+ */
+const unsigned char (*x86_font8x8(void))[8]
+{
+    return font8x8_basic;
+}

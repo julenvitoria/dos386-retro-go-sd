@@ -369,8 +369,9 @@ standby. Called automatically by `make retrogo_media`.
 | `x86_io.c` | port dispatch, PIT ch2 + speaker, CGA registers |
 | `x86_audio_wave.h` | PC-speaker square-wave generator: PIT divisor -> phase increment -> samples. `<stdint.h>` only, deliberately — that is what lets `tests/host_audio.c` build it natively. Vendored from the author's earlier DOS core |
 | `x86_video.c`, `cga_blit.S` | mode 4 blitter, mode 3 text renderer (4x8 cells, all 80 columns), palette |
+| `x86_osk.c/.h` | on-screen keyboard + the mouse UI shell: layout, navigation, sticky modifiers, echo, the GAME cycle, and the overlay painted into the letterbox bars. Ported UI (`docs/input/03`); the injection under it is our own scancode path |
 | `x86_hle.c` | `0F 0B` stubs, IVT planting, service dispatch |
-| `x86_bios.c` | INT 10h / 16h / 1Ah and the BIOS Data Area |
+| `x86_bios.c` | INT 10h / 16h / 1Ah and the BIOS Data Area, including INT 09h's shift decode (the OSK's shifted cells depend on it) |
 | `x86_dos.c` | INT 21h, PSP, MCB arena, MZ loader |
 | `font8x8.h` | 8x8 CP437 font, public domain (Daniel Hepper); the BIOS font handed to the guest |
 | `font4x8.h` | 4x8 1-bit CP437, generated — Everex letters + hand-drawn line art; what `text_render` draws |
@@ -406,6 +407,15 @@ python3 tests/test_audio.py              # PC-speaker wave generator, NATIVE --
                                          # by side, because a wrong pitch is
                                          # invisible in a screenshot and
                                          # unjudgeable under gwemu
+python3 tests/test_osk.py                # the on-screen keyboard, driven by
+                                         # button MASK exactly as src/main.c
+                                         # drives it: the grid press, the
+                                         # navigation, B as Backspace, a
+                                         # SHIFTED cell (which only works if a
+                                         # real Left-Shift make reaches INT 09h
+                                         # first), the three-state GAME cycle,
+                                         # the row-width check, and that
+                                         # drawing never touches guest VRAM
 python3 tests/test_video.py              # CGA mode 4 blitter, pixel-exact
 python3 tests/test_text.py               # CGA text mode 3, pixel-exact:
                                          # CP437 at 4x8 and 8x8, attributes,
@@ -487,6 +497,29 @@ the key goes to a program that ignores it. Capture with
 `timelines/run-to-completion.tl` is the same launch with a 58 s window, for a
 guest doing real work whose result only appears at the end -- the one case where
 the wait IS the result rather than a symptom to chase with `probe.py`.
+
+**GAME NO LONGER SENDS RETURN**, and a timeline written against that is testing
+something that was deliberately removed. It is the on-screen keyboard's only
+door (`docs/input/02-button-mapping.md`), so `pad_scancode[6]` is 0 and Return
+moved to the physical START button -- which IS gwemu's `press start`, the key
+this document used to warn was inert. Three timelines drive the keyboard:
+
+- `timelines/osk-open.tl` -- open with GAME, move the cursor, press a key,
+  cycle the layer, step into mouse mode, move the pointer, close. One
+  screenshot per state, so the keyboard's own picture is the evidence.
+- `timelines/osk-over-game.tl` -- the same over a GRAPHICS-mode guest. It
+  answers Alley Cat's joystick prompt with `press select` first, because the
+  game stays in text mode until it is answered and the capture would otherwise
+  be of the other case.
+- `timelines/osk-with-pause.tl` -- open the keyboard, then retro-go's PAUSE
+  overlay on top of it. This is the one that exercises `core_repaint()` with
+  the OSK live; run it under `probe.py --faults` rather than only capturing,
+  because "the callback faulted" and "the menu is drawn over it" look identical
+  in a screenshot.
+
+Which key each captures is worth knowing: the OSK opens on layer 0 cell 0, so
+`press a` sends the letter `a` (scancode 0x1E) and `x86_kbd_read_log` is where
+it is confirmed to have reached the guest.
 
 ## Modules (`scripts/common/`)
 
