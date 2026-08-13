@@ -69,7 +69,16 @@ void x86_kb_push(uint8_t scancode, uint8_t ascii)
         return;                      /* full: a real BIOS beeps and drops */
     bda_w16(BDA + tail, (uint16_t)(ascii | (scancode << 8)));
     bda_w16(BDA_KB_TAIL, next);
+    x86_kb_pushes++;
 }
+
+/* Ring bookkeeping, host-readable. "The guest polls INT 16h forever" has two
+   very different causes -- nothing was ever queued, or something is taking the
+   key out from under it -- and only a count of what the PRODUCER and each
+   CONSUMER did can tell them apart. */
+volatile uint32_t x86_kb_pushes = 0;      /* keys queued by INT 09h        */
+volatile uint32_t x86_kb_pops = 0;        /* keys dequeued (AH=00, DOS)    */
+volatile uint32_t x86_kb_peek_hits = 0;   /* peeks that found a key        */
 
 static int kb_peek(uint16_t *out)
 {
@@ -77,6 +86,7 @@ static int kb_peek(uint16_t *out)
     if (head == bda_r16(BDA_KB_TAIL))
         return 0;
     *out = bda_r16(BDA + head);
+    x86_kb_peek_hits++;
     return 1;
 }
 
@@ -85,6 +95,7 @@ static int kb_pop(uint16_t *out)
     uint16_t head = bda_r16(BDA_KB_HEAD);
     if (head == bda_r16(BDA_KB_TAIL))
         return 0;
+    x86_kb_pops++;
     *out = bda_r16(BDA + head);
     head = (uint16_t)(head + 2);
     if (head >= (BDA_KB_END - BDA))

@@ -94,6 +94,8 @@ python3 scripts/probe.py --retrogo --wait-magic --set guest_kips=330     # 8088
 | `guest_ticks` / `guest_ticks_dropped` | 18.2065 Hz BIOS ticks emitted, and ones refused by the catch-up cap |
 | `panel_ms_min` | the display period, **learned** from the shortest iteration ever completed. Nothing assumes 60 fps |
 | `x86_kbd_read_log` / `x86_spk_log` | the last 32 bytes off port 0x60, and the last 32 writes that can move the speaker tone. `--dump x86_kbd_read_log:32x8` |
+| `x86_kb_pushes` / `x86_kb_pops` / `x86_kb_peek_hits` | the BDA ring's producer and its two consumers. "The guest polls INT 16h forever" has two opposite causes -- nothing was queued, or something dequeued it first -- and only these three separate them. `pushes == pops == peek_hits` means every key was queued, seen and taken; `pushes > 0` with `pops == 0` is the reported failure |
+| `x86_hle_log` | the last 32 services as `(vector << 8) \| AH`, bit 16 set if nobody answered. This is what says whether a guest is polling INT 16h AH=00 or AH=01 -- a distinction the two paths do not share a symptom for. `--dump x86_hle_log:32x8` |
 
 Guest time must not move with render rate. The measurement that proves it is
 `guest_ticks / guest_uptime_ms` at two different frame rates — force a low one
@@ -374,6 +376,11 @@ python3 tests/test_opcodes.py            # 162 cases: EFLAGS, segmentation,
 python3 tests/test_benchmark.py
 python3 tests/test_game.py
 python3 tests/test_dos.py                # MCB arena, walked from the host
+python3 tests/test_keyboard.py           # BDA ring -> INT 16h, consumed by
+                                         # GUEST code: AH=01 peek + its ZF on
+                                         # the IRET frame, AH=00 dequeue, the
+                                         # empty case and a wrap at the end of
+                                         # the ring
 python3 tests/test_video.py              # CGA mode 4 blitter, pixel-exact
 python3 tests/test_text.py               # CGA text mode 3, pixel-exact:
                                          # CP437 at 4x8 and 8x8, attributes,
@@ -429,6 +436,12 @@ covers "the menu opens", "the change takes effect" and "it survives a restart".
 It navigates by pressing UP once in the settings menu: the dialog's selection
 wraps and our entry is appended last, so this keeps working if the firmware
 grows an option.
+`timelines/press-menu-keys.tl` and `timelines/press-game-menu.tl` drive a
+guest's own MENU -- DOWN (scancode 0x50, an extended key with no ASCII) and
+then GAME (Return) -- with a screenshot between each press. A keyboard chain is
+only proven when the guest's PICTURE changes: counters can all look right while
+the key goes to a program that ignores it. Capture with
+`screenshot.py --timeline ... --wait N --text` at two different `N`.
 `timelines/run-to-completion.tl` is the same launch with a 58 s window, for a
 guest doing real work whose result only appears at the end -- the one case where
 the wait IS the result rather than a symptom to chase with `probe.py`.

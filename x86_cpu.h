@@ -275,6 +275,9 @@ extern volatile uint32_t x86_spk_events_dropped;  /* ring overflows           */
 extern volatile uint32_t x86_spk_log[32];         /* (port<<24)|value, last 32 */
 extern volatile uint32_t x86_spk_log_idx;
 /* Port 0x60: how often the guest asked, and the last 32 bytes it was given. */
+extern volatile uint32_t x86_kb_pushes;
+extern volatile uint32_t x86_kb_pops;
+extern volatile uint32_t x86_kb_peek_hits;
 extern volatile uint32_t x86_kbd_port60_reads;
 extern volatile uint32_t x86_kbd_read_log[32];
 extern volatile uint32_t x86_kbd_read_log_idx;

@@ -6,7 +6,7 @@ Last verified 2026-08-13. How to run: [`TOOLING.md`](TOOLING.md). Roadmap: [`PLA
 
 | Tier | State |
 |---|---|
-| 1. gwemu bare-metal | 260/260 `test_opcodes.py`, plus `test_video`/`test_text`/`test_dos`/`test_screen` |
+| 1. gwemu bare-metal | 268/268 `test_opcodes.py`, plus `test_video`/`test_text`/`test_dos`/`test_keyboard`/`test_screen` |
 | 2. gwemu + retro-go | `core_dtcm_ok=1`, bonus pool 153,600 B, 1,000,001 insns — matches tier 1 |
 | 3. Hardware | 50.50 cyc/insn, 5.54 MIPS |
 
@@ -173,6 +173,36 @@ The 4 KB open-bus filler for 0xA0000-0xFFFFF now comes from the **bonus pool**,
 not RAM_EMU. It was the last allocation in a region with a few hundred bytes
 spare, so any growth in the core silently unmapped upper memory;
 `upper_filler_ok` says whether it is backed at all.
+
+## The BIOS keyboard path, measured end to end
+
+A device report said keys reached the guest but INT 16h never returned them,
+with TOPBENCH's menu unresponsive. **Measured under gwemu, it does not
+reproduce, and the reported evidence does not support the diagnosis.**
+
+Tier 1, `tests/test_keyboard.py` -- guest code executing INT 16h, not host C
+calls: head/tail initialise to 0x1E; the push writes AT the offset the tail
+points to and wraps at 0x3E; AH=01 returns 0x1C0D without dequeueing and puts
+ZF on the IRET FRAME with the right sense in both directions; AH=00 dequeues
+the same word; the pop wraps. Five mutations (head/tail zeroed, ZF inverted,
+tail treated as an index, no wrap, destructive peek) each make it fail.
+
+Tier 2, TOPBENCH's own menu under gwemu: `x86_kb_pushes == x86_kb_pops ==
+x86_kb_peek_hits` on every key -- queued, seen and taken -- while
+`x86_bios_int16_calls` climbs ~23,000/s, which is simply what TOPBENCH's menu
+loop does and is NOT evidence of a stall. `x86_hle_log` says the poll is
+**AH=01**, not AH=00. And the picture moves: two DOWN presses walk the
+selection from Introduction to Database Operations (the help line at row 24
+changes with it) and GAME dismisses the Introduction dialog
+(`timelines/press-menu-keys.tl`, `timelines/press-game-menu.tl`).
+
+What the device evidence actually shows is that INT 09h consumed every
+scancode. It says nothing about what INT 16h did, because the device had no
+counter for it -- `x86_kb_pops` is that counter now, and one probe run on
+silicon settles it. The remaining silicon-only candidate is that the BDA page
+is not writable there: every `bda_w*` does `if (p) ... ;` and drops the write
+in silence, which produces exactly the reported symptom and is invisible under
+gwemu, where the whole low megabyte is plain RAM.
 
 ## Open defects
 

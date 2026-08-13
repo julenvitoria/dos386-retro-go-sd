@@ -81,12 +81,19 @@ volatile uint32_t dos_r[16];
 volatile uint32_t run_hle_flag = 0;
 volatile int32_t hle_r = -99;
 
+/* Keyboard self-test: the BDA ring and INT 16h, driven from guest code.
+   The producer is the SAME function INT 09h dispatches to, so this exercises
+   the real path from a scancode on port 0x60 to a key in AX. */
+volatile uint32_t run_kbd_flag = 0;
+volatile uint32_t kbd_r[20];
+
 volatile uint32_t run_video_flag = 0;
 volatile uint32_t video_blit_cycles = 0;
-uint8_t cga_test_vram[X86_VRAM_BYTES];
-uint8_t cga_test_out[320 * 240];
+uint8_t cga_test_vram[X86_VRAM_BYTES] __attribute__((section(".test_bss")));
+uint8_t cga_test_out[320 * 240] __attribute__((section(".test_bss")));
 /* 32-bit ARGB entries, matching lcd_set_clut(). */
-uint32_t cga_test_palette[32];   /* X86_TEXT_CLUT_ENTRIES: 32 is what the
+uint32_t cga_test_palette[32] __attribute__((section(".test_bss")));
+                                /* X86_TEXT_CLUT_ENTRIES: 32 is what the
                                     firmware needs for its darkened twins to
                                     line up with LCD_DARKEN_BIT, and what the
                                     anti-aliased text path allocates from */
@@ -224,6 +231,180 @@ int load_mz_executable(FIL *file) {
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Keyboard / INT 16h self-test.
+ *
+ * A scancode is queued on the controller and handed to x86_bios_kbd_irq() --
+ * the exact function INT 09h dispatches to -- so the producer side is the
+ * shipping one, not a re-implementation. The consumer side is GUEST code:
+ * INT 16h AH=01 (peek, ZF reports empty) and AH=00 (blocking read), with the
+ * results and the FLAGS the IRET actually delivered stored into guest memory
+ * where the host can read them.
+ */
+#define KBD_CODE_BASE   0x2000u
+#define KBD_RES_BASE    0x4000u
+
+static const uint8_t kbd_guest_code[] = {
+    /* --- phase A at 0x2000: peek an EMPTY buffer ------------------------ */
+    0xB8, 0x00, 0x00,             /* MOV AX,0000                            */
+    0xB4, 0x01,                   /* MOV AH,01                              */
+    0xCD, 0x16,                   /* INT 16h                                */
+    0xA3, 0x00, 0x40,             /* MOV [4000],AX  r0: AX on an empty peek */
+    0x9C,                         /* PUSHF                                  */
+    0x58,                         /* POP AX                                 */
+    0xA3, 0x02, 0x40,             /* MOV [4002],AX  r1: FLAGS, ZF must be 1 */
+    0xF4,                         /* HLT                                    */
+};
+
+/* Phase B is placed at a fixed offset so the host and the harness agree. */
+#define KBD_PHASE_B     0x2020u
+static const uint8_t kbd_guest_code_b[] = {
+    0xB4, 0x01,                   /* MOV AH,01   peek with a key waiting    */
+    0xCD, 0x16,                   /* INT 16h                                */
+    0xA3, 0x04, 0x40,             /* MOV [4004],AX  r2: the key             */
+    0x9C, 0x58,                   /* PUSHF ; POP AX                         */
+    0xA3, 0x06, 0x40,             /* MOV [4006],AX  r3: FLAGS, ZF must be 0 */
+    0xB4, 0x01,                   /* MOV AH,01   peek again                 */
+    0xCD, 0x16,                   /* INT 16h                                */
+    0xA3, 0x08, 0x40,             /* MOV [4008],AX  r4: non-destructive     */
+    0xB8, 0x00, 0x00,             /* MOV AX,0000                            */
+    0xCD, 0x16,                   /* INT 16h AH=00: dequeue                 */
+    0xA3, 0x0A, 0x40,             /* MOV [400A],AX  r5: the key             */
+    0xB4, 0x01,                   /* MOV AH,01   drained now                */
+    0xCD, 0x16,                   /* INT 16h                                */
+    0x9C, 0x58,                   /* PUSHF ; POP AX                         */
+    0xA3, 0x0C, 0x40,             /* MOV [400C],AX  r6: FLAGS, ZF must be 1 */
+    0xF4,                         /* HLT                                    */
+};
+
+/* Phase C: the same read, used after the ring has been walked to its end so
+   the push and the pop both have to wrap. */
+#define KBD_PHASE_C     0x2080u
+static const uint8_t kbd_guest_code_c[] = {
+    0xB8, 0x00, 0x00,             /* MOV AX,0000                            */
+    0xCD, 0x16,                   /* INT 16h AH=00                          */
+    0xA3, 0x0E, 0x40,             /* MOV [400E],AX  r7: the wrapped key     */
+    0xF4,                         /* HLT                                    */
+};
+
+static void kbd_test_reset_cpu(uint32_t eip)
+{
+    memset(&cpu_state_dtcm, 0, sizeof(cpu_state_dtcm));
+    for (int i = 0; i < 6; i++)
+        cpu_state_dtcm.segs[i].limit = 0xFFFF;   /* real mode, CS.D clear */
+    cpu_state_dtcm.eip = eip;
+    cpu_state_dtcm.regs[4] = 0x1F00;             /* ESP */
+    cpu_state_dtcm.eflags = 0x0002;
+    cpu_state_dtcm.idtr_base = 0;
+    cpu_state_dtcm.idtr_limit = 0x3FF;
+    cpu_state_dtcm.hle_enabled = 1;
+    cpu_state_dtcm.pit_counter = 20000;
+    cpu_state_dtcm.pit_reload = 20000;
+}
+
+/* Run until the guest HLTs, servicing HLE exits the way the core's frame loop
+   does. Returns the exit reason it stopped on. */
+static uint32_t kbd_test_run_to_halt(void)
+{
+    /* Bounded: a guest that never halts must FAIL the test, not hang the
+       harness. 200 x 20,000 instructions is far more than any phase needs. */
+    for (int guard = 0; guard < 200; guard++) {
+        x86_cpu_interp_asm();
+        if (cpu_state_dtcm.exit_reason == X86_EXIT_HLE_INT) {
+            x86_hle_service();
+            cpu_state_dtcm.exit_reason = 0;
+            continue;
+        }
+        if (cpu_state_dtcm.exit_reason == X86_EXIT_TIMER) {
+            cpu_state_dtcm.exit_reason = 0;
+            cpu_state_dtcm.pit_counter = 20000;
+            continue;
+        }
+        return cpu_state_dtcm.exit_reason;
+    }
+    return 0xFFFFFFFFu;
+}
+
+static uint16_t kbd_bda_r16(uint32_t off)
+{
+    return (uint16_t)(test_ram[0x400 + off] | (test_ram[0x401 + off] << 8));
+}
+static void kbd_bda_w16(uint32_t off, uint16_t v)
+{
+    test_ram[0x400 + off] = (uint8_t)v;
+    test_ram[0x401 + off] = (uint8_t)(v >> 8);
+}
+
+static void kbd_test_run(void)
+{
+    static const uint8_t hle_vectors[] = {
+        0x08, 0x09, 0x10, 0x16, 0x1A, 0x20, 0x21,
+    };
+
+    memset(&test_ram[KBD_RES_BASE], 0, 32);
+    /* x86_bios_init() puts the renderer into mode 3, which needs a VRAM
+       pointer -- the real core calls x86_video_init() first and so must this. */
+    x86_video_init(cga_test_vram, cga_test_palette);
+    x86_bios_init();
+    x86_hle_install(hle_vectors, sizeof(hle_vectors));
+
+    memcpy(&test_ram[KBD_CODE_BASE], kbd_guest_code, sizeof(kbd_guest_code));
+    memcpy(&test_ram[KBD_PHASE_B], kbd_guest_code_b, sizeof(kbd_guest_code_b));
+    memcpy(&test_ram[KBD_PHASE_C], kbd_guest_code_c, sizeof(kbd_guest_code_c));
+
+    /* What a freshly initialised BDA says. Zero here means the first key is
+       written over the IVT and INT 16h compares head==tail forever. */
+    kbd_r[8] = kbd_bda_r16(0x1A);
+    kbd_r[9] = kbd_bda_r16(0x1C);
+
+    /* Phase A: nothing buffered. */
+    kbd_test_reset_cpu(KBD_CODE_BASE);
+    kbd_r[19] = 0xC0DE0003;   /* progress marker: a hang must say WHERE */
+    kbd_r[16] = kbd_test_run_to_halt();
+
+    /* Inject a key exactly as INT 09h does: a scancode on the controller,
+       then the BIOS keyboard interrupt handler. 0x1C is Enter. */
+    x86_kbd_scancode(0x1C);
+    kbd_r[10] = (uint32_t)x86_bios_kbd_irq();
+    kbd_r[11] = kbd_bda_r16(0x1A);
+    kbd_r[12] = kbd_bda_r16(0x1C);
+    /* The word the producer left in the ring, read straight out of guest
+       memory at the offset the head points to -- head is an offset within
+       segment 0x40, not an index. */
+    kbd_r[13] = (uint16_t)(test_ram[0x400 + kbd_r[11]] |
+                           (test_ram[0x401 + kbd_r[11]] << 8));
+    /* Drain the break code the controller still holds, so it cannot leak into
+       a later phase. */
+    x86_kbd_scancode(0x9C);
+    x86_bios_kbd_irq();
+
+    /* Phase B: peek, peek again, read, peek empty. */
+    kbd_test_reset_cpu(KBD_PHASE_B);
+    kbd_r[19] = 0xC0DE0004;
+    kbd_r[17] = kbd_test_run_to_halt();
+
+    /* Phase C: walk head and tail to the LAST entry of the ring so the push
+       and the pop each have to wrap back to 0x1E. */
+    kbd_bda_w16(0x1A, 0x3C);
+    kbd_bda_w16(0x1C, 0x3C);
+    x86_kbd_scancode(0x39);          /* Space */
+    x86_bios_kbd_irq();
+    kbd_r[14] = kbd_bda_r16(0x1C);   /* tail must have wrapped to 0x1E */
+    kbd_r[15] = (uint16_t)(test_ram[0x400 + 0x3C] |
+                           (test_ram[0x401 + 0x3C] << 8));
+    x86_kbd_scancode(0xB9);
+    x86_bios_kbd_irq();
+    kbd_test_reset_cpu(KBD_PHASE_C);
+    kbd_r[19] = 0xC0DE0005;
+    kbd_r[18] = kbd_test_run_to_halt();
+    kbd_r[19] = kbd_bda_r16(0x1A);   /* head must have wrapped to 0x1E */
+
+    /* The seven words the guest stored. */
+    for (int i = 0; i < 8; i++)
+        kbd_r[i] = (uint16_t)(test_ram[KBD_RES_BASE + i * 2] |
+                              (test_ram[KBD_RES_BASE + i * 2 + 1] << 8));
+}
+
 // External arrays from x86_cpu.c
 extern uint32_t (*io_port_read_table[1024])(void *opaque, uint32_t offset, int size_log2);
 extern void *io_port_opaque_table[1024];
@@ -253,6 +434,13 @@ void Reset_Handler(void) {
     extern uint32_t _sbss;
     extern uint32_t _ebss;
     for (uint32_t *p = &_sbss; p < &_ebss; p++) {
+        *p = 0;
+    }
+
+    // The harness's own scratch lives in RAM_UC, outside .bss, so it needs
+    // zeroing here or a test reads whatever the previous run left.
+    extern uint32_t _stestbss, _etestbss;
+    for (uint32_t *p = &_stestbss; p < &_etestbss; p++) {
         *p = 0;
     }
 
@@ -419,6 +607,11 @@ void Reset_Handler(void) {
             };
             hle_r = x86_hle_install(hle_vectors, sizeof(hle_vectors));
             run_hle_flag = 0;
+        }
+
+        if (run_kbd_flag == 1) {
+            kbd_test_run();
+            run_kbd_flag = 0;
         }
 
         if (run_video_flag == 1) {

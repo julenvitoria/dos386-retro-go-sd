@@ -79,4 +79,20 @@ SECTIONS {
     *(.dtcm_bss*)
     . = ALIGN(4);
   } > DTCMRAM
+
+  /* Harness-only scratch: the video test's VRAM, its render target and its
+     palette. These are the HOST's copies, not guest memory, and they were
+     costing 107 KB of RAM_EMU -- which left 2,948 bytes of headroom and made
+     any new object in front of the 4 KB-aligned test_ram overflow the region
+     by a whole page. The bare-metal harness drives no LCD, so RAM_UC (the
+     firmware's framebuffer pool) is dead space here and is exactly where this
+     belongs. Zeroed explicitly by Reset_Handler; it is outside _sbss.._ebss. */
+  .test_bss (NOLOAD) : {
+    . = ALIGN(4);
+    _stestbss = .;
+    *(.test_bss)
+    *(.test_bss*)
+    . = ALIGN(4);
+    _etestbss = .;
+  } > RAM_UC
 }
