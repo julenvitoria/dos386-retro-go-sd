@@ -34,6 +34,24 @@ Based on past project experience (specifically from `game-and-watch-retro-go-sd`
 - **Breakpoints**: Use `hbreak` (hardware breakpoints), not `break`, for flash addresses (`0x08xxxxxx`). A software breakpoint silently fails to write to flash.
 - **Device Log Ring Buffer**: The hardware device log is only 4KB and wraps very quickly. Do NOT use `gnwmanager monitor` terminal commands. Instead, strictly use the Python bindings (e.g. `scripts/gwtarget.py`) to read the log buffer out of memory, as per the global rules.
 
+## 4b. Reading a fault once retro-go has BSOD'd
+Retro-go installs its own fault handlers: `HardFault_Handler` tail-calls
+`common_fault_handler_c`, which calls `BSOD(type, pc, lr)`. `BSOD()` **paints
+the faulting PC and LR on the panel** and then spins in `buttons_get()` waiting
+for a keypress. Two consequences:
+
+- A sampled PC of `HAL_GPIO_ReadPin` / `buttons_get` after a crash means "sitting
+  in the BSOD", not "polling input".
+- `probe.py --faults` still gives you a true `CFSR`/`HFSR`/`BFAR` (they latch),
+  but its **stacked-frame decode is meaningless here**: it derives MSP-vs-PSP
+  from the *current* `LR`, and by then `LR` is an ordinary function return
+  inside the BSOD loop, not an `EXC_RETURN`. The R0-R3/PC/xPSR it prints are
+  whatever happens to be at that address.
+- The reliable read is the screen: `scripts/screenshot.py`, then crop/upscale
+  the top two lines (`FATAL EXCEPTION: ...` and `PC=0x… LR=0x…`) and resolve
+  them with `arm-none-eabi-addr2line -f -i -e .../build/gw_retro_go.elf`.
+  Note the LR may skip a frame: a tail-called leaf keeps its caller's LR.
+
 ## 5. Input Replay (`gwharness.py`)
 - `scripts/gwharness.py` allows interleaving button inputs via shadow-cell writes with the log poll, without evicting the OpenOCD connection. This enables true deterministic timeline replay on real hardware, which can then be directly diff'd against a `gwemu` log.
 

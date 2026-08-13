@@ -39,6 +39,61 @@ def wait_for_value(backend, addr, want, timeout, poll=0.25):
     return False
 
 
+ODROID_INPUT_RIGHT = 1        # odroid_input.h order: UP, RIGHT, DOWN, LEFT...
+PAD_SCANCODE_RIGHT = 0x4D     # src/main.c pad_scancode[]
+
+
+def check_input(runner, syms, out=print):
+    """A host key press must reach the emulated keyboard controller.
+
+    Nothing else in the suite covers the stages between the firmware's gamepad
+    and port 0x60, which is how a guest that ignored the keyboard went
+    unnoticed. Injects a real press through gwemu's QMP and
+    walks the chain: poll_input runs -> the firmware's overlay handler did not
+    swallow the frame -> the button mapped to a scancode -> the scancode was
+    queued and IRQ 1 raised.
+    """
+    b = runner.backend
+    if not hasattr(runner, "press"):
+        out("input: target cannot inject keys, skipped")
+        return True
+
+    before = {n: b.read_uint32(syms[n]) for n in
+              ("input_polls", "input_pad_seen", "input_scancodes",
+               "input_irqs", "input_kbd_ht", "x86_kbd_port60_reads")}
+    runner.press("RIGHT", delay=0.0)
+    time.sleep(2.0)
+    after = {n: b.read_uint32(syms[n]) for n in before}
+
+    out("\n--- input chain ---")
+    for n in before:
+        out(f"{n:24s} {before[n]} -> {after[n]}")
+
+    ok = True
+    if after["input_polls"] <= before["input_polls"]:
+        out("FAIL: poll_input is not running every frame")
+        ok = False
+    if not (after["input_pad_seen"] & (1 << ODROID_INPUT_RIGHT)):
+        out("FAIL: the press never reached the core's gamepad read "
+            "(firmware overlay handler consuming it?)")
+        ok = False
+    if after["input_scancodes"] <= before["input_scancodes"]:
+        out("FAIL: no scancode was produced from the pad state")
+        ok = False
+    if after["input_irqs"] <= before["input_irqs"]:
+        out("FAIL: IRQ 1 was never raised")
+        ok = False
+    # The code is either still queued (tail moved) or the guest has already
+    # taken it off port 0x60. Either proves it reached the controller; which
+    # one happens depends on the guest, so accept both.
+    if (after["input_kbd_ht"] == before["input_kbd_ht"]
+            and after["x86_kbd_port60_reads"] == before["x86_kbd_port60_reads"]):
+        out("FAIL: the scancode never reached the controller queue")
+        ok = False
+    out("input: PASS" if ok else "input: FAIL")
+    return ok
+
+
 def wait_for(backend, addr, timeout, poll=0.25):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -190,6 +245,8 @@ def main():
         if clut_sample != 0xFF55FFFF:
             print(f"FAIL: clut[1] was 0x{clut_sample:08x}, expected 0xff55ffff")
             loop_ok = False
+
+        loop_ok = check_input(runner, syms) and loop_ok
 
         dtcm_ok = runner.backend.read_uint32(syms["core_dtcm_ok"])
         bonus = runner.backend.read_uint32(syms["bonus_pool_size"])

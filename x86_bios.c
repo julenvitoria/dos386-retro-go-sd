@@ -130,8 +130,12 @@ static const uint8_t sc_to_ascii[128] = {
     0,   ' ',
 };
 
+volatile uint32_t x86_bios_kbd_irqs = 0;     /* INT 09h entries served */
+volatile uint32_t x86_bios_int16_calls = 0;  /* guest polls of INT 16h */
+
 int x86_bios_kbd_irq(void)
 {
+    x86_bios_kbd_irqs++;
     /* Read the controller exactly as a real handler does, so the queue drains
        through the same path whichever handler is installed. */
     uint8_t sc = (uint8_t)x86_port_read(0x60, 1);
@@ -250,12 +254,16 @@ int x86_bios_video(uint8_t func)
 /* The keyboard ring, for the DOS layer. INT 21h's console input functions read
    the same buffer INT 16h does -- on a real machine DOS goes through the BIOS,
    and a program that mixes the two must see one queue, not two. */
-int x86_kb_get(uint16_t *key)  { return kb_pop(key); }
-int x86_kb_peek(uint16_t *key) { return kb_peek(key); }
+volatile uint32_t x86_kb_get_calls = 0;   /* DOS/BIOS ring consumers */
+volatile uint32_t x86_kb_peek_calls = 0;
+
+int x86_kb_get(uint16_t *key)  { x86_kb_get_calls++;  return kb_pop(key); }
+int x86_kb_peek(uint16_t *key) { x86_kb_peek_calls++; return kb_peek(key); }
 
 int x86_bios_keyboard(uint8_t func)
 {
     uint16_t key;
+    x86_bios_int16_calls++;
     switch (func) {
     case 0x00:                      /* wait for a key */
     case 0x10:

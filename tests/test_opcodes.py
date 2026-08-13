@@ -1405,6 +1405,83 @@ def run_test(args):
                 "expected_eip": 7,
             },
 
+            {
+                # F6 /0 fetched its immediate and set no flags at all, so the
+                # NEXT conditional branch ran on the previous instruction's
+                # result. Seeded here with an AND that leaves ZF clear, which
+                # is exactly how the bug stayed invisible: the flags looked
+                # plausible, they were just the wrong instruction's.
+                "name": "TEST r/m8,imm8 (F6 /0) sets ZF",
+                "code": bytes([0xB0, 0x31,        # mov al, 0x31 -> AND clears ZF
+                               0x24, 0x7F,        # and al, 0x7F
+                               0xB4, 0x31,        # mov ah, 0x31
+                               0xF6, 0xC4, 0x80,  # test ah, 0x80 -> ZF must be 1
+                               0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x3131},
+                "flags_expected": {"ZF": 1, "SF": 0, "CF": 0, "OF": 0},
+                "expected_eip": 10,
+            },
+            {
+                "name": "TEST r/m8,imm8 (F6 /0) clears ZF when bits match",
+                "code": bytes([0xB4, 0xB1,        # mov ah, 0xB1 (a break code)
+                               0xF6, 0xC4, 0x80,  # test ah, 0x80 -> ZF 0, SF 1
+                               0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0xB100},
+                "flags_expected": {"ZF": 0, "SF": 1, "CF": 0, "OF": 0},
+                "expected_eip": 6,
+            },
+            {
+                # Alley Cat's INT 09h handler, byte for byte. It sets ES to its
+                # data segment, reads the scancode, and bumps a counter that the
+                # game's wait loops poll -- through an ES override on the
+                # read-modify-write form of INC. If any part of that is wrong
+                # the game takes the keystroke and does nothing with it, which
+                # is exactly what "the guest ignores the keyboard" looked like.
+                "name": "INC word ES:[disp16] (Alley Cat's INT 09h counter)",
+                "code": bytes([0xBF, 0x91, 0x00,              # mov di, 0x0091
+                               0x8E, 0xC7,                    # mov es, di
+                               0xB0, 0x31,                    # mov al, 0x31 (N)
+                               0x8A, 0xE0,                    # mov ah, al
+                               0x24, 0x7F,                    # and al, 0x7F
+                               0xF6, 0xC4, 0x80,              # test ah, 0x80
+                               0x75, 0x05,                    # jnz over the INC
+                               0x26, 0xFF, 0x06, 0x93, 0x06,  # inc es:[0x0693]
+                               0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x8000},
+                "ram_setup": [(0x0FA3, bytes([0x07, 0x00]))],
+                "regs_initial": {},
+                "regs_expected": {},
+                "mem_expected": [(0x0FA3, bytes([0x08, 0x00]))],
+                "expected_eip": 22,
+            },
+            {
+                # The break code must NOT bump it: the JNZ has to be taken. A
+                # TEST that got ZF backwards passes the make-code case above and
+                # fails only here.
+                "name": "INC skipped on a break code (TEST ah,0x80 / JNZ)",
+                "code": bytes([0xBF, 0x91, 0x00,
+                               0x8E, 0xC7,
+                               0xB0, 0xB1,                    # mov al, 0xB1
+                               0x8A, 0xE0,
+                               0x24, 0x7F,
+                               0xF6, 0xC4, 0x80,
+                               0x75, 0x05,
+                               0x26, 0xFF, 0x06, 0x93, 0x06,
+                               0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x8000},
+                "ram_setup": [(0x0FA3, bytes([0x07, 0x00]))],
+                "regs_initial": {},
+                "regs_expected": {},
+                "mem_expected": [(0x0FA3, bytes([0x07, 0x00]))],
+                "expected_eip": 22,
+            },
+
             # --- 16-bit control flow ------------------------------------------
             {
                 "name": "O16: JMP rel16 displacement is 2 bytes",

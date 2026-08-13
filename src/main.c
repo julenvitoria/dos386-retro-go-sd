@@ -77,7 +77,20 @@ static char dsk_path[256];
 volatile uint32_t dsk_mounted = 0;
 volatile uint32_t dsk_exec_rc = 0xFFFFFFFF;
 volatile uint32_t dsk_startup_ok = 0;
-static uint32_t core_clut[32];
+/*
+ * The LUT8 CLUT we hand the firmware. 32 entries, and the COUNT WE PUSH IS
+ * ALWAYS 32, even though CGA graphics uses four of them and text sixteen.
+ *
+ * That is a hard requirement of the firmware's darkening contract, not
+ * tidiness: lcd_set_clut() programs the darkened twin of entry i at i+count,
+ * while odroid_overlay_darken_all() dims a pixel by ORing LCD_DARKEN_BIT
+ * (0x20 == 32) into its index. The two only agree at count == 32. Pushing 4
+ * put the twins at 4..7 while the overlay asked for 32..35 -- unprogrammed,
+ * i.e. black -- so opening the menu blanked the guest picture underneath.
+ * Pushing 32 also stops mode 3 from losing colours 4..15.
+ */
+#define CORE_CLUT_ENTRIES 32
+static uint32_t core_clut[CORE_CLUT_ENTRIES];
 static uint8_t *upper_filler;
 
 /* Host-readable so a failure to place either block is visible rather than a
@@ -99,6 +112,19 @@ volatile uint32_t fb_addr = 0;        /* the buffer the blit was handed */
 volatile uint32_t fb_sample = 0;      /* first 4 pixels of the picture area */
 volatile uint32_t clut_sample = 0;    /* colour 1, to prove the CLUT took */
 volatile uint32_t hle_calls_seen = 0;
+/* Input chain, made observable end to end. The failure mode this exists for is
+   "nothing happens when I press a key", which has five candidate breaks and no
+   way to tell them apart from outside: the poll not running, the firmware
+   handing us an empty pad, the mapping producing no bits, no scancode reaching
+   the controller queue, or the IRQ never being delivered. One counter per
+   stage, read with scripts/probe.py --watch. */
+volatile uint32_t input_polls = 0;      /* poll_input() calls               */
+volatile uint32_t input_pad_raw = 0;    /* last raw pad, bit N = values[N]  */
+volatile uint32_t input_pad_seen = 0;   /* sticky OR of the above           */
+volatile uint32_t input_keys_now = 0;   /* our 8-bit mapped key mask        */
+volatile uint32_t input_scancodes = 0;  /* codes handed to the controller   */
+volatile uint32_t input_irqs = 0;       /* IRQ 1 raises                     */
+volatile uint32_t input_kbd_ht = 0;     /* controller head | tail<<8        */
 volatile uint32_t hle_bad_vector = 0;
 volatile uint32_t hle_bad_func = 0;
 volatile uint32_t guest_ax = 0;
@@ -331,7 +357,8 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
          * the game to solid black. Pushing 32 also gives the anti-aliased text
          * renderer the eight four-entry blocks it allocates per frame. */
         x86_video_init(guest_vram, core_clut);
-        abi->lcd_ctl(GW_LCD_SET_CLUT, (uintptr_t)core_clut, 32, 0);
+        abi->lcd_ctl(GW_LCD_SET_CLUT, (uintptr_t)core_clut,
+                     CORE_CLUT_ENTRIES, 0);
         cga_clut_dirty = 0;
     }
 
@@ -547,16 +574,55 @@ static void guest_reset(void)
  * and a game that installs its own INT 09h and reads port 0x60 directly -- as
  * most action games do -- needs no BIOS layer at all.
  */
+/*
+ * The machine has SIX buttons a guest may use: the d-pad, A, B, GAME and TIME.
+ * The firmware reports GAME as ODROID_INPUT_START and TIME as
+ * ODROID_INPUT_SELECT (odroid_input.c), so "Start" and "Game" are one physical
+ * button and so are "Select" and "Time" -- there is no fourth face button to
+ * give away.
+ *
+ * Which key each one sends is not cosmetic. Alley Cat opens with
+ * "Do you want to use a joystick (Y/N)?" and reads port 0x60 for the answer:
+ * with the previous table (Ctrl / Enter / Esc) NO button could produce a Y or
+ * an N, so the game sat on that prompt forever and every later press went to a
+ * program that had not started. That is the whole of "the guest ignores the
+ * keyboard" -- the delivery chain underneath was already working.
+ *
+ * N, not Y, on the shared TIME/SELECT button: answering "no joystick" is what
+ * puts the game on the keyboard we actually emulate. Y is unreachable until
+ * the GAME button's on-screen keyboard exists.
+ */
 static const uint8_t pad_scancode[8] = {
     0x48,  /* UP    */
     0x50,  /* DOWN  */
     0x4B,  /* LEFT  */
     0x4D,  /* RIGHT */
-    0x39,  /* A      -> Space */
-    0x1D,  /* B      -> Ctrl  */
-    0x1C,  /* START  -> Enter */
-    0x01,  /* SELECT -> Esc   */
+    0x39,  /* A            -> Space  */
+    0x01,  /* B            -> Esc    */
+    0x1C,  /* START = GAME -> Return */
+    0x31,  /* SELECT= TIME -> N      */
 };
+
+/*
+ * Repaint the guest frame under the overlay.
+ *
+ * NOT optional. Retro-Go's repaint_overlay() calls this callback
+ * UNCONDITIONALLY -- `repaint()` with no NULL test -- so passing NULL to
+ * common_emu_input_loop() branches to address 0 the moment PAUSE/SET opens the
+ * menu: CFSR INVSTATE, HardFault, BSOD. (The save/load-state handlers ARE
+ * NULL-guarded by odroid_system_emu_save_state/load_state; this one is not.)
+ *
+ * The menu draws into the ACTIVE buffer and calls us whenever it needs the
+ * game picture back underneath, so render into the active buffer and do not
+ * swap -- the menu owns the swap.
+ */
+static void core_repaint(void)
+{
+    const gw_firmware_abi_t *abi = gw_firmware_abi();
+    uint8_t *fb = (uint8_t *)abi->lcd_ctl(GW_LCD_BUFFER, GW_LCD_BUF_ACTIVE, 0, 0);
+    if (fb)
+        x86_video_render(fb, FRAME_W);
+}
 
 static void poll_input(const gw_firmware_abi_t *abi)
 {
@@ -569,7 +635,16 @@ static void poll_input(const gw_firmware_abi_t *abi)
        brightness, volume and exit. Reading the gamepad directly and stopping
        there -- which is what this did -- leaves the core running inside
        Retro-Go with no way to get back out of it. */
-    abi->common_emu_input_loop(&pad, NULL, NULL);
+    abi->common_emu_input_loop(&pad, NULL, core_repaint);
+
+    input_polls++;
+    {
+        uint32_t raw = 0;
+        for (unsigned i = 0; i < ODROID_INPUT_MAX && i < 32; i++)
+            if (pad.values[i]) raw |= 1u << i;
+        input_pad_raw = raw;
+        input_pad_seen |= raw;
+    }
 
     uint32_t keys = 0;
     if (pad.values[ODROID_INPUT_UP])     keys |= 1u << 0;
@@ -583,6 +658,7 @@ static void poll_input(const gw_firmware_abi_t *abi)
 
     uint32_t changed = keys ^ x86_io.input_keys;
     x86_io.input_keys = keys;
+    input_keys_now = keys;
     if (!changed)
         return;
 
@@ -591,13 +667,16 @@ static void poll_input(const gw_firmware_abi_t *abi)
             continue;
         uint8_t sc = pad_scancode[i];
         x86_kbd_scancode((keys & (1u << i)) ? sc : (uint8_t)(sc | 0x80));
+        input_scancodes++;
     }
+    input_kbd_ht = (uint32_t)x86_io.kbd_head | ((uint32_t)x86_io.kbd_tail << 8);
 
     /* Raise IRQ 1 and pull the next instruction boundary forward, so it is
        delivered now instead of at the end of the slice. */
     if (x86_kbd_pending()) {
         cpu_state_ptr->hard_int_pending = 0x09;
         cpu_state_ptr->pit_counter = 1;
+        input_irqs++;
     }
 }
 
@@ -713,7 +792,8 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         /* A guest write to 0x3D9 changes the palette; the firmware holds its
          * own copy, so push ours again when it moves. */
         if (cga_clut_dirty) {
-            abi->lcd_ctl(GW_LCD_SET_CLUT, (uintptr_t)core_clut, 32, 0);
+            abi->lcd_ctl(GW_LCD_SET_CLUT, (uintptr_t)core_clut,
+                         CORE_CLUT_ENTRIES, 0);
             cga_clut_dirty = 0;
         }
 

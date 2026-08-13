@@ -3261,6 +3261,12 @@ L(GRP3_F6_DISPATCH):
     CMP R12, #7
     BEQ.W L(GRP3_F6_IDIV)
     B.W .exit_loop
+/* TEST r/m8, imm8. It fetched the immediate and then set NO FLAGS -- the whole
+   point of the instruction. Everything downstream ran on whatever the previous
+   instruction had left behind, which is how Alley Cat's INT 09h handler
+   (AND AL,7Fh / TEST AH,80h / JNZ) took the JNZ on every make code and never
+   bumped the counter its wait loops poll: keys arrived, nothing happened.
+   Normalized to bit 31 like the A8 byte form so SF/ZF describe the byte. */
 L(GRP3_F6_TEST):
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
@@ -3268,6 +3274,9 @@ L(GRP3_F6_TEST):
     BMI .mem_fault
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
+    AND.W R3, R3, R5               @ TEST sets flags and discards the result
+    LSLS.W R0, R3, #24
+    X86_FLAGS_LOGIC R3, R0, R1
     B.W .fetch_decode_loop
 L(GRP3_F6_NOT):
     MVN.W R3, R3
