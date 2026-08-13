@@ -757,7 +757,7 @@ OP_AGNOSTIC .op_test_eb_gb_84
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
     CMP R3, #192
-    BNE.W .exit_loop
+    BNE.N L(TEST_EB_GB_84_MEM)
     UBFX R4, R1, #3, #3            @ Gb: high byte registers are regs 4-7
     AND.W R5, R4, #3
     MOV.W R5, R5, LSL #2
@@ -772,10 +772,25 @@ OP_AGNOSTIC .op_test_eb_gb_84
     ADD R2, R3
     ADD.W R2, R2, #8
     LDRB.W R3, [R8, R2]
+L(TEST_EB_GB_84_FLAGS):
     AND.W R3, R3, R5
     LSLS.W R0, R3, #24             @ set N/Z for the byte width
     X86_FLAGS_LOGIC R3, R0, R1
     B.W .fetch_decode_loop
+/* Gb is read AFTER the decoder: DECODE_MODRM uses R4 and R5 as scratch. */
+L(TEST_EB_GB_84_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN]
+    BLX R12
+    MEM_GET_PTR R12, R7
+    LDRB R3, [R12]
+    UBFX R4, R1, #3, #3
+    AND.W R5, R4, #3
+    MOV.W R5, R5, LSL #2
+    MOV.W R4, R4, LSR #2
+    ADD R4, R5
+    ADD.W R4, R4, #8
+    LDRB.W R5, [R8, R4]
+    B.N L(TEST_EB_GB_84_FLAGS)
 
 OP .op_test_ev_gv_85
     UBFX R1, R10, #12, #12

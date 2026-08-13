@@ -2664,6 +2664,21 @@ def run_test(args):
                 "mem_expected": [(0x10460, bytes([0x34, 0x12, 0x00, 0x00]))],
                 "expected_eip": 6,
             },
+            {
+                "name": "TEST Eb,Gb (84) memory form sets ZF",
+                # MOV BX,0x470 ; MOV AL,0xF0 ; TEST [BX],AL ; HLT. 0x85 got its
+                # memory form; its 8-bit twin did not, and TOPBENCH stops dead
+                # on it right after printing its banner.
+                "code": bytes([0xBB, 0x70, 0x04, 0xB0, 0xF0, 0x84, 0x07, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x10000},
+                "ram_setup": [(0x10470, bytes([0x0F, 0x00]))],
+                "regs_initial": {},
+                "regs_expected": {0: 0x00F0, 3: 0x470},
+                "flags_expected": {"ZF": 1, "CF": 0, "OF": 0},
+                "mem_expected": [(0x10470, bytes([0x0F, 0x00]))],
+                "expected_eip": 8,
+            },
         ])
 
         all_passed = True
