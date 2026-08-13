@@ -3819,36 +3819,94 @@ L(FAR_SET):
 /* ===========================================================================
  * REP (F3) / REPNE (F2).
  *
- * One element runs per pass through the main fetch loop; if the run is not
- * finished the string op re-points EIP at the prefix and the pair executes
- * again. That keeps interrupts serviceable in the middle of a long REP MOVS --
- * an inner loop would stall the PIT for its whole duration, which is precisely
- * how a DOS game's timing comes apart -- and it means each string op has ONE
- * implementation rather than a plain and a repeating variant.
- *
- * The continuation test lives on the string ops' shared exit, so it costs
- * nothing anywhere else in the interpreter.
- *
  * The counter is CX or ECX by ADDRESS size, which is live in R2.
+ *
+ * TWO paths, and the slow one is the fallback, not the exception to be avoided.
+ *
+ * REWIND (original): one element per pass through the main fetch loop; if the
+ * run is not finished the string op re-points EIP at the prefix and the pair
+ * executes again. That is what keeps interrupts serviceable in the middle of a
+ * long REP MOVS -- an unbounded inner loop would stall the PIT for its whole
+ * duration, which is precisely how a DOS game's timing comes apart -- and it
+ * means each string op has ONE implementation rather than a plain and a
+ * repeating variant.
+ *
+ * BATCH (fast path): the price of the rewind is a full fetch/decode/dispatch
+ * for the prefix AND for the string opcode on EVERY element. Measured on
+ * silicon against TOPBENCH, F3 alone was 17% of all cycles and the string ops
+ * plus their prefixes ~59% -- 7 million dispatches of F3 that do no guest work.
+ * So when the run is going to continue anyway, re-enter the string handler
+ * DIRECTLY (`rep_handler`, resolved off the live dispatch table by the prefix)
+ * instead of going round the loop. Nothing about an element changes: the
+ * handler re-walks the fold per element, so a granule straddle, a segment
+ * wrap and a 16-bit index wrap all behave exactly as they do on the slow path,
+ * and the ZF test above still runs between elements, so REPZ/REPNZ terminate on
+ * the same element they would have.
+ *
+ * The batch is BOUNDED, by two things that are both the real quantity rather
+ * than a proxy for it:
+ *   - `rep_batch`, a hard cap reloaded by the prefix, so the loop cannot run
+ *     away no matter what the guest put in CX;
+ *   - `pit_counter`, which IS the slice budget: a batched element decrements it
+ *     exactly as a trip round .fetch_decode_loop would, and the batch stops
+ *     while at least one tick is left. That single test covers the PIT slice
+ *     AND a pending hardware interrupt, because the host raises one by writing
+ *     the vector and dropping pit_counter to 1 -- so an IRQ lands on the same
+ *     element boundary it would have landed on before.
+ * Decrementing pit_counter per element is not bookkeeping hygiene: main.c pays
+ * down guest_insn_debt by the slice and counts guest_insns_total from it, so a
+ * batch that ran elements for free would silently make the guest faster than
+ * guest_kips asked for.
  * =========================================================================== */
+#ifndef REP_BATCH_MAX
+/* Elements per batch. Large enough that a 64 KB REP MOVSW collapses from 65535
+   dispatch pairs to 256, small enough that the interpreter is never away from
+   its instruction boundary for long. */
+#define REP_BATCH_MAX 256
+#endif
+
 #ifndef USE_16_BIT
 .str_exit:
     LDR.W R3, [R8, #CPU_REP_ACTIVE]
     CBZ R3, 1f
-    MOV.W R3, #0
-    STR.W R3, [R8, #CPU_REP_ACTIVE]    @ self-clearing: one run, one arming
     LDR.W R5, [R8, #REG_ECX]
     TST.W R2, #ADDRSIZE_XOR
     IT EQ
     UXTHEQ R5, R5
-    CBZ R5, 1f                         @ count exhausted -> done
+    CBZ R5, 9f                         @ count exhausted -> done
     LDR.W R4, [R8, #CPU_REP_ZF_SENSE]
     CMP R4, #2
     BEQ.N 2f                           @ MOVS/STOS/LODS ignore ZF
     UBFX R3, R11, #6, #1               @ ZF
     CMP R3, R4
-    BNE.N 1f                           @ REPE saw ZF=0, or REPNE saw ZF=1
-2:  LDR.W R10, [R8, #CPU_REP_RESUME]   @ rewind to the prefix
+    BNE.N 9f                           @ REPE saw ZF=0, or REPNE saw ZF=1
+2:  /* The run continues. Batch it if both bounds allow, else rewind. */
+    LDR.W R12, [R8, #CPU_REP_BATCH]
+    CMP R12, #0
+    BEQ.N 3f                           @ cap spent
+    LDR.W R3, [R8, #CPU_PIT_COUNTER]
+    CMP R3, #2
+    BLO.N 3f                           @ slice expiring, or an IRQ is armed
+    SUB.W R12, R12, #1
+    STR.W R12, [R8, #CPU_REP_BATCH]
+    SUB.W R3, R3, #1                   @ a batched element still costs a tick
+    STR.W R3, [R8, #CPU_PIT_COUNTER]   @ of the slice
+    SUB.W R5, R5, #1
+    TST.W R2, #ADDRSIZE_XOR
+    IT EQ
+    UXTHEQ R5, R5
+    STR.W R5, [R8, #REG_ECX]
+    LDR.W R3, [R8, #CPU_REP_HANDLER]
+    BX R3                              @ straight back into the string handler
+    /* rep_active must NOT survive into another instruction: an interrupt can be
+       delivered at the boundary below, and a stale arming would make the ISR's
+       own first string op repeat. Both slow paths clear it; the prefix re-arms. */
+3:  MOV.W R3, #0
+    STR.W R3, [R8, #CPU_REP_ACTIVE]
+    LDR.W R10, [R8, #CPU_REP_RESUME]   @ rewind to the prefix
+    B.W .fetch_decode_loop
+9:  MOV.W R3, #0
+    STR.W R3, [R8, #CPU_REP_ACTIVE]
 1:  B.W .fetch_decode_loop
 #endif
 
@@ -3901,6 +3959,13 @@ L(REP_ONE):
     STR.W R4, [R8, #CPU_REP_ZF_SENSE]
     SUB.W R3, R10, #1              @ this prefix, for the rewind
     STR.W R3, [R8, #CPU_REP_RESUME]
+    /* The batch re-entry point, taken from the LIVE dispatch table with the
+       opcode still in R0, so it is by construction the same handler the fetch
+       below is about to reach -- including the right operand-size variant. */
+    LDR.W R12, [R2, R0, LSL #2]
+    STR.W R12, [R8, #CPU_REP_HANDLER]
+    MOV.W R12, #REP_BATCH_MAX
+    STR.W R12, [R8, #CPU_REP_BATCH]
     MOV.W R3, #1
     STR.W R3, [R8, #CPU_REP_ACTIVE]
     B.W .fetch_next_byte_no_reset
