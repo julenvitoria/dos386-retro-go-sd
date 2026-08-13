@@ -147,8 +147,16 @@ divergence by comparing a register (CX, DX) over the same window, not just EIP.
 
 ```bash
 python3 scripts/screenshot.py --wait 20 --out build/artifacts/topbench.png
+python3 scripts/screenshot.py --timeline timelines/run-to-completion.tl \
+    --wait 48 --pan 16 --text --out build/artifacts/topbench.png
 python3 scripts/screenshot.py --target hardware --wait 20
 ```
+
+`--text` dumps the 80x25 character buffer alongside the image; judging 8x8
+glyphs by eye is how a `Runtime error 203` went unread through two captures.
+`--pan N` pins the text window's leftmost column: the panel shows 40 of the 80
+columns and normally follows the cursor, so anything further right -- a score at
+the end of a wide line -- is invisible until you pin it.
 
 gwemu's own headless screendump comes back black, so it proves nothing. The
 LTDC registers ARE modelled: this reads Layer 1's framebuffer address, pitch
@@ -247,6 +255,9 @@ validation, multiple destinations and target awareness.
 
 Launch is driven by `/CONFIG` preselection plus
 `timelines/start-preselected-game.tl` (presses A twice). Do not navigate menus.
+`timelines/run-to-completion.tl` is the same launch with a 58 s window, for a
+guest doing real work whose result only appears at the end -- the one case where
+the wait IS the result rather than a symptom to chase with `probe.py`.
 
 ## Modules (`scripts/common/`)
 

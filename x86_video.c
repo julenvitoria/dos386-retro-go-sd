@@ -184,6 +184,19 @@ static uint8_t  video_mode = 0x04;
 static uint8_t  cur_row, cur_col;
 static uint16_t text_scroll_col;    /* leftmost visible column */
 
+/*
+ * The panel is 320 px wide and the font is 8 px, so 40 of the 80 text columns
+ * fit. The window normally follows the cursor, which is right for a program
+ * that prints and then waits -- but wrong for one that rewrites a wide line and
+ * returns the cursor to column 0, because the part it just wrote scrolls back
+ * out of view. TOPBENCH's score sits at column 46.
+ *
+ * Set this to a column to pin the window there instead; -1 restores following
+ * the cursor. Written by scripts/screenshot.py --pan. A user-facing pan (on a
+ * button) is the real fix and is not this.
+ */
+volatile int32_t x86_video_pan = -1;
+
 void x86_video_set_mode(uint8_t mode)
 {
     video_mode = mode;
@@ -305,8 +318,13 @@ void x86_video_set_palette_bios(uint8_t which, uint8_t value)
 static void text_render(uint8_t *dst, uint32_t stride)
 {
     for (unsigned row = 0; row < TEXT_ROWS; row++) {
+        unsigned left = text_scroll_col;
+        if (x86_video_pan >= 0)
+            left = (unsigned)x86_video_pan;
+        if (left > TEXT_COLS - TEXT_VIS_COLS)
+            left = TEXT_COLS - TEXT_VIS_COLS;
         for (unsigned vc = 0; vc < TEXT_VIS_COLS; vc++) {
-            unsigned col = text_scroll_col + vc;
+            unsigned col = left + vc;
             uint16_t cell = (col < TEXT_COLS) ? *text_cell(row, col) : 0x0720;
             const unsigned char *glyph = font8x8_basic[cell & 0x7F];
             uint8_t fg = (uint8_t)((cell >> 8) & 0x0F);

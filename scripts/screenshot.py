@@ -85,6 +85,12 @@ def main():
     p.add_argument("--out", default="build/artifacts/screen.png")
     p.add_argument("--wait", type=float, default=15.0,
                    help="seconds to let the guest run before capturing")
+    p.add_argument("--pan", type=int, default=None,
+                   help="pin the text window's leftmost column instead of "
+                        "letting it follow the cursor. The panel shows 40 of "
+                        "the 80 columns, so anything past column 40 -- a score "
+                        "at the end of a wide line, say -- is only visible with "
+                        "this")
     p.add_argument("--text", action="store_true",
                    help="also dump the 80x25 character buffer, which is much "
                         "easier to judge than 8x8 glyphs and shows the 40 "
@@ -121,6 +127,18 @@ def main():
             return 1
         print(f"core drawing; letting it run {args.wait:g}s")
         time.sleep(args.wait)
+        if args.pan is not None:
+            b.halt()
+            b.write_uint32(core["x86_video_pan"], args.pan & 0xFFFFFFFF)
+            b.resume()
+            # Let the core draw at least one frame with the new window.
+            start = b.read_uint32(core["frames_rendered"])
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if b.read_uint32(core["frames_rendered"]) > start + 2:
+                    break
+                time.sleep(0.05)
+            print(f"panned the text window to column {args.pan}")
 
         b.halt()
         fb = b.read_uint32(LTDC_L1CFBAR)
