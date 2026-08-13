@@ -367,6 +367,7 @@ standby. Called automatically by `make retrogo_media`.
 | `x86_disk.c` | the block device under our FatFs, plus the .dsk sector cache: 4 x 16 KB LRU windows from the bonus pool, which are the read-ahead AND the cache |
 | `x86_mem.c` | guest page pool, fold mapping, guest↔host copies |
 | `x86_io.c` | port dispatch, PIT ch2 + speaker, CGA registers |
+| `x86_audio_wave.h` | PC-speaker square-wave generator: PIT divisor -> phase increment -> samples. `<stdint.h>` only, deliberately — that is what lets `tests/host_audio.c` build it natively. Vendored from the author's earlier DOS core |
 | `x86_video.c`, `cga_blit.S` | mode 4 blitter, mode 3 text renderer (4x8 cells, all 80 columns), palette |
 | `x86_hle.c` | `0F 0B` stubs, IVT planting, service dispatch |
 | `x86_bios.c` | INT 10h / 16h / 1Ah and the BIOS Data Area |
@@ -393,6 +394,18 @@ python3 tests/test_keyboard.py           # BDA ring -> INT 16h, consumed by
                                          # the IRET frame, AH=00 dequeue, the
                                          # empty case and a wrap at the end of
                                          # the ring
+python3 tests/test_audio.py              # PC-speaker wave generator, NATIVE --
+                                         # no target at all. Compiles
+                                         # tests/host_audio.c against
+                                         # x86_audio_wave.h with the host cc and
+                                         # MEASURES divisor -> output frequency,
+                                         # the Nyquist guard and the anti-click
+                                         # reset, in under a second. It also
+                                         # carries the implementation it
+                                         # replaced and prints both errors side
+                                         # by side, because a wrong pitch is
+                                         # invisible in a screenshot and
+                                         # unjudgeable under gwemu
 python3 tests/test_video.py              # CGA mode 4 blitter, pixel-exact
 python3 tests/test_text.py               # CGA text mode 3, pixel-exact:
                                          # CP437 at 4x8 and 8x8, attributes,

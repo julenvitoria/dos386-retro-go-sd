@@ -128,7 +128,7 @@ typedef struct {
     uint8_t  pit2_access;     /* latched access mode from port 0x43 */
     uint8_t  pit2_latched;    /* half-way through a lo/hi pair */
     uint8_t  port61;          /* bit0 = ch2 gate, bit1 = speaker data */
-    uint32_t spk_phase;       /* 16.16 square-wave phase, carried across buffers */
+    uint32_t spk_phase;       /* 32-bit square-wave phase, carried across buffers */
     /* Speaker EVENTS, not a per-frame sample of the speaker.
      *
      * The renderer used to run once a frame and point-sample the CURRENT
@@ -139,15 +139,21 @@ typedef struct {
      * window and lays each segment down where it belongs.
      *
      * X86_SPK_EVENTS is small on purpose: a guest sweeping a siren changes the
-     * divisor far faster than 16 kHz can show, and the overflow is COUNTED
-     * (x86_spk_events_dropped) rather than papered over. */
+     * divisor far faster than the output rate can show, and the overflow is
+     * COUNTED (x86_spk_events_dropped) rather than papered over.
+     *
+     * The ring carries the PIT DIVISOR, not a frequency. It used to carry
+     * `1193182 / divisor` as an integer, which threw away the pitch before the
+     * generator ever saw it -- see x86_audio_wave.h. 0 means "gated off";
+     * a guest reload of 0 is carried as 65536, so this cannot be uint16_t. */
 #define X86_SPK_EVENTS 32u
     uint32_t spk_ev_ms[X86_SPK_EVENTS];
-    uint32_t spk_ev_hz[X86_SPK_EVENTS];
+    uint32_t spk_ev_div[X86_SPK_EVENTS];
     uint8_t  spk_ev_head, spk_ev_tail;
-    uint32_t spk_last_hz;     /* frequency at the last logged event          */
-    uint32_t spk_render_hz;   /* frequency the renderer left off at          */
+    uint32_t spk_last_div;    /* divisor at the last logged event            */
+    uint32_t spk_render_div;  /* divisor the renderer left off at            */
     uint32_t spk_window_ms;   /* host ms the next render's window starts at  */
+    uint8_t  spk_was_on;      /* last rendered run was audible -> edge detect */
     uint8_t  cga_mode;        /* 0x3D8 mode control */
     uint8_t  cga_color_select;/* 0x3D9 background + palette + intensity */
     uint16_t cga_beam;        /* 0..0xFFFF through the frame, set by the core */
@@ -308,7 +314,8 @@ extern uint32_t x86_hle_unhandled_vector, x86_hle_unhandled_func;
 
 uint32_t x86_port_read(uint32_t port, uint32_t size);
 void x86_port_write(uint32_t port, uint32_t value, uint32_t size);
-uint32_t x86_speaker_hz(void);
+uint32_t x86_speaker_divisor(void);   /* the signal path's pitch source */
+uint32_t x86_speaker_hz(void);        /* reporting only */
 void x86_speaker_render(int16_t *dst, unsigned frames, unsigned sample_rate,
                         int16_t amplitude);
 /* Host millisecond clock, for timestamping speaker events. The core points

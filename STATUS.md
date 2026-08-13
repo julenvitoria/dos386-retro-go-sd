@@ -6,7 +6,7 @@ Last verified 2026-08-13. How to run: [`TOOLING.md`](TOOLING.md). Roadmap: [`PLA
 
 | Tier | State |
 |---|---|
-| 1. gwemu bare-metal | 268/268 `test_opcodes.py`, plus `test_video`/`test_text`/`test_dos`/`test_keyboard`/`test_screen` |
+| 1. gwemu bare-metal | 268/268 `test_opcodes.py`, plus `test_video`/`test_text`/`test_dos`/`test_keyboard`/`test_screen`; `test_audio` runs natively, no target |
 | 2. gwemu + retro-go | `core_dtcm_ok=1`, bonus pool 153,600 B, 1,000,001 insns — matches tier 1 |
 | 3. Hardware | 50.50 cyc/insn, 5.54 MIPS |
 
@@ -70,6 +70,42 @@ a few %). Only the COUNTS mean anything under gwemu:
 there is nothing to batch — the fast path is not silently skipping it.
 `asm_metrics`: `.str_exit` 17 → 37 (+20), `REP_ONE_16/32` +4 each; no string
 handler changed. Silicon numbers not yet taken.
+## The PC speaker, and the four things that made it sound tinny
+
+The device report was "the beep is lower quality than the old DOS port". The
+generator from that port (`dos_audio_wave.h`) is **vendored** here as
+`x86_audio_wave.h` — `<stdint.h>` only, which is what makes it host-testable —
+and `tests/host_audio.c` measures both implementations side by side. All four
+defects are measurements, not opinions:
+
+1. **Pitch.** The old path computed an integer `1193182 / divisor` and then a
+   16-bit step from it. Two floors compound and the error grows as the tone
+   falls: **middle C came out 4.7 cents flat, C3 12.9 and C2 13.5**. The
+   32-bit accumulator takes the divisor directly — no integer frequency exists
+   in the signal path — and the worst case over the same divisors is
+   **0.23 cents**.
+2. **No Nyquist guard.** At 16 kHz every divisor below 149 was above Nyquist
+   and folded down as a loud, tuneless alias; divisor 10 (119 kHz) came out as
+   a **7,318 Hz** tone. Those are silence now.
+3. **The half-buffer was four frames long.** `GW_AUDIO_GET_LENGTH` only reports
+   what `START` last set, so asking first and starting with the answer left the
+   firmware default of 1077 samples — 67 ms at 16 kHz, refilled every ~17 ms.
+   The writer lapped the DMA reader three times over and a correct tone reached
+   the SAI as a stitch of restarts. Now 48 kHz with an 800-sample half-buffer:
+   one panel period exactly, inside the 1077 ceiling.
+4. **48 kHz, and the volume knob.** A speaker square is all edge; at 16 kHz
+   every edge quantised to one of ~48 samples per period. Amplitude follows
+   `common_emu_sound_get_volume()` (0..255, `>> 11`) instead of a fixed 6000.
+
+Kept: the timestamped-event renderer and the 8253 latch fixes below. The ring
+carries the **divisor** now, not an integer Hz, and the anti-click phase reset
+fires on the rising edge the events already locate.
+
+Measured under gwemu, Alley Cat: 26 tone changes, **0 dropped**, 59 fps, 3.0 M
+insn/s. `x86_spk_log` shows the real sequence — `43h=B6` (ch2, lo/hi, mode 3),
+`42h=FB`, `42h=11`, `61h=03` — i.e. divisor **0x11FB = 4603 = 259.2 Hz**.
+gwemu cannot judge audio quality; the listening test is the user's.
+
 ## Phase 3 — Wolf3D
 
 - [ ] COW/pool/eviction with dirty tracking, loud exhaustion; pool sizing

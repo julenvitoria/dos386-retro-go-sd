@@ -13,6 +13,7 @@
 
 #include "cutils.h"   /* x86_cpu.h leans on BOOL/TRUE from here */
 #include "x86_cpu.h"
+#include "x86_audio_wave.h"   /* the generator; <stdint.h> only, host-testable */
 
 /* ---------------------------------------------------------------------------
  * PIT (8253) channel 2 and the PC speaker.
@@ -21,7 +22,7 @@
  * sound comes out only when both are set. The tone is the channel's reload
  * divisor against the 1.193182 MHz PIT input.
  */
-#define PIT_HZ 1193182u
+#define PIT_HZ X86_PIT_HZ
 
 X86IOState x86_io;
 
@@ -69,13 +70,28 @@ static void pit_write_ch2(uint8_t v)
     }
 }
 
-uint32_t x86_speaker_hz(void)
+/*
+ * The audible PIT divisor right now, or 0 for silence.
+ *
+ * This -- not a frequency -- is what the renderer and the event ring carry.
+ * An integer `PIT_HZ / divisor` loses the pitch before the generator sees it,
+ * and the loss grows as the tone falls: it is what put middle C 4.5 cents flat
+ * and the octave below it 12.5 (measured, tests/host_audio.c).
+ */
+uint32_t x86_speaker_divisor(void)
 {
     if ((x86_io.port61 & 3) != 3)
         return 0;                    /* gate or data line off: silence */
-    if (x86_io.pit2_reload == 0)
-        return PIT_HZ / 65536u;      /* a 0 divisor means the full 16-bit period */
-    return PIT_HZ / x86_io.pit2_reload;
+    /* A reload of 0 means the full 16-bit period, i.e. 65536 -- not 0, which
+       the generator reads as "never programmed". */
+    return x86_io.pit2_reload ? x86_io.pit2_reload : 65536u;
+}
+
+/* Reporting only (probe.py, logs, tier-1 assertions). Never in the signal
+   path; see x86_audio_wave.h. */
+uint32_t x86_speaker_hz(void)
+{
+    return x86_spkr_freq_hz(x86_speaker_divisor());
 }
 
 uint32_t (*x86_io_time_ms)(void);
@@ -93,10 +109,10 @@ static void spk_event(uint32_t port, uint32_t value)
     x86_spk_log[x86_spk_log_idx & 31] = (port << 24) | (value & 0xFFu);
     x86_spk_log_idx++;
 
-    uint32_t hz = x86_speaker_hz();
-    if (hz == x86_io.spk_last_hz)
+    uint32_t div = x86_speaker_divisor();
+    if (div == x86_io.spk_last_div)
         return;
-    x86_io.spk_last_hz = hz;
+    x86_io.spk_last_div = div;
 
     uint8_t next = (uint8_t)((x86_io.spk_ev_tail + 1u) % X86_SPK_EVENTS);
     if (next == x86_io.spk_ev_head) {
@@ -105,34 +121,43 @@ static void spk_event(uint32_t port, uint32_t value)
         return;
     }
     x86_io.spk_ev_ms[x86_io.spk_ev_tail] = x86_io_time_ms ? x86_io_time_ms() : 0;
-    x86_io.spk_ev_hz[x86_io.spk_ev_tail] = hz;
+    x86_io.spk_ev_div[x86_io.spk_ev_tail] = div;
     x86_io.spk_ev_tail = next;
     x86_spk_events++;
 }
 
 /*
- * One constant-frequency run of samples. Phase is carried in x86_io.spk_phase
- * so the waveform does not restart at a buffer or segment boundary, which
- * would put a click at every one.
+ * One constant-divisor run of samples. Phase is carried in x86_io.spk_phase so
+ * the waveform does not restart at a buffer or segment boundary, which would
+ * put a click at every one.
+ *
+ * ANTI-CLICK: the phase is zeroed on each RISING edge of the gate -- the
+ * transition from "no tone" to "tone" -- so a beep always begins at the same
+ * point of the cycle instead of mid-swing. The event ring is exactly where
+ * that edge is visible: an event whose divisor goes from 0 (or from a divisor
+ * above Nyquist, which is equally silent) to an audible one IS the rising
+ * edge, at the sample offset the guest made it. Zeroing on the falling edge
+ * instead -- which is what the old renderer did, from inside its silence
+ * branch -- gets the same starting phase but only because silence always
+ * precedes a beep; it says nothing about the edge and breaks the moment a
+ * divisor changes while the gate stays open.
  */
-static void spk_run(int16_t *dst, unsigned n, uint32_t hz,
+static void spk_run(int16_t *dst, unsigned n, uint32_t divisor,
                     unsigned sample_rate, int16_t amplitude)
 {
     if (!n)
         return;
-    if (!hz || !sample_rate) {
+    uint32_t inc = x86_spkr_phase_inc(divisor, sample_rate);
+    if (inc == 0) {
         memset(dst, 0, n * sizeof(*dst));
-        x86_io.spk_phase = 0;
-        return;
+        x86_io.spk_was_on = 0;
+        return;                       /* phase deliberately left where it was */
     }
-    /* 16-bit phase accumulator: a full wrap is one square-wave period. */
-    uint32_t step = (uint32_t)(((uint64_t)hz << 16) / sample_rate);
-    uint32_t phase = x86_io.spk_phase;
-    for (unsigned i = 0; i < n; i++) {
-        dst[i] = (phase & 0x8000u) ? amplitude : (int16_t)-amplitude;
-        phase = (phase + step) & 0xFFFFu;
+    if (!x86_io.spk_was_on) {
+        x86_io.spk_phase = 0;         /* rising edge */
+        x86_io.spk_was_on = 1;
     }
-    x86_io.spk_phase = phase;
+    x86_spkr_render(dst, n, inc, amplitude, &x86_io.spk_phase);
 }
 
 /*
@@ -159,7 +184,7 @@ void x86_speaker_render(int16_t *dst, unsigned frames, unsigned sample_rate,
     unsigned pos = 0;
     while (x86_io.spk_ev_head != x86_io.spk_ev_tail) {
         uint32_t ev_ms = x86_io.spk_ev_ms[x86_io.spk_ev_head];
-        uint32_t hz    = x86_io.spk_ev_hz[x86_io.spk_ev_head];
+        uint32_t div   = x86_io.spk_ev_div[x86_io.spk_ev_head];
         x86_io.spk_ev_head =
             (uint8_t)((x86_io.spk_ev_head + 1u) % X86_SPK_EVENTS);
 
@@ -174,12 +199,12 @@ void x86_speaker_render(int16_t *dst, unsigned frames, unsigned sample_rate,
             idx = pos;                          /* the ring is in order */
         if (idx > frames)
             idx = frames;
-        spk_run(dst + pos, idx - pos, x86_io.spk_render_hz,
+        spk_run(dst + pos, idx - pos, x86_io.spk_render_div,
                 sample_rate, amplitude);
         pos = idx;
-        x86_io.spk_render_hz = hz;
+        x86_io.spk_render_div = div;
     }
-    spk_run(dst + pos, frames - pos, x86_io.spk_render_hz,
+    spk_run(dst + pos, frames - pos, x86_io.spk_render_div,
             sample_rate, amplitude);
 }
 
