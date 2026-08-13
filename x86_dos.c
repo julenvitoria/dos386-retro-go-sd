@@ -476,7 +476,15 @@ static int dos_find_report(const FILINFO *fno)
     d[0x1A] = (uint8_t)fno->fsize;       d[0x1B] = (uint8_t)(fno->fsize >> 8);
     d[0x1C] = (uint8_t)(fno->fsize >> 16); d[0x1D] = (uint8_t)(fno->fsize >> 24);
 
+    /* The 8.3 name. FILINFO only HAS an altname when FatFs is built with long
+       file names (FF_USE_LFN); with LFN off -- which is this submodule's
+       ffconf.h, and what the tree actually compiles against -- fname already IS
+       the short name, and referring to altname does not compile. */
+#if FF_USE_LFN
     const char *n = fno->altname[0] ? fno->altname : fno->fname;
+#else
+    const char *n = fno->fname;
+#endif
     unsigned i = 0;
     for (; n[i] && i < 12; i++)
         d[0x1E + i] = (uint8_t)dos_up(n[i]);
@@ -497,7 +505,11 @@ static int dos_find_step(void)
         if (extra & ~dos_find_attr)
             continue;
         char field[11];
+#if FF_USE_LFN
         const char *n = fno.altname[0] ? fno.altname : fno.fname;
+#else
+        const char *n = fno.fname;      /* see dos_find_report() */
+#endif
         dos_83_field(n, field);
         if (dos_83_match(dos_find_pat, field))
             return dos_find_report(&fno);
