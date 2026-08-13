@@ -2543,6 +2543,19 @@ OP .op_grp5_FF
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
     CMP R3, #192
     BNE.N L(GRP5_MEM)
+    /* Register form. /3 (CALL FAR) and /5 (JMP FAR) have NO register
+       encoding: their operand is a POINTER IN MEMORY, so mod=11 is #UD.
+       Falling through into the far handlers instead let them read the far
+       pointer through R7 -- the effective address left behind by whichever
+       EARLIER instruction last decoded a ModRM -- and then install that
+       garbage as CS:IP. That is the interpreter taking its next fetch address
+       from an arbitrary place in guest memory, which is how a run ends up
+       executing data. R12 is scratch and is recomputed at GRP5_DISPATCH. */
+    UBFX R12, R1, #3, #3
+    CMP R12, #3
+    BEQ.W .exit_loop
+    CMP R12, #5
+    BEQ.W .exit_loop
     AND.W R2, R1, #7
     MOV.W R2, R2, LSL #2
     ADD.W R2, R2, #8
@@ -4006,19 +4019,26 @@ L(HYPERCALL_UD):
     MOV.W R4, #6                   @ #UD
     B.W L(HANDLE_INTERRUPT)
 
-/* FF /3 CALL FAR m16:16 and FF /5 JMP FAR m16:16.
+/* FF /3 CALL FAR m16:v and FF /5 JMP FAR m16:v.
  *
  * Indirect far transfers: the target is a pointer IN MEMORY, offset first then
  * selector -- not an immediate. Every relocating program uses one to reach its
  * relocated copy, so their absence stopped TOPBENCH dead with an unimplemented
- * 0xFF. R7 holds the effective address from the ModRM decode. */
+ * 0xFF. R7 holds the effective address from the ModRM decode.
+ *
+ * The OFFSET is operand-size wide and the SELECTOR is always 16 bits, so the
+ * selector sits at +2 in a 16-bit segment and at +4 in a 32-bit one. Both
+ * loads used to be hardcoded LDRH at +0/+2, which in a 32-bit segment threw
+ * away the top half of EIP and then read the offset's own high half as the
+ * selector -- an arbitrary CS built out of the target address. LES/LDS
+ * (L(LOAD_FAR_PTR)) already reads the pair this way; this now matches it. */
 L(GRP5_FAR_ENTRY):
     UBFX R3, R7, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R7
     BMI .mem_fault
-    LDRH R4, [R3, #0]              @ new IP
-    ADD.W R7, R7, #2
+    LD_V R4, R3                    @ new IP/EIP, operand-size wide
+    ADD.W R7, R7, #OPSZ
     UBFX R3, R7, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R7

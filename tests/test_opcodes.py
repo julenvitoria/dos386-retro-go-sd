@@ -3007,6 +3007,149 @@ def run_test(args):
                 "flags_expected": {"CF": 1, "AF": 1},
                 "expected_eip": 5,
             },
+
+            # ---- FF /3 far CALL and FF /5 far JMP through memory ------------
+            # The pointer is IN MEMORY: offset first, then selector, each at
+            # the ADDRESS the ModRM decode produced. In a 16-bit segment that
+            # is m16:16; in a 32-bit one it is m16:32, so the offset is four
+            # bytes wide and the selector sits at +4, not at +2.
+            {
+                "name": "FAR: CALL FAR m16:16 (FF /3) switches CS and pushes CS:IP",
+                # FF 1E 00 03 = CALL FAR [0x0300]; the pointer there is
+                # 0100:0000, whose linear target 0x1000 holds a HLT.
+                "code": bytes([0xFF, 0x1E, 0x00, 0x03, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x20000},
+                "ram_setup": [(0x20000, bytes(0x20)),
+                              (0x300, bytes([0x00, 0x00, 0x00, 0x01])),
+                              (0x1000, bytes([0xF4]))],
+                "regs_initial": {4: 0x0010},
+                "regs_expected": {4: 0x000C},
+                # SP 0x10 -> push CS at 0x0E -> push IP at 0x0C
+                "mem_expected": [(0x2000C, bytes([0x04, 0x00, 0x00, 0x00]))],
+                "expected_eip": 1,
+            },
+            {
+                "name": "FAR: JMP FAR m16:16 (FF /5) switches CS and leaves SP alone",
+                # FF 2E 00 03 = JMP FAR [0x0300]
+                "code": bytes([0xFF, 0x2E, 0x00, 0x03, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x20000},
+                "ram_setup": [(0x20000, bytes(0x20)),
+                              (0x300, bytes([0x00, 0x00, 0x00, 0x01])),
+                              (0x1000, bytes([0xF4]))],
+                "regs_initial": {4: 0x0010},
+                "regs_expected": {4: 0x0010},
+                "mem_expected": [(0x2000C, bytes(4))],
+                "expected_eip": 1,
+            },
+            {
+                "name": "FAR: CALL FAR m16:16 to F000:FFF0, the BIOS entry point",
+                # The exact transfer TOPBENCH's detection unit makes. Guest
+                # page 0xFF is aliased into test_ram so the target is real
+                # memory rather than a fault, and it holds a HLT.
+                "code": bytes([0xFF, 0x1E, 0x00, 0x03, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x20000},
+                "page_map": [(0xFF, 0x70000)],
+                "ram_setup": [(0x20000, bytes(0x20)),
+                              (0x300, bytes([0xF0, 0xFF, 0x00, 0xF0])),
+                              (0x70FF0, bytes([0xF4]))],
+                "regs_initial": {4: 0x0010},
+                "regs_expected": {4: 0x000C},
+                "mem_expected": [(0x2000C, bytes([0x04, 0x00, 0x00, 0x00]))],
+                "expected_eip": 0xFFF1,
+            },
+            {
+                "name": "FAR: JMP FAR m16:16 to F000:FFF0, the BIOS entry point",
+                "code": bytes([0xFF, 0x2E, 0x00, 0x03, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x20000},
+                "page_map": [(0xFF, 0x70000)],
+                "ram_setup": [(0x20000, bytes(0x20)),
+                              (0x300, bytes([0xF0, 0xFF, 0x00, 0xF0])),
+                              (0x70FF0, bytes([0xF4]))],
+                "regs_initial": {4: 0x0010},
+                "regs_expected": {4: 0x0010},
+                "expected_eip": 0xFFF1,
+            },
+            {
+                "name": "FAR: CALL FAR m16:32 (FF /3) takes a 32-BIT offset",
+                # 32-bit segment: FF 1D 00 03 00 00 = CALL FAR [0x00000300].
+                # The pointer there is 00012000 / 0000: a FOUR-byte offset with
+                # the selector at +4. An LDRH offset keeps only 0x2000, and a
+                # selector read at +2 picks up 0x0001 from the offset's own
+                # high half -- CS.base 0x10, EIP 0x2000, i.e. control taken to
+                # an address built out of the target rather than from it. The
+                # high half is deliberately non-zero so the two cannot agree.
+                "code": bytes([0xF4]),
+                "mode": 32,
+                "segs_initial": {"SS": 0x20000, "CS": 0x1000},
+                "sels_initial": {"CS": 0x0100},
+                "ram_setup": [(0x20000, bytes(0x20)),
+                              (0x300, bytes([0x00, 0x20, 0x01, 0x00,
+                                             0x00, 0x00])),
+                              (0x1000, bytes([0xFF, 0x1D, 0x00, 0x03,
+                                              0x00, 0x00])),
+                              (0x12000, bytes([0xF4]))],
+                "regs_initial": {4: 0x00000020},
+                "regs_expected": {4: 0x00000018},
+                # push CS (dword) at 0x1C, push EIP (dword) at 0x18
+                "mem_expected": [(0x20018, bytes([0x06, 0x00, 0x00, 0x00,
+                                                  0x00, 0x01, 0x00, 0x00]))],
+                "expected_eip": 0x12001,
+            },
+            {
+                "name": "FAR: JMP FAR m16:32 (FF /5) takes a 32-BIT offset",
+                "code": bytes([0xF4]),
+                "mode": 32,
+                "segs_initial": {"SS": 0x20000, "CS": 0x1000},
+                "sels_initial": {"CS": 0x0100},
+                "ram_setup": [(0x20000, bytes(0x20)),
+                              (0x300, bytes([0x00, 0x20, 0x01, 0x00,
+                                             0x00, 0x00])),
+                              (0x1000, bytes([0xFF, 0x2D, 0x00, 0x03,
+                                              0x00, 0x00])),
+                              (0x12000, bytes([0xF4]))],
+                "regs_initial": {4: 0x00000020},
+                "regs_expected": {4: 0x00000020},
+                "mem_expected": [(0x20018, bytes(8))],
+                "expected_eip": 0x12001,
+            },
+            {
+                # The register form of /3 and /5 does not exist: the operand is
+                # a pointer IN MEMORY. Dispatching it anyway made the far
+                # handlers read CS:IP through R7, the effective address left
+                # over from an EARLIER instruction's ModRM decode -- here the
+                # MOV BX,[0x0300] in front of it, so the far pointer would come
+                # from 0x0300 and the run would continue at 0100:0000 as if the
+                # encoding had been valid. It must trap instead.
+                "name": "FAR: FF /3 register form (FF DB) is #UD, not a far call",
+                # MOV BX,[0x0300] ; FF DB ; HLT
+                "code": bytes([0x8B, 0x1E, 0x00, 0x03, 0xFF, 0xDB, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x20000},
+                "ram_setup": [(0x20000, bytes(0x20)),
+                              (0x300, bytes([0x00, 0x00, 0x00, 0x01])),
+                              (0x1000, bytes([0xF4]))],
+                "regs_initial": {4: 0x0010},
+                "regs_expected": {4: 0x0010},
+                "expected_exit_reason": 4,
+                "expected_eip": 6,
+            },
+            {
+                "name": "FAR: FF /5 register form (FF EB) is #UD, not a far jump",
+                "code": bytes([0x8B, 0x1E, 0x00, 0x03, 0xFF, 0xEB, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x20000},
+                "ram_setup": [(0x20000, bytes(0x20)),
+                              (0x300, bytes([0x00, 0x00, 0x00, 0x01])),
+                              (0x1000, bytes([0xF4]))],
+                "regs_initial": {4: 0x0010},
+                "regs_expected": {4: 0x0010},
+                "expected_exit_reason": 4,
+                "expected_eip": 6,
+            },
         ])
 
         all_passed = True
@@ -3027,7 +3170,17 @@ def run_test(args):
             if "ram_setup" in tc:
                 for addr, data in tc["ram_setup"]:
                     backend.write_memory(ram_addr + addr, data)
-            
+
+            # Alias a guest page somewhere the harness's 752 KB of test_ram
+            # cannot reach on its own. A far transfer to F000:FFF0 is the BIOS
+            # entry point at linear 0xFFF F0, above the identity-mapped range,
+            # and without a mapping the case would only ever measure .mem_fault.
+            # Entries are reverted after the case so nothing leaks forward.
+            page_map = tc.get("page_map", [])
+            for guest_page, ram_off in page_map:
+                fold = ((ram_addr + ram_off) - (guest_page << 12)) & 0xFFFFFFFF
+                backend.write_uint32(page_table_addr + guest_page * 4, fold)
+
             # Write program to test_ram
             backend.write_memory(ram_addr, tc["code"])
             
@@ -3090,11 +3243,15 @@ def run_test(args):
                 time.sleep(0.05)
                 timeout -= 1
                 
+            for guest_page, _ in page_map:
+                backend.write_uint32(page_table_addr + guest_page * 4,
+                                     0x80000000)
+
             if timeout == 0:
                 print(f"  -> TIMEOUT: CPU loop did not finish!")
                 all_passed = False
                 continue
-                
+
             # Check results
             eip = backend.read_uint32(dtcm_addr + 0)
             passed = eip == tc["expected_eip"]
