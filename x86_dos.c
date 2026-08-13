@@ -242,9 +242,12 @@ static uint32_t dta_lin;            /* disk transfer area, default PSP:0080 */
 
 static void psp_build(uint16_t seg, uint16_t mem_top, const char *tail)
 {
-    uint8_t *p = x86_guest_ptr(SEG(seg), 256);
-    if (!p)
-        return;
+    /* Built in a local and copied granule-aware: a PSP is placed at an
+       arbitrary PARAGRAPH, so 256 bytes from it straddles a 4 KB granule
+       whenever the segment lands in the last 240 bytes of a page --
+       x86_guest_ptr() refuses that span and the PSP was then never written at
+       all, in silence. Same defect class as the DTA. */
+    uint8_t p[256];
     memset(p, 0, 256);
 
     p[0] = 0xCD; p[1] = 0x20;                   /* INT 20h */
@@ -260,6 +263,8 @@ static void psp_build(uint16_t seg, uint16_t mem_top, const char *tail)
     p[0x80] = (uint8_t)n;
     if (n) memcpy(p + 0x81, tail, n);
     p[0x81 + n] = 0x0D;
+
+    x86_guest_copy_in(SEG(seg), p, 256);
 
     psp_seg = seg;
     dta_lin = SEG(seg) + 0x80u;
@@ -479,24 +484,43 @@ static uint8_t dos_find_serial;
 #define DOS_SHORT_NAME(f)  ((f)->fname)
 #endif
 
+/*
+ * The DTA is guest memory at an address the GUEST chose, so it can sit
+ * anywhere -- including within 43 bytes of the end of a 4 KB granule.
+ * `x86_guest_ptr()` refuses a span that crosses one and returns NULL, and
+ * this function used to ask it for all 43 bytes at once and treat the refusal
+ * as "no match". The caller cannot tell that from "the directory ended", so
+ * the guest was told the disk was EMPTY. WOLF3D sets its DTA to DS:0xFFBA and
+ * its findfirst("*.WL1") returned AX=0x12 with all eight data files present.
+ *
+ * `x86_guest_copy_in()` walks granules, so it is the only correct way to put a
+ * multi-byte record into guest memory at an address we did not pick.
+ *
+ * The two writes are separate because bytes 2..0x14 are DOS's own search
+ * state, which the caller may not clobber; only our magic/serial at 0..1 and
+ * the result record at 0x15..0x2A belong to us.
+ */
 static int dos_find_report(const FILINFO *fno)
 {
-    uint8_t *d = x86_guest_ptr(dta_lin, 43);
-    if (!d)
-        return 0;
-    d[0] = DOS_FIND_MAGIC;
-    d[1] = dos_find_serial;
-    d[0x15] = fno->fattrib;
-    d[0x16] = (uint8_t)fno->ftime;       d[0x17] = (uint8_t)(fno->ftime >> 8);
-    d[0x18] = (uint8_t)fno->fdate;       d[0x19] = (uint8_t)(fno->fdate >> 8);
-    d[0x1A] = (uint8_t)fno->fsize;       d[0x1B] = (uint8_t)(fno->fsize >> 8);
-    d[0x1C] = (uint8_t)(fno->fsize >> 16); d[0x1D] = (uint8_t)(fno->fsize >> 24);
+    uint8_t hdr[2] = { DOS_FIND_MAGIC, dos_find_serial };
+    uint8_t rec[22];
 
+    rec[0x00] = fno->fattrib;
+    rec[0x01] = (uint8_t)fno->ftime;       rec[0x02] = (uint8_t)(fno->ftime >> 8);
+    rec[0x03] = (uint8_t)fno->fdate;       rec[0x04] = (uint8_t)(fno->fdate >> 8);
+    rec[0x05] = (uint8_t)fno->fsize;       rec[0x06] = (uint8_t)(fno->fsize >> 8);
+    rec[0x07] = (uint8_t)(fno->fsize >> 16);
+    rec[0x08] = (uint8_t)(fno->fsize >> 24);
+
+    memset(rec + 0x09, 0, 13);
     const char *n = DOS_SHORT_NAME(fno);
-    unsigned i = 0;
-    for (; n[i] && i < 12; i++)
-        d[0x1E + i] = (uint8_t)dos_up(n[i]);
-    d[0x1E + i] = 0;
+    for (unsigned i = 0; n[i] && i < 12; i++)
+        rec[0x09 + i] = (uint8_t)dos_up(n[i]);
+
+    if (x86_guest_copy_in(dta_lin, hdr, sizeof(hdr)) != sizeof(hdr))
+        return 0;
+    if (x86_guest_copy_in(dta_lin + 0x15, rec, sizeof(rec)) != sizeof(rec))
+        return 0;
     return 1;
 }
 
@@ -682,9 +706,30 @@ int x86_dos_terminate(void)
 static void ok_clear_cf(void)   { x86_hle_set_cf(0); }
 static void fail(uint16_t code) { x86_set_ax(code); x86_hle_set_cf(1); }
 
-uint32_t x86_dos_file_log[64];
+/*
+ * The file-call trace.
+ *
+ * It used to be a 32-slot WRAPPING ring of two words. That is the wrong shape
+ * for the question it gets asked: a guest stuck in a loop overwrites the whole
+ * ring with the loop body in milliseconds, and the call that ISSUED the handle
+ * the loop is failing on -- the only interesting entry -- is always gone.
+ * WOLF3D's 32 identical AH=42h slots said nothing about where its handle came
+ * from, which is the entire question.
+ *
+ * So it SATURATES at DOS_FILE_LOG_SLOTS instead of wrapping, keeping the
+ * PROLOGUE of the run, and `x86_dos_file_calls` counts every call whether it
+ * was recorded or not. Writing 0 to `x86_dos_file_log_idx` from the host
+ * re-arms it, so a later phase can be captured without a rebuild.
+ *
+ * Four words per slot, not two: a func/AX pair cannot answer "which handle",
+ * and BX plus CX:DX is the difference between "the seek is broken" and "the
+ * handle was never issued".
+ */
+#define DOS_FILE_LOG_SLOTS 96
+uint32_t x86_dos_file_log[DOS_FILE_LOG_SLOTS * 4];
 uint32_t x86_dos_file_log_idx;
-char x86_dos_path_log[4][32];
+uint32_t x86_dos_file_calls;
+char x86_dos_path_log[16][32];
 static uint32_t dos_path_log_idx;
 
 static int dos_func_is_file(uint8_t f)
@@ -705,7 +750,7 @@ static int dos_func_is_file(uint8_t f)
 
 static void dos_log_path(const char *p)
 {
-    unsigned slot = dos_path_log_idx & 3;
+    unsigned slot = dos_path_log_idx & 15;
     strncpy(x86_dos_path_log[slot], p, sizeof(x86_dos_path_log[0]) - 1);
     x86_dos_path_log[slot][sizeof(x86_dos_path_log[0]) - 1] = 0;
     dos_path_log_idx++;
@@ -718,9 +763,17 @@ int x86_dos_int21(uint8_t func)
     if (!dos_func_is_file(func))
         return dos_int21_dispatch(func);
 
-    unsigned slot = (x86_dos_file_log_idx & 31) * 2;
+    x86_dos_file_calls++;
+    if (x86_dos_file_log_idx >= DOS_FILE_LOG_SLOTS)
+        return dos_int21_dispatch(func);
+
+    unsigned slot = x86_dos_file_log_idx * 4;
     x86_dos_file_log[slot] =
         ((uint32_t)func << 8) | (uint8_t)(cpu_state_ptr->regs[0] & 0xFF);
+    x86_dos_file_log[slot + 2] = (uint16_t)(cpu_state_ptr->regs[3] & 0xFFFF);
+    x86_dos_file_log[slot + 3] =
+        ((uint32_t)(cpu_state_ptr->regs[1] & 0xFFFFu) << 16) |
+        (uint16_t)(cpu_state_ptr->regs[2] & 0xFFFFu);
     int rc = dos_int21_dispatch(func);
     uint16_t *fl = x86_hle_flags_on_stack();
     x86_dos_file_log[slot + 1] =
@@ -1150,9 +1203,10 @@ static int dos_int21_dispatch(uint8_t func)
         return 1;
     }
     case 0x4F: {                                /* find next */
-        uint8_t *d = x86_guest_ptr(dta_lin, 2);
-        if (!dos_find_open || !d || d[0] != DOS_FIND_MAGIC ||
-            d[1] != dos_find_serial) {
+        uint8_t d[2];
+        if (!dos_find_open ||
+            x86_guest_copy_out(d, dta_lin, 2) != 2 ||
+            d[0] != DOS_FIND_MAGIC || d[1] != dos_find_serial) {
             fail(0x12);
             return 1;
         }
@@ -1185,6 +1239,18 @@ static int dos_int21_dispatch(uint8_t func)
     }
 
     case 0x42: {                                /* seek */
+        /* A character device has no file pointer, and DOS says so by
+           SUCCEEDING with DX:AX = 0 rather than by failing. 3Eh/3Fh/40h/44h
+           all consult dos_handle_device(); 42h was the one that did not, so a
+           seek on handle 0/1/2 came back "invalid handle" -- and a program
+           that treats that as retryable sits in the retry forever. WOLF3D
+           issued 81 of them in a row before walking off into 0xFF filler. */
+        if (dos_handle_device(bx)) {
+            x86_set_ax(0);
+            x86_set_dx(0);
+            ok_clear_cf();
+            return 1;
+        }
         FIL *f = handle_get(bx);
         if (!f) { fail(0x06); return 1; }
         uint32_t off = ((uint32_t)cx << 16) | dx;

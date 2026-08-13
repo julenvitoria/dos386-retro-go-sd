@@ -388,9 +388,13 @@ extern char x86_dos_last_path[32];
  * -- plus the path of the last four opens, so "which call, on which name, with
  * what answer" is one dump instead of a rebuild.
  */
-extern uint32_t x86_dos_file_log[64];
+extern uint32_t x86_dos_file_log[96 * 4];
 extern uint32_t x86_dos_file_log_idx;
-extern char x86_dos_path_log[4][32];
+extern uint32_t x86_dos_file_calls;
+extern volatile uint32_t x86_io_log[64];
+extern volatile uint32_t x86_io_log_idx;
+extern volatile uint32_t x86_io_log_total;
+extern char x86_dos_path_log[16][32];
 uint16_t *x86_hle_flags_on_stack(void);
 uint16_t dos_test_alloc(uint16_t paras, uint16_t *largest);
 uint16_t dos_test_free(uint16_t seg);

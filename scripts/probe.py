@@ -26,7 +26,9 @@ import sys
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from scripts.common.probe import (                       # noqa: E402
-    dump_arrays, dump_symbol_name, load_symbol_maps, parse_deref, parse_dump,
+    dump_arrays, dump_dos_log, dump_io_log, dump_symbol_name,
+    load_symbol_maps,
+    parse_deref, parse_dump,
     parse_watch,
     sample, wait_for_value,
 )
@@ -90,6 +92,11 @@ def main():
                         "reset and reflash and is only lost on real power "
                         "removal -- so a bad value there outlives every "
                         "recovery step short of this")
+    p.add_argument("--dos-log", action="store_true",
+                   help="decode the INT 21h file-call trace "
+                        "(x86_dos_file_log) into one line per call")
+    p.add_argument("--io-log", action="store_true",
+                   help="decode the coalesced port-I/O ring (x86_io_log)")
     p.add_argument("--faults", action="store_true",
                    help="also dump ARMv7-M fault/exception state")
     p.add_argument("--samples", type=int, default=10)
@@ -175,6 +182,16 @@ def main():
         if dumps:
             target.backend.halt()
             dump_arrays(target, syms, dumps, symbol_maps=maps)
+            target.backend.resume()
+        if args.dos_log:
+            print("INT 21h file trace:")
+            target.backend.halt()
+            dump_dos_log(target, syms)
+            target.backend.resume()
+        if args.io_log:
+            print("port I/O trace:")
+            target.backend.halt()
+            dump_io_log(target, syms)
             target.backend.resume()
         if args.faults:
             from scripts.common.probe import read_faults

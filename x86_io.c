@@ -32,6 +32,107 @@ X86IOState x86_io;
 volatile uint32_t x86_spk_log[32];
 volatile uint32_t x86_spk_log_idx = 0;
 
+/*
+ * Every port access, as (dir << 28) | (port << 12) | count, with the byte in
+ * the low 12 bits of the NEXT word. dir 1 = IN, 2 = OUT.
+ *
+ * Consecutive accesses to the SAME port in the same direction are COALESCED
+ * into one slot with a count, which is the only thing that makes a 32-slot
+ * ring useful here: a mode-13h palette upload is 768 consecutive writes to
+ * 0x3C9 and would otherwise flush every other port out of the log. What the
+ * log is for is the SHAPE of a guest's hardware conversation -- which register
+ * files it programs and in what order -- and that is exactly what coalescing
+ * preserves. x86_spk_log answers a different question (the tone) and stays.
+ *
+ * scripts/probe.py --io-log
+ */
+#define X86_IO_LOG_SLOTS 32
+volatile uint32_t x86_io_log[X86_IO_LOG_SLOTS * 2];
+volatile uint32_t x86_io_log_idx = 0;
+volatile uint32_t x86_io_log_total = 0;
+
+static void io_log(unsigned dir, uint32_t port, uint32_t value)
+{
+    x86_io_log_total++;
+    unsigned prev = (x86_io_log_idx - 1u) & (X86_IO_LOG_SLOTS - 1u);
+    uint32_t head = x86_io_log[prev * 2];
+    if (x86_io_log_idx && (head >> 28) == dir &&
+        ((head >> 12) & 0xFFFFu) == port && (head & 0xFFFu) != 0xFFFu) {
+        x86_io_log[prev * 2] = head + 1u;       /* same port again: just count */
+        x86_io_log[prev * 2 + 1] = value & 0xFFFu;
+        return;
+    }
+    unsigned slot = x86_io_log_idx & (X86_IO_LOG_SLOTS - 1u);
+    x86_io_log[slot * 2] = (dir << 28) | ((port & 0xFFFFu) << 12) | 1u;
+    x86_io_log[slot * 2 + 1] = value & 0xFFFu;
+    x86_io_log_idx++;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * The VGA register FILES: CRTC, Sequencer, Graphics Controller, Attribute.
+ *
+ * These were not modelled at all -- writes vanished and reads fell through to
+ * the 0xFF default. That is not a missing feature a guest degrades around, it
+ * is a missing DEVICE, and the way a DOS program finds its display is to WRITE
+ * a register and READ IT BACK. WOLF3D does exactly that: `OUT 3D4,0F / OUT
+ * 3D5,66 / IN 3D5` and then the same against the mono alias 3B4/3B5
+ * (measured, x86_io_log). Both readbacks came back 0xFF, its detection
+ * concluded nothing was there, and the engine walked off into its own heap and
+ * halted on 0xFF filler -- three subsystems away from anything that looked
+ * like video.
+ *
+ * So this is deliberately a STORE, not an emulation: index latch plus an array
+ * per file, written and read back faithfully. That is the whole contract a
+ * detection probe tests, and it is honest about what it is -- nothing here
+ * changes what the renderer draws. Unchained (Mode Y) addressing, the CRTC
+ * start address at 0x0C/0x0D and split-screen still do nothing; they now do
+ * nothing VISIBLY, with the values a probe can read, instead of invisibly.
+ *
+ * 0x3B4/0x3B5 is the mono alias of the CRTC pair and reaches the same file:
+ * on a real card the Misc Output register's bit 0 selects which address the
+ * CRTC decodes, and a program that probes both must see one of them answer.
+ */
+#define VGA_CRTC_REGS  32
+#define VGA_SEQ_REGS    8
+#define VGA_GC_REGS    16
+#define VGA_ATTR_REGS  32
+
+static struct {
+    uint8_t crtc[VGA_CRTC_REGS], crtc_idx;
+    uint8_t seq[VGA_SEQ_REGS],   seq_idx;
+    uint8_t gc[VGA_GC_REGS],     gc_idx;
+    uint8_t attr[VGA_ATTR_REGS], attr_idx;
+    uint8_t attr_flipflop;               /* 0 = next 0x3C0 write is the INDEX */
+    uint8_t misc;
+} vga_regs = { .misc = 0x67 };
+
+/*
+ * Misc Output bit 0 is the I/O ADDRESS SELECT, and it is not decoration: it
+ * decides whether the CRTC answers at the colour addresses (0x3D4/0x3D5,
+ * status 0x3DA) or the mono ones (0x3B4/0x3B5, status 0x3BA). A card decodes
+ * ONE pair; the other is silent.
+ *
+ * That silence carries information, and answering both is worse than answering
+ * neither. WOLF3D probes 0x3D5 and then 0x3B5 to decide which display it has;
+ * with both replying it concluded MONO and then polled 0x3BA 32,000 times
+ * waiting for a retrace on a card that is not there. Measured -- the first
+ * version of this register file did exactly that.
+ *
+ * 0x67 is what a VGA BIOS leaves after a colour mode set, and it is the reset
+ * value here so a guest that never writes 0x3C2 still sees a colour card.
+ */
+static int vga_mono_decoded(void) { return (vga_regs.misc & 1u) == 0u; }
+
+/*
+ * The Attribute controller is one PORT for both halves, sequenced by a
+ * flip-flop that a READ OF THE INPUT STATUS REGISTER (0x3DA) resets to
+ * "index". A program that is interrupted mid-pair re-syncs by reading 0x3DA,
+ * so the reset has to live in the 0x3DA path or the two halves swap roles
+ * permanently and every subsequent write lands in the wrong register.
+ */
+void x86_vga_attr_reset_flipflop(void) { vga_regs.attr_flipflop = 0; }
+
 static void pit_write_control(uint8_t v)
 {
     unsigned ch = v >> 6;
@@ -259,9 +360,18 @@ static uint8_t kbd_read_data(void)
 
 /* --------------------------------------------------------------------------- */
 
+static uint32_t port_read_inner(uint32_t port);
+
 uint32_t x86_port_read(uint32_t port, uint32_t size)
 {
     (void)size;
+    uint32_t v = port_read_inner(port);
+    io_log(1, port, v);
+    return v;
+}
+
+static uint32_t port_read_inner(uint32_t port)
+{
     switch (port) {
     case 0x42:
         return x86_io.pit2_reload & 0xFF;
@@ -291,8 +401,12 @@ uint32_t x86_port_read(uint32_t port, uint32_t size)
      * Bit 3 is vertical retrace; bit 0 is "display disabled", true during
      * either.
      */
+    case 0x3BA:
+        if (!vga_mono_decoded()) return 0xFFu;
+        /* fall through */
     case 0x3DA: {
         unsigned v = 0;
+        vga_regs.attr_flipflop = 0;      /* the documented re-sync */
         uint32_t reload = cpu_state_ptr->pit_reload;
         if (reload) {
             uint32_t elapsed = reload - cpu_state_ptr->pit_counter;
@@ -309,6 +423,34 @@ uint32_t x86_port_read(uint32_t port, uint32_t size)
             v |= 0x01u;
         return v;
     }
+    case 0x3B4:
+        if (!vga_mono_decoded()) return 0xFFu;
+        /* fall through */
+    case 0x3D4:
+        return vga_regs.crtc_idx;
+    case 0x3B5:
+        if (!vga_mono_decoded()) return 0xFFu;
+        /* fall through */
+    case 0x3D5:
+        return vga_regs.crtc[vga_regs.crtc_idx & (VGA_CRTC_REGS - 1)];
+    case 0x3C4:
+        return vga_regs.seq_idx;
+    case 0x3C5:
+        return vga_regs.seq[vga_regs.seq_idx & (VGA_SEQ_REGS - 1)];
+    case 0x3CE:
+        return vga_regs.gc_idx;
+    case 0x3CF:
+        return vga_regs.gc[vga_regs.gc_idx & (VGA_GC_REGS - 1)];
+    case 0x3C0:
+        return vga_regs.attr_idx;
+    case 0x3C1:
+        return vga_regs.attr[vga_regs.attr_idx & (VGA_ATTR_REGS - 1)];
+    case 0x3CC:
+        return vga_regs.misc;
+    case 0x3C2:
+        /* Input status 0. Bit 4 is the DAC comparator ("switch sense"), which
+           a detection routine reads; 0 is the safe answer. */
+        return 0x00u;
     case 0x3D8:
         return x86_io.cga_mode;
     case 0x3D9:
@@ -330,6 +472,7 @@ uint32_t x86_port_read(uint32_t port, uint32_t size)
 void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
 {
     (void)size;
+    io_log(2, port, value);
     switch (port) {
     case 0x42:
         pit_write_ch2((uint8_t)value);
@@ -348,6 +491,41 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
     case 0x64:                       /* controller commands: accepted, ignored */
         break;
 
+    case 0x3B4:
+        if (!vga_mono_decoded()) break;
+        /* fall through */
+    case 0x3D4:
+        vga_regs.crtc_idx = (uint8_t)value;
+        break;
+    case 0x3B5:
+        if (!vga_mono_decoded()) break;
+        /* fall through */
+    case 0x3D5:
+        vga_regs.crtc[vga_regs.crtc_idx & (VGA_CRTC_REGS - 1)] = (uint8_t)value;
+        break;
+    case 0x3C4:
+        vga_regs.seq_idx = (uint8_t)value;
+        break;
+    case 0x3C5:
+        vga_regs.seq[vga_regs.seq_idx & (VGA_SEQ_REGS - 1)] = (uint8_t)value;
+        break;
+    case 0x3CE:
+        vga_regs.gc_idx = (uint8_t)value;
+        break;
+    case 0x3CF:
+        vga_regs.gc[vga_regs.gc_idx & (VGA_GC_REGS - 1)] = (uint8_t)value;
+        break;
+    case 0x3C0:
+        if (!vga_regs.attr_flipflop)
+            vga_regs.attr_idx = (uint8_t)value;
+        else
+            vga_regs.attr[vga_regs.attr_idx & (VGA_ATTR_REGS - 1)] =
+                (uint8_t)value;
+        vga_regs.attr_flipflop ^= 1u;
+        break;
+    case 0x3C2:
+        vga_regs.misc = (uint8_t)value;
+        break;
     case 0x3D8:
         x86_io.cga_mode = (uint8_t)value;
         x86_video_log_event(2, 0, value);

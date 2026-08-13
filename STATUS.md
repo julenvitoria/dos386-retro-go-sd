@@ -17,7 +17,7 @@ segmentation, unchanged through the 66/67 axes, segment loads and REP.
 
 Complete except below.
 
-- [ ] `XLAT` (no segment base), `WAIT`, `INS`/`OUTS`, `BOUND`/`ARPL`
+- [ ] `XLAT` (no segment base), `WAIT`, `BOUND`/`ARPL`  (`INS`/`OUTS` done)
 - [ ] Five handlers call `DECODE_MODRM` by symbol, so they ignore a `0x67` prefix
 - [ ] Limit checks off the R6 descriptor; lazy PF/AF; software TLB above 16 MB
 - [ ] Size-aware `MEM_R*`/`MEM_W*` macros + CI grep banning raw `[R9,`
@@ -26,8 +26,8 @@ Complete except below.
 
 ## Phase 2 — Alley Cat
 
-17 opcode slots still reach `.exit_loop`: x87 (`D8`-`DF`), `BOUND`/`ARPL`,
-`INS`/`OUTS`, `XLAT`, `WAIT`, `INT1`.
+13 opcode slots still reach `.exit_loop`: x87 (`D8`-`DF`), `BOUND`/`ARPL`,
+`XLAT`, `WAIT`, `INT1`. `INS`/`OUTS` (6C-6F) are implemented.
 
 Done: real-mode interrupts and `IRET`; the `0F 0B` hypercall and its HLE service
 table; BIOS INT 10h/16h/1Ah over a real BDA; CGA text mode 3 and a mode 4 LUT8
@@ -149,13 +149,89 @@ letterbox untouched; and the 256-entry table WITHDRAWN on leaving 13h, without
 which the firmware keeps a core-owned palette the overlay then draws through.
 The old "13h is refused" arm now uses mode 0x11, or it would test nothing.
 
-**WOLF3D does not reach video, so it neither confirms nor refutes any of this.**
-Measured under gwemu at 30 s: `x86_video_mode_log` holds two events for the
-whole run (mode 3 at boot, the renderer following), `x86_vga_dac_writes` is 0,
-and `x86_dos_file_log` is all 32 slots of **INT 21h AH=42h returning CF=1,
-AX=0x0006 "invalid handle"**, repeating at 3.0 M insn/s after a FindFirst for
-`*.WL1`. A DOS-layer defect in front of everything here, the same shape as
-TOPBENCH's AH=43h. The screen is black before and after, for that reason.
+**WOLF3D now reaches video: mode 13h adopted, two full 768-byte palettes
+streamed through the DAC. It does not yet render a picture -- it still walks
+off later -- but the four walls in front of it were measured and removed, and
+none of them was a video defect.**
+
+The previous reading was that `x86_dos_file_log` held 32 slots of `AH=42h`
+returning CF=1 "invalid handle" after a FindFirst for `*.WL1`. **That log was
+the wrong shape for the question.** A 32-slot WRAPPING ring is overwritten by a
+loop body in milliseconds, so the call that ISSUED the handle was always gone,
+and two words per slot could not say WHICH handle. It is now **96 slots,
+SATURATING, four words** (adding `BX` and `CX:DX`) with a decoder in
+`probe.py --dos-log`. The whole prologue then fits, and the answer was in
+**entry 2, not in the 81 identical entries after it**:
+
+```
+[0] 2Fh get DTA    ok        [2] 4Eh findfirst "*.WL1"  -> CF=1 AX=0x12 no more files
+[1] 1Ah set DTA    ok        [3] 1Ah set DTA (restore)  -> ok
+```
+
+Every one of Wolf3D's eight `.WL1` files IS on the image (checked host-side --
+and the image is an **MBR-partitioned FAT16**, not a bare FAT12 floppy, which
+FatFs mounts correctly). Four defects, each with a failing tier-1 test written
+first:
+
+1. **A DTA that straddles a 4 KB granule made the disk look EMPTY.**
+   `x86_guest_ptr()` refuses a span that crosses a granule and returns NULL;
+   `dos_find_report()` asked it for all 43 bytes of the result record at once
+   and treated the refusal as "no match", which the caller cannot tell from
+   "the directory ended". Wolf3D's DTA is at **DS:0xFFBA**. It goes through
+   `x86_guest_copy_in()` now, which walks granules. **The same defect class was
+   live in two more places** and is fixed in both: `psp_build()` wrote 256
+   bytes at an arbitrary PARAGRAPH, and INT 10h AH=10h AL=12h/17h moved up to
+   **768** bytes of palette, which can never fit in one granule -- so a
+   256-colour game installing its whole palette in one BIOS call had it
+   silently dropped.
+2. **`INS`/`OUTS` (6C-6F) did not exist.** Wolf3D's `VL_SetPalette` is
+   literally `mov cx,768 / rep outsb` to 0x3C9, so an entire 256-colour palette
+   went through one missing opcode: `guest_halted=1`, `exit_reason=4`,
+   `x86_vga_dac_writes=0`, black screen -- which reads exactly like a video bug
+   and is not one. Implemented for both widths with REP support (the prefix's
+   opcode range now covers 6C-6F with no ZF test; without that arm `REP OUTSB`
+   would have run ONE byte and dropped 767, which is strictly worse than the
+   missing opcode). They are the same opcodes TOPBENCH halts on.
+   R2 is the mode record and `x86_port_*` are C calls that clobber it, so R4
+   carries it across and every index advance happens before the call.
+3. **`AH=42h` was the one file call that never consulted `dos_handle_device()`.**
+   A seek on handle 0/1/2 is a seek on a character device; DOS SUCCEEDS with
+   DX:AX = 0. We returned "invalid handle", and a program that treats that as
+   retryable never leaves the retry.
+4. **There was no VGA register FILE at all** -- CRTC, Sequencer, Graphics
+   Controller, Attribute. Writes vanished, reads returned the 0xFF no-device
+   default. That is not a missing feature a guest degrades around: **the way a
+   DOS program finds its display is to write a register and read it back**, and
+   `x86_io_log` (new; see `TOOLING.md`) showed Wolf3D doing exactly
+   `OUT 3D4,0F / OUT 3D5,66 / IN 3D5` and then repeating it against the mono
+   alias. Both read 0xFF. It is a faithful STORE now, deliberately not an
+   emulation -- unchained addressing, the start address at CRTC 0x0C/0x0D and
+   split-screen still do nothing, but they do nothing VISIBLY, with values a
+   probe can read.
+
+   **The first version of that fix overshot, and the port log caught it.**
+   Answering the 0x3B4/0x3B5 mono alias as well made Wolf3D conclude it had an
+   MDA and poll 0x3BA **32,000 times** waiting for a retrace on a card that is
+   not there. Misc Output bit 0 is the I/O address select and a card decodes
+   ONE pair; the silence of the other pair is information. Gated, port accesses
+   went 35,165 -> 2,370.
+
+**Where it stops now, measured:** `guest_halted=1`, `exit_reason=4`,
+`exit_info=0xFF` at CS=SS=DS=0x3804 -- executing 0xFF filler inside its own
+heap, i.e. a wild far transfer. Immediately before it there are **81 identical
+`AH=42h` calls with identical registers** (`BX=0`, `CX:DX=0x0000FC00`), which
+is a loop of already-corrupted code, not a service we are answering wrongly --
+all 81 now succeed and the outcome is unchanged. The port log ends cleanly with
+the CRTC probe completing correctly, so the divergence is in pure computation
+after it. Naming it needs a reference trace, and `refdos.py` has no port I/O so
+it cannot follow Wolf3D past its first VGA access. That is the next piece of
+tooling, not the next guess.
+
+RAM_EMU headroom **30,728 -> 28,288 B** across all of it. Tier 1 all green:
+`test_opcodes` **273/273** (+5 INS/OUTS cases), `test_dos` (+ a split-granule
+DTA arm and a device-handle seek), `test_video` (+ the register-file probe,
+including the mono alias staying silent), `test_text`, `test_keyboard`,
+`test_osk`, `test_audio`, `test_disk_cache`, `test_nor`.
 
 **Mode Y (unchained 13h), which is what Wolf3D actually uses, is scoped and NOT
 built.** The blit would be nearly free — at the standard geometry the correct
@@ -698,7 +774,7 @@ twice). **RAM_EMU headroom 7,680 → 4,576 B** (`__CORE_BSS_END__` 0x24057078 �
   keeps the override for the elements it runs in-handler (R6 is not reset there)
   and so is if anything closer to the hardware. The fix is to record the START
   of the prefix run, not the repeat prefix.
-- **TOPBENCH halts ~3 s in on `INSB` (`6C`)** — `exit_reason=4`,
+- ~~TOPBENCH halts ~3 s in on `INSB` (`6C`)~~ -- FIXED: 6C-6F are implemented. Original note: — `exit_reason=4`,
   `exit_info=0x6C`, EIP 21695, identical before and after the string work.
   `INS`/`OUTS` are on the Phase 0/1 list above. It is why a TOPBENCH profile
   window has to start at `--settle 0`: past ~3 s there is no guest running and

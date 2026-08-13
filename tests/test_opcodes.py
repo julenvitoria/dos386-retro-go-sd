@@ -1654,6 +1654,67 @@ def run_test(args):
                 "mem_expected": [(0x2020, bytes([0xDE, 0xAD, 0xBE, 0xEF, 0x00]))],
                 "expected_eip": 3,
             },
+            # --- INS / OUTS (6C-6F) -------------------------------------------
+            # These reached .exit_loop until now, which is what halted WOLF3D:
+            # its VL_SetPalette is `mov cx,768 / rep outsb` to the VGA DAC, so
+            # a whole 256-colour palette went through one missing opcode.
+            # Port 0x1F is unassigned and reads back 0xFF, which is what makes
+            # the INS side checkable without a device model.
+            {
+                "name": "REP INSB fills ES:DI from a port, CX to 0",
+                # MOV DX,0x1F ; REP INSB ; HLT
+                "code": bytes([0xBA, 0x1F, 0x00, 0xF3, 0x6C, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"ES": 0x2000},
+                "regs_initial": {1: 4, 2: 0x1F, 7: 0x60},
+                "regs_expected": {1: 0, 7: 0x64},
+                "mem_expected": [(0x2060, bytes([0xFF, 0xFF, 0xFF, 0xFF, 0x00]))],
+                "expected_eip": 6,
+            },
+            {
+                "name": "INSW advances DI by 2, not by 1",
+                "code": bytes([0xBA, 0x1F, 0x00, 0x6D, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"ES": 0x2000},
+                "regs_initial": {2: 0x1F, 7: 0x70},
+                "regs_expected": {7: 0x72},
+                "mem_expected": [(0x2070, bytes([0xFF, 0xFF, 0x00]))],
+                "expected_eip": 5,
+            },
+            {
+                "name": "STD makes INSB decrement DI",
+                "code": bytes([0xFD, 0xBA, 0x1F, 0x00, 0x6C, 0xFC, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"ES": 0x2000},
+                "regs_initial": {2: 0x1F, 7: 0x80},
+                "regs_expected": {7: 0x7F},
+                "mem_expected": [(0x2080, bytes([0xFF]))],
+                "expected_eip": 7,
+            },
+            {
+                # OUTSB reads DS:SI and advances SI. The port sink is not
+                # observable here, so what is asserted is the MEMORY SIDE and
+                # the count -- exactly the half that a "write one byte and stop"
+                # regression would break.
+                "name": "REP OUTSB walks DS:SI and lands CX at 0",
+                "code": bytes([0xBA, 0x1F, 0x00, 0xF3, 0x6E, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000},
+                "ram_setup": [(0x1090, bytes([0x11, 0x22, 0x33, 0x44]))],
+                "regs_initial": {1: 4, 2: 0x1F, 6: 0x90},
+                "regs_expected": {1: 0, 6: 0x94},
+                "expected_eip": 6,
+            },
+            {
+                "name": "OUTSW advances SI by 2",
+                "code": bytes([0xBA, 0x1F, 0x00, 0x6F, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x1000},
+                "ram_setup": [(0x10A0, bytes([0x11, 0x22]))],
+                "regs_initial": {2: 0x1F, 6: 0xA0},
+                "regs_expected": {6: 0xA2},
+                "expected_eip": 5,
+            },
             {
                 "name": "REP with CX=0 does nothing and skips the string op",
                 "code": bytes([0xF3, 0xA4, 0xF4]),

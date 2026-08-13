@@ -79,6 +79,9 @@ DOSF_RES_NAMES = (
     "findnext AX", "findnext FLAGS",
     "open A:TEST.INI AX", "open A:TEST.INI FLAGS",
     "open test.ini AX", "open test.ini FLAGS",
+    "findfirst split-DTA AX", "findfirst split-DTA FLAGS",
+    "findnext split-DTA AX", "findnext split-DTA FLAGS",
+    "seek device AX", "seek device DX", "seek device FLAGS",
 )
 
 
@@ -106,8 +109,8 @@ def file_test(b, syms):
         print("FAIL: the file arm never completed")
         return False
 
-    r = [b.read_uint32(syms["dosfile_r"] + 4 * i) for i in range(26)]
-    mount, exit_reason = r[24], r[25]
+    r = [b.read_uint32(syms["dosfile_r"] + 4 * i) for i in range(38)]
+    mount, exit_reason = r[36], r[37]
     print(f"\nf_mount on the test image  {mount} (0 = FR_OK)")
     print(f"guest exit reason          {exit_reason} (1 = HLT/unimplemented)")
     for i, name in enumerate(DOSF_RES_NAMES):
@@ -194,6 +197,32 @@ def file_test(b, syms):
         fail(f"opening 'A:TEST.INI' returned AX=0x{r[20]:04x} CF={r[21] & CF}."
              f" A drive letter is not a FatFs volume id; it has to be "
              f"stripped, or every program that names its own drive fails")
+    # A DTA that straddles a 4 KB granule. x86_guest_ptr() refuses a span that
+    # crosses one, and the refusal used to surface as "no more files" -- an
+    # empty disk, for a program whose DTA merely sits near the end of a page.
+    # WOLF3D's is at DS:0xFFBA, so this is the call that stopped it dead.
+    if r[25] & CF:
+        fail("AH=4Eh FindFirst found nothing with the DTA straddling a 4 KB "
+             "boundary; the same search over an aligned DTA works, so this is "
+             "the granule refusal in x86_guest_ptr(), not the matcher")
+    else:
+        n3 = bytes(b.read_memory(ram + 0x4920, 13)).split(b"\0")[0]
+        n4 = bytes(b.read_memory(ram + 0x4930, 13)).split(b"\0")[0]
+        print(f"  {'split-DTA findfirst name':<26} {n3!r}")
+        print(f"  {'split-DTA findnext name':<26} {n4!r}")
+        if n3 != b"TEST.INI":
+            fail(f"split-DTA FindFirst wrote {n3!r}, expected b'TEST.INI' -- "
+                 f"a partial record is worse than none")
+        if r[27] & CF:
+            fail("split-DTA FindNext ended the search early")
+        elif n4 != b"DATA.INI":
+            fail(f"split-DTA FindNext wrote {n4!r}, expected b'DATA.INI'")
+
+    if (r[30] & CF) or (r[28], r[29]) != (0, 0):
+        fail(f"AH=42h on handle 0 (a character device) returned "
+             f"DX:AX = 0x{r[29]:04x}:0x{r[28]:04x} CF={r[30] & CF}; DOS "
+             f"succeeds with 0:0. Failing it makes a retry loop immortal")
+
     if (r[23] & CF) or r[22] < 5:
         fail(f"opening 'test.ini' in lower case returned AX=0x{r[22]:04x} "
              f"CF={r[23] & CF}; FAT names are case-insensitive")

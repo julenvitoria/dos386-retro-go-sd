@@ -486,6 +486,8 @@ L(OP_0F_MOVSX_GV_EW_WRITE):
 .set .op_in_eax_imm8_E5, .op_in_eax_imm8_E5_32
 .set .op_out_dx_eax_EF, .op_out_dx_eax_EF_32
 .set .op_out_imm8_eax_E7, .op_out_imm8_eax_E7_32
+.set .op_insv_6D, .op_insv_6D_32
+.set .op_outsv_6F, .op_outsv_6F_32
 opcode_table_32:
 #include "opcode_table.S"
 
@@ -574,6 +576,8 @@ opcode_table_0f_32:
 .set .op_in_eax_imm8_E5, .op_in_eax_imm8_E5_16
 .set .op_out_dx_eax_EF, .op_out_dx_eax_EF_16
 .set .op_out_imm8_eax_E7, .op_out_imm8_eax_E7_16
+.set .op_insv_6D, .op_insv_6D_16
+.set .op_outsv_6F, .op_outsv_6F_16
 opcode_table_16:
 #include "opcode_table.S"
 

@@ -1369,6 +1369,85 @@ OP .op_scasd_AF
     STR_ADV REG_EDI, R7, R5
     B.W .str_exit
 
+/* ---------------------------------------------------------------------------
+ * INS / OUTS (6C-6F) -- string I/O.
+ *
+ * These are the last string ops and they were the last opcodes reaching
+ * .exit_loop on two real titles at once: TOPBENCH halts ~3 s in on `INSB`, and
+ * WOLF3D's VL_SetPalette is literally `mov cx,768 / rep outsb` to 0x3C9, so
+ * the whole 256-colour palette went through ONE opcode we did not have. The
+ * screen was black with x86_vga_dac_writes = 0 and the guest halted with
+ * exit_reason 4 -- which reads exactly like a video bug and is not one.
+ *
+ * They are ordinary string ops with the memory operand on one side and a PORT
+ * on the other, so they get .str_exit and REP for free. The one thing that is
+ * NOT free is R2: `x86_port_read`/`x86_port_write` are C calls and R2 is
+ * caller-saved, but R2 is the MODE RECORD (CLAUDE.md) and .str_exit needs it
+ * for the address-size test and for the batched re-entry. R4 carries it across
+ * the call -- R4-R11 are callee-saved, so the C side cannot touch it -- and
+ * every use of R2 for the index advance happens BEFORE the call, never after.
+ *
+ * INS takes ES:DI and ignores a segment override (architectural); OUTS takes
+ * DS:SI through the override, which STR_SRC already implements.
+ * ------------------------------------------------------------------------- */
+OP_AGNOSTIC .op_insb_6C
+    MOV R4, R2                     @ the mode record, across the C call
+    CHECK_IOPL R2, R3
+    LDRH.W R0, [R8, #REG_EDX]
+    MOV.W R1, #1
+    BL x86_port_read
+    MOV R2, R4
+    MOV R1, R0
+    STR_DST R5, R12
+    MEM_GET_PTR R12, R5
+    STRB R1, [R12]
+    STR_DELTA R7, 1
+    STR_ADV REG_EDI, R7, R5
+    B.W .str_exit
+
+OP .op_insv_6D
+    MOV R4, R2
+    CHECK_IOPL R2, R3
+    LDRH.W R0, [R8, #REG_EDX]
+    MOV.W R1, #OPSZ
+    BL x86_port_read
+    MOV R2, R4
+    MOV R1, R0
+    STR_DST R5, R12
+    MEM_GET_PTR R12, R5
+    ST_V R1, R12
+    STR_DELTA R7, OPSZ
+    STR_ADV REG_EDI, R7, R5
+    B.W .str_exit
+
+OP_AGNOSTIC .op_outsb_6E
+    STR_SRC R4, R3
+    MEM_GET_PTR_R R3, R4
+    LDRB R1, [R3]
+    STR_DELTA R7, 1
+    STR_ADV REG_ESI, R7, R4        @ the index advance, while R2 is still live
+    MOV R4, R2
+    CHECK_IOPL R2, R3
+    LDRH.W R0, [R8, #REG_EDX]
+    MOV.W R2, #1
+    BL x86_port_write
+    MOV R2, R4
+    B.W .str_exit
+
+OP .op_outsv_6F
+    STR_SRC R4, R3
+    MEM_GET_PTR_R R3, R4
+    LD_V R1, R3
+    STR_DELTA R7, OPSZ
+    STR_ADV REG_ESI, R7, R4
+    MOV R4, R2
+    CHECK_IOPL R2, R3
+    LDRH.W R0, [R8, #REG_EDX]
+    MOV.W R2, #OPSZ
+    BL x86_port_write
+    MOV R2, R4
+    B.W .str_exit
+
 OP_AGNOSTIC .op_mov_r8_imm8
     AND.W R2, R0, #7
     AND.W R3, R2, #3
@@ -3937,9 +4016,17 @@ L(REP_ENTER):
     LDRB R0, [R3, #0]
 
     /* Only string opcodes repeat; on anything else the prefix is ignored,
-       which is what the hardware does. A4..A7 are MOVS/CMPS, AA..AF are
-       STOS/LODS/SCAS. Only the comparing forms consult ZF -- sense 2 means
-       "no ZF test". */
+       which is what the hardware does. 6C..6F are INS/OUTS, A4..A7 are
+       MOVS/CMPS, AA..AF are STOS/LODS/SCAS. Only the comparing forms consult
+       ZF -- sense 2 means "no ZF test", and INS/OUTS never compare, so they
+       take it unconditionally. Without this arm `REP OUTSB` would run exactly
+       ONE byte and drop the other 767 of a VGA palette, with no error
+       anywhere -- strictly worse than the missing opcode it replaced. */
+    SUB.W R3, R0, #0x6C
+    CMP R3, #4
+    ITT LO
+    MOVLO R4, #2
+    BLO.N L(REP_COUNT)
     SUB.W R3, R0, #0xA4
     CMP R3, #4
     BLO.N L(REP_STRING)

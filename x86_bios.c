@@ -339,12 +339,22 @@ int x86_bios_video(uint8_t func)
             unsigned count = cpu_state_ptr->regs[1] & 0xFFFF;
             uint32_t lin = cpu_state_ptr->segs[0].base
                          + (cpu_state_ptr->regs[2] & 0xFFFF);
-            uint8_t *p;
             if (first > 255u) return 1;
             if (count > 256u - first) count = 256u - first;
-            p = x86_guest_ptr(lin, count * 3u);
-            if (p)
-                x86_vga_dac_set_block(first, count, p);
+            /* Up to 768 bytes, so it ALWAYS spans several 4 KB granules and
+               x86_guest_ptr() would refuse it outright -- silently leaving the
+               palette at whatever it was. Copy it out granule-aware instead.
+               This is the call a 256-colour game uses to install its whole
+               palette in one go. */
+            uint8_t blk[3 * 64];
+            for (unsigned done = 0; done < count; ) {
+                unsigned n = count - done;
+                if (n > 64u) n = 64u;
+                if (x86_guest_copy_out(blk, lin + done * 3u, n * 3u) != n * 3u)
+                    break;
+                x86_vga_dac_set_block(first + done, n, blk);
+                done += n;
+            }
             return 1;
         }
         if (al == 0x15 || al == 0x17) {   /* read one / read a block */
@@ -369,10 +379,17 @@ int x86_bios_video(uint8_t func)
             } else {
                 uint32_t lin = cpu_state_ptr->segs[0].base
                              + (cpu_state_ptr->regs[2] & 0xFFFF);
-                uint8_t *p = x86_guest_ptr(lin, count * 3u);
-                if (p)
-                    for (unsigned i = 0; i < count * 3u; i++)
-                        p[i] = x86_vga_dac_read();
+                uint8_t blk[3 * 64];
+                for (unsigned done = 0; done < count; ) {
+                    unsigned n = count - done;
+                    if (n > 64u) n = 64u;
+                    for (unsigned i = 0; i < n * 3u; i++)
+                        blk[i] = x86_vga_dac_read();
+                    if (x86_guest_copy_in(lin + done * 3u, blk, n * 3u)
+                        != n * 3u)
+                        break;
+                    done += n;
+                }
             }
             return 1;
         }

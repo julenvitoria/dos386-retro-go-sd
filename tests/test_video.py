@@ -261,6 +261,8 @@ def mode_switch_checks(b, syms):
         return False
     print("PASS: mode 11h refused, mode 0 stays up (nothing renders it)")
 
+    if not vga_reg_file_checks(b, syms):
+        return False
     if not vga13_checks(b, syms):
         return False
     return ok
@@ -276,6 +278,46 @@ def expected_vga13(aperture):
         img[FB_TOP + y * FB_STRIDE : FB_TOP + y * FB_STRIDE + 320] = \
             aperture[y * 320 : y * 320 + 320]
     return bytes(img)
+
+
+def vga_reg_file_checks(b, syms):
+    """Write-then-read-back on the CRTC/Sequencer/GC/Attribute register files.
+
+    This is how a DOS program finds its display, and it is the probe WOLF3D
+    failed: with no register file every readback was 0xFF, its detection
+    concluded nothing was there, and the engine walked off into its own heap
+    and halted on 0xFF filler -- three subsystems away from anything that
+    looked like video. Measured with `probe.py --io-log`.
+    """
+    if "vga_regs_out" not in syms:
+        print("missing symbol vga_regs_out -- rebuild tests/main.c")
+        return False
+    b.write_uint32(syms["run_video_flag"], 8)
+    if not wait_flag(b, syms["run_video_flag"], 0, "VGA register-file probe"):
+        return False
+    got = [b.read_uint32(syms["vga_regs_out"] + 4 * i) for i in range(9)]
+    want = [0x66, 0xFF, 0x06, 0x40, 0x41, 0x04, 0x66, 0x66, 0xFF]
+    names = ["CRTC 0x0F via 0x3D5",
+             "the 0x3B5 MONO alias while Misc Output selects colour "
+             "(must be silent: answering both is what made WOLF3D poll a "
+             "monochrome retrace that never comes)",
+             "Sequencer 0x04", "Graphics Controller 0x05",
+             "Attribute 0x10 (flip-flop resynced by 0x3DA)",
+             "the Sequencer index latch itself",
+             "the mono alias AFTER clearing Misc Output bit 0",
+             "the colour address, same register file",
+             "the mono alias once Misc Output selects colour again"]
+    ok = True
+    for g, w, n in zip(got, want, names):
+        if g != w:
+            print(f"FAIL: {n} read back {g:#04x}, expected {w:#04x}"
+                  + (" -- 0xff is the no-device default, i.e. the register "
+                     "file is missing" if g == 0xFF else ""))
+            ok = False
+    if ok:
+        print("PASS: CRTC/Sequencer/GC/Attribute register files read back "
+              "what was written, on both the colour and mono CRTC addresses")
+    return ok
 
 
 def vga13_checks(b, syms):

@@ -104,7 +104,7 @@ volatile uint32_t osk_r[16];
 #define DOSFILE_IMG_BYTES (128u * 512u)
 uint8_t dosfile_img[DOSFILE_IMG_BYTES] __attribute__((aligned(4)));
 volatile uint32_t run_dosfile_flag = 0;
-volatile uint32_t dosfile_r[32];
+volatile uint32_t dosfile_r[40];
 
 volatile uint32_t run_nor_flag = 0;
 volatile uint32_t nor_r[24];
@@ -134,7 +134,8 @@ uint8_t  vga_test_aperture[X86_VGA_APERTURE_BYTES] __attribute__((section(".ahb_
 uint8_t  vga_test_pal[X86_VGA_PALETTE_BYTES] __attribute__((section(".ahb_bss")));
 uint8_t  vga_dac_arg[768] __attribute__((section(".ahb_bss")));
 uint32_t vga_clut_out[256] __attribute__((section(".ahb_bss")));
-volatile uint32_t vga_dac_readback[6];   /* first two entries, read back via 0x3C7/0x3C9 */
+volatile uint32_t vga_dac_readback[6];
+volatile uint32_t vga_regs_out[9];   /* CRTC/Seq/GC/Attr write-then-read-back */   /* first two entries, read back via 0x3C7/0x3C9 */
 
 volatile uint32_t text_mode_arg = 0x03;
 volatile uint32_t text_scroll_arg = 0;      /* (attr << 8) | lines */
@@ -710,6 +711,34 @@ static const uint8_t dosfile_guest_code[] = {
     0xB8, 0x00, 0x3D,  0xBA, 0x40, 0x40,  0xCD, 0x21,
     0x89, 0xC3,  0xA3, 0x2C, 0x41,  0x9C, 0x58, 0xA3, 0x2E, 0x41,
     0xB4, 0x3E,  0xCD, 0x21,
+    /*
+     * The same FindFirst/FindNext again, with the DTA STRADDLING a 4 KB
+     * granule boundary (0x6FE0: the 43-byte result record ends at 0x700B).
+     *
+     * This is not a corner case dressed up as one. x86_guest_ptr() refuses any
+     * span that crosses a granule, dos_find_report() asked it for all 43 bytes
+     * at once, and a refusal there was indistinguishable from "no more files"
+     * -- so a program whose DTA happens to sit near the end of a page sees an
+     * EMPTY DISK. WOLF3D's DTA is at DS:0xFFBA and that is exactly what
+     * happened to its findfirst("*.WL1").
+     */
+    0xB4, 0x1A,  0xBA, 0xE0, 0x6F,  0xCD, 0x21,
+    0xB8, 0x00, 0x4E,  0xB9, 0x00, 0x00,  0xBA, 0x20, 0x40,  0xCD, 0x21,
+    0xA3, 0x30, 0x41,  0x9C, 0x58, 0xA3, 0x32, 0x41,
+    0xBE, 0xFE, 0x6F,  0xBF, 0x20, 0x49,  0xB9, 0x0D, 0x00, 0xFC, 0xF3, 0xA4,
+    0xB4, 0x4F,  0xCD, 0x21,
+    0xA3, 0x34, 0x41,  0x9C, 0x58, 0xA3, 0x36, 0x41,
+    0xBE, 0xFE, 0x6F,  0xBF, 0x30, 0x49,  0xB9, 0x0D, 0x00, 0xFC, 0xF3, 0xA4,
+    /*
+     * AH=42h on handle 0 -- a CHARACTER DEVICE, not a file. DOS succeeds with
+     * DX:AX = 0; it does not report "invalid handle". 3Eh/3Fh/40h/44h all
+     * route through dos_handle_device() and 42h did not, so a seek on stdin
+     * failed, and a program that treats that as retryable never leaves the
+     * retry. WOLF3D issued 81 in a row.
+     */
+    0xB8, 0x00, 0x42,  0xBB, 0x00, 0x00,  0xB9, 0x00, 0x00,  0xBA, 0x00, 0xFC,
+    0xCD, 0x21,
+    0xA3, 0x38, 0x41,  0x89, 0x16, 0x3A, 0x41,  0x9C, 0x58, 0xA3, 0x3C, 0x41,
     0xF4,                                                       /* HLT */
 };
 
@@ -857,11 +886,12 @@ static void dosfile_test_run(void)
         0x08, 0x09, 0x10, 0x16, 0x1A, 0x20, 0x21,
     };
 
-    for (int i = 0; i < 32; i++)
+    for (int i = 0; i < 40; i++)
         dosfile_r[i] = 0;
-    memset(&test_ram[DOSF_RES], 0, 64);
+    memset(&test_ram[DOSF_RES], 0, 128);
     memset(&test_ram[DOSF_BUF], 0, 1024);
-    memset(&test_ram[DOSF_NAME1], 0, 32);
+    memset(&test_ram[DOSF_NAME1], 0, 64);
+    memset(&test_ram[0x6FE0], 0, 64);
 
     x86_video_init(cga_test_vram, cga_test_palette);
     x86_video_set_aperture(vga_test_aperture, vga_test_pal);
@@ -870,7 +900,7 @@ static void dosfile_test_run(void)
 
     /* The image the host wrote into dosfile_img IS the guest's floppy. */
     x86_disk_set_memory(dosfile_img, DOSFILE_IMG_BYTES);
-    dosfile_r[24] = (uint32_t)f_mount(&dosfile_fs, "", 1);
+    dosfile_r[36] = (uint32_t)f_mount(&dosfile_fs, "", 1);
 
     memcpy(&test_ram[DOSF_STR + 0x00], "TEST.INI", 9);
     memcpy(&test_ram[DOSF_STR + 0x10], "NOPE.INI", 9);
@@ -881,9 +911,9 @@ static void dosfile_test_run(void)
            sizeof(dosfile_guest_code));
 
     kbd_test_reset_cpu(DOSF_CODE);
-    dosfile_r[25] = kbd_test_run_to_halt();
+    dosfile_r[37] = kbd_test_run_to_halt();
 
-    for (int i = 0; i < 24; i++)
+    for (int i = 0; i < 31; i++)
         dosfile_r[i] = (uint16_t)(test_ram[DOSF_RES + i * 2] |
                                   (test_ram[DOSF_RES + i * 2 + 1] << 8));
 }
@@ -1158,6 +1188,48 @@ void Reset_Handler(void) {
             x86_port_write(0x3C7, 0, 1);
             for (i = 0; i < 6; i++)
                 vga_dac_readback[i] = x86_port_read(0x3C9, 1);
+            run_video_flag = 0;
+        }
+        if (run_video_flag == 8) {
+            /* The VGA register FILES, probed the way a DOS program detects a
+               display: write a register, read it back. WOLF3D does exactly
+               `OUT 3D4,0F / OUT 3D5,66 / IN 3D5` and then repeats it against
+               the mono alias 3B4/3B5 -- measured off x86_io_log. With no
+               register file both readbacks were 0xFF and its detection walked
+               off into its own heap. */
+            x86_port_write(0x3D4, 0x0F, 1);
+            x86_port_write(0x3D5, 0x66, 1);
+            vga_regs_out[0] = x86_port_read(0x3D5, 1);        /* 0x66 */
+            /* The mono pair must be SILENT while Misc Output bit 0 selects
+               the colour addresses -- a card decodes one pair, not both, and
+               that silence is what tells a probe which display it has. */
+            x86_port_write(0x3B4, 0x0F, 1);
+            vga_regs_out[1] = x86_port_read(0x3B5, 1);        /* 0xFF: silent */
+            x86_port_write(0x3C4, 0x04, 1);
+            x86_port_write(0x3C5, 0x06, 1);
+            vga_regs_out[2] = x86_port_read(0x3C5, 1);        /* 0x06 */
+            x86_port_write(0x3CE, 0x05, 1);
+            x86_port_write(0x3CF, 0x40, 1);
+            vga_regs_out[3] = x86_port_read(0x3CF, 1);        /* 0x40 */
+            /* The attribute controller: ONE port, sequenced by a flip-flop
+               that a read of 0x3DA resets to "index". Without that reset the
+               two halves swap roles permanently. */
+            (void)x86_port_read(0x3DA, 1);
+            x86_port_write(0x3C0, 0x10, 1);                   /* index */
+            x86_port_write(0x3C0, 0x41, 1);                   /* data  */
+            (void)x86_port_read(0x3DA, 1);
+            x86_port_write(0x3C0, 0x10, 1);
+            vga_regs_out[4] = x86_port_read(0x3C1, 1);        /* 0x41 */
+            /* And the index latch itself reads back, which is what a probe
+               that writes only the index relies on. */
+            vga_regs_out[5] = x86_port_read(0x3C4, 1);        /* 0x04 */
+            /* Clear Misc Output bit 0 and the mono pair takes over. */
+            x86_port_write(0x3C2, 0x66, 1);
+            x86_port_write(0x3B4, 0x0F, 1);
+            vga_regs_out[6] = x86_port_read(0x3B5, 1);        /* 0x66 now */
+            vga_regs_out[7] = x86_port_read(0x3D5, 1);        /* same file */
+            x86_port_write(0x3C2, 0x67, 1);                   /* colour again */
+            vga_regs_out[8] = x86_port_read(0x3B5, 1);        /* silent again */
             run_video_flag = 0;
         }
         if (run_video_flag == 7) {

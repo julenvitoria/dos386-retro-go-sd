@@ -107,10 +107,10 @@
     .word .op_imul_imm32_69 + 1 // 0x69
     .word .op_push_imm8_6A + 1 // 0x6a
     .word .op_imul_imm8_6B + 1 // 0x6b
-    .word .exit_loop + 1 // 0x6c
-    .word .exit_loop + 1 // 0x6d
-    .word .exit_loop + 1 // 0x6e
-    .word .exit_loop + 1 // 0x6f
+    .word .op_insb_6C + 1 // 0x6c
+    .word .op_insv_6D + 1 // 0x6d
+    .word .op_outsb_6E + 1 // 0x6e
+    .word .op_outsv_6F + 1 // 0x6f
     .word .op_jcc_rel8_7X + 1 // 0x70
     .word .op_jcc_rel8_7X + 1 // 0x71
     .word .op_jcc_rel8_7X + 1 // 0x72

@@ -208,6 +208,95 @@ def dump_arrays(target, syms, dumps, out=print, symbol_maps=()):
             out(f"    [{i // group}] " + "  ".join(cells))
 
 
+DOS_FUNCS = {
+    0x0F: "FCB open", 0x10: "FCB close", 0x11: "FCB findfirst",
+    0x12: "FCB findnext", 0x13: "FCB delete", 0x14: "FCB seqread",
+    0x15: "FCB seqwrite", 0x16: "FCB create", 0x17: "FCB rename",
+    0x1A: "set DTA", 0x21: "FCB randread", 0x22: "FCB randwrite",
+    0x23: "FCB filesize", 0x27: "FCB blkread", 0x28: "FCB blkwrite",
+    0x29: "parse filename", 0x2F: "get DTA",
+    0x39: "mkdir", 0x3A: "rmdir", 0x3B: "chdir", 0x3C: "create",
+    0x3D: "open", 0x3E: "close", 0x3F: "read", 0x40: "write",
+    0x41: "delete", 0x42: "lseek", 0x43: "attrib", 0x44: "ioctl",
+    0x45: "dup", 0x46: "dup2", 0x47: "getcwd", 0x4E: "findfirst",
+    0x4F: "findnext", 0x56: "rename", 0x57: "file date",
+    0x5A: "mktemp", 0x5B: "create new", 0x68: "commit", 0x6C: "extopen",
+}
+
+DOS_ERRS = {
+    1: "invalid function", 2: "file not found", 3: "path not found",
+    4: "too many open files", 5: "access denied", 6: "invalid handle",
+    0x0F: "invalid drive", 0x12: "no more files", 0x19: "seek error",
+}
+
+
+def dump_dos_log(target, syms, out=print):
+    """Decode the INT 21h file-call trace into one readable line per call.
+
+    Four words per slot (`x86_dos.c`): (func<<8)|AL, (CF<<16)|AX, BX, CX:DX.
+    Raw, this is 384 hex words and nobody reads it; decoded, the sequence
+    "findfirst *.WL1 -> open MAPHEAD.WL1 -> handle 5 -> lseek BX=5" is legible
+    at a glance, which is the only reason the extra fields were added.
+    """
+    need = ("x86_dos_file_log", "x86_dos_file_log_idx", "x86_dos_file_calls")
+    if any(n not in syms for n in need):
+        out("  dos log: symbols not in this build")
+        return
+    b = target.backend
+    n = b.read_uint32(syms["x86_dos_file_log_idx"])
+    total = b.read_uint32(syms["x86_dos_file_calls"])
+    base = syms["x86_dos_file_log"]
+    out(f"  INT 21h file calls: {total} total, {n} recorded "
+        f"(log SATURATES; write x86_dos_file_log_idx=0 to re-arm)")
+    for i in range(n):
+        w = [b.read_uint32(base + 16 * i + 4 * k) for k in range(4)]
+        func, al = (w[0] >> 8) & 0xFF, w[0] & 0xFF
+        cf, ax = (w[1] >> 16) & 1, w[1] & 0xFFFF
+        bx, cxdx = w[2], ((w[3] >> 16) & 0xFFFF) << 16 | (w[3] & 0xFFFF)
+        name = DOS_FUNCS.get(func, "?")
+        res = (f"CF=1 AX={ax:#06x} {DOS_ERRS.get(ax, '')}".rstrip()
+               if cf else f"ok AX={ax:#06x}")
+        out(f"    [{i:3d}] {func:02X}h/{al:02X} {name:<14} "
+            f"BX={bx:#06x} CX:DX={cxdx:#010x}  -> {res}")
+    if "x86_dos_path_log" in syms:
+        pbase = syms["x86_dos_path_log"]
+        out("  paths (ring of 16, oldest position unknown):")
+        for i in range(16):
+            raw = b.read_memory(pbase + 32 * i, 32)
+            s = raw.split(b"\0")[0].decode("latin-1")
+            if s:
+                out(f"    [{i:2d}] {s}")
+
+
+def dump_io_log(target, syms, out=print):
+    """Decode the coalesced port-I/O ring: one line per (dir, port) run.
+
+    A guest's hardware conversation is a SHAPE -- which register files it
+    programs, in what order -- and a raw ring drowns in the 768 consecutive
+    0x3C9 writes of one palette upload. The on-target side coalesces runs, so
+    this prints "OUT 0x3C9 x768" as a single line next to the CRTC and
+    Sequencer writes around it, which is the part that carries information.
+    """
+    if "x86_io_log" not in syms:
+        out("  io log: symbols not in this build")
+        return
+    b = target.backend
+    n = b.read_uint32(syms["x86_io_log_idx"])
+    total = b.read_uint32(syms["x86_io_log_total"])
+    base = syms["x86_io_log"]
+    slots = 32
+    out(f"  port accesses: {total} total, last {min(n, slots)} runs "
+        f"(oldest first)")
+    first = max(0, n - slots)
+    for i in range(first, n):
+        s = i % slots
+        head = b.read_uint32(base + 8 * s)
+        val = b.read_uint32(base + 8 * s + 4)
+        d = "IN " if (head >> 28) == 1 else "OUT"
+        port, cnt = (head >> 12) & 0xFFFF, head & 0xFFF
+        out(f"    [{i:4d}] {d} {port:#06x} x{cnt:<4d} last={val:#04x}")
+
+
 def sample(target, syms, watches=(), derefs=(), count=10, interval=1.0,
            symbol_maps=(), out=print, on_sample=None):
     """Halt/read/resume `count` times. Returns the rows it printed.
