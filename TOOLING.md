@@ -65,6 +65,31 @@ Samples PC (labelled ITCM / firmware symbol / region), watched globals, and
 pointer dereferences. Reach for this when a harness reports a value that makes
 no sense — it is faster than lengthening a timeline, which is capped at 60s.
 
+#### Reading GUEST memory — `--guest` and `--guest-save`
+
+```bash
+python3 scripts/probe.py --retrogo --wait-magic --guest 0x10e80:96=CSIP
+python3 scripts/probe.py --retrogo --wait-magic --guest 0x400:64=BDA
+python3 scripts/probe.py --retrogo --wait-magic \
+    --guest-save 0x0:0xA0000:build/artifacts/ours.bin
+```
+
+`--guest LIN[:BYTES][=LABEL]` hexdumps guest LINEAR memory; `--guest-save
+LIN:BYTES:FILE` writes it to a file so it can be byte-compared against a
+reference emulator's image.
+
+**This is the only correct way to read guest RAM, and `*guest_ram+OFF` is not.**
+Since demand paging landed, `guest_ram` is a frame POOL, not a flat image of the
+low megabyte: `*guest_ram+0x400` reads the pool's first page, so the BDA comes
+back as zeros and a code dump comes back as an unrelated page — a wrong answer
+that looks exactly like a correct one. Both options walk `guest_page_table_ptr`
+(host = lin + k, one entry per 4 KB page) and render a page whose entry is
+`FOLD_INVALID` as `0xFF`, which is what the guest would fetch there, so a dump
+never silently invents zeros for memory that is not mapped.
+
+`scripts/watch_memory.py --addr guest:0xLIN` resolves the same way, for catching
+the write that corrupted a guest address rather than reading it after the fact.
+
 #### The three clocks, and how to watch them
 
 The emulator loop has three independent clocks (see the block comment at the

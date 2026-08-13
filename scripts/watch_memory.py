@@ -52,7 +52,20 @@ GUEST_EIP_REG = "r10"
 
 
 def resolve(backend, syms, spec):
-    """'0xADDR' | 'SYM[+OFF]' | '*SYM[+OFF]' (pointer dereference)."""
+    """'0xADDR' | 'SYM[+OFF]' | '*SYM[+OFF]' | 'guest:0xLIN'.
+
+    `guest:` walks the fold table, which is the only correct way to reach guest
+    memory since demand paging landed: `guest_ram` is a frame POOL, so
+    `*guest_ram+OFF` no longer names a guest linear address at all.
+    """
+    if spec.startswith("guest:"):
+        from scripts.common.probe import GUEST_PAGE_SIZE, FOLD_INVALID
+        lin = int(spec.split(":", 1)[1], 0)
+        base = backend.read_uint32(syms["guest_page_table_ptr"])
+        k = backend.read_uint32(base + 4 * (lin // GUEST_PAGE_SIZE))
+        if k & FOLD_INVALID:
+            sys.exit(f"--addr: guest linear {lin:#x} is not mapped right now")
+        return (lin + k) & 0xFFFFFFFF
     deref = spec.startswith("*")
     body = spec[1:] if deref else spec
     name, _, off = body.partition("+")
@@ -80,7 +93,8 @@ def main():
     p.add_argument("--elf", default=None)
     p.add_argument("--addr", required=True,
                    metavar="0xADDR|SYM[+OFF]|*SYM[+OFF]",
-                   help="address to watch; '*' dereferences the symbol first")
+                   help="address to watch; '*' dereferences the symbol first, "
+                        "'guest:0xLIN' walks the fold table to guest memory")
     p.add_argument("--length", type=int, default=4,
                    help="bytes covered by the watchpoint (default 4)")
     p.add_argument("--hits", type=int, default=1,

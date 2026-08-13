@@ -297,6 +297,78 @@ def dump_io_log(target, syms, out=print):
         out(f"    [{i:4d}] {d} {port:#06x} x{cnt:<4d} last={val:#04x}")
 
 
+GUEST_PAGE_SIZE = 4096
+FOLD_INVALID = 0x80000000
+
+
+def parse_guest(spec):
+    """'0x10E90:64=CSIP' -> (0x10E90, 64, 'CSIP')
+
+    A guest LINEAR address and a byte count. Not a symbol: guest memory has no
+    ELF symbols, and since demand paging landed it has no flat host image
+    either -- `*guest_ram+OFF` reads a frame POOL, not linear memory, and comes
+    back as zeros or as an unrelated page. The fold table is the only correct
+    translation and this is the only tool that walks it.
+    """
+    label = None
+    if "=" in spec:
+        spec, label = spec.split("=", 1)
+    addr_s, _, len_s = spec.partition(":")
+    addr = int(addr_s, 0)
+    return addr, int(len_s or 64, 0), (label or f"guest:{addr:#x}")
+
+
+def guest_read(backend, syms, lin, nbytes):
+    """Read guest LINEAR memory through the fold table. Returns bytes, with
+    0xFF for any page that is unmapped (FOLD_INVALID) -- which is exactly what
+    the guest would fetch there, so a dump never silently invents zeros."""
+    pt = syms.get("guest_page_table_ptr")
+    if pt is None:
+        raise KeyError("guest_page_table_ptr not in this ELF")
+    base = backend.read_uint32(pt)
+    out = bytearray()
+    while len(out) < nbytes:
+        a = lin + len(out)
+        page, off = a // GUEST_PAGE_SIZE, a % GUEST_PAGE_SIZE
+        n = min(GUEST_PAGE_SIZE - off, nbytes - len(out))
+        k = backend.read_uint32(base + 4 * page)
+        if k & FOLD_INVALID:
+            out += b"\xff" * n
+        else:
+            out += backend.read_memory((a + k) & 0xFFFFFFFF, n)
+    return bytes(out)
+
+
+def save_guest(target, syms, specs, out=print):
+    """Write guest linear ranges to files, for diffing against a reference.
+
+    A hexdump is the wrong shape once the range is larger than a screen: the
+    question then is "where does our image stop matching a known-good one",
+    and that is a byte compare, not a read.
+    """
+    for lin, nbytes, path in specs:
+        data = guest_read(target.backend, syms, lin, nbytes)
+        with open(path, "wb") as f:
+            f.write(data)
+        out(f"  wrote {len(data)} bytes of guest linear "
+            f"{lin:#07x}..{lin + nbytes:#07x} to {path}")
+
+
+def dump_guest(target, syms, specs, out=print):
+    for lin, nbytes, label in specs:
+        try:
+            data = guest_read(target.backend, syms, lin, nbytes)
+        except KeyError as e:
+            out(f"  {label}: {e}")
+            continue
+        out(f"  {label} guest linear {lin:#07x} ({lin >> 4:04x}:{lin & 15:04x}+):")
+        for i in range(0, len(data), 16):
+            row = data[i:i + 16]
+            hexs = " ".join(f"{b:02x}" for b in row)
+            txt = "".join(chr(b) if 32 <= b < 127 else "." for b in row)
+            out(f"    {lin + i:06x}  {hexs:<47}  |{txt}|")
+
+
 def sample(target, syms, watches=(), derefs=(), count=10, interval=1.0,
            symbol_maps=(), out=print, on_sample=None):
     """Halt/read/resume `count` times. Returns the rows it printed.

@@ -26,9 +26,10 @@ import sys
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from scripts.common.probe import (                       # noqa: E402
-    dump_arrays, dump_dos_log, dump_io_log, dump_symbol_name,
+    dump_arrays, dump_dos_log, dump_guest, dump_io_log, dump_symbol_name,
+    save_guest,
     load_symbol_maps,
-    parse_deref, parse_dump,
+    parse_deref, parse_dump, parse_guest,
     parse_watch,
     sample, wait_for_value,
 )
@@ -92,6 +93,16 @@ def main():
                         "reset and reflash and is only lost on real power "
                         "removal -- so a bad value there outlives every "
                         "recovery step short of this")
+    p.add_argument("--guest", action="append", default=[],
+                   metavar="LINADDR[:BYTES][=LABEL]",
+                   help="hexdump guest LINEAR memory through the fold table, "
+                        "e.g. --guest 0x10eac:64=CSIP. This is the only correct "
+                        "way to read guest RAM: under demand paging it is a "
+                        "frame pool, so *guest_ram+OFF is NOT linear memory")
+    p.add_argument("--guest-save", action="append", default=[],
+                   metavar="LINADDR:BYTES:FILE",
+                   help="write a guest LINEAR range to a file, for byte-"
+                        "comparing our image against a reference emulator's")
     p.add_argument("--dos-log", action="store_true",
                    help="decode the INT 21h file-call trace "
                         "(x86_dos_file_log) into one line per call")
@@ -129,6 +140,7 @@ def main():
         watches.extend(WATCH_GROUPS.get(w, [w]))
     derefs = [parse_deref(d) for d in args.deref]
     dumps = [parse_dump(d) for d in args.dump]
+    guests = [parse_guest(g) for g in args.guest]
 
     missing = [w for w in watches if w not in syms]
     missing += [s for s, _, _ in derefs if s not in syms]
@@ -182,6 +194,16 @@ def main():
         if dumps:
             target.backend.halt()
             dump_arrays(target, syms, dumps, symbol_maps=maps)
+            target.backend.resume()
+        if args.guest_save:
+            target.backend.halt()
+            save_guest(target, syms,
+                       [(int(a, 0), int(b, 0), f) for a, b, f in
+                        (g.split(":", 2) for g in args.guest_save)])
+            target.backend.resume()
+        if guests:
+            target.backend.halt()
+            dump_guest(target, syms, guests)
             target.backend.resume()
         if args.dos_log:
             print("INT 21h file trace:")
