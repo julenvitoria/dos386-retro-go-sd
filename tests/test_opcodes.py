@@ -2040,6 +2040,63 @@ def run_test(args):
                 "io_expected": {"pit2_reload": 0x0497, "speaker_hz": 0},
                 "expected_eip": 17,
             },
+            # The 8253's access modes are not "write the whole divisor three
+            # different ways". A lo-byte-only write leaves the HIGH byte
+            # standing and vice versa; zeroing the other half moves the tone by
+            # octaves, which is what "the beeps are the wrong pitch" was.
+            {
+                "name": "SPK: lo-byte-only write keeps the high byte",
+                # 0xB6 lo/hi -> 0x0497, then 0x90 (ch2, lo only) + 0x33.
+                "code": bytes([0xB0, 0xB6, 0xE6, 0x43,
+                               0xB0, 0x97, 0xE6, 0x42,
+                               0xB0, 0x04, 0xE6, 0x42,
+                               0xB0, 0x90, 0xE6, 0x43,
+                               0xB0, 0x33, 0xE6, 0x42,
+                               0xB0, 0x03, 0xE6, 0x61,
+                               0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {},
+                "io_expected": {"pit2_reload": 0x0433,
+                                "speaker_hz": 1193182 // 0x0433},
+                "expected_eip": 25,
+            },
+            {
+                "name": "SPK: hi-byte-only write keeps the low byte",
+                # 0xA0 is ch2, access mode 2 (high byte only).
+                "code": bytes([0xB0, 0xB6, 0xE6, 0x43,
+                               0xB0, 0x97, 0xE6, 0x42,
+                               0xB0, 0x04, 0xE6, 0x42,
+                               0xB0, 0xA0, 0xE6, 0x43,
+                               0xB0, 0x02, 0xE6, 0x42,
+                               0xB0, 0x03, 0xE6, 0x61,
+                               0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {},
+                "io_expected": {"pit2_reload": 0x0297,
+                                "speaker_hz": 1193182 // 0x0297},
+                "expected_eip": 25,
+            },
+            {
+                "name": "SPK: a counter-latch command is not an access mode",
+                # 0x80 has access field 0, which LATCHES the count for reading.
+                # Storing it as the access mode reset the lo/hi pair phase, so
+                # the high byte that followed landed in the low half and the
+                # divisor came out 0x0404 instead of 0x0497.
+                "code": bytes([0xB0, 0xB6, 0xE6, 0x43,
+                               0xB0, 0x97, 0xE6, 0x42,
+                               0xB0, 0x80, 0xE6, 0x43,
+                               0xB0, 0x04, 0xE6, 0x42,
+                               0xB0, 0x03, 0xE6, 0x61,
+                               0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {},
+                "io_expected": {"pit2_reload": 0x0497,
+                                "speaker_hz": 1193182 // 0x0497},
+                "expected_eip": 21,
+            },
             {
                 "name": "SPK: OUT DX,AL uses DX, not ESP",
                 # DX=0x61, ESP=0x43 -- reading the wrong register would send the

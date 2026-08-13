@@ -98,13 +98,142 @@ static uint8_t *upper_filler;
 volatile uint32_t guest_ram_bytes = 0;
 volatile uint32_t guest_vram_ok = 0;
 volatile uint32_t frames_rendered = 0;
-/* The emulated machine's speed, expressed the only way the emulator can: guest
-   instructions per BIOS tick. 20,000 at 18.2 Hz is about 0.36 MIPS -- an
-   8088-class PC. Everything a guest measures about "how fast is this machine"
-   comes out of this one number. */
-#define PIT_SLICE_INSNS   200000u
-#define INSNS_PER_TICK     20000u
-#define TICKS_PER_SLICE   (PIT_SLICE_INSNS / INSNS_PER_TICK)
+/*
+ * ===========================================================================
+ * THREE CLOCKS, and the fact that they are three.
+ * ===========================================================================
+ *
+ * One constant used to do all three jobs (PIT_SLICE_INSNS: guest instructions
+ * per iteration), which is why moving it broke unrelated things -- the frame
+ * rate, the BIOS tick rate and the emulated machine's speed were the same
+ * number wearing three hats. They are now separate, and none of them is a
+ * hardcoded 60:
+ *
+ *   1. DISPLAY RATE -- follows the hardware. The loop renders, asks for a
+ *      swap, and waits on GW_LCD_IS_SWAP_PENDING. That is the panel's own
+ *      signal, so an overclocked device or a different refresh rate paces us
+ *      correctly with no constant to update. Nothing here assumes 60 fps.
+ *
+ *   2. GUEST WALL CLOCK -- the firmware's millisecond counter, see the tick
+ *      block below. The 18.2065 Hz PIT/BIOS tick derives from elapsed real
+ *      time and from nothing else, which is what makes music, delays and
+ *      INT 1Ah correct at any frame rate and any host speed.
+ *
+ *   3. GUEST CPU RATE -- a configurable target, PACED AGAINST WALL TIME. The
+ *      instruction budget is per elapsed millisecond:
+ *
+ *          budget = guest_kips * elapsed_ms          (kips = insns per ms)
+ *
+ *      so overclocking the H7 does not make the guest faster; it makes the
+ *      budget arrive sooner and the leftover become idle, which the panel
+ *      wait spends. That is the point: the emulated CPU's speed is a property
+ *      of the emulated machine, not of ours.
+ *
+ * kips is "thousands of instructions per second", which is also exactly
+ * "instructions per millisecond" -- so the budget is an integer multiply with
+ * no remainder to carry and no division in the loop.
+ *
+ * WHEN WE CANNOT KEEP UP, IT IS LOUD. Unmet budget accumulates in insn_debt;
+ * past GUEST_DEBT_MAX it is written off into guest_insn_deficit, a
+ * host-readable count of instructions the emulated CPU owed and never ran.
+ * A guest quietly running at half its configured speed is indistinguishable
+ * from a correct one, which is the exact failure this project keeps hitting.
+ *
+ * TWO PACING MODES, one knob (guest_kips):
+ *
+ *   guest_kips > 0   PACED. The guest runs at that many thousand instructions
+ *                    per second and NO FASTER, however fast the silicon is.
+ *                    Leftover time becomes idle in the panel wait. This is
+ *                    what makes a speed-sensitive title behave, and what makes
+ *                    overclocking the H7 change nothing about game speed. The
+ *                    number to watch is guest_insn_deficit: it is the answer
+ *                    to "I asked for a 386 -- am I getting one?".
+ *
+ *   guest_kips == 0  UNTHROTTLED. No budget, no idle: run as much as fits
+ *                    between panel frames, which is what the benchmark and
+ *                    the optimisation work want to see. The slice sizes itself
+ *                    from measured execution time against panel_ms_min -- the
+ *                    shortest iteration the hardware has ever let us complete,
+ *                    i.e. the display's own period -- so it tracks the panel
+ *                    rather than a hardcoded 60. A deficit is meaningless
+ *                    here; guest_ips_achieved is the number.
+ *
+ * The BIOS tick is wall-clock in BOTH modes. Unthrottling the CPU must not
+ * unthrottle time -- that is the bug being fixed, not a mode.
+ */
+#define KIPS_MAX              0u   /* as fast as the silicon delivers */
+#define KIPS_8088_477       330u   /* 8088 @ 4.77 MHz, ~0.33 MIPS     */
+#define KIPS_286_8          800u   /* 286 @ 8 MHz                     */
+#define KIPS_286_12        1200u   /* 286 @ 12 MHz                    */
+#define KIPS_386SX_16      2500u   /* 386SX @ 16 MHz                  */
+#define KIPS_386_33        6000u   /* 386DX @ 33 MHz                  */
+volatile uint32_t guest_kips = KIPS_286_12;   /* default: a period-correct
+                                                 machine the H7 can actually
+                                                 sustain. 0 = unthrottled. */
+volatile uint32_t guest_slice_now  = 0;  /* instructions this iteration got   */
+volatile uint32_t guest_insn_debt  = 0;  /* owed but not yet run              */
+volatile uint32_t guest_insn_deficit = 0;/* owed and WRITTEN OFF -- the loud   */
+volatile uint32_t guest_ips_achieved = 0;/* measured instructions per second  */
+volatile uint32_t guest_fps_achieved = 0;/* measured iterations per second    */
+volatile uint32_t guest_insns_total = 0; /* instructions run since boot       */
+volatile uint32_t frame_ms_last    = 0;  /* last iteration, host ms           */
+volatile uint32_t panel_ms_min     = 0;  /* shortest iteration seen = the panel*/
+volatile uint32_t guest_exec_ms    = 0;  /* host ms spent RUNNING the guest    */
+static uint32_t   max_slice = 20000u;    /* unthrottled mode's working slice  */
+static uint32_t   rate_window_ms;        /* start of the achieved-rate window */
+static uint32_t   rate_window_insns;
+static uint32_t   rate_window_frames;
+/* One iteration's work is bounded so the render, the input poll and the audio
+   refill still happen when a guest stretch is expensive: a frame that owes
+   200 ms of instructions must not spend 200 ms before drawing anything. */
+#define GUEST_SLICE_MAX_MS  33u
+#define GUEST_DEBT_MAX_MS  100u
+#define MAX_SLICE_FLOOR   1000u
+#define MAX_SLICE_CEIL 4000000u
+
+/*
+ * The guest's clock, and the fact that it is REAL time.
+ *
+ * 18.2065 Hz is 1193182/65536 -- the PIT input divided by channel 0's boot
+ * divisor. A guest counts note durations, delays and animation frames in these
+ * ticks, so if the tick rate moves, everything the user hears and sees moves
+ * with it. Two earlier drivers both got that wrong, in opposite directions and
+ * at the same time (they were merged into one loop):
+ *
+ *   - one derived the tick from RENDERED FRAMES (182/600 per frame, exact only
+ *     at 60 fps). At the measured ~10 fps it fired at ~3 Hz, six times slow.
+ *   - one derived it from the instruction SLICE (TICKS_PER_SLICE = 10 per
+ *     iteration), which fired at ~100 Hz and moved with our throughput.
+ *
+ * Both are gone. The tick is now driven from the firmware's millisecond
+ * counter, with the remainder carried in `tick_acc` so the long-run rate is
+ * exact rather than accumulating a rounding error:
+ *
+ *      tick_acc += elapsed_ms * 1193182;  while (tick_acc >= 65536000) tick.
+ *
+ * The rejected alternative was to keep the slice-derived clock because a
+ * benchmark divides fixed work by elapsed ticks and a too-slow clock reads as
+ * zero elapsed ticks (a #DE). That is a real hazard, but the answer to it is
+ * enough guest throughput per real second, not a clock that lies -- a clock
+ * slaved to our own speed makes every benchmark measure 1.0 by construction.
+ *
+ * CATCH-UP IS CAPPED. A debugger halt or a long SD read owes hundreds of ticks
+ * at once, and emitting them is worse than not: a guest hooked to INT 08h
+ * would run its music routine hundreds of times back to back. Anything past
+ * TICK_CATCHUP_MAX is dropped -- and COUNTED, in guest_ticks_dropped, because
+ * time silently going missing is precisely the class of bug this whole file
+ * exists to make visible.
+ */
+#define TICK_NUM          1193182u    /* PIT input, Hz                       */
+#define TICK_DEN_MS      65536000u    /* 65536 (divisor) * 1000 (ms per s)   */
+#define TICK_CATCHUP_MAX        4u    /* ~220 ms of arrears, then drop       */
+#define TICK_STALL_MS        1000u    /* longer than this is a stall, not lag */
+static uint32_t tick_acc;             /* ms * TICK_NUM, below one tick       */
+static uint32_t tick_last_ms;
+volatile uint32_t guest_ticks = 0;          /* ticks handed to the guest     */
+volatile uint32_t guest_ticks_dropped = 0;  /* owed but refused (see above)  */
+volatile uint32_t guest_tick_irq_lost = 0;  /* tick IRQ the 1-deep slot ate  */
+volatile uint32_t guest_uptime_ms = 0;      /* host ms since the loop started */
 
 volatile uint32_t guest_exit_reason = 0;
 volatile uint32_t guest_halted = 0;
@@ -428,7 +557,8 @@ static int sd_sector_write(void *ctx, const void *src, uint32_t offset,
  * the .dsk name -- ALLEYCAT.dsk runs CAT.EXE. Reading it keeps this working
  * for the other images too instead of hardcoding one game.
  */
-static int find_startup_program(char *out, unsigned max)
+static int find_startup_program(char *out, unsigned max,
+                                char *tail, unsigned tail_max)
 {
     FIL f;
     if (f_open(&f, "AUTOEXEC.BAT", FA_READ) != FR_OK)
@@ -467,6 +597,19 @@ static int find_startup_program(char *out, unsigned max)
             i++;
         }
         out[i] = 0;
+        /* The COMMAND TAIL, which was silently dropped. TOPBENCH.EXE -l and
+           TOPBENCH.EXE are different programs -- one scores and exits, the
+           other draws a menu and waits for a key that a headless run never
+           sends -- so throwing away everything after the first token quietly
+           changed what the disk was asked to do. */
+        const char *rest = q + i;
+        while (*rest == ' ' || *rest == '\t') rest++;
+        unsigned j = 0;
+        while (rest[j] && j < tail_max - 1) {
+            tail[j] = rest[j];
+            j++;
+        }
+        tail[j] = 0;
         return i ? 0 : -1;
     }
     return -1;
@@ -540,12 +683,13 @@ static void guest_reset(void)
        demo so a missing or unreadable .dsk shows a picture rather than a black
        screen with no explanation. */
     char startup[64];
+    char cmdtail[64];
     dsk_startup_ok = 0;
     dsk_exec_rc = 0xFFFFFFFF;
-    if (dsk_mounted && find_startup_program(startup, sizeof(startup)) == 0) {
+    if (dsk_mounted && find_startup_program(startup, sizeof(startup),
+                                            cmdtail, sizeof(cmdtail)) == 0) {
         dsk_startup_ok = 1;
-        /* TOPBENCH wants "-l" (log/list mode) on its command tail. */
-        dsk_exec_rc = (uint32_t)x86_dos_exec(startup, "");
+        dsk_exec_rc = (uint32_t)x86_dos_exec(startup, cmdtail);
     }
     if (dsk_exec_rc != 0) {
         memcpy(guest_ram + 0x100, demo_guest, sizeof(demo_guest));
@@ -555,11 +699,14 @@ static void guest_reset(void)
     cpu_state_ptr->eflags = 0x0202;              /* IF set, bit 1 reserved-1 */
     cpu_state_ptr->hle_enabled = 1;
 
-    /* A slice of guest instructions per frame. The PIT exit is what ends a
-       slice, so this is the emulator's time base, and TICKS_PER_SLICE turns it
-       into the 18.2 Hz BIOS tick. */
-    cpu_state_ptr->pit_reload = PIT_SLICE_INSNS;
-    cpu_state_ptr->pit_counter = PIT_SLICE_INSNS;
+    /* A first slice, replaced on the very next iteration by the wall-clock
+       budget (see the three-clock block). The PIT exit is what ends a slice.
+       It is NOT the clock -- the BIOS tick comes from real time -- it is how
+       often we come up for air to render, poll and feed audio. The CGA
+       retrace bit is derived from how far this counter has run down, so a
+       slice is also the emulated machine's notion of a display frame. */
+    cpu_state_ptr->pit_reload = guest_slice_now ? guest_slice_now : 20000u;
+    cpu_state_ptr->pit_counter = cpu_state_ptr->pit_reload;
 }
 
 /*
@@ -682,10 +829,19 @@ static void poll_input(const gw_firmware_abi_t *abi)
 
 static void emulator_loop(const gw_firmware_abi_t *abi)
 {
-    uint32_t pit_accum = 0;          /* 1/600ths of a frame, see below */
+    /* Give the I/O layer the host clock BEFORE the guest runs: it is what
+       timestamps speaker events, and without it every beep collapses onto the
+       start of its buffer (the old point-sampled behaviour). */
+    x86_io_time_ms = abi->HAL_GetTick;
 
     guest_reset();
     guest_halted = 0;
+    tick_last_ms = abi->HAL_GetTick();
+    tick_acc = 0;
+    x86_io.spk_window_ms = tick_last_ms;
+    rate_window_ms = tick_last_ms;
+    rate_window_insns = guest_insns_total;
+    rate_window_frames = frames_rendered;
 
     abi->audio_ctl(GW_AUDIO_INIT, SAMPLE_RATE);
     uint32_t audio_frames = (uint32_t)abi->audio_ctl(GW_AUDIO_GET_LENGTH, 0);
@@ -702,34 +858,133 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
             itcm_byte_120_post = itcm_byte_120();
             run_benchmark_flag = 0;
             guest_reset();
+            /* The benchmark is seconds of wall clock the guest did not live
+               through. Re-base rather than let it read as owed ticks. */
+            tick_last_ms = abi->HAL_GetTick();
+            tick_acc = 0;
         }
+
+        uint32_t frame_start_ms = abi->HAL_GetTick();
 
         poll_input(abi);
 
         /*
-         * The 18.2 Hz PIT tick.
+         * CLOCKS 2 AND 3, both off the same reading of the host millisecond
+         * counter: the 18.2065 Hz PIT/BIOS tick, and the guest's instruction
+         * budget. See the three-clock block near the top of this file.
          *
-         * Nothing drove it before, so the BDA tick count never moved and any
-         * guest that waits on it waited forever -- Alley Cat draws its title
-         * screen and then polls INT 1Ah for a delay, which is why the picture
-         * was correct and completely frozen.
-         *
-         * The count is advanced HERE rather than in the INT 08h service,
-         * because a game that hooks INT 08h (most do) replaces our stub and
-         * the BIOS count would stop dead. IRQ 0 is raised at the same moment
-         * so a hooked handler still runs, and the instruction boundary is
-         * pulled in so it is delivered now instead of at the end of the slice.
-         *
-         * 182/600 = 18.2 ticks per 60 frames, accumulated so the rate is right
-         * even though no single frame carries a whole tick.
+         * The BDA count is advanced HERE rather than inside the INT 08h
+         * service, because a game that hooks INT 08h (most do) replaces our
+         * stub and the count would stop dead. IRQ 0 is raised alongside it so
+         * a hooked handler still runs, and the instruction boundary is pulled
+         * in so it lands now instead of at the end of the slice.
          */
-        pit_accum += 182u;
-        if (pit_accum >= 600u) {
-            pit_accum -= 600u;
-            x86_bios_tick();
-            if (!cpu_state_ptr->hard_int_pending) {
-                cpu_state_ptr->hard_int_pending = 0x08;
-                cpu_state_ptr->pit_counter = 1;
+        uint32_t slice;
+        {
+            uint32_t now = abi->HAL_GetTick();
+            uint32_t dt  = now - tick_last_ms;      /* wraps correctly */
+            tick_last_ms = now;
+            guest_uptime_ms += dt;
+
+            uint32_t stalled_ms = 0;
+            if (dt > TICK_STALL_MS) {
+                stalled_ms = dt - TICK_STALL_MS;
+                dt = TICK_STALL_MS;   /* keeps dt * TICK_NUM inside 32 bits */
+            }
+
+            /* --- clock 3: how many instructions this iteration may run. */
+            uint32_t kips = guest_kips;
+            if (kips > 100000u)
+                kips = 100000u;                /* keeps dt*kips in 32 bits */
+
+            /*
+             * How many instructions FIT in one display period, regulated from
+             * measurement. This runs in both modes: unthrottled uses it as the
+             * slice, paced uses it as a ceiling so an impossible target
+             * degrades into a deficit instead of into a slideshow.
+             *
+             * It regulates on the time spent EXECUTING, not on the iteration
+             * period: at 60 fps with idle to spare the iteration period equals
+             * the display period whatever the slice is, so a controller
+             * watching that has no gradient and hunts between its rails --
+             * which it did, swinging the slice 20x frame to frame.
+             *
+             * The target is three quarters of a display period, the remaining
+             * quarter being the render, the audio refill and the input poll.
+             * panel_ms_min is the shortest iteration the hardware has ever let
+             * us finish, i.e. the panel's own period -- learned, so an
+             * overclocked or differently-timed display needs no constant here.
+             */
+            {
+                uint32_t panel = panel_ms_min ? panel_ms_min : 16u;
+                uint32_t target4 = panel * 3u;          /* 4 * (3/4 * panel) */
+                if (guest_exec_ms * 4u < target4) {
+                    max_slice += max_slice / 8u;
+                    if (max_slice > MAX_SLICE_CEIL)
+                        max_slice = MAX_SLICE_CEIL;
+                } else if (guest_exec_ms * 4u > target4) {
+                    max_slice -= max_slice / 8u;
+                    if (max_slice < MAX_SLICE_FLOOR)
+                        max_slice = MAX_SLICE_FLOOR;
+                }
+            }
+
+            if (kips == 0u) {
+                slice = max_slice;
+                guest_insn_debt = 0;           /* no target, so nothing owed */
+            } else {
+                uint32_t debt = guest_insn_debt + dt * kips;
+                uint32_t debt_max = kips * GUEST_DEBT_MAX_MS;
+                if (debt > debt_max) {
+                    /* Written off, and COUNTED. This is the emulated CPU
+                       running slower than it was asked to, which is otherwise
+                       completely invisible. */
+                    guest_insn_deficit += debt - debt_max;
+                    debt = debt_max;
+                }
+                slice = debt;
+                uint32_t slice_max = kips * GUEST_SLICE_MAX_MS;
+                if (slice > slice_max)
+                    slice = slice_max;
+                if (slice < kips)
+                    slice = kips;              /* always make a millisecond's
+                                                  worth of progress */
+                guest_insn_debt = debt;
+            }
+            /* The ceiling is what actually FITS in a display period.
+               GUEST_SLICE_MAX_MS bounds the slice in the EMULATED machine's
+               milliseconds, and ask for a 100 MIPS CPU and 33 of those are
+               3.3 M instructions -- a quarter of a second here, with no
+               render, no input and no audio in it. */
+            if (slice > max_slice)
+                slice = max_slice;
+            guest_slice_now = slice;
+            cpu_state_ptr->pit_reload = slice;
+
+            /* --- clock 2: the BIOS tick. */
+            tick_acc += dt * TICK_NUM;
+            uint32_t owed = tick_acc / TICK_DEN_MS;
+            tick_acc -= owed * TICK_DEN_MS;
+            /* Time lost to a stall is still time: count it as dropped rather
+               than pretending the target was never away. */
+            owed += (stalled_ms * TICK_NUM) / TICK_DEN_MS;
+
+            uint32_t emit = owed > TICK_CATCHUP_MAX ? TICK_CATCHUP_MAX : owed;
+            guest_ticks_dropped += owed - emit;
+            guest_ticks += emit;
+            for (uint32_t i = 0; i < emit; i++)
+                x86_bios_tick();
+
+            if (emit) {
+                if (cpu_state_ptr->hard_int_pending) {
+                    /* One-deep slot, already holding the keyboard's IRQ 1.
+                       Counted, not hidden: a guest whose music runs off INT
+                       08h loses a beat here and we want to see how often. */
+                    guest_tick_irq_lost++;
+                } else {
+                    cpu_state_ptr->hard_int_pending = 0x08;
+                    cpu_state_ptr->pit_counter = 1;
+                }
             }
         }
 
@@ -739,12 +994,16 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
          * stops the guest rather than looping on the same instruction forever,
          * which would look exactly like a hang.
          */
+        uint32_t exec_start_ms = abi->HAL_GetTick();
         while (!guest_halted) {
             x86_cpu_interp_asm();
             uint32_t reason = cpu_state_ptr->exit_reason;
             guest_exit_reason = reason;
             if (reason == X86_EXIT_TIMER) {
                 cpu_state_ptr->exit_reason = 0;
+                /* The budget was spent, so that much of the debt is paid. */
+                guest_insn_debt -= (guest_insn_debt < slice)
+                                 ? guest_insn_debt : slice;
                 break;
             }
             if (reason == X86_EXIT_HLE_INT) {
@@ -762,12 +1021,22 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
              */
             if (reason == X86_EXIT_HALT) {
                 cpu_state_ptr->exit_reason = 0;
-                if (!cpu_state_ptr->hard_int_pending)
-                    cpu_state_ptr->hard_int_pending = 0x08;
-                cpu_state_ptr->pit_counter = 1;
                 if (!(cpu_state_ptr->eflags & 0x200u))
                     break;            /* interrupts masked: nothing can wake it */
-                continue;
+                if (cpu_state_ptr->hard_int_pending) {
+                    /* Something is genuinely waiting. Pull the boundary in so
+                       it lands now; EIP is already past the HLT, which is
+                       where the handler's IRET belongs. */
+                    cpu_state_ptr->pit_counter = 1;
+                    continue;
+                }
+                /* Nothing is due YET. This used to fabricate an INT 08h on
+                   the spot, which is the frame-rate bug in its purest form: a
+                   guest that HLTs in a wait loop got a timer interrupt every
+                   time it asked, so its music ran at our loop rate instead of
+                   at 18.2 Hz. Go and draw a frame instead; the real-time
+                   driver raises the tick when it is actually owed. */
+                break;
             }
             /* Fault, HLT or unimplemented: latch it. Re-entering re-executes
                the same faulting instruction forever, spinning the frame loop
@@ -776,30 +1045,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
             break;
         }
 
-        /*
-         * The BIOS tick at 0040:006C. Until now it only moved when the guest
-         * executed INT 08h, and nothing generates INT 08h -- so for a program
-         * that reads the counter directly, which is how essentially every DOS
-         * timing loop works, guest time stood still.
-         *
-         * It has to advance with GUEST time, not with panel frames. A
-         * benchmark measures a fixed amount of work against the tick and then
-         * DIVIDES by the elapsed count: too slow a clock reads as zero elapsed
-         * ticks and the program takes a divide-by-zero. Tying it to the
-         * instruction slice fixes the emulated machine at
-         * INSNS_PER_TICK * 18.2 instructions per second -- about 0.36 MIPS,
-         * i.e. an 8088-class PC, which is the era these programs expect.
-         *
-         * In-guest INT 08h DELIVERY is still not implemented, so a program
-         * that hooks the vector rather than polling the counter sees nothing.
-         */
-        for (unsigned t = 0; t < TICKS_PER_SLICE; t++)
-            x86_bios_tick();
-        /* And the interrupt itself, for a guest that hooked the vector rather
-           than polling the counter. Only if nothing else is queued: the
-           keyboard uses the same one-deep slot. */
-        if (!cpu_state_ptr->hard_int_pending)
-            cpu_state_ptr->hard_int_pending = 0x08;
+        guest_exec_ms = abi->HAL_GetTick() - exec_start_ms;
 
         /* Video. The beam fraction drives the CGA status register, so a guest
            polling for vertical retrace sees it arrive about once per frame. */
@@ -836,6 +1082,9 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
            the screen stays black and nothing reaches the host. Wait on the
            swap the firmware has already queued instead, which is modelled and
            bounds the loop to the panel rate on both targets. */
+        /* CLOCK 1: the DISPLAY rate, and it is the panel's, not a constant.
+           Whether we had to wait here is also the only honest measure of
+           headroom, so it is what sizes the unthrottled slice. */
         abi->lcd_ctl(GW_LCD_SWAP, 0, 0, 0);
         for (unsigned spins = 0;
              spins < 100000u && abi->lcd_ctl(GW_LCD_IS_SWAP_PENDING, 0, 0, 0);
@@ -843,6 +1092,34 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
             /* bounded: never trade a black screen for a hang */
         }
         frames_rendered++;
+        guest_insns_total += slice;
         abi->wdog_refresh();
+
+        /* What this iteration really cost. */
+        uint32_t frame_end_ms = abi->HAL_GetTick();
+        frame_ms_last = frame_end_ms - frame_start_ms;
+
+        /* The display period, learned rather than declared. It creeps upward
+           so a panel that slows down (or an overclock that goes away) is
+           re-learned instead of pinning us to a number that was true once. */
+        if (!panel_ms_min || frame_ms_last < panel_ms_min)
+            panel_ms_min = frame_ms_last;
+        else if ((frames_rendered & 511u) == 0u)
+            panel_ms_min++;
+
+        /* Achieved rates, over a one-second window. In unthrottled mode this
+           is THE number -- there is no target to be short of, so "what did we
+           actually get" is the only report that means anything. */
+        if ((uint32_t)(frame_end_ms - rate_window_ms) >= 1000u) {
+            uint32_t elapsed = frame_end_ms - rate_window_ms;
+            guest_ips_achieved =
+                (uint32_t)(((uint64_t)(guest_insns_total - rate_window_insns)
+                            * 1000u) / elapsed);
+            guest_fps_achieved =
+                ((frames_rendered - rate_window_frames) * 1000u) / elapsed;
+            rate_window_ms = frame_end_ms;
+            rate_window_insns = guest_insns_total;
+            rate_window_frames = frames_rendered;
+        }
     }
 }

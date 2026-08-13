@@ -65,6 +65,43 @@ closed, one commit each; one shape accounts for four — reading a register
 operand BEFORE `DECODE_MODRM`, which uses R4/R5 as scratch. `refdos.py` still
 has no port I/O, so the oracle stops at the first CGA-retrace timing loop.
 
+## Guest timing — three clocks, measured
+
+The loop used to derive everything from one constant (`PIT_SLICE_INSNS`), and
+after the merge it carried **two** BIOS-tick drivers at once: one per rendered
+frame (182/600, exact only at 60 fps — at the device's measured 10 fps it fired
+at ~3 Hz) and one per instruction slice (`TICKS_PER_SLICE = 10`, ~100 Hz and
+moving with our throughput). That is Alley Cat's "pitch right, timing horrible".
+
+Now separated, none of them a hardcoded 60:
+
+1. **Display** — the panel's own swap signal; the period is *learned*
+   (`panel_ms_min`), so an overclock needs no constant changed.
+2. **Guest wall clock** — the firmware's ms counter. 18.2065 Hz exactly, carry
+   in fixed point, catch-up capped at 4 ticks with the excess counted in
+   `guest_ticks_dropped`.
+3. **Guest CPU rate** — `guest_kips`, paced against wall time. `0` is
+   unthrottled; anything else runs at that speed *and no faster*, with the
+   shortfall counted in `guest_insn_deficit`.
+
+Measured under gwemu (`probe.py`, tier 2): tick 18.24 Hz **identical** at 60 fps
+and at a forced 19 fps, and `0040:006C` tracks it exactly. Paced at 1200 kips
+(286-12): 1,200,000 insn/s, 60 fps, deficit 0. Unthrottled: ~10 M insn/s at
+60 fps. Asked for 100,000 kips: still 60 fps, deficit climbing ~90 M/s — loud,
+not silent. TOPBENCH scores 46 at 1200 kips (was 236 when a "CGA frame" was
+200,000 instructions, i.e. a machine 6x faster than we are); no divide-by-zero.
+
+Also fixed here: HLT no longer fabricates an INT 08h on demand (a guest that
+HLTs in a wait loop got a timer tick every time it asked); the PC speaker is
+rendered from timestamped *events* rather than point-sampled once a frame, so
+a beep shorter than one frame is heard; the 8253 lo-only/hi-only writes keep
+the other byte; a counter-latch command is no longer stored as an access mode;
+and `AUTOEXEC.BAT`'s command tail is no longer dropped (`TOPBENCH.EXE -l`).
+
+`guest_kips` is a single global. Per-title selection via `roms/dos/*.cfg` is
+**not** wired: those files belong to another project's core and nothing here
+parses them.
+
 ## Open defects
 
 - **RAM_EMU headroom is 2,528 bytes, and running out is SILENT.** The core ends
@@ -91,7 +128,18 @@ has no port I/O, so the oracle stops at the first CGA-retrace timing loop.
   on the 80 (TOPBENCH's menu is columns 25-52) was sliced at column 40, and no
   40-column window could contain a 28-column box plus its context. 4 px now;
   80 x 4 = 320 exactly. `x86_video_pan` survives as a no-op.
-- PC speaker: sub-frame beeps are never heard and the pitch reads low.
+- **GAME does reach the guest as Return — measured.** `input_pad_seen` bit 5,
+  0x1C/0x9C queued, IRQ 1 raised, and the guest read `0x1C` off port 0x60
+  (`x86_kbd_read_log`). The chain is not the defect. What is: the *test* pressed
+  gwemu's `start`, which is `B_START`/`ODROID_INPUT_X` and not the GAME button
+  at all; and Alley Cat's skill-level menu wants K/H/T/A, which **no button can
+  send** — so Return there is correctly delivered and correctly ignored. The
+  eight-button pad cannot reach a letter menu; that needs the on-screen
+  keyboard, not a mapping change.
+- `tests/test_core_retrogo.py` fails its blitter/CLUT assertions whenever a real
+  `.dsk` is on the card: they expect `demo_guest`'s pattern, and the demo only
+  runs when no disk mounts. Pre-existing; the assertions need to be
+  guest-aware.
 - gwemu's headless **screendump** produces nothing (Retro-Go's own menu comes
   back black too), but its **LTDC registers are modelled**, so `test_screen.py`
   rebuilds the scanned-out image. A black timeline screenshot is not a bug.

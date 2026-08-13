@@ -91,6 +91,66 @@ def check_input(runner, syms, out=print):
         out("FAIL: the scancode never reached the controller queue")
         ok = False
     out("input: PASS" if ok else "input: FAIL")
+    return ok and check_game_is_return(runner, syms, out)
+
+
+ODROID_INPUT_START = 5        # odroid_input.h; the firmware maps B_GAME here
+PAD_SCANCODE_ENTER = 0x1C     # src/main.c pad_scancode[6]
+
+
+def check_game_is_return(runner, syms, out=print):
+    """The GAME button must put 0x1C (Return) in front of the guest.
+
+    This exists because "START sends Return" was believed working while the
+    device said otherwise, and the reason was the TEST: gwemu's "start" key is
+    B_START, a button the stock Game & Watch does not have, which the firmware
+    reports as ODROID_INPUT_X -- a bit nothing in the core reads. The physical
+    GAME button is ODROID_INPUT_START. Press GAME to test GAME.
+
+    It also asserts the BYTE, not just that something happened: the counters
+    upstream prove a code was queued, but the whole question is WHICH.
+    """
+    b = runner.backend
+    if not hasattr(runner, "press"):
+        return True
+
+    def read_log():
+        base = syms["x86_kbd_read_log"]
+        return [b.read_uint32(base + 4 * i) for i in range(32)]
+
+    idx_before = b.read_uint32(syms["x86_kbd_read_log_idx"])
+    ht_before = b.read_uint32(syms["input_kbd_ht"])
+    runner.press("GAME", delay=0.0)
+    time.sleep(2.0)
+    idx_after = b.read_uint32(syms["x86_kbd_read_log_idx"])
+    seen = b.read_uint32(syms["input_pad_seen"])
+
+    out("\n--- GAME -> Return ---")
+    out(f"pad_seen bit {ODROID_INPUT_START} (START/GAME): "
+        f"{'set' if seen & (1 << ODROID_INPUT_START) else 'CLEAR'}")
+    out(f"port 0x60 reads logged: {idx_before} -> {idx_after}")
+
+    ok = True
+    if not (seen & (1 << ODROID_INPUT_START)):
+        out("FAIL: GAME never reached the core's gamepad read")
+        ok = False
+
+    if idx_after > idx_before:
+        log = read_log()
+        fresh = [log[i & 31] for i in range(idx_before, idx_after)]
+        out("bytes the guest read: " + " ".join(f"0x{v:02X}" for v in fresh))
+        if PAD_SCANCODE_ENTER not in fresh:
+            out(f"FAIL: 0x{PAD_SCANCODE_ENTER:02X} (Return) was not among them")
+            ok = False
+    elif b.read_uint32(syms["input_kbd_ht"]) == ht_before:
+        # The guest reads port 0x60 itself only if it wants to; but the code
+        # must at least have reached the controller.
+        out("FAIL: nothing reached the controller queue for GAME")
+        ok = False
+    else:
+        out("(guest has not drained the queue; code is still buffered)")
+
+    out("GAME->Return: PASS" if ok else "GAME->Return: FAIL")
     return ok
 
 

@@ -65,6 +65,37 @@ Samples PC (labelled ITCM / firmware symbol / region), watched globals, and
 pointer dereferences. Reach for this when a harness reports a value that makes
 no sense — it is faster than lengthening a timeline, which is capped at 60s.
 
+#### The three clocks, and how to watch them
+
+The emulator loop has three independent clocks (see the block comment at the
+top of `src/main.c`). All of them are host-readable, and all of them are
+host-**writable** where that is a knob, so the trade is measured on a running
+target instead of rebuilt for:
+
+```bash
+# what the guest is actually getting
+python3 scripts/probe.py --retrogo --wait-magic \
+    --watch guest_kips,guest_slice_now,guest_ips_achieved,guest_fps_achieved,\
+guest_insn_deficit,guest_ticks,guest_uptime_ms,guest_ticks_dropped,\
+frame_ms_last,guest_exec_ms,panel_ms_min
+
+python3 scripts/probe.py --retrogo --wait-magic --set guest_kips=0       # max
+python3 scripts/probe.py --retrogo --wait-magic --set guest_kips=330     # 8088
+```
+
+| Symbol | Meaning |
+|---|---|
+| `guest_kips` | emulated CPU speed in thousands of insns/s. **0 = unthrottled.** `KIPS_*` in `src/main.c` has the profile rungs |
+| `guest_insn_deficit` | instructions the emulated CPU owed and never ran. The answer to "I asked for a 386 — am I getting one?". Meaningful only in paced mode |
+| `guest_ips_achieved` / `guest_fps_achieved` | measured over a 1 s window. The number that matters in unthrottled mode |
+| `guest_ticks` / `guest_ticks_dropped` | 18.2065 Hz BIOS ticks emitted, and ones refused by the catch-up cap |
+| `panel_ms_min` | the display period, **learned** from the shortest iteration ever completed. Nothing assumes 60 fps |
+| `x86_kbd_read_log` / `x86_spk_log` | the last 32 bytes off port 0x60, and the last 32 writes that can move the speaker tone. `--dump x86_kbd_read_log:32x8` |
+
+Guest time must not move with render rate. The measurement that proves it is
+`guest_ticks / guest_uptime_ms` at two different frame rates — force a low one
+with a large `--set guest_kips=…` or by loading a heavy guest.
+
 ### `watch_memory.py` — catch whatever is writing to an address
 
 ```bash
@@ -327,6 +358,16 @@ validation, multiple destinations and target awareness.
 
 Launch is driven by `/CONFIG` preselection plus
 `timelines/start-preselected-game.tl` (presses A twice). Do not navigate menus.
+
+**Button names are not what they look like.** gwemu's `press start` drives
+`B_START` — a button the stock Game & Watch does not have, which retro-go maps
+to `ODROID_INPUT_X`, a bit the core does not read. The physical **GAME** button
+is `ODROID_INPUT_START`, so `press game` is what tests the core's Return
+mapping. A timeline that says `press start` exercises nothing, which is how
+"START sends Return" stayed believed-working while the device disagreed.
+`timelines/press-game.tl` presses TIME (N, to answer Alley Cat's joystick
+prompt) and then GAME, and `tests/test_core_retrogo.py` asserts the byte
+0x1C reaches the guest through `x86_kbd_read_log`.
 `timelines/run-to-completion.tl` is the same launch with a 58 s window, for a
 guest doing real work whose result only appears at the end -- the one case where
 the wait IS the result rather than a symptom to chase with `probe.py`.

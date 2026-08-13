@@ -25,23 +25,37 @@
 
 X86IOState x86_io;
 
+/* The last 32 writes that can move the tone, as (port << 24) | value, so a
+   guest whose beeps come out at the wrong pitch can be read rather than
+   guessed at. scripts/probe.py --dump x86_spk_log:32x4 */
+volatile uint32_t x86_spk_log[32];
+volatile uint32_t x86_spk_log_idx = 0;
+
 static void pit_write_control(uint8_t v)
 {
     unsigned ch = v >> 6;
     if (ch != 2)
         return;                     /* channels 0/1 are the tick, not sound */
-    x86_io.pit2_access = (v >> 4) & 3;
-    x86_io.pit2_latched = 0;
+    unsigned access = (v >> 4) & 3;
+    /* Access field 0 is the COUNTER LATCH command, not an access mode: it
+       freezes the count for reading and leaves the programmed mode alone.
+       Storing it as the mode put the next 0x42 write through the lo/hi path
+       with a stale half-pair flag, which is one way a tone comes out an octave
+       or more off. */
+    if (access == 0)
+        return;
+    x86_io.pit2_access = (uint8_t)access;
+    x86_io.pit2_latched = 0;        /* a control word resets the pair phase */
 }
 
 static void pit_write_ch2(uint8_t v)
 {
     switch (x86_io.pit2_access) {
-    case 1:                          /* lo byte only */
-        x86_io.pit2_reload = v;
+    case 1:                          /* lo byte only: the HIGH byte STAYS */
+        x86_io.pit2_reload = (uint16_t)((x86_io.pit2_reload & 0xFF00) | v);
         break;
-    case 2:                          /* hi byte only */
-        x86_io.pit2_reload = (uint16_t)(v << 8);
+    case 2:                          /* hi byte only: the LOW byte STAYS  */
+        x86_io.pit2_reload = (uint16_t)((v << 8) | (x86_io.pit2_reload & 0xFF));
         break;
     default:                         /* lo then hi */
         if (!x86_io.pit2_latched) {
@@ -64,28 +78,109 @@ uint32_t x86_speaker_hz(void)
     return PIT_HZ / x86_io.pit2_reload;
 }
 
+uint32_t (*x86_io_time_ms)(void);
+volatile uint32_t x86_spk_events = 0;
+volatile uint32_t x86_spk_events_dropped = 0;
+
 /*
- * Render `frames` samples of the current tone. Phase is carried across calls in
- * x86_io.spk_phase so the waveform does not restart every audio buffer, which
- * would put a click at the start of each one.
+ * Log a change in the audible frequency, stamped with the host clock.
+ *
+ * Called after every write that can move it (0x42, 0x43, 0x61). Only CHANGES
+ * are recorded, so a guest that rewrites the same divisor costs nothing.
  */
-void x86_speaker_render(int16_t *dst, unsigned frames, unsigned sample_rate,
-                        int16_t amplitude)
+static void spk_event(uint32_t port, uint32_t value)
 {
+    x86_spk_log[x86_spk_log_idx & 31] = (port << 24) | (value & 0xFFu);
+    x86_spk_log_idx++;
+
     uint32_t hz = x86_speaker_hz();
+    if (hz == x86_io.spk_last_hz)
+        return;
+    x86_io.spk_last_hz = hz;
+
+    uint8_t next = (uint8_t)((x86_io.spk_ev_tail + 1u) % X86_SPK_EVENTS);
+    if (next == x86_io.spk_ev_head) {
+        x86_spk_events_dropped++;    /* loud: the ring is too short for this
+                                        guest, and silence would hide it */
+        return;
+    }
+    x86_io.spk_ev_ms[x86_io.spk_ev_tail] = x86_io_time_ms ? x86_io_time_ms() : 0;
+    x86_io.spk_ev_hz[x86_io.spk_ev_tail] = hz;
+    x86_io.spk_ev_tail = next;
+    x86_spk_events++;
+}
+
+/*
+ * One constant-frequency run of samples. Phase is carried in x86_io.spk_phase
+ * so the waveform does not restart at a buffer or segment boundary, which
+ * would put a click at every one.
+ */
+static void spk_run(int16_t *dst, unsigned n, uint32_t hz,
+                    unsigned sample_rate, int16_t amplitude)
+{
+    if (!n)
+        return;
     if (!hz || !sample_rate) {
-        memset(dst, 0, frames * sizeof(*dst));
+        memset(dst, 0, n * sizeof(*dst));
         x86_io.spk_phase = 0;
         return;
     }
-    /* 16.16 phase step: how far through the square wave one sample moves. */
+    /* 16-bit phase accumulator: a full wrap is one square-wave period. */
     uint32_t step = (uint32_t)(((uint64_t)hz << 16) / sample_rate);
     uint32_t phase = x86_io.spk_phase;
-    for (unsigned i = 0; i < frames; i++) {
+    for (unsigned i = 0; i < n; i++) {
         dst[i] = (phase & 0x8000u) ? amplitude : (int16_t)-amplitude;
         phase = (phase + step) & 0xFFFFu;
     }
     x86_io.spk_phase = phase;
+}
+
+/*
+ * Render `frames` samples covering the real time since the previous call.
+ *
+ * This used to point-sample the speaker once per frame, which is why beeps
+ * went missing: at the measured ~10 fps a tone had to survive 100 ms to be
+ * observed at all, and a DOS beep is often 20. Now every frequency change the
+ * guest made during the window is placed at its own offset within the buffer,
+ * so a 20 ms beep becomes 20 ms of tone in the middle of the buffer instead of
+ * either the whole buffer or nothing.
+ *
+ * With no host clock (the bare-metal harness) every event lands at offset 0
+ * and the last one wins, which is the old behaviour exactly.
+ */
+void x86_speaker_render(int16_t *dst, unsigned frames, unsigned sample_rate,
+                        int16_t amplitude)
+{
+    uint32_t t1 = x86_io_time_ms ? x86_io_time_ms() : 0;
+    uint32_t t0 = x86_io.spk_window_ms;
+    x86_io.spk_window_ms = t1;
+    uint32_t span = t1 - t0;
+
+    unsigned pos = 0;
+    while (x86_io.spk_ev_head != x86_io.spk_ev_tail) {
+        uint32_t ev_ms = x86_io.spk_ev_ms[x86_io.spk_ev_head];
+        uint32_t hz    = x86_io.spk_ev_hz[x86_io.spk_ev_head];
+        x86_io.spk_ev_head =
+            (uint8_t)((x86_io.spk_ev_head + 1u) % X86_SPK_EVENTS);
+
+        unsigned idx = 0;
+        if (span) {
+            uint32_t d = ev_ms - t0;            /* wrap-safe */
+            if (d > span)
+                d = span;                       /* clamp, never index past */
+            idx = (unsigned)(((uint64_t)d * frames) / span);
+        }
+        if (idx < pos)
+            idx = pos;                          /* the ring is in order */
+        if (idx > frames)
+            idx = frames;
+        spk_run(dst + pos, idx - pos, x86_io.spk_render_hz,
+                sample_rate, amplitude);
+        pos = idx;
+        x86_io.spk_render_hz = hz;
+    }
+    spk_run(dst + pos, frames - pos, x86_io.spk_render_hz,
+            sample_rate, amplitude);
 }
 
 /* ---------------------------------------------------------------------------
@@ -109,12 +204,31 @@ int x86_kbd_pending(void)
     return x86_io.kbd_head != x86_io.kbd_tail;
 }
 
+/*
+ * What the guest actually got off port 0x60, and how often it asked.
+ *
+ * The counters upstream of this (input_scancodes, input_irqs, kbd_head/tail)
+ * prove a code was QUEUED. They cannot tell you WHICH code the guest read,
+ * and "this button does nothing" is exactly the question that turns on which
+ * byte arrived -- 0x1C or something else, make or break, once or twice. The
+ * log is the last 32 bytes handed out, newest at (idx-1) & 31.
+ *
+ *   python3 scripts/probe.py --retrogo --wait-magic \
+ *       --watch x86_kbd_port60_reads --dump x86_kbd_read_log:32x8
+ */
+volatile uint32_t x86_kbd_port60_reads = 0;
+volatile uint32_t x86_kbd_read_log[32];
+volatile uint32_t x86_kbd_read_log_idx = 0;
+
 static uint8_t kbd_read_data(void)
 {
+    x86_kbd_port60_reads++;
     if (x86_io.kbd_head == x86_io.kbd_tail)
         return x86_io.kbd_last;      /* re-reading holds the last code */
     x86_io.kbd_last = x86_io.kbd_queue[x86_io.kbd_head];
     x86_io.kbd_head = (uint8_t)((x86_io.kbd_head + 1u) & 15u);
+    x86_kbd_read_log[x86_kbd_read_log_idx & 31] = x86_io.kbd_last;
+    x86_kbd_read_log_idx++;
     return x86_io.kbd_last;
 }
 
@@ -186,12 +300,15 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
     switch (port) {
     case 0x42:
         pit_write_ch2((uint8_t)value);
+        spk_event(port, value);
         break;
     case 0x43:
         pit_write_control((uint8_t)value);
+        spk_event(port, value);
         break;
     case 0x61:
         x86_io.port61 = (uint8_t)value;
+        spk_event(port, value);
         break;
     case 0x20:                       /* PIC end-of-interrupt: nothing to model
                                         while only one IRQ source exists */

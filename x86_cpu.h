@@ -121,6 +121,25 @@ typedef struct {
     uint8_t  pit2_latched;    /* half-way through a lo/hi pair */
     uint8_t  port61;          /* bit0 = ch2 gate, bit1 = speaker data */
     uint32_t spk_phase;       /* 16.16 square-wave phase, carried across buffers */
+    /* Speaker EVENTS, not a per-frame sample of the speaker.
+     *
+     * The renderer used to run once a frame and point-sample the CURRENT
+     * state, so a tone that started and stopped between two calls was never
+     * heard at all -- which is what "half the beeps are missing" was. Every
+     * change to the audible frequency is timestamped in HOST milliseconds
+     * (x86_io_time_ms) as the guest makes it, and the render then walks the
+     * window and lays each segment down where it belongs.
+     *
+     * X86_SPK_EVENTS is small on purpose: a guest sweeping a siren changes the
+     * divisor far faster than 16 kHz can show, and the overflow is COUNTED
+     * (x86_spk_events_dropped) rather than papered over. */
+#define X86_SPK_EVENTS 32u
+    uint32_t spk_ev_ms[X86_SPK_EVENTS];
+    uint32_t spk_ev_hz[X86_SPK_EVENTS];
+    uint8_t  spk_ev_head, spk_ev_tail;
+    uint32_t spk_last_hz;     /* frequency at the last logged event          */
+    uint32_t spk_render_hz;   /* frequency the renderer left off at          */
+    uint32_t spk_window_ms;   /* host ms the next render's window starts at  */
     uint8_t  cga_mode;        /* 0x3D8 mode control */
     uint8_t  cga_color_select;/* 0x3D9 background + palette + intensity */
     uint16_t cga_beam;        /* 0..0xFFFF through the frame, set by the core */
@@ -234,6 +253,19 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size);
 uint32_t x86_speaker_hz(void);
 void x86_speaker_render(int16_t *dst, unsigned frames, unsigned sample_rate,
                         int16_t amplitude);
+/* Host millisecond clock, for timestamping speaker events. The core points
+   this at the firmware's HAL_GetTick; the bare-metal harness leaves it NULL,
+   which collapses every event onto the start of the window -- i.e. exactly the
+   old point-sampled behaviour, so tier-1 expectations are unchanged. */
+extern uint32_t (*x86_io_time_ms)(void);
+extern volatile uint32_t x86_spk_events;          /* frequency changes logged */
+extern volatile uint32_t x86_spk_events_dropped;  /* ring overflows           */
+extern volatile uint32_t x86_spk_log[32];         /* (port<<24)|value, last 32 */
+extern volatile uint32_t x86_spk_log_idx;
+/* Port 0x60: how often the guest asked, and the last 32 bytes it was given. */
+extern volatile uint32_t x86_kbd_port60_reads;
+extern volatile uint32_t x86_kbd_read_log[32];
+extern volatile uint32_t x86_kbd_read_log_idx;
 
 #define X86_MODE_REC_STRIDE     2048
 #define X86_MODE_REC_TABLE_OFF  1024
