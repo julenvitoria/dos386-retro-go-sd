@@ -47,11 +47,17 @@ x86_offsets.inc: offset.c x86_cpu.h cutils.h
 cpu_exec.o: x86_offsets.inc cpu_exec_handlers.S cpu_exec_handlers_0f.S \
             opcode_table.S opcode_0f_table.S
 
+# Header dependencies. Without these, editing a header leaves every .o that
+# included it stale and the harness measures the PREVIOUS build -- which is how
+# a rewritten font8x8.h produced a "fixed" renderer that still drew the old
+# glyphs. sdk/Makefile has done this all along; this build had not.
 %.o: %.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
 %.o: %.S
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+-include $(TEST_OBJS:.o=.d)
 
 qemu_bank1.bin: test_core.elf
 	$(OBJCOPY) -O binary $< test_core_intflash.bin
