@@ -48,6 +48,7 @@
 
 #include "cutils.h"
 #include "x86_cpu.h"
+#include "x86_pager.h"
 
 #define PAGE_SIZE   4096u
 
@@ -172,18 +173,47 @@ int x86_nor_attach(void *nor, uint32_t nor_bytes, void *ram, uint32_t ram_bytes,
     /* Readback. Under gwemu this is exact; on silicon it is the only thing
        that distinguishes a good program from an OCTOSPI that came back in the
        wrong mode. Either way it costs one pass and buys the whole invariant. */
-    if (memcmp(n, r, ram_bytes) != 0)  { x86_nor_attach_err = 7; return -1; }
-
     uint32_t pages = ram_bytes / PAGE_SIZE;
+    for (uint32_t i = 0; i < pages; i++) {
+        uint32_t idx = first_page + i;
+        uint32_t k = guest_page_table_ptr[idx];
+        /* Compare against what the guest can actually SEE at this page, which
+           is not `r + i*4096` once guest RAM is demand paged. A page with no
+           mapping contributed nothing to the snapshot either, so it is skipped
+           on both sides rather than compared against stale block contents. */
+        if (k == FOLD_INVALID)
+            continue;
+        const uint8_t *host = (const uint8_t *)(uintptr_t)((idx << FOLD_SHIFT) + k);
+        if (memcmp(n + i * PAGE_SIZE, host, PAGE_SIZE) != 0) {
+            x86_nor_attach_err = 7;
+            return -1;
+        }
+    }
 
     /* Only now. Every entry that currently points into the AXI block moves to
        the matching NOR page; anything else (VRAM, the open-bus filler, the
        BIOS id page) is left exactly as it was. */
+    /*
+     * Every entry that currently points ANYWHERE INSIDE the AXI block moves to
+     * its matching NOR page.
+     *
+     * It used to test `guest_page_table_ptr[idx] == FOLD_K(r + i*4096, idx)`,
+     * i.e. it assumed guest RAM was mapped 1:1. Demand paging broke that
+     * assumption -- a page lives in whichever frame was free when it was first
+     * touched -- and the old test would have matched almost nothing, quietly
+     * leaving the guest on AXI while every counter said it had moved. The host
+     * address is derived from the fold entry itself now, so the check is
+     * "does this page live in the block we are replacing", which is the
+     * question that was always meant.
+     */
     for (uint32_t i = 0; i < pages; i++) {
-        uint8_t *axi = r + i * PAGE_SIZE;
         uint8_t *nor_page = n + i * PAGE_SIZE;
         uint32_t idx = first_page + i;
-        if (guest_page_table_ptr[idx] != FOLD_K(axi, idx))
+        uint32_t k = guest_page_table_ptr[idx];
+        if (k == FOLD_INVALID)
+            continue;               /* not resident: nothing to repoint */
+        uint8_t *axi = (uint8_t *)(uintptr_t)((idx << FOLD_SHIFT) + k);
+        if (axi < r || axi >= r + ram_bytes)
             continue;               /* not ours to move */
         fold_repoint(idx, nor_page, axi);
     }
@@ -249,9 +279,36 @@ static uint32_t nor_cow_locked(uint32_t off)
     return (uint32_t)axi + (off & (PAGE_SIZE - 1u));
 }
 
+/*
+ * Is this trap a fold MISS rather than a NOR access?
+ *
+ * `bad` is host_base + guest_linear. An unmapped page holds
+ * FOLD_INVALID = 0x80000000, so a miss arrives as 0x80000000 + lin with lin
+ * below 16 MB -- i.e. 0x80000000-0x80FFFFFF. NOR is at 0x90000000. The two are
+ * separable by inspection, and the FAULTING LINEAR ADDRESS falls straight out
+ * of a miss, which is what lets the pager be reached from ~181 trap sites
+ * without plumbing a fault address down from any of them.
+ */
+static inline int is_fold_miss(uint32_t bad, uint32_t *lin)
+{
+    if ((bad & 0xFF000000u) != 0x80000000u)
+        return 0;
+    *lin = bad - 0x80000000u;
+    return 1;
+}
+
 void x86_nor_slow_r(uint32_t bad)
 {
     uint32_t t0 = DWT_CYCCNT;
+    uint32_t lin;
+
+    if (is_fold_miss(bad, &lin)) {
+        cpu_state_ptr->nor_ptr = x86_pager_fault(lin, 0);
+        if (!cpu_state_ptr->nor_ptr)
+            x86_nor_unmapped++;
+        return;
+    }
+
     uint32_t off = nor_offset(bad);
 
     if (!x86_nor_attached || off >= nor_len) {
@@ -294,6 +351,15 @@ uint32_t x86_nor_cow(uint32_t bad)
 void x86_nor_slow_w(uint32_t bad)
 {
     uint32_t t0 = DWT_CYCCNT;
+    uint32_t lin;
+
+    if (is_fold_miss(bad, &lin)) {
+        cpu_state_ptr->nor_ptr = x86_pager_fault(lin, 1);
+        if (!cpu_state_ptr->nor_ptr)
+            x86_nor_unmapped++;
+        return;
+    }
+
     uint32_t off = nor_offset(bad);
 
     if (!x86_nor_attached || off >= nor_len) {

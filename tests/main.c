@@ -5,6 +5,7 @@
 #include "../cutils.h"
 #include "../x86_cpu.h"
 #include "../x86_arena.h"
+#include "../x86_pager.h"
 #include "../x86_profile.h"
 #include "../x86_osk.h"
 
@@ -12,6 +13,9 @@
 // every index the 12-bit lookup can produce must exist -- a short table meant
 // the walk read past its end and a zero entry aliased address 0, which is ITCM.
 uint32_t guest_page_table[FOLD_ENTRIES] __attribute__((section(".dtcm_bss")));
+/* The pager's per-page state, in DTCM as it is in a real core -- there it is
+   handed out by mem_ctl(GW_MEM_DTC), here it is placed. */
+uint8_t pager_tables[X86_PG_TABLE_BYTES] __attribute__((section(".dtcm_bss")));
 /* Mode records: four dispatch tables plus their headers. Over-allocated by one
    record so x86_build_mode_records can align the base up to 8 KB, which the
    66/67 EORs require. */
@@ -126,6 +130,9 @@ volatile uint32_t a20_r[24];
 #define arena_test_mem   (test_ram + ARENA_TEST_OFF)
 volatile uint32_t run_arena_flag = 0;
 volatile uint32_t arena_r[32];
+
+volatile uint32_t run_pager_flag = 0;
+volatile uint32_t pager_r[24];
 
 volatile uint32_t run_video_flag = 0;
 volatile uint32_t video_blit_cycles = 0;
@@ -1315,6 +1322,134 @@ static void arena_test_run(void)
     arena_r[31] = x86_arena_used;
 }
 
+/*
+ * Demand paging, driven by GUEST instructions.
+ *
+ * The window is 0xC0000-0xC7FFF -- eight pages that the harness leaves
+ * unmapped, inside what real-mode segment:offset can reach -- and the pager is
+ * given FOUR frames for it. That 2:1 overcommit is the point: the first four
+ * pages fault in and the fifth cannot, so both the working case and the
+ * exhaustion case are exercised by one program.
+ *
+ * Exhaustion has to be LOUD. A pool that silently eats stores is
+ * indistinguishable from one that works, and this project has hit silent
+ * allocation failure five times; here the guest takes a clean
+ * X86_EXIT_MEM_FAULT and x86_pg_exhausted says exactly why.
+ */
+#define PGT_SEG    0xC000u
+#define PGT_FIRST  (0xC0000u >> 12)
+#define PGT_PAGES  8u
+#define PGT_FRAMES 4u
+#define PGT_MEM_OFF (700u * 1024u)      /* page-aligned inside test_ram */
+static void pager_test_run(void)
+{
+    for (uint32_t i = 0; i < 24; i++)
+        pager_r[i] = 0;
+
+    x86_pager_reset();
+    x86_pager_own(PGT_FIRST, PGT_PAGES);
+    pager_r[0] = (x86_pager_add_frames(test_ram + PGT_MEM_OFF,
+                                       PGT_FRAMES * 4096u) == 0);
+    pager_r[1] = x86_pg_frames_total;
+    pager_r[2] = x86_pg_frames_free;
+    for (uint32_t i = 0; i < PGT_PAGES; i++)
+        guest_page_table[PGT_FIRST + i] = FOLD_INVALID;
+
+    uint32_t fr0 = x86_pg_faults_r, fw0 = x86_pg_faults_w;
+    uint32_t fz0 = x86_pg_fill_zero, ex0 = x86_pg_exhausted;
+
+    /*
+     *   MOV AX,0C000h    B8 00 C0
+     *   MOV DS,AX        8E D8
+     *   MOV BYTE [0],5Ah C6 06 00 00 5A     <- write fault, page fills as ZERO
+     *   MOV AL,[0]       A0 00 00           <- resident now: no second fault
+     *   HLT              F4
+     */
+    static const uint8_t prog_one[] = {
+        0xB8, 0x00, 0xC0,  0x8E, 0xD8,
+        0xC6, 0x06, 0x00, 0x00, 0x5A,
+        0xA0, 0x00, 0x00,
+        0xF4,
+    };
+    memcpy(test_ram, prog_one, sizeof(prog_one));
+    memset(&cpu_state_dtcm, 0, sizeof(cpu_state_dtcm));
+    for (int i = 0; i < 6; i++)
+        cpu_state_dtcm.segs[i].limit = 0xFFFFFFFF;
+    cpu_state_dtcm.pit_reload = 0xFFFFFFFF;
+    cpu_state_dtcm.pit_counter = 0xFFFFFFFF;
+    x86_cpu_interp_asm();
+
+    pager_r[3] = cpu_state_dtcm.exit_reason;             /* 6 = HLT */
+    pager_r[4] = cpu_state_dtcm.regs[0] & 0xFFu;         /* 0x5A read back */
+    pager_r[5] = x86_pg_faults_w - fw0;                  /* exactly one */
+    pager_r[6] = x86_pg_faults_r - fr0;                  /* zero: it is resident */
+    pager_r[7] = x86_pg_fill_zero - fz0;                 /* filled from ZERO */
+    pager_r[8] = x86_pg_resident;                        /* 1 */
+    pager_r[9] = x86_pg_frames_free;                     /* 3 */
+    /* The fold entry now points into the frame pool, i.e. the page really is
+       on the FAST path and the next access will not trap at all. */
+    {
+        uint32_t k = guest_page_table[PGT_FIRST];
+        uint32_t host = (PGT_FIRST << 12) + k;
+        pager_r[10] = (k != FOLD_INVALID)
+                      && (host >= (uint32_t)(uintptr_t)(test_ram + PGT_MEM_OFF))
+                      && (host <  (uint32_t)(uintptr_t)(test_ram + PGT_MEM_OFF
+                                                        + PGT_FRAMES * 4096u));
+    }
+
+    /*
+     * Four more pages against three remaining frames.
+     *
+     *   MOV AX,0C000h  / MOV DS,AX
+     *   MOV [1000h],AL   A2 00 10
+     *   MOV [2000h],AL   A2 00 20
+     *   MOV [3000h],AL   A2 00 30    <- the last frame
+     *   MOV [4000h],AL   A2 00 40    <- nothing left: clean MEM_FAULT
+     *   HLT
+     */
+    static const uint8_t prog_full[] = {
+        0xB8, 0x00, 0xC0,  0x8E, 0xD8,
+        0xA2, 0x00, 0x10,
+        0xA2, 0x00, 0x20,
+        0xA2, 0x00, 0x30,
+        0xA2, 0x00, 0x40,
+        0xF4,
+    };
+    memcpy(test_ram, prog_full, sizeof(prog_full));
+    memset(&cpu_state_dtcm, 0, sizeof(cpu_state_dtcm));
+    for (int i = 0; i < 6; i++)
+        cpu_state_dtcm.segs[i].limit = 0xFFFFFFFF;
+    cpu_state_dtcm.pit_reload = 0xFFFFFFFF;
+    cpu_state_dtcm.pit_counter = 0xFFFFFFFF;
+    x86_cpu_interp_asm();
+
+    pager_r[11] = cpu_state_dtcm.exit_reason;            /* 5 = MEM_FAULT */
+    pager_r[12] = x86_pg_resident;                       /* 4, not 5 */
+    pager_r[13] = x86_pg_frames_free;                    /* 0 */
+    pager_r[14] = x86_pg_exhausted - ex0;                /* 1: loud */
+
+    /* The HOST side faults too, and reports exhaustion the same way rather
+       than returning a pointer into nothing. DOS loads a program by copying
+       into memory the guest has never touched, so this path carries every
+       program load in the system. */
+    pager_r[15] = (x86_guest_ptr(0xC5000u, 16) == NULL);
+    pager_r[16] = x86_pg_exhausted - ex0;                /* 2 */
+
+    /* An address outside the window is NOT a page fault -- it is a genuinely
+       unmapped address, and conflating the two would turn a guest's own wild
+       pointer into a silent allocation. */
+    uint32_t un0 = x86_pg_unmapped;
+    pager_r[17] = (x86_pager_fault(0x00500000u, 1) == 0);
+    pager_r[18] = (x86_pg_unmapped - un0);               /* 1 */
+
+    /* Leave nothing behind: the window goes back to unmapped and the pager
+       lets go of the frames it was lent out of test_ram. */
+    for (uint32_t i = 0; i < PGT_PAGES; i++)
+        guest_page_table[PGT_FIRST + i] = FOLD_INVALID;
+    x86_pager_reset();
+    pager_r[19] = x86_pg_frames_total;
+}
+
 static void dosfile_test_run(void)
 {
     static const uint8_t hle_vectors[] = {
@@ -1419,6 +1554,7 @@ void Reset_Handler(void) {
     // Point the interpreter at our statically-placed DTCM state. A retro-go
     // core sets these to dtc_malloc'd memory instead; the assembly is the same.
     guest_page_table_ptr = guest_page_table;
+    x86_pager_set_tables(pager_tables, sizeof(pager_tables));
     x86_build_mode_records(mode_record_block);
 
     // Every page starts unmapped, so a stray access faults loudly instead of
@@ -1543,6 +1679,11 @@ void Reset_Handler(void) {
         if (run_arena_flag == 1) {
             arena_test_run();
             run_arena_flag = 0;
+        }
+
+        if (run_pager_flag == 1) {
+            pager_test_run();
+            run_pager_flag = 0;
         }
 
         if (run_dos_flag == 1) {

@@ -1,19 +1,17 @@
 /*
  * Guest physical memory: a page pool and the fold-table mapping over it.
  *
- * This is deliberately NOT a pager. There is no fault path, no eviction, no
- * copy-on-write and no backing store -- those belong to the Wolf3D/Win3.11
- * work, where the guest wants more memory than the machine has. A DOS game in
- * conventional memory does not: 640 KB of RAM plus a 16 KB CGA window is
- * 656 KB against a measured ~724 KB AXI pool, so every guest page can simply
- * be resident. What is "dynamic" here is only that the pages come out of a
- * pool at runtime rather than from a static array, which is what lets the
- * video window be sized by the mode the guest selects.
+ * This file owns the MAPPING -- fixed mappings, guest<->host copies, the A20
+ * gate and the real-mode wrap. The PAGER is x86_pager.c and the display's AXI
+ * is x86_arena.c; the split is deliberate, because "which host memory does
+ * this guest address name" and "which guest pages are resident" fail in
+ * different ways and want different counters.
  *
- * Keeping it this small is the point. The prior project measured eviction
- * policy as worth at most 2.1x while the pool-size cliff was 350x, so there is
- * nothing to be gained by building machinery before something actually needs
- * to overcommit.
+ * The one place they meet is x86_guest_ptr(), which resolves the fold itself
+ * and therefore never touches the interpreter's trap stubs. It has to fault a
+ * non-resident page in, or DOS would be unable to load a program: loading is a
+ * copy into memory the guest has never touched, and under demand paging every
+ * one of those pages is non-resident.
  */
 #include <stdint.h>
 #include <string.h>
@@ -21,6 +19,7 @@
 #include "cutils.h"
 #include "x86_cpu.h"
 #include "x86_arena.h"
+#include "x86_pager.h"
 
 #define PAGE_SIZE 4096u
 
@@ -131,11 +130,26 @@ void *x86_guest_ptr(uint32_t lin, uint32_t bytes)
     uint32_t idx = lin >> FOLD_SHIFT;
     if (idx >= FOLD_ENTRIES)
         return NULL;
-    uint32_t k = guest_page_table_ptr[idx];
-    if (k == FOLD_INVALID)
-        return NULL;
     if (((lin + bytes - 1u) >> FOLD_SHIFT) != idx)
         return NULL;                 /* would cross a granule */
+
+    uint32_t k = guest_page_table_ptr[idx];
+    if (k == FOLD_INVALID) {
+        /* HOST-SIDE DEMAND FAULT. The interpreter reaches the pager through its
+         * trap stubs; everything on this side -- the BDA tick, INT 21h filling
+         * a DTA, a disk read landing in a guest buffer -- arrives here, and
+         * returning NULL would make a non-resident page indistinguishable from
+         * an unmapped one. That is not a theoretical difference: DOS loads a
+         * program by copying into memory the guest has never touched, so with
+         * demand paging every one of those pages is non-resident and nothing
+         * would load at all. */
+        uint32_t host = x86_pager_fault(lin, 1);
+        if (!host)
+            return NULL;
+        x86_pg_faults_host++;
+        x86_livemap_note(idx);
+        return (void *)host;
+    }
 
     /* A NOR-backed page must be pulled back into AXI BEFORE the pointer
      * escapes, because the caller may write through it.

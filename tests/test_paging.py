@@ -154,6 +154,44 @@ def main(args):
             ("arena left empty",                    a[31], 0),
         ]
 
+        # ---- demand paging, driven by guest instructions -------------------
+        p = run_arm(b, syms, "run_pager_flag", "pager_r", 24)
+        if p is None:
+            print("FAIL: target never ran the pager test")
+            return False
+
+        checks += [
+            ("pager took 4 frames",                 p[0], 1),
+            ("  ... frames total",                  p[1], 4),
+            ("  ... all free",                      p[2], 4),
+
+            # A guest store to a page that does not exist yet.
+            ("guest ran to HLT",                    p[3], HALT),
+            ("the byte read back",                  p[4], 0x5A),
+            ("exactly one write fault",             p[5], 1),
+            ("no read fault: it was resident",      p[6], 0),
+            ("filled from the ZERO tier",           p[7], 1),
+            ("one page resident",                   p[8], 1),
+            ("one frame taken",                     p[9], 3),
+            ("the page is on the FAST path now",    p[10], 1),
+
+            # Four pages against three frames. Exhaustion must be loud.
+            ("the 5th page takes a clean fault",    p[11], MEM_FAULT),
+            ("four resident, not five",             p[12], 4),
+            ("no frames left",                      p[13], 0),
+            ("exhaustion counted",                  p[14], 1),
+
+            # The host path carries every DOS program load.
+            ("host fault reports exhaustion",       p[15], 1),
+            ("  ... and counts it",                 p[16], 2),
+
+            # An address outside the window is not a page fault at all.
+            ("outside the window is unmapped",      p[17], 1),
+            ("  ... counted separately",            p[18], 1),
+
+            ("frames handed back",                  p[19], 0),
+        ]
+
         bad = 0
         for name, got, want in checks:
             ok = got == want

@@ -40,6 +40,7 @@
 #include "x86_zones.h"   /* ZONES: frame-loop phase accounting, X86_ZONES=1 */
 #include "x86_osk.h"
 #include "x86_arena.h"
+#include "x86_pager.h"
 
 #define APP_ID       100
 
@@ -599,6 +600,16 @@ static bool dtcm_state_init(void)
         GW_MEM_OP_ALLOC, GW_MEM_DTC, 1, sizeof(x86_zones_t))) ? 1 : 0;
 #endif
 
+    /* The pager's per-page state: 8 KB, read on every fault, so DTCM like the
+       fold table it sits beside. A failure here is not fatal -- the pager
+       simply owns nothing and every guest page stays unmapped -- but it would
+       be a guest that cannot run, so it reaches core_dtcm_ok. */
+    if (x86_pager_set_tables((void *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_DTC,
+                                                  1, X86_PG_TABLE_BYTES),
+                             X86_PG_TABLE_BYTES) != 0) {
+        return false;
+    }
+
     /*
      * A WITNESS FOR DTCM, because there is not one anywhere else.
      *
@@ -759,8 +770,17 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
     }
     guest_vram_ok = guest_vram ? 1 : 0;
 
-    guest_ram = (uint8_t *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM,
-                                        1, GUEST_RAM_SIZE);
+    /* Over-allocated by a page and aligned UP, because guest RAM is a pool of
+       4 KB frames now. ram_malloc() aligns to 4 bytes, and MEASURED on target
+       the block came back misaligned: x86_pg_frames_total read 159 instead of
+       160, one whole frame lost to a partial page at each end. The spare page
+       comes out of RAM_EMU headroom, which had 24,672 bytes doing nothing. */
+    {
+        uint8_t *raw = (uint8_t *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM,
+                                               1, GUEST_RAM_SIZE + 4096u);
+        guest_ram = raw ? (uint8_t *)(((uint32_t)(uintptr_t)raw + 4095u)
+                                      & ~4095u) : NULL;
+    }
     guest_ram_bytes = guest_ram ? GUEST_RAM_SIZE : 0;
 
     /* The open-bus filler comes from the BONUS POOL, not from RAM_EMU.
@@ -1054,8 +1074,26 @@ static void guest_reset(void)
        from 32-bit rather than the same handlers under another name. */
 
     x86_unmap_all();
-    for (uint32_t i = 0; i < GUEST_RAM_SIZE / 4096u; i++)
-        guest_page_table_ptr[i] = FOLD_K((uint32_t)guest_ram + i * 4096, i);
+
+    /*
+     * Guest RAM is DEMAND PAGED now, not mapped 1:1 up front.
+     *
+     * The pager gets exactly the same AXI the eager mapping used, so at this
+     * size nothing can be evicted and the guest sees identical memory -- the
+     * pages simply bind on first touch instead of at reset. That is the point
+     * of doing it at this size first: the whole fault path is exercised by
+     * every title, under conditions where a shortage is impossible, before the
+     * pool is ever made smaller than the working set.
+     *
+     * The window is [0, 640 KB). Everything above it -- VRAM, the mode 13h
+     * aperture, the open-bus filler, the BIOS id page -- is a FIXED mapping to
+     * real hardware storage and must never be paged, which is expressed by
+     * simply not giving those pages to the pager.
+     */
+    x86_pager_reset();
+    x86_pager_own(0, GUEST_RAM_SIZE / 4096u);
+    if (guest_ram)
+        x86_pager_add_frames(guest_ram, GUEST_RAM_SIZE);
     x86_video_map();
 
     /* What INT 12h and 0040:0013 will report, taken from the allocation that
@@ -1356,8 +1394,16 @@ static void nor_snap_fill(uint8_t *buf, uint32_t len, uint32_t off,
     uint32_t n = len;
     if (off + n > GUEST_RAM_SIZE)
         n = GUEST_RAM_SIZE - off;
-    memcpy(buf, guest_ram + off, n);
-    nor_snap_cb_bytes += n;
+    /* Through the FOLD, not `guest_ram + off`.
+     *
+     * That shortcut was correct only while guest RAM was mapped 1:1, and it is
+     * not any more: a demand-paged page lives in whichever frame was free when
+     * it was first touched, so `guest_ram + off` names an unrelated page's
+     * contents. It would have snapshotted a shuffled image of guest memory and
+     * then VERIFIED it against itself successfully, because the readback
+     * compares flash against the same wrong pointer. x86_guest_copy_out()
+     * resolves each granule properly and faults in anything not resident. */
+    nor_snap_cb_bytes += x86_guest_copy_out(buf, off, n);
 }
 
 /* A file of the right length and nothing else. 512 bytes of zeros pushed
@@ -1442,6 +1488,12 @@ static void nor_snapshot_run(void)
         nor_snap_result = NOR_SNAP_ATTACH;
         return;
     }
+    /* The AXI block has changed hands: x86_nor.c has taken it over as its COW
+       pool, one page at a time as writes demand. The pager must let go of it
+       in the same breath or two owners would hand out the same page. Its state
+       is dropped rather than migrated because after an attach there is nothing
+       left for it to own -- every guest page is served from NOR. */
+    x86_pager_reset();
     nor_snap_result = NOR_SNAP_OK;
     nor_snap_ms = abi->HAL_GetTick() - t0;
 }
