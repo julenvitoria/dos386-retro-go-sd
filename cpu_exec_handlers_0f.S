@@ -136,6 +136,25 @@ L(HANDLE_INTERRUPT):
     MEM_GET_PTR_R R12, R3
     LDRH R5, [R12]                 @ new CS selector
 
+    /* Which vector, and what it is about to install. x86_cs_log says an
+       interrupt happened; only this says which one, which is the question the
+       moment a guest hooks a vector and then walks off. */
+    MOVW R3, #:lower16:x86_int_vec_log_idx
+    MOVT R3, #:upper16:x86_int_vec_log_idx
+    LDR R12, [R3]
+    ADD.W R0, R12, #1
+    STR R0, [R3]
+    AND.W R12, R12, #15
+    MOVW R3, #:lower16:x86_int_vec_log
+    MOVT R3, #:upper16:x86_int_vec_log
+    ORR.W R0, R5, R4, LSL #16
+    STR.W R0, [R3, R12, LSL #2]
+
+    LDR.W R3, [R8, #CPU_IDTR_BASE]
+    ADD.W R3, R3, R4, LSL #2
+    MEM_GET_PTR_R R12, R3
+    LDRH R0, [R12]                 @ new IP (reloaded: R0 was used above)
+
     PUSH {R0, LR}
     MOV.W R4, #1                   @ CS
     BL L(SET_SREG)

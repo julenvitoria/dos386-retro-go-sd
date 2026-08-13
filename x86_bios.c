@@ -395,7 +395,17 @@ int x86_bios_video(uint8_t func)
      */
     case 0x12:
         /* AH=12h/BL=10h asks for EGA configuration; a machine without EGA
-           returns BL UNCHANGED, which is precisely "do nothing". */
+           returns BL UNCHANGED, which is precisely "do nothing".
+         *
+         * DO NOT "fix" this by claiming EGA. It was measured under gwemu with
+         * Commander Keen 4, which is EGA-only: answering BX=0003/CX=0009 ("EGA
+         * present, 256 KB") gets the title PAST its video gate -- it reads 200
+         * more sectors of EGAGRAPH.CK4 and then asks for mode 0Dh, which
+         * x86_video REFUSES (mode log tag 5, value 0x0D), after which it runs
+         * forever against a black screen with no way to tell it has failed.
+         * The honest answer stops it at the gate instead. The planar video
+         * this needs is a subsystem, not a BIOS return value -- see STATUS.md.
+         */
         return 1;
     case 0x1A:
         /* AH=1Ah is VGA's display-combination call. It reports support by

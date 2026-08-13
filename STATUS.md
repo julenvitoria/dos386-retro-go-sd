@@ -689,6 +689,70 @@ Cost: ITCM 36,416 → 48,208 B of 65,536 (~360 trap stubs — handlers are emitt
 twice). **RAM_EMU headroom 7,680 → 4,576 B** (`__CORE_BSS_END__` 0x24057078 →
 0x24057c98). That is the number to watch before anything else lands.
 
+## Commander Keen 4 — reaches its startup screen, dies on the EGA gate
+
+First run of `KEEN4.dsk`, measured under gwemu (tier 2). It gets **further than
+any title here has**: its full 80x25 startup banner renders
+(`build/artifacts/keen4_startup.png`, `--text`) — title box, "Video Modes
+Available", "Detected Sound Hardware: PC Speaker", "Initializing... Please
+Wait". 7.2 M instructions, 418 sectors, `x86_dos_last_error=0`.
+
+The DOS and BIOS surface underneath it is **clean, and that is a measurement,
+not an assumption**. `x86_dos_file_log` holds three calls for the whole run and
+all three are correct: `3Dh` on `EGAGRAPH.CK4` → handle 5, `3Eh` on it, and
+`3Dh` on **`EMMXXXX0`** → CF=1, AX=2. That last one is the EMS probe, and
+"file not found" IS the right answer — the device name is how a program asks
+whether an EMS driver is loaded. INT 2Fh (XMS) reaches the bare-IRET stub and
+leaves AL alone, which is likewise "absent". **Nothing in the INT 21h surface
+was wrong for this title**, so nothing there was changed.
+
+Then it stops, `guest_halted=1`, `guest_exit_reason=4`, **`exit_info=0xFF` at
+CS:EIP `D02A:D18C`** — which is not an unimplemented instruction at all. It is
+the **open-bus filler**: 0xD02A0 is upper memory, and 0xFF FF decodes as group 5
+`/7`, i.e. the interpreter reporting that the guest is executing nothing.
+
+The chain, read off `x86_int_vec_log` (added for this) and `x86_cs_log`:
+
+1. The last two BIOS calls are the video-card detection pair, INT 10h **AH=1Ah**
+   then **AH=12h**. Both answer "absent", which is what this machine is.
+2. The guest then clears "video memory" with `REP STOSW`, CX=0x8000, through a
+   screen segment of **0x0000** — it never set a graphics mode, so the variable
+   was never initialised. `x86_video_mode_log` holds two events for the whole
+   run (BIOS mode 3 at boot, the renderer following); no mode set, no refusal.
+3. That wipes the low 64 KB. Measured after the halt: guest linear 0x0000
+   (**the IVT**), 0x0400 (the BDA) and 0x0600 (**our own HLE stub page**) are all
+   zero.
+4. The 18.2 Hz tick lands mid-`REP`. `x86_int_vec_log` ends with **`0x00080000`
+   — INT 08h dispatched into CS=0x0000**, every earlier entry being 0x21/0x2F/
+   0x10 into the stub segment 0x0060. It executes the zeroed memory as `ADD
+   [BX+SI],AL` until it reaches the part of the wipe that had not happened yet,
+   hits an `EA` far JMP in that data, and lands in the filler.
+
+It is **intermittent** for exactly that reason: the run survives when the tick
+misses the window.
+
+**The blocker is EGA, and this was tested rather than argued.** Answering AH=12h
+BL=10h with BX=0003/CX=0009 ("EGA present, 256 KB") gets Keen 4 past the gate:
+it reads 200 more sectors and asks for **mode 0Dh**, which `x86_video` refuses
+(mode log tag 5, value 0x0D), after which it runs forever against a black
+screen. That change was **reverted** — a wrong answer converts a clean stop into
+a silent one — and the measurement is recorded at the call site in `x86_bios.c`
+so nobody repeats the experiment.
+
+Mode 0Dh is 320x200x16 planar through the Sequencer: a store-side hook on every
+VRAM write (our VRAM is deliberately plain mapped RAM with no MMIO path), a
+Sequencer + Graphics Controller register file (we model neither; the guest was
+already writing `OUT 3CE` when it died), and 32 KB of page storage against
+45,056 B free in the bonus pool. Three subsystems. **Not started** — same
+verdict, and the same three reasons, as Mode Y for Wolf3D.
+
+Fixed here, and it is the reason the numbers above are trustworthy:
+`guest_insns_total` was incremented by the whole slice BUDGET once per frame
+**unconditionally**, so a latched guest went on "running" and
+`guest_ips_achieved` read **2,982,107 insn/s in the same sample as
+`guest_halted=1`, `guest_exit_reason=4`**. It now stops when the guest does, and
+the rate falls to 0 — measured before (3.0 M/s forever) and after (0).
+
 ## Open defects
 
 - **A segment override in front of `REP` survives only the first element.**

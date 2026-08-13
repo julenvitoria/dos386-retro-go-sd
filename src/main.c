@@ -1912,7 +1912,17 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         }
         X86_ZONE_EXIT();                            /* ZONES: end SWAP */
         frames_rendered++;
-        guest_insns_total += slice;
+        /* Only if the guest actually ran. This is the slice BUDGET, not a
+         * retired-instruction count, and it used to be added every frame
+         * unconditionally -- so a guest latched at X86_EXIT_UNIMPLEMENTED went
+         * on "executing" 3.0 M insn/s forever, and guest_ips_achieved (which is
+         * derived from it) agreed. Measured on Commander Keen 4: guest_halted=1,
+         * guest_exit_reason=4 and guest_ips_achieved=2,982,107 in the same
+         * sample. An instrument that reports full speed for a dead guest is
+         * worse than no instrument; the rate now falls to 0, which is the
+         * signal. */
+        if (!guest_halted)
+            guest_insns_total += slice;
         abi->wdog_refresh();
 
         /* What this iteration really cost. */
