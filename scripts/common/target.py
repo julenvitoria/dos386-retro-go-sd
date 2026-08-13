@@ -26,6 +26,7 @@ import os
 import shutil
 import socket
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 
@@ -35,6 +36,8 @@ from gnwmanager.ocdbackend.openocd_backend import OpenOCDBackend
 
 from .sdcard import (HardwarePhysicalSDCardManager, HardwareProbeSDCardManager,
                      QemuSDCardManager)
+from .timeline import (ShadowWordPlayer, TimelineError, parse,
+                       quit_time as timeline_quit)
 
 # gwemu key map (gnw-input.ini), per the firmware's docs/gwemu.md.
 KEYS = {
@@ -111,18 +114,9 @@ def timeline_quit_time(path):
     that silently goes stale when the timeline changes.
     """
     try:
-        with open(path) as fh:
-            lines = fh.readlines()
-    except OSError:
+        return timeline_quit(parse(path))
+    except (OSError, TimelineError):
         return None
-    for line in lines:
-        parts = line.split()
-        if len(parts) >= 2 and parts[1] == "quit":
-            try:
-                return float(parts[0])
-            except ValueError:
-                return None
-    return None
 
 
 class QMP:
@@ -179,13 +173,46 @@ class QMP:
             pass
 
 
+class _SerialBackend:
+    """Serialise every backend call behind one lock.
+
+    A hardware timeline is delivered from its own thread while the harness
+    keeps polling memory on the main one, and both go down a SINGLE OpenOCD
+    socket. Interleaving two request/response exchanges on it desynchronises
+    the link and the failure looks like a corrupted read, not a race. Every
+    attribute access is wrapped, so nothing has to remember to take the lock.
+    """
+
+    def __init__(self, inner, lock):
+        object.__setattr__(self, "_inner", inner)
+        object.__setattr__(self, "_lock", lock)
+
+    def __getattr__(self, name):
+        attr = getattr(self._inner, name)
+        if not callable(attr):
+            return attr
+        lock = self._lock
+
+        def locked(*a, **kw):
+            with lock:
+                return attr(*a, **kw)
+        return locked
+
+    def __setattr__(self, name, value):
+        setattr(self._inner, name, value)
+
+
 class Target:
     """Common surface: .backend, .sdcard, start(), stop()."""
+
+    # gwemu replays a .tl itself (GNW_TIMELINE); hardware needs a player.
+    timeline_is_builtin = False
 
     def __init__(self, image):
         self.image = image
         self.backend = None
         self.sdcard = None
+        self.player = None
 
     def start(self):
         raise NotImplementedError
@@ -199,6 +226,8 @@ class Target:
 
 class GwemuTarget(Target):
     """Boot an Image under gwemu."""
+
+    timeline_is_builtin = True
 
     def __init__(self, image, display=False, audio=False, icount=None,
                  timeline=None, record=None, port=None, qmp_port=None,
@@ -347,18 +376,24 @@ class HardwareTarget(Target):
     """Boot an Image on the real device over a debug probe."""
 
     def __init__(self, image, physical_sdcard=None, no_flash=False,
-                 hard_reset=False, erase_first=False, precise_faults=False):
+                 hard_reset=False, erase_first=False, precise_faults=False,
+                 timeline=None):
         super().__init__(image)
         self.physical_sdcard = physical_sdcard
         self.no_flash = no_flash
         self.hard_reset = hard_reset
         self.erase_first = erase_first
         self.precise_faults = precise_faults
+        # The SAME --timeline file gwemu replays internally. Here it is played
+        # back by writing the REMOTE_INPUT shadow word over the probe, so a
+        # test does not have to know which tier it is on. Needs a firmware
+        # built with REMOTE_INPUT=1 (scripts/common/retrogo_build.py).
+        self.timeline = timeline
         self.gnw = None
 
     def start(self):
         print("Attaching to hardware via OpenOCD...")
-        self.backend = OpenOCDBackend()
+        self.backend = _SerialBackend(OpenOCDBackend(), threading.Lock())
         self.backend.open()
 
         # OBSERVE-ONLY: attach without disturbing what is running.
@@ -382,9 +417,11 @@ class HardwareTarget(Target):
                 if self.precise_faults:
                     self._enable_precise_faults()
                 self.backend.resume()
+                self._start_timeline()
                 return
             print("--no-flash: observing the device WITHOUT reset "
                   "(no gnwmanager, no flash, no SD)")
+            self._start_timeline()
             return
 
         self.gnw = GnW(self.backend)
@@ -416,6 +453,7 @@ class HardwareTarget(Target):
                        else HardwareProbeSDCardManager(self.gnw))
 
         self._start_firmware()
+        self._start_timeline()
 
 
     # SCB->CCR bit 1 (DISDEFWBUF) turns off the write buffer, which makes bus
@@ -468,7 +506,26 @@ class HardwareTarget(Target):
         self.backend.write_register("pc", self.gnw.read_uint32(base + 4))
         self.backend.resume()
 
+    def _start_timeline(self):
+        """Begin replaying --timeline over the probe, from THIS instant.
+
+        t0 is the moment the firmware was released to run, which is the same
+        origin gwemu uses for the file it replays internally -- so a timeline
+        recorded under gwemu lines up on silicon without being rewritten.
+        Playback runs on its own thread; the harness keeps its main thread.
+        """
+        if not self.timeline:
+            return
+        events = parse(self.timeline)
+        self.player = ShadowWordPlayer(self.backend, events)
+        print(f"[timeline] replaying {self.timeline} on hardware "
+              f"(needs a REMOTE_INPUT=1 firmware)")
+        self.player.start()
+
     def stop(self):
+        if self.player:
+            self.player.stop()
+            print(self.player.report())
         proc = getattr(self.backend, "_openocd_process", None)
         if proc:
             proc.terminate()
@@ -489,7 +546,10 @@ def add_target_args(parser):
                         help="gwemu -icount shift; makes DWT counts "
                              "reproducible (see docs/06)")
     parser.add_argument("--timeline", default=None,
-                        help="input timeline to replay under gwemu")
+                        help="input timeline (.tl) to replay. gwemu replays it "
+                             "itself; on hardware it is injected through the "
+                             "REMOTE_INPUT shadow word, so the same file drives "
+                             "both tiers")
     parser.add_argument("--record", default=None, metavar="FILE.tl",
                         help="RECORD an input timeline from an interactive "
                              "session. Implies a window; quit gwemu cleanly or "
@@ -528,7 +588,8 @@ def open_target(args, image):
                               hard_reset=getattr(args, "hard_reset", False),
                               erase_first=getattr(args, "erase_first", False),
                               precise_faults=getattr(args, "precise_faults",
-                                                     False))
+                                                     False),
+                              timeline=getattr(args, "timeline", None))
     return GwemuTarget(image, display=getattr(args, "gui", False),
                        audio=getattr(args, "audio", False),
                        icount=getattr(args, "icount", None),

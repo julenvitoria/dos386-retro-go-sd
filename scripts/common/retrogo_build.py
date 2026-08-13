@@ -56,6 +56,18 @@ RELEASE_DEFAULTS = {
     "KO_KR": 1,
     "JA_JP": 1,
     "CHECK_DIRTY_SUBMODULE": 0,
+    # ALWAYS ON in our builds, and deliberately not a switch.
+    #
+    # REMOTE_INPUT makes buttons_get() OR a shadow word at 0x30001FF4 into the
+    # live button state, which is the ONLY way `--timeline` can mean the same
+    # thing on hardware as it does under gwemu. Making it optional would mean a
+    # timeline that silently presses nothing on a firmware someone built
+    # without it -- a test that passes while testing nothing. The cost is one
+    # uncached load and twelve bit tests per input poll (~60 Hz) and four bytes
+    # of the AHB .persistent pad, which is nothing next to that failure mode.
+    # It is a development firmware; the "backdoor" only exists for a debugger
+    # that is already attached.
+    "REMOTE_INPUT": 1,
 }
 
 # Deliberately NOT retro-go's release value of 2. See the module docstring:
@@ -183,6 +195,22 @@ def build(path=DEFAULT_FIRMWARE_PATH, clean=False, target="gwemu_release",
         raise RuntimeError(
             f"build reported success but these artifacts are missing: {missing}. "
             f"Target '{target}' may not produce emulator media -- use gwemu_release.")
+    _refresh_bank_images(fb, verbose=verbose)
+
+    # The build flags are not dependencies here, so "I passed REMOTE_INPUT=1"
+    # is not evidence that the image has it. Check the image.
+    if params.get("REMOTE_INPUT") == 1:
+        got = verify_remote_input(fb.elf)
+        if got is False:
+            raise RuntimeError(
+                "REMOTE_INPUT=1 was passed but buttons_get() in the built image "
+                "does not read the shadow cell -- a stale object. Rebuild with "
+                "--clean; --timeline on hardware would press nothing.")
+        if verbose:
+            print(f"[build_retrogo] REMOTE_INPUT shadow cell "
+                  f"0x{REMOTE_INPUT_ADDR:08X} in image: "
+                  + ("yes" if got else "UNVERIFIED (no arm objdump)"))
+
     if verbose:
         print(f"[build_retrogo] bank{fb.intflash_bank} firmware ready:")
         for n in ("bank1", "bank2", "extflash", "sdcard", "elf"):
@@ -190,6 +218,65 @@ def build(path=DEFAULT_FIRMWARE_PATH, clean=False, target="gwemu_release",
             if p:
                 print(f"    {n:9} {p} ({os.path.getsize(p)} bytes)")
     return fb
+
+
+def _refresh_bank_images(fb, verbose=True):
+    """Re-cut qemu_bank{1,2}.bin from the intflash image this build produced.
+
+    THE EMULATOR IMAGES ARE NOT REBUILT BY `gwemu_release`. Its prep block is
+    guarded by `if [ ! -f build/sdcard.img ]`, so once any gwemu media exists
+    the bank images are never cut again -- every later build updates
+    gw_retro_go_intflash.bin and leaves qemu_bank1.bin at whatever the FIRST
+    build produced. Tier 2 then boots firmware that can be hours old while the
+    build log says success, which is exactly how a REMOTE_INPUT=1 firmware came
+    up with no remote input in it. Same failure shape as the stale SD image in
+    docs/04, one layer down.
+
+    Only the bank the firmware was LINKED for is touched: on a bank-2 build,
+    bank 1 holds the stock-firmware backup and is not ours to overwrite.
+    """
+    src = fb.intflash_bin
+    if not src or not os.path.exists(src):
+        return
+    dst = os.path.join(fb.path, "build",
+                       "qemu_bank2.bin" if fb.intflash_bank == 2
+                       else "qemu_bank1.bin")
+    stale = (not os.path.exists(dst)
+             or os.path.getmtime(dst) < os.path.getmtime(src))
+    pad_bank(src, dst)
+    setattr(fb, "bank2" if fb.intflash_bank == 2 else "bank1", dst)
+    if verbose and stale:
+        print(f"[build_retrogo] refreshed {os.path.basename(dst)} from "
+              f"{os.path.basename(src)} (gwemu_release does NOT)")
+
+
+# The shadow cell a REMOTE_INPUT firmware reads. Keep in sync with
+# scripts/common/timeline.py and the firmware's Core/Inc/gw_buttons.h.
+REMOTE_INPUT_ADDR = 0x30001FF4
+
+
+def verify_remote_input(elf, addr=REMOTE_INPUT_ADDR, objdump=None):
+    """True if buttons_get() actually reads the shadow cell in THIS image.
+
+    Do NOT test this by grepping the .bin for the address: the compiler does
+    not put 0x30001FF4 in the literal pool. It emits the page base
+    (`.word 0x30001000`) and reaches the cell with `ldr.w rX,[rY,#4084]`, so a
+    byte search for the full address finds ZERO hits in an image that has the
+    feature -- which reads exactly like the define not taking.
+
+    So: disassemble the function, collect its literals and its register-plus-
+    offset loads, and see whether any pair sums to the cell.
+    """
+    tool = objdump or os.environ.get("OBJDUMP", "arm-none-eabi-objdump")
+    try:
+        out = subprocess.run([tool, "-d", elf, "--disassemble=buttons_get"],
+                             capture_output=True, text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None                      # cannot tell; caller decides
+    import re
+    words = [int(m, 16) for m in re.findall(r"\.word\s+0x([0-9a-f]+)", out)]
+    offs = [int(m) for m in re.findall(r"ldr(?:\.w)?\s+\w+,\s*\[\w+,\s*#(\d+)\]", out)]
+    return any(w + o == addr for w in words for o in offs + [0])
 
 
 def pad_bank(src, dst, size=BANK_SIZE):
