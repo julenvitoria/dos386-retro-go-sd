@@ -59,6 +59,10 @@ static void bda_w32(uint32_t lin, uint32_t v)
  * (consumer). It is the real 16-entry ring at 0040:001E so a program reading
  * the BDA directly sees the same thing INT 16h reports.
  */
+/* Modifier state as the controller sees it. Not derived from the BDA: a guest
+   may write 0040:0017 itself, and a real 8042 does not read the guest's mind. */
+static uint8_t kbd_flags;         /* bit0 RSHIFT, 1 LSHIFT, 2 CTRL, 3 ALT */
+
 void x86_kb_push(uint8_t scancode, uint8_t ascii)
 {
     uint16_t tail = bda_r16(BDA_KB_TAIL);
@@ -111,6 +115,8 @@ void x86_bios_init(void)
     bda_w16(BDA_KB_TAIL, BDA_KB_BUF - BDA);
     bda_w8(BDA_MODE, 0x03);
     bda_w16(BDA_COLS, 80);
+    kbd_flags = 0;
+    bda_w8(BDA + 0x17, 0);
     /* Keep the renderer and the BDA agreeing. They did not: the BDA said mode
        3 (text, what a PC boots into) while the renderer stayed on mode 4, so a
        guest that never calls INT 10h AH=00 had its text cells drawn as 2bpp
@@ -141,6 +147,35 @@ static const uint8_t sc_to_ascii[128] = {
     0,   ' ',
 };
 
+/*
+ * The SHIFTED half of the same table, as pairs rather than as a second 128-byte
+ * array: 21 pairs is 43 bytes of rodata against 128, and the pairing is exactly
+ * what is printed on the key.
+ *
+ * This exists because the on-screen keyboard needs it. Without a shift decode
+ * the BDA ring receives '1' for a key labelled '!' and 'a' for 'A' -- the same
+ * class of silent wrong answer the previous port's osk_needs_shift() comment
+ * calls "the single most likely thing to get silently wrong here", only on our
+ * side of the wire. The OSK sends a real Left-Shift make/break around the key
+ * (x86_osk.c), so the decode has to be here, in the handler that reads the
+ * port, and not in the OSK.
+ */
+static const char sc_shift_pairs[] =
+    "1!2@3#4$5%6^7&8*9(0)-_=+[{]}" ";:" "'\"" "`~" "\\|" ",<.>/?";
+
+uint8_t x86_kbd_ascii(uint8_t sc, int shift)
+{
+    uint8_t base = (sc < sizeof(sc_to_ascii)) ? sc_to_ascii[sc] : 0;
+    if (!shift || !base)
+        return base;
+    if (base >= 'a' && base <= 'z')
+        return (uint8_t)(base - 'a' + 'A');
+    for (unsigned i = 0; sc_shift_pairs[i]; i += 2)
+        if ((uint8_t)sc_shift_pairs[i] == base)
+            return (uint8_t)sc_shift_pairs[i + 1];
+    return base;
+}
+
 volatile uint32_t x86_bios_kbd_irqs = 0;     /* INT 09h entries served */
 volatile uint32_t x86_bios_int16_calls = 0;  /* guest polls of INT 16h */
 
@@ -150,10 +185,33 @@ int x86_bios_kbd_irq(void)
     /* Read the controller exactly as a real handler does, so the queue drains
        through the same path whichever handler is installed. */
     uint8_t sc = (uint8_t)x86_port_read(0x60, 1);
+    uint8_t make = (uint8_t)(sc & 0x7F);
+    uint8_t bit = 0;
+
+    /* Modifiers are STATE, not characters: a real BIOS updates 0040:0017 and
+       buffers nothing, on make and on break alike. Handling the break half is
+       what stops a Shift from latching down forever after one shifted key. */
+    switch (make) {
+    case 0x2A: bit = 0x02; break;    /* left shift  */
+    case 0x36: bit = 0x01; break;    /* right shift */
+    case 0x1D: bit = 0x04; break;    /* ctrl        */
+    case 0x38: bit = 0x08; break;    /* alt         */
+    default:   break;
+    }
+    if (bit) {
+        if (sc & 0x80)
+            kbd_flags &= (uint8_t)~bit;
+        else
+            kbd_flags |= bit;
+        /* The BDA copy, which is what INT 16h AH=02 and every program that
+           peeks 0040:0017 reads. */
+        bda_w8(BDA + 0x17, kbd_flags);
+        return 1;
+    }
+
     if (sc & 0x80)
         return 1;                    /* break code: nothing to buffer */
-    uint8_t ascii = (sc < sizeof(sc_to_ascii)) ? sc_to_ascii[sc] : 0;
-    x86_kb_push(sc, ascii);
+    x86_kb_push(sc, x86_kbd_ascii(sc, (kbd_flags & 0x03) != 0));
     return 1;
 }
 
@@ -297,7 +355,10 @@ int x86_bios_keyboard(uint8_t func)
         }
         return 1;
     case 0x02:                      /* shift flags */
-        x86_set_al(0);
+        /* The real state, not a hardcoded 0. A program that asks whether Shift
+           is down and is always told "no" cannot be given a shifted key by any
+           amount of correctness elsewhere. */
+        x86_set_al(bda_r8(BDA + 0x17));
         return 1;
     default:
         x86_hle_unhandled_vector = 0x16;
