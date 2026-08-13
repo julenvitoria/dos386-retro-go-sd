@@ -143,12 +143,35 @@ static uint32_t core_clut[CORE_CLUT_ENTRIES];
  * Free space is deliberately left contiguous at the TOP: the next thing that
  * wants it is a VRAM arena that can balloon for an EGA mode and shrink again.
  */
+/*
+ * ORDERING IS ARITHMETIC HERE, not taste. Everything the pager will hand out
+ * is handed out in 4 KB pages, so the free region has to START page-aligned
+ * and END at the top of the pool or the odd bytes at each end are simply lost.
+ *
+ * The 2 KB palette used to sit in the MIDDLE of this map, which pushed the
+ * free region to offset 108,544 -- not a multiple of 4,096. Aligning up cost a
+ * page and left a 2,048-byte tail nobody could use: 10 usable pages out of a
+ * 45,056-byte hole that is exactly 11.
+ *
+ * So the palette moves to the very TOP, above the free region, and the blocks
+ * below it sum to 106,496 = 26 pages exactly. The hole between them is
+ * 45,056 bytes = 11 whole pages with nothing wasted at either end. Same total
+ * footprint, one more page of resident set.
+ */
+#define BONUS_POOL_BYTES   153600u      /* what LUT8 releases; checked at runtime */
 #define BONUS_FILLER_OFF   0u
 #define BONUS_BIOSID_OFF   4096u
 #define BONUS_VGA_OFF      8192u
-#define BONUS_VGAPAL_OFF   (BONUS_VGA_OFF + X86_VGA_APERTURE_BYTES)
-#define BONUS_VRAM_OFF     (BONUS_VGAPAL_OFF + X86_VGA_PALETTE_BYTES)
-#define BONUS_USED         (BONUS_VRAM_OFF + X86_VRAM_BYTES)
+#define BONUS_VRAM_OFF     (BONUS_VGA_OFF + X86_VGA_APERTURE_BYTES)
+/* The page-aligned hole: the VRAM arena and, behind it, resident guest pages. */
+#define BONUS_ARENA_OFF    (BONUS_VRAM_OFF + X86_VRAM_BYTES)
+#define BONUS_VGAPAL_OFF   (BONUS_POOL_BYTES - X86_VGA_PALETTE_BYTES)
+#define BONUS_ARENA_BYTES  (BONUS_VGAPAL_OFF - BONUS_ARENA_OFF)
+#define BONUS_USED         BONUS_POOL_BYTES
+_Static_assert(BONUS_ARENA_OFF % 4096u == 0u,
+               "the bonus arena must start on a 4 KB page");
+_Static_assert(BONUS_ARENA_BYTES % 4096u == 0u,
+               "the bonus arena must be a whole number of 4 KB pages");
 /* Which table the firmware currently holds: NULL = the 32-entry cached path,
    non-NULL = the core-owned 256-entry one. Compared by POINTER, so entering
    and leaving a 256-colour mode each push exactly once. */
@@ -496,6 +519,12 @@ volatile uint32_t run_benchmark_flag = 0;
 #define DWT_CYCCNT      (*(volatile uint32_t *)0xE0001004)
 #define CoreDebug_DEMCR (*(volatile uint32_t *)0xE000EDFC)
 
+#define DTCM_TOP 0x20020000u        /* 0x20000000 + 128 KB */
+/* Where the DTCM bump pool had got to after the core's own allocations, and an
+   UPPER BOUND on what is left above it. See dtcm_state_init(). */
+volatile uint32_t core_dtcm_next = 0;
+volatile uint32_t core_dtcm_headroom_max = 0;
+
 /* Allocate the 0-wait-state state from the firmware's DTCM bump pool. */
 static bool dtcm_state_init(void)
 {
@@ -541,6 +570,31 @@ static bool dtcm_state_init(void)
     zones_block_ok = x86_zones_init((void *)abi->mem_ctl(
         GW_MEM_OP_ALLOC, GW_MEM_DTC, 1, sizeof(x86_zones_t))) ? 1 : 0;
 #endif
+
+    /*
+     * A WITNESS FOR DTCM, because there is not one anywhere else.
+     *
+     * GW_MEM_OP_FREE_SIZE is documented "RAM only today", so the ABI cannot be
+     * asked how much DTCM is left -- and the pager about to land here wants
+     * ~8 KB of per-page metadata on top of the 16 KB fold table. Spending it
+     * blind is exactly the shape that has cost this project days: a bump
+     * allocator returns NULL, a caller tolerates it, and a whole subsystem is
+     * quietly absent.
+     *
+     * So: allocate a 4-byte marker LAST and publish where it landed. DTCM is
+     * 128 KB at 0x20000000, the pool bumps upward, and the firmware's own
+     * state sits below us, so (top - marker) BOUNDS what remains. It is a
+     * bound and not an exact figure -- the firmware reserves a stack up there
+     * and this cannot see it -- which is why the name says so.
+     */
+    {
+        uint32_t *marker = (uint32_t *)abi->mem_ctl(GW_MEM_OP_ALLOC,
+                                                    GW_MEM_DTC, 1, 4);
+        core_dtcm_next = (uint32_t)(uintptr_t)marker;
+        core_dtcm_headroom_max =
+            (marker && (uint32_t)(uintptr_t)marker < DTCM_TOP)
+                ? DTCM_TOP - (uint32_t)(uintptr_t)marker : 0;
+    }
     return true;
 }
 
@@ -757,7 +811,12 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
      * the mapping needs no partial page and no special case against the
      * open-bus filler that aliases the rest of the upper megabyte.
      */
-    if (bonus && bonus_sz >= BONUS_USED)
+    /* Per-BLOCK guards, not one guard on the whole map: the palette now sits
+       at the top of the pool, so testing against BONUS_USED would refuse the
+       aperture on any firmware whose bonus pool came back a byte short. Each
+       block is placed if its own extent fits and reported if it does not. */
+    if (bonus && bonus_sz >= BONUS_VGA_OFF + X86_VGA_APERTURE_BYTES
+              && bonus_sz >= BONUS_POOL_BYTES)
         vga_aperture = bonus + BONUS_VGA_OFF;
     else
         vga_aperture = NULL;            /* mode 13h refuses itself; see below */

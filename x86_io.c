@@ -431,7 +431,27 @@ static uint32_t port_read_inner(uint32_t port)
     case 0x42:
         return x86_io.pit2_reload & 0xFF;
     case 0x60:
+        /* 0x64 command 0xD0 is "read output port", and its answer comes back
+           HERE, not on 0x64. A guest that reads the port, flips bit 1 and
+           writes it back through 0xD1 is the classic A20 sequence; answering
+           it with a scancode makes the guest write a scancode into the output
+           port and mask A20 by accident. */
+        if (x86_io.kbd_cmd == 0xD0u) {
+            x86_io.kbd_cmd = 0;
+            /* Bit 1 is answered from the GATE, not from the latch, so the
+               0xDD/0xDF and port 0x92 doors are visible through this one. Two
+               places that can move A20 and one that reports a stale copy of it
+               is how a guest concludes its write did not take. */
+            return (uint32_t)((x86_io.kbd_outport & (uint32_t)~0x03u) |
+                              (x86_io.a20_open ? 0x02u : 0x00u) | 0x01u);
+        }
         return kbd_read_data();
+    case 0x92:
+        /* System Control Port A. Bit 1 IS the fast A20 gate, and it is the
+           door most 386-era code uses because it costs two instructions
+           instead of an 8042 handshake. */
+        return (uint32_t)((x86_io.port92 & (uint32_t)~0x02u) |
+                          (x86_io.a20_open ? 0x02u : 0x00u));
     case 0x64:
         /* Status: bit 0 = output buffer full, bit 2 = self-test passed. Polled
            by code that reads the port without using the interrupt. */
@@ -592,7 +612,63 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
         break;
     case 0x20:                       /* PIC end-of-interrupt: nothing to model
                                         while only one IRQ source exists */
-    case 0x64:                       /* controller commands: accepted, ignored */
+        break;
+
+    /*
+     * The 8042, as far as the A20 GATE is concerned -- and no further.
+     *
+     * Keyboard commands are still accepted and ignored, exactly as before;
+     * what is modelled here is the output port, because bit 1 of it is A20 and
+     * A20 decides whether this machine has memory above 1 MB. Three commands
+     * matter and all three are in real BIOSes and real extenders:
+     *
+     *   0xD0  read output port  -> the answer arrives on 0x60 (see the read side)
+     *   0xD1  write output port -> the NEXT byte written to 0x60 is the value
+     *   0xDD / 0xDF             -> disable / enable A20 outright
+     *
+     * Anything else clears the pending-argument latch rather than leaving it
+     * armed: a stale 0xD1 would turn the guest's next keyboard command byte
+     * into an output-port write, which silently masks A20 mid-run.
+     */
+    case 0x64:
+        switch (value & 0xFFu) {
+        case 0xD0:
+        case 0xD1:
+            x86_io.kbd_cmd = (uint8_t)value;
+            break;
+        case 0xDD:
+            x86_io.kbd_cmd = 0;
+            x86_a20_set(0);
+            break;
+        case 0xDF:
+            x86_io.kbd_cmd = 0;
+            x86_a20_set(1);
+            break;
+        default:
+            x86_io.kbd_cmd = 0;      /* controller command: accepted, ignored */
+            break;
+        }
+        break;
+
+    case 0x60:
+        /* Only meaningful as the argument to a pending 0xD1. A bare write to
+           0x60 is a keyboard command (set LEDs, set typematic) and stays
+           dropped -- modelling those is a separate piece of work with its own
+           ACK protocol, and half-modelling it is worse than not. */
+        if (x86_io.kbd_cmd == 0xD1u) {
+            x86_io.kbd_cmd = 0;
+            x86_io.kbd_outport = (uint8_t)value;
+            x86_a20_set((value & 0x02u) != 0u);
+        }
+        break;
+
+    case 0x92:
+        /* The fast A20 gate. Bit 0 is FAST RESET and is deliberately NOT
+           modelled as a reset -- a guest that pulses it expects to reboot, and
+           silently rebooting the emulator is a far worse answer than ignoring
+           it. It is stored so a read-back sees what was written. */
+        x86_io.port92 = (uint8_t)value;
+        x86_a20_set((value & 0x02u) != 0u);
         break;
 
     case 0x3B4:

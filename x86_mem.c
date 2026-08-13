@@ -202,30 +202,64 @@ uint32_t x86_guest_copy_in(uint32_t lin, const void *src, uint32_t bytes)
 }
 
 /*
- * Real-mode address wrap.
+ * Real-mode address wrap, and the A20 gate that decides whether it happens.
  *
- * With A20 masked, an 8086 address space is 20 bits: segment:offset can reach
- * 0x10FFEF, and everything at or above 1 MB wraps to the bottom. Programs rely
- * on it -- a block-copy loop walking segments upward runs off the top and
- * expects to come back round, and faulting there instead stops it dead.
+ * WHAT THIS USED TO DO, AND WHY IT WAS WRONG. It aliased every fold entry from
+ * 1 MB to 16 MB onto its counterpart in the low 1 MB. That is an 8086's 20-bit
+ * address space, not this machine's, and it has a consequence far bigger than
+ * an inaccuracy: with all 3,840 entries above 1 MB held as aliases, there is
+ * no memory above 1 MB at all, and the 8 MB guest space this project is being
+ * built toward cannot exist. It was harmless only because nothing had ever
+ * mapped anything up there.
  *
- * Every fold entry above 1 MB is aliased onto its counterpart in the low 1 MB.
- * The table is index-based, so this is a plain copy of k values; no memory is
- * spent and the wrap costs nothing at access time.
+ * What a real AT wraps is ONE 64 KB window. Segment:offset reaches at most
+ * 0xFFFF:0xFFFF = 0x10FFEF, so only 0x100000-0x110000 is reachable past the
+ * megabyte, and masking A20 forces address bit 20 low so that window reads the
+ * bottom of memory. Everything from 0x110000 up is ordinary extended memory
+ * and was never part of the wrap.
+ *
+ * So: sixteen pages, conditional on the gate. A block-copy loop walking
+ * segments off the top still comes back round, which is the property programs
+ * depend on and the reason this exists.
  */
+volatile uint32_t x86_a20_changes = 0;
+volatile uint32_t x86_a20_state = 0;
+
 void x86_mem_wrap_1mb(void)
 {
-    const uint32_t low = 0x100000u >> FOLD_SHIFT;   /* 256 granules in 1 MB */
-    for (uint32_t i = low; i < FOLD_ENTRIES; i++) {
-        uint32_t src = i & (low - 1u);
-        uint32_t k = guest_page_table_ptr[src];
+    for (uint32_t i = 0; i < X86_HMA_PAGES; i++) {
+        uint32_t dst = X86_HMA_FIRST_PAGE + i;
+        if (dst >= FOLD_ENTRIES)
+            break;
+        if (x86_io.a20_open) {
+            /* The gate is open: the HMA is its own memory. Nothing here owns
+             * it yet -- there is no XMS driver and no pager stage behind this
+             * one -- so it is left UNMAPPED rather than aliased. A guest that
+             * opens A20 and then reads the HMA takes a clean fault that
+             * x86_map_failures/the trap counters can name, instead of silently
+             * reading the interrupt vector table and believing it. */
+            guest_page_table_ptr[dst] = FOLD_INVALID;
+            continue;
+        }
+        uint32_t k = guest_page_table_ptr[i];
         if (k == FOLD_INVALID) {
-            guest_page_table_ptr[i] = FOLD_INVALID;
+            guest_page_table_ptr[dst] = FOLD_INVALID;
             continue;
         }
         /* k is host - guest_index<<12, so re-bias it for this index. */
-        guest_page_table_ptr[i] = k - ((i - src) << FOLD_SHIFT);
+        guest_page_table_ptr[dst] = k - ((dst - i) << FOLD_SHIFT);
     }
+    x86_a20_state = x86_io.a20_open ? 1u : 0u;
+}
+
+void x86_a20_set(int open)
+{
+    uint8_t want = open ? 1u : 0u;
+    if (x86_io.a20_open == want)
+        return;                       /* a probe is not a transition */
+    x86_io.a20_open = want;
+    x86_a20_changes++;
+    x86_mem_wrap_1mb();
 }
 
 void x86_unmap_all(void)

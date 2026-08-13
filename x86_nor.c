@@ -50,7 +50,6 @@
 #include "x86_cpu.h"
 
 #define PAGE_SIZE   4096u
-#define LOW_1MB_PAGES 256u          /* granules in the real-mode 1 MB window */
 
 /* ---- host-readable state and counters ---------------------------------- *
  *
@@ -117,23 +116,25 @@ static uint8_t *pool_take(void)
 /*
  * Repoint one guest page, and the real-mode 1 MB aliases that shadow it.
  *
- * x86_mem_wrap_1mb() aliases every index at or above 1 MB onto its counterpart
- * below, so a COW that only fixed the primary entry would leave sixteen stale
- * aliases still pointing into NOR -- and a guest that reached the same page
- * through a wrapped address would read the PRE-write bytes. The alias is only
- * touched when it still holds exactly the value the wrap would have given it,
- * so an index that was independently mapped to something else is never
+ * x86_mem_wrap_1mb() aliases the HMA onto the bottom of memory while the A20
+ * gate is masked, so a COW that only fixed the primary entry would leave a
+ * stale alias still pointing into NOR -- and a guest that reached the same
+ * page through a wrapped address would read the PRE-write bytes. The alias is
+ * only touched when it still holds exactly the value the wrap would have given
+ * it, so an index that was independently mapped to something else is never
  * disturbed.
+ *
+ * The wrap is sixteen pages now, not the whole space above 1 MB, so there is
+ * at most ONE alias per page and only for the lowest 64 KB of guest memory.
  */
 static void fold_repoint(uint32_t idx, uint8_t *host, const uint8_t *was)
 {
     guest_page_table_ptr[idx] = FOLD_K(host, idx);
-    if (idx >= LOW_1MB_PAGES)
+    if (idx >= X86_HMA_PAGES || x86_io.a20_open)
         return;
-    for (uint32_t i = idx + LOW_1MB_PAGES; i < FOLD_ENTRIES; i += LOW_1MB_PAGES) {
-        if (guest_page_table_ptr[i] == FOLD_K(was, i))
-            guest_page_table_ptr[i] = FOLD_K(host, i);
-    }
+    uint32_t i = X86_HMA_FIRST_PAGE + idx;
+    if (i < FOLD_ENTRIES && guest_page_table_ptr[i] == FOLD_K(was, i))
+        guest_page_table_ptr[i] = FOLD_K(host, i);
 }
 
 /*

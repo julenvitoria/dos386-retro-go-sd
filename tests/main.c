@@ -109,6 +109,9 @@ volatile uint32_t dosfile_r[40];
 volatile uint32_t run_nor_flag = 0;
 volatile uint32_t nor_r[24];
 
+volatile uint32_t run_a20_flag = 0;
+volatile uint32_t a20_r[24];
+
 volatile uint32_t run_video_flag = 0;
 volatile uint32_t video_blit_cycles = 0;
 uint8_t cga_test_vram[X86_VRAM_BYTES] __attribute__((section(".test_bss")));
@@ -1036,6 +1039,166 @@ static void nor_test_run(void)
     }
 }
 
+/*
+ * The A20 gate and the wrap it controls.
+ *
+ * Two properties are being separated here, and no existing test could see
+ * either. First, the wrap must cover exactly the 64 KB above 1 MB that
+ * segment:offset can reach -- the old code aliased all 15 MB above 1 MB onto
+ * the low megabyte, which is an 8086's address space and means there is no
+ * memory above 1 MB at all. Second, the wrap must be CONDITIONAL: while A20 is
+ * masked the HMA reads the bottom of memory, and while it is open it does not.
+ *
+ * The wrap arms are driven by GUEST code through a segment override, because
+ * that is the only way an address above 0xFFFF is formed in real mode and it is
+ * the path a program that relies on the wrap actually takes. The gate arms go
+ * through the PORTS -- all three doors -- for the same reason: a guest opens
+ * A20 by talking to hardware, and a host-side call to x86_a20_set() would test
+ * the function while leaving the ports, which is where every real failure is,
+ * completely uncovered.
+ */
+static void a20_test_run(void)
+{
+    for (uint32_t i = 0; i < 24; i++)
+        a20_r[i] = 0;
+
+    /* Start from the state a machine boots in: gate masked, low memory mapped,
+       everything above the HMA unmapped. */
+    x86_io.a20_open = 0;
+    x86_io.kbd_cmd = 0;
+    x86_io.port92 = 0;
+    x86_a20_changes = 0;
+    for (uint32_t i = X86_HMA_FIRST_PAGE; i < FOLD_ENTRIES; i++)
+        guest_page_table[i] = FOLD_INVALID;
+    x86_mem_wrap_1mb();
+
+    a20_r[0] = x86_io.a20_open;                       /* masked at boot */
+    /* The alias, at both ends of the window. */
+    a20_r[1] = (guest_page_table[X86_HMA_FIRST_PAGE]
+                == guest_page_table[0] - (X86_HMA_FIRST_PAGE << FOLD_SHIFT));
+    a20_r[2] = (guest_page_table[X86_HMA_FIRST_PAGE + X86_HMA_PAGES - 1]
+                == guest_page_table[X86_HMA_PAGES - 1]
+                   - (X86_HMA_FIRST_PAGE << FOLD_SHIFT));
+    /* And the page just PAST it, which is the arm the old whole-space wrap
+       fails: 0x110000 is extended memory and must not alias anything. */
+    a20_r[3] = (guest_page_table[X86_HMA_FIRST_PAGE + X86_HMA_PAGES]
+                == FOLD_INVALID);
+    /* Nor may anything further up. 2 MB is where an 8086-style wrap would put
+       another copy of low memory and a 286+ puts real RAM. */
+    a20_r[4] = (guest_page_table[0x200000u >> FOLD_SHIFT] == FOLD_INVALID);
+
+    /*
+     * Guest arm 1: write a byte at 0000:0400 and read it back through
+     * FFFF:0410, which is linear 0x100400. With the gate masked those are the
+     * same byte.
+     *
+     * The marker is at 0x400 and not at 0x10 for a reason worth keeping: the
+     * first version of this put it at 0x10, which is INSIDE this program, so
+     * the store overwrote the 0x26 segment-override prefix of the very
+     * instruction being tested. The read then ran unprefixed against DS and
+     * returned a byte of the program -- a test that failed for a reason that
+     * had nothing to do with A20.
+     *
+     *   MOV AX,0         B8 00 00      MOV AX,0FFFFh    B8 FF FF
+     *   MOV ES,AX        8E C0         MOV ES,AX        8E C0
+     *   MOV AL,5Ah       B0 5A         MOV AL,ES:[410h] 26 A0 10 04
+     *   MOV ES:[400h],AL 26 A2 00 04   HLT              F4
+     */
+    static const uint8_t prog_wrap[] = {
+        0xB8, 0x00, 0x00,  0x8E, 0xC0,
+        0xB0, 0x5A,        0x26, 0xA2, 0x00, 0x04,
+        0xB8, 0xFF, 0xFF,  0x8E, 0xC0,
+        0x26, 0xA0, 0x10, 0x04,
+        0xF4,
+    };
+    memcpy(test_ram, prog_wrap, sizeof(prog_wrap));
+    memset(&cpu_state_dtcm, 0, sizeof(cpu_state_dtcm));
+    for (int i = 0; i < 6; i++)
+        cpu_state_dtcm.segs[i].limit = 0xFFFFFFFF;
+    cpu_state_dtcm.pit_reload = 0xFFFFFFFF;
+    cpu_state_dtcm.pit_counter = 0xFFFFFFFF;
+    x86_cpu_interp_asm();
+    a20_r[5] = cpu_state_dtcm.exit_reason;            /* 6 = HLT: it finished */
+    /* AL is read straight out of the CPU state rather than stored somewhere in
+       guest memory first: a store would go through DS and could only confuse
+       the question this arm asks. */
+    a20_r[6] = cpu_state_dtcm.regs[0] & 0xFFu;        /* must be 0x5A */
+    a20_r[7] = test_ram[0x400];
+
+    /*
+     * Guest arm 2: open A20 through the FAST GATE at port 0x92, then reach for
+     * the same HMA address. The alias is gone, nothing owns the HMA yet, so
+     * this is a clean X86_EXIT_MEM_FAULT rather than a silent read of the
+     * interrupt vector table.
+     *
+     *   MOV AL,2        B0 02
+     *   OUT 92h,AL      E6 92
+     *   MOV AX,0FFFFh   B8 FF FF
+     *   MOV ES,AX       8E C0
+     *   MOV AL,ES:[20h] 26 A0 20 00
+     *   HLT             F4
+     */
+    static const uint8_t prog_open[] = {
+        0xB0, 0x02,  0xE6, 0x92,
+        0xB8, 0xFF, 0xFF,  0x8E, 0xC0,
+        0x26, 0xA0, 0x20, 0x00,
+        0xF4,
+    };
+    memcpy(test_ram, prog_open, sizeof(prog_open));
+    memset(&cpu_state_dtcm, 0, sizeof(cpu_state_dtcm));
+    for (int i = 0; i < 6; i++)
+        cpu_state_dtcm.segs[i].limit = 0xFFFFFFFF;
+    cpu_state_dtcm.pit_reload = 0xFFFFFFFF;
+    cpu_state_dtcm.pit_counter = 0xFFFFFFFF;
+    x86_cpu_interp_asm();
+    a20_r[8]  = x86_io.a20_open;                      /* the OUT took */
+    a20_r[9]  = x86_a20_changes;                      /* exactly one transition */
+    a20_r[10] = cpu_state_dtcm.exit_reason;           /* 5 = MEM_FAULT */
+    a20_r[11] = (guest_page_table[X86_HMA_FIRST_PAGE] == FOLD_INVALID);
+    a20_r[12] = x86_port_read(0x92, 1) & 0x02u;       /* reads back as open */
+
+    /* Masking it again must RESTORE the alias -- a gate that only works in one
+       direction passes every test written in the opening direction only. */
+    x86_port_write(0x92, 0x00, 1);
+    a20_r[13] = x86_io.a20_open;
+    a20_r[14] = x86_a20_changes;                      /* two transitions now */
+    a20_r[15] = (guest_page_table[X86_HMA_FIRST_PAGE]
+                 == guest_page_table[0] - (X86_HMA_FIRST_PAGE << FOLD_SHIFT));
+
+    /* The 8042 output-port door: 0x64 = D1, then the value to 0x60. */
+    x86_port_write(0x64, 0xD1, 1);
+    x86_port_write(0x60, 0x02, 1);
+    a20_r[16] = x86_io.a20_open;
+    /* ... and read it back through 0x64 = D0, whose answer arrives on 0x60. */
+    x86_port_write(0x64, 0xD0, 1);
+    a20_r[17] = x86_port_read(0x60, 1) & 0x02u;
+
+    /* The 0xDD / 0xDF shortcuts. */
+    x86_port_write(0x64, 0xDD, 1);
+    a20_r[18] = x86_io.a20_open;                      /* masked */
+    x86_port_write(0x64, 0xDF, 1);
+    a20_r[19] = x86_io.a20_open;                      /* open */
+
+    /* A command that is NOT an output-port write must clear the pending latch.
+       A stale 0xD1 turns the guest's next keyboard command byte into an
+       output-port write and masks A20 in the middle of a running program --
+       silently, which is the whole reason this arm exists. */
+    x86_port_write(0x64, 0xD1, 1);
+    x86_port_write(0x64, 0xAE, 1);       /* enable keyboard: not D1 */
+    x86_port_write(0x60, 0x00, 1);       /* would mask A20 if the latch stuck */
+    a20_r[20] = x86_io.a20_open;                      /* still open */
+
+    /* Probing an already-open gate is not a transition. */
+    uint32_t changes = x86_a20_changes;
+    x86_port_write(0x92, 0x02, 1);
+    a20_r[21] = (x86_a20_changes == changes);
+
+    /* Leave the machine as the rest of the harness expects to find it. */
+    x86_a20_set(0);
+    a20_r[22] = x86_io.a20_open;
+    a20_r[23] = x86_a20_state;
+}
+
 static void dosfile_test_run(void)
 {
     static const uint8_t hle_vectors[] = {
@@ -1254,6 +1417,11 @@ void Reset_Handler(void) {
         if (run_nor_flag == 1) {
             nor_test_run();
             run_nor_flag = 0;
+        }
+
+        if (run_a20_flag == 1) {
+            a20_test_run();
+            run_a20_flag = 0;
         }
 
         if (run_dos_flag == 1) {

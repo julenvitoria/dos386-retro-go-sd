@@ -176,6 +176,24 @@ typedef struct {
     uint8_t  kbd_queue[16];
     uint8_t  kbd_head, kbd_tail;
     uint8_t  kbd_last;        /* last byte handed out on port 0x60 */
+    /* ---- the A20 gate ----------------------------------------------------
+     * A20 is not a curiosity: it is the difference between "this machine has
+     * memory above 1 MB" and "it does not". While the gate is MASKED, address
+     * bit 20 is forced to zero and the 64 KB above 1 MB that segment:offset
+     * can reach (0x100000-0x10FFEF, the HMA) aliases the bottom of memory --
+     * which real-mode programs depend on. While it is OPEN, that range is its
+     * own memory and the 8 MB space above 1 MB exists at all.
+     *
+     * Boot state is MASKED, which is what a real AT does and what preserves
+     * the behaviour every guest in this tree has been tested against.
+     *
+     * Three doors, because guests use all three: the 8042 output port (0x64
+     * command 0xD1 then a byte to 0x60, bit 1), the 8042's own 0xDD/0xDF
+     * shortcuts, and the fast A20 gate at port 0x92 bit 1. */
+    uint8_t  a20_open;        /* 0 = masked (HMA wraps), 1 = open */
+    uint8_t  kbd_cmd;         /* 8042 command byte awaiting its 0x60 argument */
+    uint8_t  kbd_outport;     /* 8042 output port latch; bit 1 IS A20 */
+    uint8_t  port92;          /* System Control Port A latch */
 } X86IOState;
 
 extern X86IOState x86_io;
@@ -300,7 +318,30 @@ extern volatile uint32_t x86_nor_cow_pulls, x86_nor_cow_failures;
 extern volatile uint32_t x86_nor_slow_cycles, x86_nor_unmapped, x86_nor_attach_err;
 extern volatile uint32_t x86_nor_host_cow;
 void x86_unmap_all(void);
+/*
+ * The real-mode address wrap, scoped to what it is actually FOR.
+ *
+ * This used to alias every fold entry from 1 MB to 16 MB onto the low 1 MB,
+ * which is an 8086's 20-bit address space and not this machine's. The cost was
+ * not theoretical: with every index above 1 MB an alias, there IS no memory
+ * above 1 MB, and an 8 MB guest space cannot exist at all.
+ *
+ * What a real AT wraps is one 64 KB window -- segment:offset reaches at most
+ * 0x10FFEF -- and it wraps it only while the A20 gate is MASKED. So this
+ * aliases exactly the sixteen pages 0x100000-0x110000 onto 0x000000-0x010000,
+ * and only when x86_io.a20_open is 0. Call it after the low megabyte is
+ * mapped, and again from x86_a20_set() whenever a guest moves the gate.
+ */
+#define X86_HMA_FIRST_PAGE  (0x100000u >> FOLD_SHIFT)   /* 256 */
+#define X86_HMA_PAGES       16u                          /* 64 KB */
 void x86_mem_wrap_1mb(void);
+/* Move the A20 gate. Re-aliases (or un-aliases) the HMA and nothing else.
+   x86_a20_changes counts every ACTUAL transition -- a guest that opens an
+   already-open gate is not a transition, and a counter that said it was could
+   not distinguish "the guest is probing" from "the guest is toggling". */
+void x86_a20_set(int open);
+extern volatile uint32_t x86_a20_changes;
+extern volatile uint32_t x86_a20_state;   /* host-readable mirror of the gate */
 void *x86_guest_ptr(uint32_t lin, uint32_t bytes);
 uint32_t x86_guest_copy_out(void *dst, uint32_t lin, uint32_t bytes);
 uint32_t x86_guest_copy_in(uint32_t lin, const void *src, uint32_t bytes);
