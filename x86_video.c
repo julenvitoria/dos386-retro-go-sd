@@ -61,6 +61,71 @@
 #define CELL_W          4
 #define CELL_H          8
 
+/* ---------------------------------------------------------------------------
+ * The mode set, and what selects it.
+ *
+ * Ported from the author's previous DOS core (dos_video.c) and the design in
+ * references/8086tiny/docs/video/. Two rules carry over unchanged, and both are
+ * corrections of things that were tried and failed there:
+ *
+ *   1. THE BDA IS AUTHORITATIVE for graphics-vs-text: 0040:0049 is the mode and
+ *      0040:004A the column count. Port 0x3D8 is read for the things it alone
+ *      knows (the palette variant), NEVER to decide the mode -- a program that
+ *      sets its mode through INT 10h need never touch 0x3D8, and something in a
+ *      DOS boot path leaves its graphics bit set at the prompt, which latches a
+ *      "ports win" renderer into decoding text memory as 2 bpp.
+ *   2. THE COLUMN COUNT SELECTS THE FONT: 80 -> the 4x8 cell, 40 -> the 8x8
+ *      cell. Both are exactly 320 px wide, so 40-column modes 0/1 need no
+ *      geometry of their own and no mode-number lookup.
+ *
+ * A mode we cannot render is REFUSED rather than accepted-and-ignored: a guest
+ * drawing into memory nothing reads looks like a blank screen and reads like a
+ * bug, whereas keeping the old mode up leaves the previous picture and a log
+ * entry that names the mode.
+ */
+#define VM_TEXT   0     /* char+attr pairs at 0xB8000                      */
+#define VM_CGA2   1     /* 320x200 2 bpp, two-bank interleave              */
+#define VM_CGA1   2     /* 640x200 1 bpp, same interleave, decimated 2:1   */
+
+typedef struct {
+    uint8_t mode;       /* the BDA 0x449 value                             */
+    uint8_t kind;
+    uint8_t cols;       /* text columns -- of the mode, or of its TTY grid */
+} x86_vmode;
+
+/* Mode 7 is folded to 3: the B000:0 mono buffer is not backed, and the
+   previous port's BIOS folds it for the same reason. */
+static const x86_vmode vmodes[] = {
+    { 0x00, VM_TEXT, 40 },
+    { 0x01, VM_TEXT, 40 },
+    { 0x02, VM_TEXT, 80 },
+    { 0x03, VM_TEXT, 80 },
+    { 0x04, VM_CGA2, 40 },
+    { 0x05, VM_CGA2, 40 },
+    { 0x06, VM_CGA1, 80 },
+};
+
+/* The active mode. Not static: the harness reads the byte to know which
+   renderer to check against. `cur_desc` is never NULL -- every writer goes
+   through mode_select(), which refuses a mode it has no descriptor for. */
+uint8_t x86_video_mode_byte = 0x04;
+#define video_mode x86_video_mode_byte
+static const x86_vmode *cur_desc = &vmodes[4];      /* 0x04, power-on */
+
+static const x86_vmode *vmode_find(uint8_t mode)
+{
+    if (mode == 0x07)                   /* mono text, folded to 3 */
+        mode = 0x03;
+    for (unsigned i = 0; i < sizeof vmodes / sizeof vmodes[0]; i++)
+        if (vmodes[i].mode == mode)
+            return &vmodes[i];
+    return 0;
+}
+
+unsigned x86_video_text_cols(void) { return cur_desc->cols; }
+
+static void mode_sync_from_bda(void);
+
 /* Mode 4 planes: even scanlines at +0x0000, odd at +0x2000, 80 bytes a row. */
 #define CGA_PLANE_ODD   0x2000u
 #define CGA_ROW_BYTES   80u
@@ -72,12 +137,16 @@ void cga_mode4_blit(uint8_t *dst, const uint8_t *even, const uint8_t *odd,
 
 static uint8_t *cga_vram;
 static void text_render(uint8_t *dst, uint32_t stride);
+static void cga_mode6_blit(uint8_t *dst, uint32_t stride);
+static void text_render_wide(uint8_t *dst, uint32_t stride);
 #if X86_TEXT_AA
 static void text_alloc_palette(void);
 #endif
 /* 2bpp -> four palette bytes. In DTCM: the blitter hits it once per source
    byte, and DTCM's second port keeps that off the AXI path the source is on. */
 static uint32_t cga_expand[256] __attribute__((section(".dtcm_bss")));
+/* Mode 6, nibble-indexed: two OR-ed output pixels per entry. 64 bytes. */
+static uint32_t cga1_expand[16];
 
 /* ---------------------------------------------------------------------------
  * Text rendering tables. Both turn one glyph row into one 32-bit store.
@@ -126,6 +195,10 @@ static const uint32_t cga_argb[16] = {
  * menu dimmed our screen to solid black instead of darkening it.
  */
 #define X86_TEXT_CLUT_ENTRIES   32
+
+/* Where the four CGA graphics colours live inside those 32. See the layout
+   note in x86_video_refresh_palette(). */
+#define X86_GFX_CLUT_BASE       16
 
 /* ---------------------------------------------------------------------------
  * Anti-aliased text.
@@ -207,40 +280,51 @@ void x86_video_refresh_palette(void)
     unsigned background = sel & 0x0F;
     unsigned bright = (sel & 0x10) ? 8u : 0u;
 
-    unsigned c1, c2, c3;
-    if (x86_io.cga_mode & 0x04) {          /* composite/BW: cyan, red, white */
-        c1 = 3; c2 = 4; c3 = 7;
-    } else if (sel & 0x20) {               /* palette 1: cyan, magenta, white */
-        c1 = 3; c2 = 5; c3 = 7;
-    } else {                               /* palette 0: green, red, brown */
-        c1 = 2; c2 = 4; c3 = 6;
+    /* Which four colours the graphics block holds.
+     *
+     * Keyed on the MODE NUMBER, not on the 0x3D8 black-and-white bit, which is
+     * the previous port's rule: mode 5 IS the colour-burst-off palette whether
+     * or not anyone wrote the register, and a guest that sets its mode through
+     * INT 10h may never write 0x3D8 at all. The register is still honoured
+     * (bit 2) for a guest that does drive it directly. */
+    unsigned c0 = background, c1, c2, c3;
+    if (cur_desc->kind == VM_CGA1) {
+        /* 640x200 is two colours. Pixel 0 is black and pixel 1 takes the
+           foreground from the low nibble -- and an UNTOUCHED 0x3D9 (zero) has
+           to mean white on black, or the whole screen is black on black. */
+        c0 = 0;
+        c1 = c2 = c3 = background ? background : 15;
+    } else if (video_mode == 0x05 || (x86_io.cga_mode & 0x04)) {
+        c1 = 3 | bright; c2 = 4 | bright; c3 = 7 | bright;   /* cyan/red/white */
+    } else if (sel & 0x20) {
+        c1 = 3 | bright; c2 = 5 | bright; c3 = 7 | bright;   /* cyan/magenta/grey */
+    } else {
+        c1 = 2 | bright; c2 = 4 | bright; c3 = 6 | bright;   /* green/red/brown */
     }
 
-    if (x86_video_is_text()) {
-        /* Attributes index all 16 colours directly, so the CLUT is the whole
-           CGA palette rather than the four graphics entries. It is written
-           TWICE, into 0-15 and 16-31, because 32 entries are always published
-           (see X86_TEXT_CLUT_ENTRIES) and an undefined half is a stale colour
-           waiting to be drawn. The anti-aliased path overwrites all 32. */
-        for (unsigned i = 0; i < X86_TEXT_CLUT_ENTRIES; i++)
-            cga_clut[i] = cga_argb[i & 15];
+    /*
+     * ONE CLUT LAYOUT FOR EVERY MODE, which is the previous port's arrangement
+     * and worth the change on its own: 0-15 are the fixed CGA palette that text
+     * attributes index directly, 16-19 are the four currently selected graphics
+     * colours, and 20-31 mirror 4-15 so no index anywhere lands on an
+     * uninitialised entry.
+     *
+     * The old layout put the graphics colours in 0-3, which meant a mode switch
+     * had to REWRITE the whole table in both directions and entry 0 -- the
+     * letterbox clear, and the colour any stray byte draws in -- was the
+     * guest's chosen background rather than black. Here a mode change moves
+     * four entries and nothing else can be left stale by it.
+     */
+    for (unsigned i = 0; i < X86_TEXT_CLUT_ENTRIES; i++)
+        cga_clut[i] = cga_argb[i & 15];
+    cga_clut[X86_GFX_CLUT_BASE + 0] = cga_argb[c0 & 15];
+    cga_clut[X86_GFX_CLUT_BASE + 1] = cga_argb[c1 & 15];
+    cga_clut[X86_GFX_CLUT_BASE + 2] = cga_argb[c2 & 15];
+    cga_clut[X86_GFX_CLUT_BASE + 3] = cga_argb[c3 & 15];
 #if X86_TEXT_AA
+    if (cur_desc->kind == VM_TEXT)
         aa_nblocks = 0;                 /* force a rebuild if AA is on */
 #endif
-        cga_clut_dirty = 1;
-        return;
-    }
-
-    cga_clut[0] = cga_argb[background];
-    cga_clut[1] = cga_argb[(c1 | bright) & 15];
-    cga_clut[2] = cga_argb[(c2 | bright) & 15];
-    /* Brown is the odd one out: index 6 brightens to 14 (yellow); white (7)
-       brightens to 15, which the mask already gives. */
-    cga_clut[3] = cga_argb[(c3 | bright) & 15];
-    /* Mode 4 pixels only ever index 0-3, but the whole table is pushed to the
-       panel, so leave nothing undefined behind them. */
-    for (unsigned i = 4; i < X86_TEXT_CLUT_ENTRIES; i++)
-        cga_clut[i] = cga_argb[i & 15];
     cga_clut_dirty = 1;
 }
 
@@ -251,12 +335,29 @@ void x86_video_init(void *vram, void *lut8_palette)
     memset(cga_vram, 0, X86_VRAM_BYTES);
 
     /* CGA packs the leftmost pixel in the HIGH bits of each byte. The table is
-       built so a little-endian word store lands them left to right. */
+       built so a little-endian word store lands them left to right, and every
+       entry carries the graphics block base so the blitter's output indexes the
+       CLUT directly. */
     for (unsigned b = 0; b < 256; b++) {
-        cga_expand[b] = ((b >> 6) & 3)
+        cga_expand[b] = (X86_GFX_CLUT_BASE * 0x01010101u)
+                      + (((b >> 6) & 3)
                       | (((b >> 4) & 3) << 8)
                       | (((b >> 2) & 3) << 16)
-                      | (((b >> 0) & 3) << 24);
+                      | (((b >> 0) & 3) << 24));
+    }
+
+    /* Mode 6 is 640 pixels across a 320 px panel, so pixel PAIRS are OR-ed --
+       a rule taken from the previous port: a set bit in either lights the
+       output pixel, which keeps one-pixel-wide rules visible where dropping
+       every other column would erase half of them.
+       Indexed by a NIBBLE (4 source pixels -> 2 output), so the table is 64
+       bytes rather than the 1 KB a byte-indexed one would cost -- RAM_EMU has
+       four figures of headroom, not five. */
+    for (unsigned n = 0; n < 16; n++) {
+        unsigned p0 = ((n >> 3) | (n >> 2)) & 1;
+        unsigned p1 = ((n >> 1) | (n >> 0)) & 1;
+        cga1_expand[n] = (uint32_t)((X86_GFX_CLUT_BASE + p0)
+                                    | ((X86_GFX_CLUT_BASE + p1) << 8));
     }
 
     /* Bilevel row expansion: 0xFF per lit pixel, leftmost pixel in the low
@@ -325,6 +426,10 @@ void x86_video_render(uint8_t *dst, uint32_t stride)
        and bottom; leaving them alone means they keep whatever the firmware or
        the other buffer had, reinterpreted through the CGA palette -- which is
        what turns an otherwise black screen into colour flashes. */
+    /* Follow the guest BEFORE anything reads the mode: the renderer, the
+       palette and the letterbox clear must all be for the same frame. */
+    mode_sync_from_bda();
+
     unsigned band = (240u - CGA_HEIGHT) / 2u;
     int aa = X86_TEXT_AA && x86_video_is_text() && x86_text_aa;
     /* Index 0 is CGA black everywhere EXCEPT under a per-frame anti-aliased
@@ -353,11 +458,53 @@ void x86_video_render(uint8_t *dst, uint32_t stride)
     memset(dst + (band + CGA_HEIGHT) * stride, clear, band * stride);
 
     uint8_t *top = dst + band * stride;
-    if (x86_video_is_text())
+    /* One entry per CHANGE of renderer, not per frame: the ring is 16 deep and
+       a per-frame entry would flush the causes off the end in a quarter of a
+       second. */
+    {
+        static int last_text = -1;
+        int now = x86_video_is_text() ? 1 : 0;
+        if (now != last_text) {
+            last_text = now;
+            x86_video_log_event(3, (uint32_t)now, x86_video_mode_byte);
+        }
+    }
+    switch (cur_desc->kind) {
+    case VM_TEXT:
         text_render(top, stride);
-    else
+        break;
+    case VM_CGA1:
+        cga_mode6_blit(top, stride);
+        break;
+    default:
         cga_mode4_blit(top, cga_vram, cga_vram + CGA_PLANE_ODD,
                        cga_expand, stride - CGA_WIDTH);
+        break;
+    }
+}
+
+/*
+ * Mode 6: 640x200 at 1 bpp, in the same two-bank interleave as mode 4 and the
+ * same 80 bytes per row -- one byte is EIGHT pixels here, so a row is 640 wide
+ * and is decimated to the panel's 320 by the OR rule in cga1_expand.
+ *
+ * In C rather than in cga_blit.S deliberately: it is 80 iterations of two table
+ * lookups over a mode almost nothing uses, against an assembly routine that
+ * would have to be maintained alongside the hot one.
+ */
+static void cga_mode6_blit(uint8_t *dst, uint32_t stride)
+{
+    for (unsigned y = 0; y < CGA_HEIGHT; y++) {
+        const uint8_t *src = cga_vram + ((y & 1) ? CGA_PLANE_ODD : 0)
+                           + (y >> 1) * CGA_ROW_BYTES;
+        uint32_t *out = (uint32_t *)(dst + y * stride);
+        for (unsigned x = 0; x < CGA_ROW_BYTES; x++) {
+            uint8_t b = src[x];
+            /* Leftmost source pixel is bit 7, and the leftmost output pixel
+               must land in the LOW byte of the word. */
+            out[x] = cga1_expand[b >> 4] | (cga1_expand[b & 0x0F] << 16);
+        }
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -365,8 +512,37 @@ void x86_video_render(uint8_t *dst, uint32_t stride)
  */
 /* Not static: the harness reads it to know which renderer to check against.
    `x86_video_mode()` is the call for C callers; this is the storage. */
-uint8_t  x86_video_mode_byte = 0x04;
-#define video_mode x86_video_mode_byte
+
+/*
+ * Every event that can change what the renderer draws, in order.
+ *
+ * "The mode did not switch" and "the mode switched and the renderer did not
+ * follow" are the same picture -- a screen of pixels -- and a sampled
+ * `x86_video_mode_byte` cannot separate them: a mode set that is immediately
+ * overwritten, or one that never happens, both read as a constant. The ring
+ * records the CAUSE, so the order of a BIOS set against a 0x3D8 write is
+ * visible.
+ *
+ * Word layout: (tag << 24) | (aux << 8) | value
+ *   tag 1  mode adopted (INT 10h, or the BDA)   value = mode, aux = columns
+ *   tag 2  port 0x3D8 write                     value = the byte written
+ *   tag 3  renderer follow                      value = mode, aux = is_text
+ *   tag 5  mode REFUSED, previous one stays     value = old mode, aux = asked
+ *
+ * A run with tag 1 and tag 3 disagreeing is a renderer that did not follow the
+ * guest; a run of tag 5 names a mode a title wants and we do not have, which is
+ * otherwise indistinguishable from a guest that draws nothing.
+ * scripts/probe.py --dump x86_video_mode_log:16x4
+ */
+volatile uint32_t x86_video_mode_log[16];
+volatile uint32_t x86_video_mode_log_idx = 0;
+
+void x86_video_log_event(uint32_t tag, uint32_t aux, uint32_t value)
+{
+    x86_video_mode_log[x86_video_mode_log_idx & 15] =
+        (tag << 24) | ((aux & 0xFFFFu) << 8) | (value & 0xFFu);
+    x86_video_mode_log_idx++;
+}
 static uint8_t  cur_row, cur_col;
 static uint16_t text_scroll_col;    /* leftmost visible column */
 
@@ -380,13 +556,40 @@ static uint16_t text_scroll_col;    /* leftmost visible column */
  */
 volatile int32_t x86_video_pan = -1;
 
+/*
+ * Adopt a mode WITHOUT touching guest VRAM. This is the renderer-selection
+ * half: which blit runs, which font, which palette rule. It is what the
+ * per-frame BDA re-read calls, and clearing VRAM there would wipe the screen of
+ * a guest that set the mode by writing the BDA itself.
+ */
+static int mode_select(uint8_t mode)
+{
+    const x86_vmode *d = vmode_find(mode);
+    if (!d) {
+        x86_video_log_event(5, mode, video_mode);   /* refused; old mode stays */
+        return 0;
+    }
+    if (d == cur_desc && mode == video_mode)
+        return 1;
+    x86_video_log_event(1, d->cols, mode);
+    cur_desc = d;
+    video_mode = mode;
+    x86_video_refresh_palette();
+    return 1;
+}
+
+/*
+ * INT 10h AH=00. The mode set half: adopt the mode AND clear the display, which
+ * is what the call promises and what mode_select() deliberately does not do.
+ */
 void x86_video_set_mode(uint8_t mode)
 {
-    video_mode = mode;
+    if (!mode_select(mode))
+        return;
     cur_row = cur_col = 0;
     text_scroll_col = 0;
-    memset(cga_vram, (mode == 0x03 || mode == 0x02) ? 0 : 0, X86_VRAM_BYTES);
-    if (mode == 0x03 || mode == 0x02) {
+    memset(cga_vram, 0, X86_VRAM_BYTES);
+    if (cur_desc->kind == VM_TEXT) {
         /* Text mode: blank cells are space on black, not zero bytes -- a zero
            attribute renders black-on-black and hides everything written
            before the guest sets its own colours. */
@@ -395,6 +598,31 @@ void x86_video_set_mode(uint8_t mode)
             cell[i] = 0x0720;
     }
     x86_video_refresh_palette();
+}
+
+/*
+ * Follow the BIOS Data Area. Called once per frame, which is where the
+ * previous port does its detection too -- per-instruction polling buys nothing
+ * a frame-rate check does not.
+ *
+ * Two guards, and they are the difference between this being robust and being
+ * a hardware-only failure. The BDA page may not be backed at all (x86_bios.c
+ * tolerates that everywhere else, and on silicon it is an open question), and
+ * an unbacked or blank page reads mode 0 / cols 0 -- which is a VALID mode
+ * number and would silently reinterpret every screen as 40-column text. So the
+ * columns must ALSO be sane, and 0 is not.
+ */
+static void mode_sync_from_bda(void)
+{
+    uint8_t bmode; uint16_t bcols;
+
+    if (!x86_bios_bda_video(&bmode, &bcols))
+        return;
+    if (bcols != 40 && bcols != 80)
+        return;                         /* not a BDA anyone is maintaining */
+    if (bmode == video_mode)
+        return;
+    mode_select(bmode);
 }
 
 uint8_t x86_video_mode(void) { return video_mode; }
@@ -413,52 +641,173 @@ uint16_t x86_video_get_cursor(void)
     return (uint16_t)((cur_row << 8) | cur_col);
 }
 
+/* The cell buffer's row stride is the ACTIVE column count: a 40-column mode
+   packs 40 cells per row, so indexing it at 80 reads the middle of row 2. */
 static uint16_t *text_cell(unsigned row, unsigned col)
 {
-    return (uint16_t *)cga_vram + row * TEXT_COLS + col;
+    return (uint16_t *)cga_vram + row * cur_desc->cols + col;
 }
 
 /* The cell under the cursor, character in the low byte and attribute in the
    high byte -- the layout INT 10h AH=08 returns in AX. */
 uint16_t x86_video_read_cell(void)
 {
-    if (!cga_vram)
+    /* A graphics screen has no cell to read back -- the pixels under the
+       cursor are not a character. A blank is what a real BIOS's own read-back
+       buffer would hold, and it is what a program probing the display can act
+       on; returning pixel bytes would have it believe them. */
+    if (!cga_vram || !x86_video_is_text())
         return 0x0720;
     return *text_cell(cur_row, cur_col);
 }
 
+/* ---------------------------------------------------------------------------
+ * CHARACTER OUTPUT IN A GRAPHICS MODE, which is the whole of the reported bug.
+ *
+ * MEASURED, Alley Cat under gwemu (`x86_video_mode_log`, tag 4): the guest sets
+ * mode 4 through INT 10h -- correctly, and both our mode byte and BDA 0040:0049
+ * follow it -- and THEN prints "Do you want to use a joystick (Y/N)?" through
+ * the BIOS/DOS character path. Every one of those 36 characters was stored as a
+ * char/attr PAIR into 0xB8000. In mode 4 those two bytes are not a cell, they
+ * are eight pixels, so the mode-4 blitter drew 72 bytes of prompt as 288 pixels
+ * of confetti across guest scanline 0 and nothing else. The mode switch was
+ * never the defect; the characters were simply never rasterised.
+ *
+ * A real BIOS renders the glyph as an 8x8 BITMAP in a graphics mode and only
+ * stores char/attr in a text one. The previous port hit this on the same title
+ * and fixed it the same way (references/8086tiny/8086tiny.c dos_gfx_putchar,
+ * bios.asm:2779). Two details taken straight from it, both of which are only
+ * obvious once they have been got wrong:
+ *
+ *   * A glyph is EIGHT scanlines, so it straddles both interleave banks. Get
+ *     that wrong and text appears with every other scanline missing, which
+ *     reads as a blit bug rather than as this.
+ *   * COLOUR 0 HAS TO MEAN VISIBLE. DOS's console output never sets a
+ *     foreground colour, and taking the zero literally renders the prompt in
+ *     the background colour -- invisible, i.e. the same symptom as not drawing
+ *     it, chased twice.
+ *
+ * It is routed from ALL of the character paths here, not just teletype: the
+ * previous port scoped its fix to INT 10h AH=0Eh and left AH=09h/0Ah and the
+ * scroll routines storing pairs into pixel memory (its own notes carry that as
+ * an open defect). Ours are three C functions over one cursor, so covering
+ * them costs nothing but doing it.
+ */
+static void gfx_putchar(uint8_t ch, uint8_t colour, unsigned col, unsigned row)
+{
+    const unsigned char *g = x86_font8x8()[ch];
+    unsigned wide = (cur_desc->kind == VM_CGA2);
+
+    if (row >= TEXT_ROWS || col >= cur_desc->cols)
+        return;
+
+    if (wide) {
+        unsigned pix = colour & 3;
+        if (!pix)
+            pix = 3;
+        for (unsigned line = 0; line < CELL_H; line++) {
+            unsigned y = row * CELL_H + line;
+            uint8_t *o = cga_vram + ((y & 1) ? CGA_PLANE_ODD : 0)
+                       + (y >> 1) * CGA_ROW_BYTES + col * 2;
+            unsigned bits = g[line];
+            /* Two bytes of 2 bpp per glyph row. Our font is bit-0-leftmost
+               (Hepper's order, see x86_osk.c); CGA packs the leftmost pixel in
+               the HIGH bits, so pixel p goes to shift 6-2p. */
+            for (unsigned half = 0; half < 2; half++) {
+                uint8_t b = 0;
+                for (unsigned p = 0; p < 4; p++)
+                    if (bits & (1u << (half * 4 + p)))
+                        b |= (uint8_t)(pix << (6 - 2 * p));
+                o[half] = b;
+            }
+        }
+    } else {
+        for (unsigned line = 0; line < CELL_H; line++) {
+            unsigned y = row * CELL_H + line;
+            uint8_t *o = cga_vram + ((y & 1) ? CGA_PLANE_ODD : 0)
+                       + (y >> 1) * CGA_ROW_BYTES + col;
+            /* 1 bpp: the row IS the byte -- once reversed, because the font is
+               bit-0-leftmost and the adapter is bit-7-leftmost. */
+            unsigned bits = g[line], b = 0;
+            for (unsigned p = 0; p < 8; p++)
+                if (bits & (1u << p))
+                    b |= 0x80u >> p;
+            *o = (uint8_t)b;
+        }
+    }
+}
+
+/* Scroll a graphics screen: a text "row" is EIGHT SCANLINES of pixels here, not
+   160 bytes of cells. Both banks move, so this walks scanlines rather than
+   memmoving the buffer. */
+static void gfx_scroll(uint8_t lines)
+{
+    unsigned shift = lines * CELL_H;
+
+    for (unsigned y = 0; y + shift < CGA_HEIGHT; y++) {
+        uint8_t *d = cga_vram + ((y & 1) ? CGA_PLANE_ODD : 0)
+                   + (y >> 1) * CGA_ROW_BYTES;
+        unsigned s = y + shift;
+        const uint8_t *sp = cga_vram + ((s & 1) ? CGA_PLANE_ODD : 0)
+                          + (s >> 1) * CGA_ROW_BYTES;
+        memcpy(d, sp, CGA_ROW_BYTES);
+    }
+    for (unsigned y = CGA_HEIGHT - shift; y < CGA_HEIGHT; y++)
+        memset(cga_vram + ((y & 1) ? CGA_PLANE_ODD : 0)
+               + (y >> 1) * CGA_ROW_BYTES, 0, CGA_ROW_BYTES);
+}
+
 void x86_video_scroll(uint8_t lines, uint8_t attr)
 {
+    unsigned cols = cur_desc->cols;
+
+    if (!x86_video_is_text()) {
+        if (lines == 0 || lines >= TEXT_ROWS)
+            memset(cga_vram, 0, X86_VRAM_BYTES);
+        else
+            gfx_scroll(lines);
+        return;
+    }
     if (lines == 0 || lines >= TEXT_ROWS) {
         uint16_t *c = (uint16_t *)cga_vram;
-        for (unsigned i = 0; i < TEXT_COLS * TEXT_ROWS; i++)
+        for (unsigned i = 0; i < cols * TEXT_ROWS; i++)
             c[i] = (uint16_t)(0x20 | (attr << 8));
         return;
     }
-    memmove(cga_vram, cga_vram + lines * TEXT_COLS * 2,
-            (TEXT_ROWS - lines) * TEXT_COLS * 2);
+    memmove(cga_vram, cga_vram + lines * cols * 2,
+            (TEXT_ROWS - lines) * cols * 2);
     uint16_t *c = text_cell(TEXT_ROWS - lines, 0);
-    for (unsigned i = 0; i < lines * TEXT_COLS; i++)
+    for (unsigned i = 0; i < lines * cols; i++)
         c[i] = (uint16_t)(0x20 | (attr << 8));
 }
 
 void x86_video_putc_attr(uint8_t ch, uint8_t attr, uint16_t count)
 {
     if (count == 0) count = 1;
-    for (unsigned i = 0; i < count && cur_col + i < TEXT_COLS; i++)
-        *text_cell(cur_row, cur_col + i) = (uint16_t)(ch | (attr << 8));
+    for (unsigned i = 0; i < count && cur_col + i < cur_desc->cols; i++) {
+        if (x86_video_is_text())
+            *text_cell(cur_row, cur_col + i) = (uint16_t)(ch | (attr << 8));
+        else
+            gfx_putchar(ch, attr, cur_col + i, cur_row);
+    }
 }
 
 void x86_video_teletype(uint8_t ch)
 {
+    unsigned cols = cur_desc->cols;
+
     switch (ch) {
+    case 0x07: break;                                   /* BEL: no glyph */
     case 0x0D: cur_col = 0; break;
     case 0x0A: cur_row++; break;
     case 0x08: if (cur_col) cur_col--; break;
     default:
-        *text_cell(cur_row, cur_col) =
-            (uint16_t)(ch | ((*text_cell(cur_row, cur_col) >> 8) << 8));
-        if (++cur_col >= TEXT_COLS) { cur_col = 0; cur_row++; }
+        if (x86_video_is_text())
+            *text_cell(cur_row, cur_col) =
+                (uint16_t)(ch | ((*text_cell(cur_row, cur_col) >> 8) << 8));
+        else
+            gfx_putchar(ch, 0, cur_col, cur_row);
+        if (++cur_col >= cols) { cur_col = 0; cur_row++; }
         break;
     }
     if (cur_row >= TEXT_ROWS) {
@@ -589,6 +938,42 @@ static void text_alloc_palette(void)
 #endif
 
 /*
+ * 40-column text (modes 0 and 1), at the authentic 8x8 cell.
+ *
+ * 40 x 8 = 320, so this is the one text case that needs no condensed face at
+ * all: it draws the SAME 8x8 CP437 table the BIOS hands the guest at F000:F000
+ * (x86_font8x8()), which is also what a real CGA character generator shows.
+ * Two word stores per glyph row, one per nibble, through the same 16-entry
+ * bilevel mask the 4 px path uses -- no second font and no second table.
+ */
+static void text_render_wide(uint8_t *dst, uint32_t stride)
+{
+    const unsigned char (*font)[8] = x86_font8x8();
+
+    for (unsigned row = 0; row < TEXT_ROWS; row++) {
+        for (unsigned col = 0; col < 40; col++) {
+            uint16_t cell = *text_cell(row, col);
+            const unsigned char *g = font[cell & 0xFF];
+            uint32_t fw = (uint32_t)((cell >> 8) & 0x0F) * 0x01010101u;
+            uint32_t bw = (uint32_t)((cell >> 12) & 0x07) * 0x01010101u;
+            uint8_t *o = dst + row * CELL_H * stride + col * 8;
+
+            for (unsigned gy = 0; gy < CELL_H; gy++) {
+                /* font8x8 puts the LEFTMOST pixel in bit 0 of the row byte
+                   (Hepper's tables are little-endian per row), and text_mask4
+                   also indexes low-bit-first, so each nibble maps straight
+                   across with no reversal. */
+                unsigned bits = g[gy];
+                uint32_t m0 = text_mask4[bits & 0x0F];
+                uint32_t m1 = text_mask4[(bits >> 4) & 0x0F];
+                *(uint32_t *)(o + gy * stride)     = (m0 & fw) | (~m0 & bw);
+                *(uint32_t *)(o + gy * stride + 4) = (m1 & fw) | (~m1 & bw);
+            }
+        }
+    }
+}
+
+/*
  * One glyph row is one 32-bit store in both paths.
  *
  * Bilevel:  out = (mask & fg_word) | (~mask & bg_word), the mask coming from a
@@ -599,6 +984,14 @@ static void text_alloc_palette(void)
 static void text_render(uint8_t *dst, uint32_t stride)
 {
     unsigned left = text_left();
+
+    /* THE COLUMN COUNT SELECTS THE FONT, which is the previous port's whole
+       two-font scheme and the reason modes 0/1 need nothing else: 40 columns of
+       an 8 px cell and 80 columns of a 4 px cell are both exactly 320 px. */
+    if (cur_desc->cols == 40) {
+        text_render_wide(dst, stride);
+        return;
+    }
 
     for (unsigned row = 0; row < TEXT_ROWS; row++) {
         for (unsigned vc = 0; vc < TEXT_VIS_COLS; vc++) {
@@ -650,6 +1043,5 @@ static void text_render(uint8_t *dst, uint32_t stride)
 
 int x86_video_is_text(void)
 {
-    return video_mode == 0x02 || video_mode == 0x03 || video_mode == 0x00
-        || video_mode == 0x01;
+    return cur_desc->kind == VM_TEXT;
 }

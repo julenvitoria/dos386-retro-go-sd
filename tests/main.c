@@ -354,6 +354,81 @@ static void kbd_bda_w16(uint32_t off, uint16_t v)
     test_ram[0x401 + off] = (uint8_t)(v >> 8);
 }
 
+/* ---------------------------------------------------------------------------
+ * Mode switching, driven by GUEST code through INT 10h.
+ *
+ * The other video arms call x86_video_set_mode() from the host, which proves
+ * the renderer but says nothing about the path a real program takes. Alley
+ * Cat's defect lived on that path: the mode was set through the BIOS, followed
+ * correctly, and the CHARACTERS printed afterwards were still stored as
+ * char/attr pairs into pixel memory. So this arm executes the guest's own
+ *
+ *      MOV AX,000m / INT 10h        (set mode)
+ *      MOV AH,0E / MOV AL,ch / INT 10h   (teletype one character)
+ *
+ * and the host then renders and compares. Only this can catch a regression in
+ * which the mode is adopted and the character path is not told.
+ */
+#define MSW_CODE_BASE   0x2600u
+#define MSW_TTY_BASE    0x2620u
+
+volatile uint32_t run_modeswitch_flag = 0;
+volatile uint32_t msw_mode_arg = 3;         /* AL for the mode set   */
+volatile uint32_t msw_char_arg = 'A';       /* AL for the teletype   */
+volatile uint32_t msw_r[6];
+
+/* 0: mode after   1: is_text   2: text cols   3: BDA 0x449   4: BDA 0x44A
+   5: guest exit reason */
+static void msw_snapshot(void)
+{
+    msw_r[0] = x86_video_mode();
+    msw_r[1] = (uint32_t)x86_video_is_text();
+    msw_r[2] = x86_video_text_cols();
+    msw_r[3] = test_ram[0x449];
+    msw_r[4] = (uint32_t)(test_ram[0x44A] | (test_ram[0x44B] << 8));
+}
+
+static void modeswitch_test_init(void)
+{
+    static const uint8_t hle_vectors[] = { 0x08, 0x09, 0x10, 0x16, 0x1A, 0x20, 0x21 };
+    static const uint8_t set_mode_code[] = {
+        0xB8, 0x03, 0x00,             /* MOV AX,0003 (AL patched by the host) */
+        0xCD, 0x10,                   /* INT 10h                              */
+        0xF4,                         /* HLT                                  */
+    };
+    static const uint8_t tty_code[] = {
+        0xB4, 0x0E,                   /* MOV AH,0E                            */
+        0xB0, 0x41,                   /* MOV AL,'A'  (patched by the host)    */
+        0xB7, 0x00,                   /* MOV BH,0                             */
+        0xB3, 0x03,                   /* MOV BL,3    (graphics fg colour)     */
+        0xCD, 0x10,                   /* INT 10h                              */
+        0xF4,                         /* HLT                                  */
+    };
+
+    x86_video_init(cga_test_vram, cga_test_palette);
+    x86_bios_init();
+    x86_hle_install(hle_vectors, sizeof(hle_vectors));
+    memcpy(&test_ram[MSW_CODE_BASE], set_mode_code, sizeof(set_mode_code));
+    memcpy(&test_ram[MSW_TTY_BASE], tty_code, sizeof(tty_code));
+    msw_snapshot();
+}
+
+static void modeswitch_test_set(void)
+{
+    test_ram[MSW_CODE_BASE + 1] = (uint8_t)msw_mode_arg;
+    kbd_test_reset_cpu(MSW_CODE_BASE);
+    msw_r[5] = kbd_test_run_to_halt();
+    msw_snapshot();
+}
+
+static void modeswitch_test_tty(void)
+{
+    test_ram[MSW_TTY_BASE + 3] = (uint8_t)msw_char_arg;
+    kbd_test_reset_cpu(MSW_TTY_BASE);
+    msw_r[5] = kbd_test_run_to_halt();
+    msw_snapshot();
+}
+
 static void kbd_test_run(void)
 {
     static const uint8_t hle_vectors[] = {
@@ -882,6 +957,18 @@ void Reset_Handler(void) {
             /* init clears VRAM; the host's pattern is written after the flag
                is armed, so re-arm ordering matters -- see tests/test_video.py */
             run_video_flag = 2;
+        }
+        if (run_modeswitch_flag == 1) {
+            modeswitch_test_init();
+            run_modeswitch_flag = 0;
+        }
+        if (run_modeswitch_flag == 2) {
+            modeswitch_test_set();
+            run_modeswitch_flag = 0;
+        }
+        if (run_modeswitch_flag == 3) {
+            modeswitch_test_tty();
+            run_modeswitch_flag = 0;
         }
         if (run_video_flag == 4) {
             x86_video_set_mode((uint8_t)text_mode_arg);

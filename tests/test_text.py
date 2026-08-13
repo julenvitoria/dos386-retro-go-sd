@@ -202,20 +202,31 @@ def main(args):
         if not wait_flag(b, syms["run_video_flag"], 0, "mode 3 not selected"):
             return False
 
-        # 32 entries, the 16 CGA colours written twice. Not decoration: the
-        # firmware puts a darkened twin of entry i at `count + i`, while the
-        # overlay finds it by OR-ing a fixed +32, so anything short of 32
-        # leaves retro-go's menu dimming the screen to solid black.
+        # 32 entries, in ONE layout that every mode shares: 0-15 the fixed CGA
+        # palette that text attributes index directly, 16-19 the four currently
+        # selected graphics colours, 20-31 a mirror of 4-15 so no index lands on
+        # an uninitialised entry.
+        #
+        # 32 and not 16 is not decoration: the firmware puts a darkened twin of
+        # entry i at `count + i`, while the overlay finds it by OR-ing a fixed
+        # +32, so anything short of 32 leaves retro-go's menu dimming the screen
+        # to solid black. And the split is what makes a mode SWITCH cheap --
+        # entries 0-15 never move, so text colours cannot be left holding a
+        # graphics palette (or the reverse), which is the stale-CLUT half of the
+        # "a bunch of pixels" report.
         clut = [b.read_uint32(syms["cga_test_palette"] + 4 * i)
                 for i in range(textmode.TEXT_CLUT_ENTRIES)]
         want_clut = CGA_ARGB * (textmode.TEXT_CLUT_ENTRIES // 16)
+        # Power-on 0x3D9 is 0x30: palette 1, high intensity -> cyan/magenta/grey
+        # over background 0.
+        want_clut[16:20] = [CGA_ARGB[0], CGA_ARGB[11], CGA_ARGB[13], CGA_ARGB[15]]
         if clut != want_clut:
-            print("FAIL: text-mode CLUT is not the 16 CGA colours, twice")
+            print("FAIL: text-mode CLUT is not 16 CGA + 4 graphics + mirror")
             for i, (g, w) in enumerate(zip(clut, want_clut)):
                 if g != w:
                     print(f"  entry {i}: {g:08x} expected {w:08x}")
             return False
-        print(f"CLUT: {len(clut)} entries, 16 CGA colours twice, exact")
+        print(f"CLUT: {len(clut)} entries, 0-15 CGA + 16-19 graphics, exact")
 
         cells = make_cells()
         ok = True

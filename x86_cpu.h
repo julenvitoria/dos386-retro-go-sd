@@ -188,6 +188,16 @@ void x86_video_set_beam(uint32_t frac);
 void x86_video_set_mode(uint8_t mode);
 uint8_t x86_video_mode(void);
 int x86_video_is_text(void);
+/* Active text column count: 80 for modes 2/3, 40 for 0/1 and for the TTY grid
+   of CGA mode 4/5. Selects the font (80 -> 4x8, 40 -> 8x8). */
+unsigned x86_video_text_cols(void);
+/* BDA 0040:0049 mode and 0040:004A columns; 0 if the page is not backed. */
+int x86_bios_bda_video(uint8_t *mode, uint16_t *cols);
+/* Ordered trace of everything that can change the active renderer; layout in
+   x86_video.c. probe.py --dump x86_video_mode_log:16x4 */
+extern volatile uint32_t x86_video_mode_log[16];
+extern volatile uint32_t x86_video_mode_log_idx;
+void x86_video_log_event(uint32_t tag, uint32_t aux, uint32_t value);
 void x86_video_set_cursor(uint8_t col, uint8_t row);
 /* The first MCB, i.e. where memory becomes the guest's to allocate. Anything
    the emulator plants for its own use has to live BELOW this, because a loaded

@@ -38,6 +38,74 @@ fold mapping; the frame-paced loop; and the DOS layer.
 - [ ] DWT per-opcode profile: tool done (`profile_opcodes.py`, `X86_PROFILE=1`),
       clean under gwemu, silicon pending; gate NOR backing on code-vs-data
 
+## "It just becomes a bunch of pixels" — which was not a mode switch at all
+
+The device report was that Alley Cat does not switch from CGA back to text.
+**Measured under gwemu with a new event ring (`x86_video_mode_log`), and the
+report's diagnosis does not survive the measurement.** The ring holds three
+events for the whole run: the BIOS setting mode 3 at boot, the guest setting
+**mode 4 through INT 10h**, and the renderer following it into graphics. Zero
+writes to port 0x3D8, ever. Our mode byte, the BDA at 0040:0049 and the renderer
+agreed at every sample — **the mode switch was never wrong**.
+
+What was wrong: the guest prints "Do you want to use a joystick (Y/N)?" **while
+in mode 4**, and every character went through `x86_video_teletype()`, which
+stored a char/attr PAIR into 0xB8000. In mode 4 those two bytes are eight
+pixels. 36 characters became 288 pixels of confetti on guest scanline 0 and
+nothing else — a screen of pixels, exactly as reported. A real BIOS rasterises
+the glyph as an 8x8 bitmap in a graphics mode; the previous DOS core hit this on
+the same title and its notes name the same prompt.
+
+`gfx_putchar()` now rasterises into the two-bank interleave (2 bpp in mode 4/5,
+1 bpp in mode 6), and **every** character path is routed through it —
+teletype, AH=09h/0Ah, and the scroll, which in a graphics mode moves eight
+SCANLINES per text row rather than 160 bytes of cells. The previous port scoped
+its fix to AH=0Eh and carries the other three as an open defect; ours are three
+C functions over one cursor, so covering them cost nothing. Colour 0 means
+*visible* (DOS's console never sets one), which is the second half of that fix.
+
+Ported with it, from `dos_video.c` and `references/8086tiny/docs/video/`:
+
+- **The BDA is authoritative and re-read every frame** — 0040:0049 mode,
+  0040:004A columns — so a guest that sets its mode by any route is followed.
+  0x3D8 is never consulted for graphics-vs-text; that rule was tried in the
+  previous port and latched the renderer into decoding text as 2 bpp.
+  Two guards make it safe here: the page may be unbacked on silicon, and a blank
+  page reads mode 0 / cols 0, so the COLUMNS must also be 40 or 80 or the byte
+  is ignored and the last good mode stays.
+- **The column count selects the font** — 80 → 4x8, 40 → 8x8, both exactly
+  320 px — which is what makes **modes 0/1 (40x25)** cost nothing but code.
+- **Mode 6** (640x200x1), decimated 2:1 by OR-ing pixel pairs so one-pixel rules
+  survive. **Mode 7** folds to 3. Mode 5 takes the colour-burst palette from its
+  MODE NUMBER, not from a 0x3D8 bit a guest need never write.
+- **One CLUT layout for every mode**: 0-15 the fixed CGA palette, 16-19 the four
+  selected graphics colours, 20-31 a mirror. A mode change now moves four
+  entries instead of rewriting the table in both directions, and index 0 is
+  black in every mode rather than the guest's chosen background.
+- A mode nothing renders is **refused** (logged, previous mode stays up) rather
+  than adopted, so "the guest draws into memory nothing reads" is never silent.
+
+Cost: **+1,120 bytes** of core (`__CORE_BSS_END__` 0x240574a0 → 0x24057900),
+leaving **1,792 bytes** of RAM_EMU headroom. New data is 64 bytes (the mode 6
+nibble table) plus the 68-byte event ring; everything else is code. The 8x8 font
+was already linked for the guest's F000:F000 copy, so the rasteriser and the
+40-column renderer add no font data.
+
+**Left out, each for a measured reason, not for effort:** mode 13h and VBE
+(64,000 / 76,800 B, and 256 CLUT entries against a `GW_LCD_SET_CLUT` that clamps
+at 32 — undisplayable, not merely tight); EGA 0Dh/0Eh/10h/12h (planar writes
+need a store-side hook, and our VRAM is deliberately plain mapped RAM with no
+MMIO path, plus 32-153 KB); Hercules (720x348 needs real resampling). The CRTC
+start address at 0040:004D is also not honoured — we do not model CRTC 12/13 —
+so a title that hardware-scrolls by moving the start register will look static.
+
+Tier 1: `tests/test_video.py` now drives 3 → 4 → 3 from GUEST code through
+INT 10h and compares the rendering at each step, checks the graphics-mode glyph
+against a host-side raster of the same font, and covers mode 6, mode 0 and the
+refusal path. Tier 2: the prompt and Alley Cat's skill-level menu are readable
+(`build/artifacts/ac_after_t12.png`, `ac_after_game.png`) where they were one
+coloured line before (`ac_t12.png`); no faults, 1,904 frames, no refused modes.
+
 ## On-screen keyboard — shipped; mouse UI — shell only
 
 `x86_osk.c`, wired from `poll_input()`/`core_repaint()` in `src/main.c`. The UI

@@ -54,6 +54,27 @@ static void bda_w32(uint32_t lin, uint32_t v)
              p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); }
 }
 
+/*
+ * The two BDA fields the renderer selects on: 0040:0049 mode, 0040:004A
+ * columns. Exported because the video layer must read what the BIOS PUBLISHES
+ * rather than a copy of its own -- a program is free to set the mode and then
+ * be believed, and the previous port's whole mode-detection design is "read the
+ * BDA, never the 0x3D8 register" (references/8086tiny/docs/video/03).
+ *
+ * Returns 0 if the BDA page is not backed, which is a real possibility on
+ * silicon (every bda_w* here already tolerates it), and the caller then keeps
+ * whatever mode it last had rather than believing a zero.
+ */
+int x86_bios_bda_video(uint8_t *mode, uint16_t *cols)
+{
+    uint8_t *p = x86_guest_ptr(BDA_MODE, 3);
+    if (!p)
+        return 0;
+    *mode = p[0];
+    *cols = (uint16_t)(p[1] | (p[2] << 8));
+    return 1;
+}
+
 /* --------------------------------------------------------------------------
  * Keyboard buffer, shared by the INT 09h handler (producer) and INT 16h
  * (consumer). It is the real 16-entry ring at 0040:001E so a program reading
@@ -222,9 +243,15 @@ int x86_bios_video(uint8_t func)
 {
     switch (func) {
     case 0x00: {                    /* set mode */
-        uint8_t mode = (uint8_t)(cpu_state_ptr->regs[0] & 0xFF);
-        bda_w8(BDA_MODE, mode);
+        /* Bit 7 of AL is "do not clear the display" (EGA and later); the mode
+           number is the low seven bits. */
+        uint8_t mode = (uint8_t)(cpu_state_ptr->regs[0] & 0x7F);
         x86_video_set_mode(mode);
+        /* Publish what the renderer actually adopted, not what was asked for:
+           a mode we cannot render leaves the previous one up, and the BDA has
+           to agree with the screen or the next frame's BDA re-read undoes it. */
+        bda_w8(BDA_MODE, x86_video_mode());
+        bda_w16(BDA_COLS, x86_video_text_cols());
         return 1;
     }
     case 0x0F:                      /* get mode */

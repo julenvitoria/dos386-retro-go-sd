@@ -101,6 +101,7 @@ python3 scripts/probe.py --retrogo --wait-magic --set guest_kips=330     # 8088
 | `x86_disk_cache_hits` / `_misses` / `_fills` / `_evictions` / `_bypass` | sectors served from a resident window, sectors that forced a fetch, window fetches, and requests that went straight through. Rising `_evictions` with a poor hit rate means the working set no longer fits four windows |
 | `x86_disk_us_total` / `x86_disk_us_worst` / `x86_disk_errors` | time in the backend, and the worst single call. **Meaningless under gwemu** (`docs/04`: SD busy state is not modelled) and the reason the timing claim needs silicon |
 | `frame_hist` / `frame_ms_worst` / `frame_overruns` | the frame-time TAIL, which is what "stutter" means. Buckets are multiples of the learned panel period, so `frame_hist[0]` is on-time and anything else is a missed deadline. A mean or a minimum cannot show a hitch; only this can. Write `frame_stats_reset=1` to open a window around a specific event. `--dump frame_hist:8x4` |
+| `x86_video_mode_log` / `_idx` | the last 16 events that can change what the renderer draws, as `(tag << 24) \| (aux << 8) \| value`: **1** mode adopted (value = mode, aux = columns), **2** a port 0x3D8 write, **3** the renderer following a change (aux = is_text), **5** a mode REFUSED because nothing renders it. A sampled mode byte cannot tell "never switched" from "switched and the renderer did not follow" — both read as a constant — and this can. `--dump x86_video_mode_log:16x4` |
 | `x86_hle_log` | the last 32 services as `(vector << 8) \| AH`, bit 16 set if nobody answered. This is what says whether a guest is polling INT 16h AH=00 or AH=01 -- a distinction the two paths do not share a symptom for. `--dump x86_hle_log:32x8` |
 
 Guest time must not move with render rate. The measurement that proves it is
@@ -368,7 +369,7 @@ standby. Called automatically by `make retrogo_media`.
 | `x86_mem.c` | guest page pool, fold mapping, guest↔host copies |
 | `x86_io.c` | port dispatch, PIT ch2 + speaker, CGA registers |
 | `x86_audio_wave.h` | PC-speaker square-wave generator: PIT divisor -> phase increment -> samples. `<stdint.h>` only, deliberately — that is what lets `tests/host_audio.c` build it natively. Vendored from the author's earlier DOS core |
-| `x86_video.c`, `cga_blit.S` | mode 4 blitter, mode 3 text renderer (4x8 cells, all 80 columns), palette |
+| `x86_video.c`, `cga_blit.S` | the mode table and everything it selects: text 0/1 (8x8 cells) and 2/3/7 (4x8, all 80 columns), CGA 4/5 through `cga_blit.S`, CGA 6 decimated 2:1, the BDA-driven per-frame mode detection, the graphics-mode glyph rasteriser, and the one 32-entry CLUT layout they share |
 | `x86_osk.c/.h` | on-screen keyboard + the mouse UI shell: layout, navigation, sticky modifiers, echo, the GAME cycle, and the overlay painted into the letterbox bars. Ported UI (`docs/input/03`); the injection under it is our own scancode path |
 | `x86_hle.c` | `0F 0B` stubs, IVT planting, service dispatch |
 | `x86_bios.c` | INT 10h / 16h / 1Ah and the BIOS Data Area, including INT 09h's shift decode (the OSK's shifted cells depend on it) |
@@ -416,7 +417,16 @@ python3 tests/test_osk.py                # the on-screen keyboard, driven by
                                          # first), the three-state GAME cycle,
                                          # the row-width check, and that
                                          # drawing never touches guest VRAM
-python3 tests/test_video.py              # CGA mode 4 blitter, pixel-exact
+python3 tests/test_video.py              # CGA mode 4 blitter, pixel-exact, plus
+                                         # MODE SWITCHING driven by GUEST code
+                                         # through INT 10h: 3 -> 4 -> 3 rendered
+                                         # and compared at every step; AH=0Eh
+                                         # rasterising an 8x8 glyph into BOTH
+                                         # interleave banks in mode 4 (the Alley
+                                         # Cat defect); mode 6 at 640x200x1;
+                                         # mode 0 at 40 columns and the 8x8
+                                         # cell; and a mode nothing renders
+                                         # being REFUSED, not adopted
 python3 tests/test_text.py               # CGA text mode 3, pixel-exact:
                                          # CP437 at 4x8 and 8x8, attributes,
                                          # all 80 columns, scroll, line-art

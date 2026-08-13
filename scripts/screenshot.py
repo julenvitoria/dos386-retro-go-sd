@@ -223,6 +223,20 @@ def main():
             # cannot fit as well as the 40 it can.
             vram = b.read_uint32(core["guest_vram"])
             cells = bytes(b.read_memory(vram, 80 * 25 * 2))
+            # ...and in a GRAPHICS mode those same bytes are pixels. Decoding
+            # them as characters produces a screenful of plausible-looking
+            # CP437 rubbish, which is worse than no dump: it reads as
+            # corruption in a screen that is perfectly correct. The mode says
+            # which, and it is one byte away.
+            mode = 0xFF
+            if "x86_video_mode_byte" in core:
+                mode = b.read_uint32(core["x86_video_mode_byte"]) & 0xFF
+            if mode not in (0x00, 0x01, 0x02, 0x03, 0x07, 0xFF):
+                print(f"video mode {mode:#04x} is GRAPHICS -- 0xB8000 holds "
+                      f"pixels, not characters, so there is no text buffer to "
+                      f"dump (text printed in this mode is rasterised into the "
+                      f"pixels by the BIOS)")
+                args.text = args.pairs = False
             # Decode as CP437, not ASCII. Printing only 0x20-0x7E hid every
             # box-drawing and shading code behind a '.', which made a
             # perfectly good full-screen UI read as four rows of stray

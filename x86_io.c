@@ -342,6 +342,7 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
 
     case 0x3D8:
         x86_io.cga_mode = (uint8_t)value;
+        x86_video_log_event(2, 0, value);
         x86_video_refresh_palette();
         break;
     case 0x3D9:
