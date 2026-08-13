@@ -603,6 +603,23 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                 x86_hle_service();
                 continue;
             }
+            /*
+             * HLT means "idle until the next interrupt", which is how a timing
+             * loop waits for the periodic tick -- not "this machine is dead".
+             * Latching it stopped TOPBENCH the moment it started benchmarking.
+             * Raise the tick the guest is waiting for and pull the boundary
+             * check forward so it lands immediately; EIP is already past the
+             * HLT, which is where the handler's IRET belongs.
+             */
+            if (reason == X86_EXIT_HALT) {
+                cpu_state_ptr->exit_reason = 0;
+                if (!cpu_state_ptr->hard_int_pending)
+                    cpu_state_ptr->hard_int_pending = 0x08;
+                cpu_state_ptr->pit_counter = 1;
+                if (!(cpu_state_ptr->eflags & 0x200u))
+                    break;            /* interrupts masked: nothing can wake it */
+                continue;
+            }
             /* Fault, HLT or unimplemented: latch it. Re-entering re-executes
                the same faulting instruction forever, spinning the frame loop
                thousands of times a second and telling us nothing new. */
@@ -629,6 +646,11 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
          */
         for (unsigned t = 0; t < TICKS_PER_SLICE; t++)
             x86_bios_tick();
+        /* And the interrupt itself, for a guest that hooked the vector rather
+           than polling the counter. Only if nothing else is queued: the
+           keyboard uses the same one-deep slot. */
+        if (!cpu_state_ptr->hard_int_pending)
+            cpu_state_ptr->hard_int_pending = 0x08;
 
         /* Video. The beam fraction drives the CGA status register, so a guest
            polling for vertical retrace sees it arrive about once per frame. */

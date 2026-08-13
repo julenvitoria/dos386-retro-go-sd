@@ -101,6 +101,7 @@ typedef struct X86CPUState X86CPUState;
 #define X86_EXIT_UNIMPLEMENTED 4  /* HLT, or an opcode with no handler */
 #define X86_EXIT_MEM_FAULT     5  /* guest access to an unmapped page */
 #define X86_EXIT_GPF           13 /* EXCP0D_GPF */
+#define X86_EXIT_HALT          6  /* HLT: idle until an interrupt, not a stop */
 
 /* Address-translation fold.
  *

@@ -2705,6 +2705,77 @@ def run_test(args):
                 "regs_expected": {1: 0x00000010},
                 "expected_eip": 7,
             },
+
+            # ---- BCD adjust: DAA, DAS, AAA, AAS ----------------------------
+            {
+                "name": "DAA adjusts the low nibble",
+                # MOV AL,0x1A ; DAA ; HLT -> 0x20, AF set, no carry.
+                "code": bytes([0xB0, 0x1A, 0x27, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0020},
+                "flags_expected": {"AF": 1, "CF": 0, "ZF": 0},
+                "expected_eip": 4,
+            },
+            {
+                "name": "DAA carries out of the high nibble",
+                # 0x9A adjusts to 0xA0, then past 0x99 to 0x00 with CF set.
+                "code": bytes([0xB0, 0x9A, 0x27, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0000},
+                "flags_expected": {"CF": 1, "AF": 1, "ZF": 1},
+                "expected_eip": 4,
+            },
+            {
+                "name": "DAS adjusts the low nibble down",
+                "code": bytes([0xB0, 0x1B, 0x2F, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0015},
+                "flags_expected": {"AF": 1, "CF": 0},
+                "expected_eip": 4,
+            },
+            {
+                "name": "DAS borrows into the high nibble",
+                # 0x05 with AF set: 0x05-6 borrows, so CF comes out set.
+                "code": bytes([0xB0, 0x05, 0x2F, 0xF4]),
+                "mode": 16,
+                "eflags_initial": 0x0010,       # AF
+                "regs_initial": {},
+                "regs_expected": {0: 0x00FF},
+                "flags_expected": {"CF": 1, "AF": 1},
+                "expected_eip": 4,
+            },
+            {
+                "name": "AAA carries the unpacked digit into AH",
+                # MOV AX,0x000B ; AAA ; HLT -> AH=1, AL=1
+                "code": bytes([0xB8, 0x0B, 0x00, 0x37, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0101},
+                "flags_expected": {"CF": 1, "AF": 1},
+                "expected_eip": 5,
+            },
+            {
+                "name": "AAA leaves AH alone when no adjust is needed",
+                "code": bytes([0xB8, 0x05, 0x03, 0x37, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0x0305},
+                "flags_expected": {"CF": 0, "AF": 0},
+                "expected_eip": 5,
+            },
+            {
+                "name": "AAS borrows the unpacked digit from AH",
+                # MOV AX,0x000B ; AAS ; HLT -> AX - 6 = 0x0005, AH - 1 = 0xFF
+                "code": bytes([0xB8, 0x0B, 0x00, 0x3F, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {0: 0xFF05},
+                "flags_expected": {"CF": 1, "AF": 1},
+                "expected_eip": 5,
+            },
         ])
 
         all_passed = True

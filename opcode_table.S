@@ -38,7 +38,7 @@
     .word .op_alu_al_imm8 + 1 // 0x24
     .word .op_alu_eax_imm32 + 1 // 0x25
     .word .op_seg_es_26 + 1 // 0x26
-    .word .exit_loop + 1 // 0x27
+    .word .op_daa_27 + 1 // 0x27
     .word .op_alu_eb_gb + 1 // 0x28
     .word .op_alu_ev_gv + 1 // 0x29
     .word .op_alu_gb_eb + 1 // 0x2a
@@ -46,7 +46,7 @@
     .word .op_alu_al_imm8 + 1 // 0x2c
     .word .op_alu_eax_imm32 + 1 // 0x2d
     .word .op_seg_cs_2E + 1 // 0x2e
-    .word .exit_loop + 1 // 0x2f
+    .word .op_das_2F + 1 // 0x2f
     .word .op_alu_eb_gb + 1 // 0x30
     .word .op_alu_ev_gv + 1 // 0x31
     .word .op_alu_gb_eb + 1 // 0x32
@@ -54,7 +54,7 @@
     .word .op_alu_al_imm8 + 1 // 0x34
     .word .op_alu_eax_imm32 + 1 // 0x35
     .word .op_seg_ss_36 + 1 // 0x36
-    .word .exit_loop + 1 // 0x37
+    .word .op_aaa_37 + 1 // 0x37
     .word .op_alu_eb_gb + 1 // 0x38
     .word .op_alu_ev_gv + 1 // 0x39
     .word .op_alu_gb_eb + 1 // 0x3a
@@ -62,7 +62,7 @@
     .word .op_alu_al_imm8 + 1 // 0x3c
     .word .op_alu_eax_imm32 + 1 // 0x3d
     .word .op_seg_ds_3E + 1 // 0x3e
-    .word .exit_loop + 1 // 0x3f
+    .word .op_aas_3F + 1 // 0x3f
     .word .op_inc_r32 + 1 // 0x40
     .word .op_inc_r32 + 1 // 0x41
     .word .op_inc_r32 + 1 // 0x42
@@ -243,7 +243,7 @@
     .word .exit_loop + 1 // 0xf1
     .word .op_repne_F2 + 1 // 0xf2
     .word .op_rep_F3 + 1 // 0xf3
-    .word .exit_loop + 1 // 0xf4
+    .word .op_hlt_F4 + 1 // 0xf4
     .word .op_cmc_F5 + 1 // 0xf5
     .word .op_grp3_eb_F6 + 1 // 0xf6
     .word .op_grp3_ev_F7 + 1 // 0xf7

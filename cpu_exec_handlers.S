@@ -1968,6 +1968,108 @@ L(SHIFT8_DONE):
     STRB R3, [R2, #0]
     B.W .fetch_decode_loop
 
+/* BCD adjust: DAA (27), DAS (2F), AAA (37), AAS (3F).
+ *
+ * Not exotic: a Pascal or C runtime formats decimal numbers with them, so a
+ * program that prints a number at all is liable to execute one. TOPBENCH stops
+ * on DAA the moment it has a score to print.
+ *
+ * Straight from the Intel pseudocode, including the parts that look wrong:
+ * DAA's second test has an ELSE that clears CF, so its final carry depends only
+ * on the ORIGINAL AL and carry, while DAS's has no ELSE and keeps the carry the
+ * first step produced. AAA/AAS leave SF, ZF and PF undefined and so leave them
+ * alone; DAA/DAS define them and set them from the result.
+ */
+OP_AGNOSTIC .op_daa_27
+    LDRB.W R3, [R8, #REG_EAX]      @ AL
+    MOV.W R4, R3                   @ old AL
+    UBFX R1, R11, #0, #1           @ old CF
+    AND.W R5, R3, #0x0F
+    CMP R5, #9
+    BHI.N 1f
+    TST.W R11, #0x10               @ AF
+    BEQ.N 2f
+1:  ADD.W R3, R3, #6
+    ORR.W R11, R11, #0x10          @ AF = 1
+    B.N 3f
+2:  BIC.W R11, R11, #0x10          @ AF = 0
+3:  CMP R4, #0x99
+    BHI.N 4f
+    CBZ R1, 5f
+4:  ADD.W R3, R3, #0x60
+    MOV.W R0, #1
+    B.N 6f
+5:  MOV.W R0, #0
+6:  BFI R11, R0, #0, #1            @ CF
+    UXTB R3, R3
+    STRB.W R3, [R8, #REG_EAX]
+    B.N L(BCD_RESULT_FLAGS)
+
+OP_AGNOSTIC .op_das_2F
+    LDRB.W R3, [R8, #REG_EAX]
+    MOV.W R4, R3                   @ old AL
+    UBFX R1, R11, #0, #1           @ old CF
+    MOV.W R0, #0                   @ new CF starts clear
+    AND.W R5, R3, #0x0F
+    CMP R5, #9
+    BHI.N 1f
+    TST.W R11, #0x10
+    BEQ.N 2f
+1:  CMP R3, #6
+    IT LO
+    MOVLO R0, #1                   @ borrow out of AL - 6
+    ORR.W R0, R0, R1               @ CF = old_CF OR that borrow
+    SUB.W R3, R3, #6
+    ORR.W R11, R11, #0x10          @ AF = 1
+    B.N 3f
+2:  BIC.W R11, R11, #0x10          @ AF = 0
+3:  CMP R4, #0x99
+    BHI.N 4f
+    CBZ R1, 5f
+4:  SUB.W R3, R3, #0x60
+    MOV.W R0, #1
+5:  BFI R11, R0, #0, #1
+    UXTB R3, R3
+    STRB.W R3, [R8, #REG_EAX]
+L(BCD_RESULT_FLAGS):
+    LSLS.W R5, R3, #24             @ N/Z for the byte
+    MRS R1, APSR
+    X86_SF_ZF R1, R5
+    X86_PF R3, R5
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_aaa_37
+    LDRH.W R3, [R8, #REG_EAX]      @ AX
+    AND.W R5, R3, #0x0F
+    CMP R5, #9
+    BHI.N 1f
+    TST.W R11, #0x10
+    BEQ.N 2f
+1:  ADD.W R3, R3, #0x106           @ AL += 6, AH += 1
+    ORR.W R11, R11, #0x11          @ AF and CF
+    B.N 3f
+2:  BIC.W R11, R11, #0x11
+3:  BIC.W R3, R3, #0xF0            @ AL &= 0x0F, AH untouched
+    STRH.W R3, [R8, #REG_EAX]
+    B.W .fetch_decode_loop
+
+OP_AGNOSTIC .op_aas_3F
+    LDRH.W R3, [R8, #REG_EAX]
+    AND.W R5, R3, #0x0F
+    CMP R5, #9
+    BHI.N 1f
+    TST.W R11, #0x10
+    BEQ.N 2f
+1:  SUB.W R3, R3, #6               @ AX -= 6, then AH -= 1
+    SUB.W R3, R3, #0x100
+    ORR.W R11, R11, #0x11
+    B.N 3f
+2:  BIC.W R11, R11, #0x11
+3:  BIC.W R3, R3, #0xF0
+    UXTH R3, R3
+    STRH.W R3, [R8, #REG_EAX]
+    B.W .fetch_decode_loop
+
 OP_AGNOSTIC .op_cld_FC
     BIC.W R11, R11, #1024
     B.W .fetch_decode_loop
@@ -2966,15 +3068,23 @@ L(LOOP_TAKEN):
 OP_AGNOSTIC .op_lock_F0
     B.W .fetch_decode_loop
 
+/* HLT is not a stop, it is "idle until the next interrupt" -- which is how a
+   timing loop waits for the periodic tick. Reported with its own exit reason so
+   the frame loop can raise that interrupt and let the guest continue, rather
+   than latching it as a dead machine the way an unimplemented opcode is. EIP is
+   already past the HLT, which is where the IRET from the handler belongs. */
 OP_AGNOSTIC .op_hlt_F4
     LDR.W R2, [R8, #CPU_CR0]        // CR0
     TST.W R2, #1                // Check PE bit
-    BEQ.W .exit_loop            // Real mode: HLT allowed
+    BEQ.N L(HLT_IDLE)           // Real mode: HLT allowed
     LDRH.W R2, [R8, #SEG_CS_SEL]  // CS.sel
     AND.W R2, R2, #3            // CPL = CS.sel[1:0]
     CMP R2, #0
     BNE.W .raise_gp_fault       // #GP if not ring 0
-    B.W .exit_loop
+L(HLT_IDLE):
+    MOV.W R2, #X86_EXIT_HALT
+    STR.W R2, [R8, #CPU_EXIT_REASON]
+    B.W .save_state_and_exit
 
 OP_AGNOSTIC .op_cmc_F5
     EOR.W R11, R11, #1
