@@ -46,9 +46,9 @@ relocations, INT 21h on FatFs -- fed by the guest `.dsk` streamed from SD.
 
 ## Phase 3 — Wolf3D
 
-- [ ] COW/pool/eviction with dirty tracking and loud exhaustion; pool sizing
+- [ ] COW/pool/eviction with dirty tracking, loud exhaustion; pool sizing
 - [ ] Gate: measure DOS FAT/sector overhead → decide the INT 21h fast path
-- [ ] Protected mode: descriptor validation, far transfers, IRET privilege change, paging walk
+- [ ] Protected mode: descriptors, far transfers, IRET privilege change, paging
 - [ ] Profile-directed tuning against a Wolf3D DWT profile
 
 ## TOPBENCH (the current 16-bit correctness driver)
