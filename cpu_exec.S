@@ -39,49 +39,93 @@
     .equ REC_TABLE_0F,    -8
     .equ MODE_REC_TABLE_OFF, 1024
 
+    /* ---------------------------------------------------------------- *
+     * The NOR cold-page trap.
+     *
+     * A page backed by memory-mapped NOR lives at 0x9xxxxxxx, so bit 31 of
+     * `lin + k` is SET and the fold check traps on EVERY access to it. That is
+     * deliberate and the sentinel encoding is not negotiable: the check is two
+     * instructions on the hottest path in the project, and a cold page paying a
+     * slow path is the entire point of putting it in NOR.
+     *
+     * So the FAST PATH BELOW IS UNCHANGED, instruction for instruction. All
+     * that moves is where the BMI goes: to a per-site stub that can service the
+     * access, instead of straight to .mem_fault, which killed the guest.
+     *
+     * The stub is out of line but still in ITCM. It has to be: BMI reaches
+     * +/-1 MB and .text is linked into RAM_EMU at 0x24xxxxxx, ~600 MB away.
+     * It costs ~28 bytes per site against 29 KB of ITCM headroom.
+     *
+     * READ vs WRITE is a property of the SITE and nothing the helper can
+     * recover, which is why there are two macros. A read is served straight out
+     * of NOR; a write copies the page into AXI first (copy-on-write) and
+     * repoints the fold entry. A site that does both is a WRITE site -- COW up
+     * front is always CORRECT there, merely pessimistic, so the conservative
+     * default can never corrupt a guest.
+     *
+     * The helper leaves its answer in cpu->nor_ptr rather than returning it in
+     * R0, because the stub has to restore R0-R3 before it can use the value and
+     * the destination register may be any of them (or R12). One LDR off R8
+     * reaches it; a global would need a literal pool inside ITCM. Zero means
+     * "genuinely unmapped", and then the stub takes the old .mem_fault exit --
+     * an absent page is still a clean, reported fault, not a hard fault.
+     * ---------------------------------------------------------------- */
+    .macro MEM_TRAP ptr, wr
+        BMI 99f
+98:
+        .pushsection .itcram_hot.norslow, "ax", %progbits
+99:     PUSH {R0-R3, R12, LR}
+        MOV R0, \ptr                  @ PUSH stores, it does not clobber
+    .if \wr
+        BL x86_nor_slow_w
+    .else
+        BL x86_nor_slow_r
+    .endif
+        POP {R0-R3, R12, LR}
+        LDR \ptr, [R8, #CPU_NOR_PTR]
+        CMP \ptr, #0
+        BEQ .mem_fault
+        B 98b
+        .popsection
+    .endm
+
+    .macro MEM_TRAP_R ptr
+        MEM_TRAP \ptr, 0
+    .endm
+
+    .macro MEM_TRAP_W ptr
+        MEM_TRAP \ptr, 1
+    .endm
+
     /* Translate a guest linear address to a host pointer, CHECKED.
      *
-     * host = lin + k, where k comes from the fold table. A mapped page yields
-     * a RAM pointer (bit 31 clear); an unmapped page's FOLD_INVALID drives the
-     * result negative, so ADDS/BMI catches it. Same four instructions as the
-     * old UBFX/LDR/BFC/BFI, but that version trusted the entry: a zero entry
-     * produced `0 | offset`, and address 0 is ITCM -- so a guest write to an
-     * unmapped page silently overwrote the interpreter's own instructions. */
-    .macro MEM_GET_PTR dest_ptr, vaddr
+     * host = lin + k, where k comes from the fold table. A mapped AXI page
+     * yields a RAM pointer (bit 31 clear); an unmapped page's FOLD_INVALID and
+     * a NOR-backed page's 0x9xxxxxxx both drive the result negative, so
+     * ADDS/BMI catches both and the stub tells them apart. Same four
+     * instructions as the old UBFX/LDR/BFC/BFI, but that version trusted the
+     * entry: a zero entry produced `0 | offset`, and address 0 is ITCM -- so a
+     * guest write to an unmapped page silently overwrote the interpreter's own
+     * instructions. */
+    .macro MEM_GET_PTR_R dest_ptr, vaddr
         UBFX \dest_ptr, \vaddr, #12, #12
         LDR \dest_ptr, [R9, \dest_ptr, LSL #2]
         ADDS \dest_ptr, \dest_ptr, \vaddr
-        BMI .mem_fault
+        MEM_TRAP_R \dest_ptr
     .endm
 
-    .macro MEM_READ8 dest, vaddr, scratch
-        MEM_GET_PTR \scratch, \vaddr
-        LDRB \dest, [\scratch]
+    .macro MEM_GET_PTR_W dest_ptr, vaddr
+        UBFX \dest_ptr, \vaddr, #12, #12
+        LDR \dest_ptr, [R9, \dest_ptr, LSL #2]
+        ADDS \dest_ptr, \dest_ptr, \vaddr
+        MEM_TRAP_W \dest_ptr
     .endm
 
-    .macro MEM_WRITE8 src, vaddr, scratch
-        MEM_GET_PTR \scratch, \vaddr
-        STRB \src, [\scratch]
-    .endm
-
-    .macro MEM_READ16 dest, vaddr, scratch
-        MEM_GET_PTR \scratch, \vaddr
-        LDRH \dest, [\scratch]
-    .endm
-
-    .macro MEM_WRITE16 src, vaddr, scratch
-        MEM_GET_PTR \scratch, \vaddr
-        STRH \src, [\scratch]
-    .endm
-
-    .macro MEM_READ32 dest, vaddr, scratch
-        MEM_GET_PTR \scratch, \vaddr
-        LDR \dest, [\scratch]
-    .endm
-
-    .macro MEM_WRITE32 src, vaddr, scratch
-        MEM_GET_PTR \scratch, \vaddr
-        STR \src, [\scratch]
+    /* Unqualified = WRITE, i.e. the safe answer. A site that only ever loads
+       through the pointer should say MEM_GET_PTR_R and get to stay in NOR;
+       forgetting to only costs it a needless pull-back into AXI. */
+    .macro MEM_GET_PTR dest_ptr, vaddr
+        MEM_GET_PTR_W \dest_ptr, \vaddr
     .endm
 
 /* ------------------------------------------------------------------ *
@@ -306,7 +350,7 @@ x86_cpu_interp_asm:
     UBFX R0, R10, #12, #12
     LDR.W R0, [R9, R0, LSL #2]
     ADDS R0, R0, R10
-    BMI .mem_fault
+    MEM_TRAP_R R0
     LDRB R0, [R0]
     ADD R10, R10, #1
 #if X86_PROFILE

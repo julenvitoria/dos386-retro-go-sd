@@ -106,6 +106,9 @@ uint8_t dosfile_img[DOSFILE_IMG_BYTES] __attribute__((aligned(4)));
 volatile uint32_t run_dosfile_flag = 0;
 volatile uint32_t dosfile_r[32];
 
+volatile uint32_t run_nor_flag = 0;
+volatile uint32_t nor_r[24];
+
 volatile uint32_t run_video_flag = 0;
 volatile uint32_t video_blit_cycles = 0;
 uint8_t cga_test_vram[X86_VRAM_BYTES] __attribute__((section(".test_bss")));
@@ -697,6 +700,142 @@ static const uint8_t dosfile_guest_code[] = {
 
 static FATFS dosfile_fs;
 
+/* ---------------------------------------------------------------------- *
+ * NOR cold-page backing, driven by GUEST code.
+ *
+ * The "NOR" here is the extflash window at 0x90000000 itself, written with
+ * plain stores. Under gwemu that region is real backing memory, which is
+ * exactly what makes this a tier-1 test: no flash programming, no OCTOSPI, no
+ * SD card and no firmware -- but the ADDRESS is genuine, so bit 31 is set and
+ * the interpreter's fold check traps for the real reason it will on silicon.
+ * A buffer in .bss would have bit 31 CLEAR and would never trap at all, so it
+ * would test nothing.
+ *
+ * The guest program is what exercises it. Reading the counters after a host-C
+ * memcpy would only prove that C works; a read served out of NOR and a write
+ * that pulls a page back into AXI are properties of the trap stubs, and only
+ * executing guest instructions can show them.
+ * ---------------------------------------------------------------------- */
+#define NOR_TEST_PAGES  8u
+#define NOR_TEST_BYTES  (NOR_TEST_PAGES * 4096u)
+#define NOR_TEST_FIRST  200u                       /* guest page, clear of test_ram */
+#define NOR_TEST_SEG    (NOR_TEST_FIRST * 4096u / 16u)   /* 0xC800 */
+#define NOR_FAKE_BASE   ((uint8_t *)0x90000000u)
+
+static uint8_t nor_test_ram[NOR_TEST_BYTES]
+    __attribute__((aligned(4096), section(".test_bss")));
+
+static uint8_t nor_pattern_byte(uint32_t off)
+{
+    return (uint8_t)(off * 7u + (off >> 8) * 31u + 1u);   /* never 0, never uniform */
+}
+
+static void nor_test_run(void)
+{
+    for (uint32_t i = 0; i < 24; i++)
+        nor_r[i] = 0;
+
+    for (uint32_t i = 0; i < NOR_TEST_BYTES; i++)
+        nor_test_ram[i] = nor_pattern_byte(i);
+
+    for (uint32_t i = 0; i < NOR_TEST_PAGES; i++) {
+        guest_page_table[NOR_TEST_FIRST + i] =
+            FOLD_K((uint32_t)nor_test_ram + i * 4096u, NOR_TEST_FIRST + i);
+    }
+
+    /* ---- 1. A snapshot that does not match must be REFUSED outright.
+     * This is the invariant the whole design turns on: a half-applied remap
+     * must be impossible, so the fold table is not touched until the bytes in
+     * NOR have been read back and verified. Corrupt one byte and the attach
+     * has to fail with the guest still running out of AXI. */
+    memcpy(NOR_FAKE_BASE, nor_test_ram, NOR_TEST_BYTES);
+    NOR_FAKE_BASE[0x2345] ^= 0xFF;
+    nor_r[0] = (uint32_t)x86_nor_attach(NOR_FAKE_BASE, NOR_TEST_BYTES,
+                                        nor_test_ram, NOR_TEST_BYTES,
+                                        NOR_TEST_FIRST);
+    nor_r[1] = x86_nor_attach_err;
+    nor_r[2] = x86_nor_attached;
+    nor_r[3] = (guest_page_table[NOR_TEST_FIRST]
+                == FOLD_K((uint32_t)nor_test_ram, NOR_TEST_FIRST));
+
+    /* ---- 2. The real thing. */
+    NOR_FAKE_BASE[0x2345] ^= 0xFF;
+    nor_r[4] = (uint32_t)x86_nor_attach(NOR_FAKE_BASE, NOR_TEST_BYTES,
+                                        nor_test_ram, NOR_TEST_BYTES,
+                                        NOR_TEST_FIRST);
+    nor_r[5] = x86_nor_attached;
+    nor_r[6] = x86_nor_pages_total;
+    nor_r[7] = x86_nor_pages_nor;
+    nor_r[8] = x86_nor_axi_free;
+
+    /* ---- 3. Guest code. 16-bit real mode, CS = 0, DS = the snapshot.
+     *
+     *   MOV AX, NOR_TEST_SEG      B8 lo hi
+     *   MOV DS, AX                8E D8
+     *   MOV AL, [3000h]           A0 00 30     read, served out of NOR
+     *   MOV [5000h], AL           A2 00 50     write, pulls page 5 into AXI
+     *   INC AL                    FE C0
+     *   MOV [5001h], AL           A2 01 50     write again, now the fast path
+     *   MOV AL, [5000h]           A0 00 50     read back through the fold
+     *   HLT                       F4
+     *
+     * The read-back lands in AL and is checked there. An extra store to park
+     * it somewhere would have gone through DS -- i.e. into the snapshot -- and
+     * COWed a SECOND page, which is exactly what the first version of this
+     * test did and why its counters read 2 instead of 1.
+     */
+    static const uint8_t prog[] = {
+        0xB8, (uint8_t)(NOR_TEST_SEG & 0xFF), (uint8_t)(NOR_TEST_SEG >> 8),
+        0x8E, 0xD8,
+        0xA0, 0x00, 0x30,
+        0xA2, 0x00, 0x50,
+        0xFE, 0xC0,
+        0xA2, 0x01, 0x50,
+        0xA0, 0x00, 0x50,
+        0xF4,
+    };
+    memcpy(test_ram, prog, sizeof(prog));
+
+    memset(&cpu_state_dtcm, 0, sizeof(cpu_state_dtcm));
+    for (int i = 0; i < 6; i++)
+        cpu_state_dtcm.segs[i].limit = 0xFFFFFFFF;
+    cpu_state_dtcm.pit_reload = 0xFFFFFFFF;
+    cpu_state_dtcm.pit_counter = 0xFFFFFFFF;
+    cpu_state_dtcm.regs[4] = 0x3000;
+
+    uint32_t reads0 = x86_nor_reads;
+    x86_cpu_interp_asm();
+
+    nor_r[9]  = cpu_state_dtcm.exit_reason;      /* 6 = HLT, i.e. it finished */
+    nor_r[10] = x86_nor_reads - reads0;
+    nor_r[11] = x86_nor_writes;
+    nor_r[12] = x86_nor_cow_pulls;
+    nor_r[13] = x86_nor_cow_failures;
+    nor_r[14] = x86_nor_pages_nor;
+    nor_r[15] = x86_nor_pages_axi;
+    nor_r[16] = x86_nor_axi_free;
+    nor_r[17] = x86_nor_unmapped;
+
+    /* What the guest actually moved. The byte at 0x3000 came out of NOR, was
+       stored into page 5 and read straight back; AL must hold it. */
+    nor_r[18] = nor_pattern_byte(0x3000);
+    nor_r[19] = cpu_state_dtcm.regs[0] & 0xFFu;
+
+    /* The COW page took the write; the NOR copy must be UNTOUCHED. If a store
+       ever reached NOR this is the only thing that would notice. */
+    nor_r[20] = NOR_FAKE_BASE[0x5000];
+    nor_r[21] = NOR_FAKE_BASE[0x5001];
+    nor_r[22] = nor_pattern_byte(0x5000);
+
+    /* Page 5 is on the fast path now: its fold entry must be an AXI address
+       from the COW pool, i.e. bit 31 CLEAR. */
+    {
+        uint32_t idx = NOR_TEST_FIRST + 5;
+        uint32_t host = guest_page_table[idx] + (idx << 12);
+        nor_r[23] = (host >> 31) & 1u;
+    }
+}
+
 static void dosfile_test_run(void)
 {
     static const uint8_t hle_vectors[] = {
@@ -904,6 +1043,11 @@ void Reset_Handler(void) {
             run_benchmark_flag = 0;
         }
         
+        if (run_nor_flag == 1) {
+            nor_test_run();
+            run_nor_flag = 0;
+        }
+
         if (run_dos_flag == 1) {
             /* Exercise the arena the way a program does: allocate, allocate,
                free the first, allocate something that only fits if the freed

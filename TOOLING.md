@@ -108,6 +108,33 @@ Guest time must not move with render rate. The measurement that proves it is
 `guest_ticks / guest_uptime_ms` at two different frame rates — force a low one
 with a large `--set guest_kips=…` or by loading a heavy guest.
 
+#### Cold guest RAM in NOR, and what to read off it
+
+```bash
+# the whole story in one word; the timeline opens the menu and presses A on
+# "Cold RAM->NOR" after letting the guest settle for 20 s
+python3 scripts/probe.py --retrogo --wait-magic \
+    --timeline timelines/nor-snapshot.tl --samples 34 --interval 1.5 \
+    --watch nor,guest_ips_achieved,frames_rendered
+```
+
+`--watch` takes GROUP names as well as symbols; `nor` is the set below. Groups
+live in `WATCH_GROUPS` at the top of `scripts/probe.py` — add to that rather
+than pasting seventeen symbols that go stale the moment a counter is added.
+
+| Symbol | Meaning |
+|---|---|
+| `nor_snap_result` | 0 = never run, 1 = ok, else the reason. **8 is the one to fear**: the firmware's ROM cache served a HIT, programmed nothing and never called our relocate callback, so the address it returned points at an OLD snapshot. The core refuses to remap on it. See `NOR_SNAP_*` in `src/main.c` |
+| `nor_snap_cb_bytes` | bytes the relocate callback actually filled. Anything other than 655,360 means the snapshot in flash is not the guest's memory, whatever the returned address looks like |
+| `nor_snap_addr` / `nor_snap_ms` | where the firmware placed it, and what the whole operation cost (placeholder file to SD, erase, program, readback verify). **1,595–1,614 ms under gwemu, which is NOT a timing claim** — `docs/04`, and OCTOSPI erase/program latency is not modelled |
+| `x86_nor_attached` / `x86_nor_attach_err` | is the guest running out of NOR at all, and if not, which check refused it. `7` means the flash readback did not match guest RAM — the fold table was never touched and the guest is still on AXI, which is the invariant the design turns on |
+| `x86_nor_pages_nor` / `_axi` / `_total` | **the measurement.** Pages still served from NOR versus pulled back by copy-on-write. `pages_nor / pages_total` is the answer to "what fraction of this guest's RAM is genuinely read-only once it has settled", and it is measured rather than guessed because the policy is demand-driven with no heuristic in it |
+| `x86_nor_axi_free` | AXI bytes reclaimed — what is left unclaimed in the COW pool. The pool IS the old guest RAM block; `ram_malloc()` has no `free()`, so this is the honest number rather than a claim about the allocator |
+| `x86_nor_reads` / `x86_nor_writes` | slow-path reads and writes. Reads dominate by orders of magnitude and include every INSTRUCTION FETCH from a NOR-backed code page — that is the cost of the trade, and it is why `guest_ips_achieved` is the number to read next to these |
+| `x86_nor_cow_pulls` / `x86_nor_host_cow` | pages copied NOR → AXI, and how many of those were forced by a HOST write rather than a guest one. The host side (BDA tick, INT 21h filling a DTA, a disk read landing in a guest buffer) goes through `x86_guest_ptr()` and never touches the trap stubs; a `pages_axi` that is implausibly small is what exposes a host path storing straight at the XIP window, which gwemu makes look like it works |
+| `x86_nor_cow_failures` / `x86_nor_unmapped` | the loud failures: the COW pool empty (structurally impossible — it is exactly as large as the snapshot) and traps that were a genuine unmapped access. Both should be 0 |
+| `x86_nor_slow_cycles` | DWT cycles inside the slow path. Ranking only under gwemu |
+
 ### `watch_memory.py` — catch whatever is writing to an address
 
 ```bash
@@ -427,6 +454,23 @@ python3 tests/test_video.py              # CGA mode 4 blitter, pixel-exact, plus
                                          # mode 0 at 40 columns and the 8x8
                                          # cell; and a mode nothing renders
                                          # being REFUSED, not adopted
+python3 tests/test_nor.py                # NOR cold-page backing and COW, driven
+                                         # by GUEST code. The fake NOR is the
+                                         # extflash window ITSELF, written with
+                                         # plain stores -- ordinary memory under
+                                         # gwemu, but a genuine 0x9xxxxxxx
+                                         # address, so bit 31 is set and the
+                                         # fold check traps for the same reason
+                                         # it will on silicon. A .bss buffer
+                                         # would never trap and would prove
+                                         # nothing. 23 checks: a mismatched
+                                         # snapshot REFUSED with the fold table
+                                         # verifiably untouched, a read served
+                                         # from NOR, a write that COWs exactly
+                                         # one page, a second write to that page
+                                         # that does not trap at all, and the
+                                         # NOR image byte-unchanged after both
+python3 tests/test_video.py              # CGA mode 4 blitter, pixel-exact
 python3 tests/test_text.py               # CGA text mode 3, pixel-exact:
                                          # CP437 at 4x8 and 8x8, attributes,
                                          # all 80 columns, scroll, line-art

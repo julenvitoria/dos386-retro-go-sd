@@ -970,6 +970,7 @@ static const uint8_t pad_scancode[10] = {
  */
 #define CPU_PROFILE_KEY   "Palette"
 #define CPU_OPTION_ID     100
+#define NOR_OPTION_ID     101
 
 static const uint16_t cpu_profile_kips[] = {
     KIPS_MAX, KIPS_8088_477, KIPS_286_8, KIPS_286_12, KIPS_386SX_16, KIPS_386_33,
@@ -1033,6 +1034,198 @@ static void cpu_profile_init(const gw_firmware_abi_t *abi)
     cpu_profile_apply(abi->odroid_settings_app_int32_get(CPU_PROFILE_KEY, 0));
 }
 
+/* ====================================================================== *
+ * Moving guest RAM into NOR.
+ *
+ * x86_nor.c owns the mechanism and knows nothing about flash; this is the
+ * transport that gets the bytes there, and it is the only part that needs the
+ * firmware ABI. Splitting it this way is what keeps the mechanism testable at
+ * tier 1 with no flash at all (tests/test_nor.py), and it leaves
+ * x86_nor_attach() as the seam a real savestate system would reuse.
+ *
+ * ---- The one door the firmware gives us ------------------------------------
+ *
+ * There is exactly ONE flash-write entry in the ABI:
+ * odroid_overlay_cache_file_in_flash_relocate(). It is the ROM cache -- it
+ * takes a PATH, erases, programs, and hands back the XIP address. There is no
+ * buffer-to-flash call, no OSPI_Erase, no OSPI_Program and no way to query the
+ * flash size or invalidate the cache.
+ *
+ * So the snapshot goes in through the RELOCATE CALLBACK. That callback gets
+ * each 16 KB chunk in RAM, after the final flash address is known and before
+ * anything is programmed, and is explicitly allowed to modify it in place. We
+ * overwrite it with live guest RAM. The file on the SD card therefore only has
+ * to be the right SIZE -- its contents never reach flash, so there is no
+ * 640 KB dump of guest memory to the card and no window where the card holds a
+ * half-written copy of the guest.
+ *
+ * ---- The stale-hit hazard, and the two things that close it ---------------
+ *
+ * The cache keys on crc32(path) + crc32(mtime). ON A HIT NOTHING IS
+ * PROGRAMMED AND THE CALLBACK NEVER RUNS -- and the call still returns a
+ * perfectly valid-looking address, pointing at whatever an earlier snapshot
+ * left there. Remapping onto that would corrupt the guest with no error
+ * anywhere, which is the worst failure shape this whole feature has.
+ *
+ * Two independent guards, either of which alone would be enough:
+ *   1. a fresh filename per snapshot, so a hit cannot be reached; and
+ *   2. the callback's coverage is COUNTED. If it did not fill the whole file
+ *      we refuse, whatever the returned address looks like.
+ * And behind both, x86_nor_attach() reads the flash back and byte-compares it
+ * against guest RAM before it moves a single fold entry.
+ * ====================================================================== */
+volatile uint32_t nor_snap_events   = 0;  /* menu presses that reached us     */
+volatile uint32_t nor_snap_result   = 0;  /* 0 = never run, 1 = ok, else why  */
+volatile uint32_t nor_snap_cb_bytes = 0;  /* bytes the relocate cb filled     */
+volatile uint32_t nor_snap_ms       = 0;  /* wall time the whole thing took   */
+volatile uint32_t nor_snap_addr     = 0;  /* XIP address the firmware chose   */
+
+#define NOR_SNAP_OK            1
+#define NOR_SNAP_NO_RAM        2
+#define NOR_SNAP_NO_PATH       3
+#define NOR_SNAP_PLACEHOLDER   4
+#define NOR_SNAP_CACHE_NULL    5
+#define NOR_SNAP_NOT_NOR       6
+#define NOR_SNAP_SIZE          7
+#define NOR_SNAP_STALE_HIT     8
+#define NOR_SNAP_ATTACH        9
+#define NOR_SNAP_ALREADY      10
+
+static char nor_snap_path[sizeof(dsk_path) + 32];
+
+static void nor_snap_fill(uint8_t *buf, uint32_t len, uint32_t off,
+                          uint8_t *file_addr, uint32_t file_size)
+{
+    (void)file_addr;
+    (void)file_size;
+    if (!guest_ram || off >= GUEST_RAM_SIZE)
+        return;
+    uint32_t n = len;
+    if (off + n > GUEST_RAM_SIZE)
+        n = GUEST_RAM_SIZE - off;
+    memcpy(buf, guest_ram + off, n);
+    nor_snap_cb_bytes += n;
+}
+
+/* A file of the right length and nothing else. 512 bytes of zeros pushed
+   1280 times: the contents are irrelevant (the callback replaces every byte on
+   the way to flash) and this needs no allocation, which matters in a region
+   with single-digit kilobytes of headroom. */
+static int nor_snap_make_placeholder(const gw_firmware_abi_t *abi,
+                                     const char *path)
+{
+    static const uint8_t zeros[512];
+    FILE *f = abi->fopen(path, "wb");
+    if (!f)
+        return -1;
+    for (uint32_t off = 0; off < GUEST_RAM_SIZE; off += sizeof(zeros)) {
+        if (abi->fwrite(zeros, 1, sizeof(zeros), f) != sizeof(zeros)) {
+            abi->fclose(f);
+            abi->remove(path);
+            return -1;
+        }
+    }
+    abi->fclose(f);
+    return 0;
+}
+
+static void nor_snapshot_run(void)
+{
+    const gw_firmware_abi_t *abi = gw_firmware_abi();
+    uint32_t t0 = abi->HAL_GetTick();
+
+    if (x86_nor_attached)  { nor_snap_result = NOR_SNAP_ALREADY;  return; }
+    if (!guest_ram)        { nor_snap_result = NOR_SNAP_NO_RAM;   return; }
+    if (!dsk_path[0])      { nor_snap_result = NOR_SNAP_NO_PATH;  return; }
+
+    /* Next to the .dsk: that directory demonstrably exists and is writable
+       (the disk write-back path opens the image there "r+b"). The name carries
+       the millisecond tick so no two snapshots in a session can collide, which
+       is what keeps the ROM cache from serving a hit. */
+    size_t dir = 0;
+    for (size_t i = 0; dsk_path[i]; i++)
+        if (dsk_path[i] == '/')
+            dir = i + 1;
+    if (dir + 24 >= sizeof(nor_snap_path)) { nor_snap_result = NOR_SNAP_NO_PATH; return; }
+    memcpy(nor_snap_path, dsk_path, dir);
+    {
+        static const char hex[] = "0123456789ABCDEF";
+        uint32_t tag = abi->HAL_GetTick();
+        char *p = nor_snap_path + dir;
+        const char *pre = "norsnap";
+        while (*pre) *p++ = *pre++;
+        for (int i = 28; i >= 0; i -= 4)
+            *p++ = hex[(tag >> i) & 0xF];
+        *p++ = '.'; *p++ = 'b'; *p++ = 'i'; *p++ = 'n'; *p = 0;
+    }
+
+    if (nor_snap_make_placeholder(abi, nor_snap_path) != 0) {
+        nor_snap_result = NOR_SNAP_PLACEHOLDER;
+        return;
+    }
+
+    nor_snap_cb_bytes = 0;
+    uint32_t size = 0;
+    uint8_t *xip = abi->odroid_overlay_cache_file_in_flash_relocate(
+        nor_snap_path, &size, false, nor_snap_fill);
+
+    /* The placeholder has done its job either way; leaving 640 KB files behind
+       on the card would be its own bug. */
+    abi->remove(nor_snap_path);
+
+    if (!xip)                        { nor_snap_result = NOR_SNAP_CACHE_NULL; return; }
+    nor_snap_addr = (uint32_t)xip;
+    if ((uint32_t)xip < 0x90000000u || (uint32_t)xip >= 0x94000000u)
+                                     { nor_snap_result = NOR_SNAP_NOT_NOR;   return; }
+    if (size != GUEST_RAM_SIZE)      { nor_snap_result = NOR_SNAP_SIZE;      return; }
+    /* The cache-hit guard: a hit programs nothing and never calls us back. */
+    if (nor_snap_cb_bytes != GUEST_RAM_SIZE)
+                                     { nor_snap_result = NOR_SNAP_STALE_HIT; return; }
+
+    /* Only now, and x86_nor_attach() still reads the flash back and compares
+       it byte for byte before it touches the fold table. If anything above was
+       wrong the guest is still running, unchanged, out of AXI. */
+    if (x86_nor_attach(xip, size, guest_ram, GUEST_RAM_SIZE, 0) != 0) {
+        nor_snap_result = NOR_SNAP_ATTACH;
+        return;
+    }
+    nor_snap_result = NOR_SNAP_OK;
+    nor_snap_ms = abi->HAL_GetTick() - t0;
+}
+
+/* The menu entry, next to CPU Speed. The value buffer must be static: the
+   options array lives on poll_input's stack but the firmware keeps the value
+   pointer, and it is what the entry shows after our callback returns. */
+static char nor_snap_value[20] = "Off";
+
+static bool nor_snap_cb(odroid_dialog_choice_t *option,
+                        odroid_dialog_event_t event, uint32_t repeat)
+{
+    (void)repeat;
+    nor_snap_events++;
+
+    if (event == ODROID_DIALOG_ENTER && !x86_nor_attached)
+        nor_snapshot_run();
+
+    if (x86_nor_attached) {
+        /* Pages still in NOR is the number worth showing: it is the answer to
+           "how much of this guest is genuinely read-only". */
+        strcpy(nor_snap_value, "NOR ");
+        uint32_t n = x86_nor_pages_nor, i = 4;
+        if (n >= 100) nor_snap_value[i++] = '0' + (n / 100) % 10;
+        if (n >= 10)  nor_snap_value[i++] = '0' + (n / 10) % 10;
+        nor_snap_value[i++] = '0' + n % 10;
+        nor_snap_value[i++] = 'p';
+        nor_snap_value[i] = 0;
+    } else if (nor_snap_result && nor_snap_result != NOR_SNAP_OK) {
+        strcpy(nor_snap_value, "Failed");
+    } else {
+        strcpy(nor_snap_value, "Off");
+    }
+    strcpy(option->value, nor_snap_value);
+    return event == ODROID_DIALOG_ENTER;
+}
+
 /*
  * Repaint the guest frame under the overlay.
  *
@@ -1076,6 +1269,7 @@ static void poll_input(const gw_firmware_abi_t *abi)
        has to outlive the call, and it is static. */
     odroid_dialog_choice_t options[] = {
         {CPU_OPTION_ID, "CPU Speed", cpu_profile_value, 1, &cpu_profile_cb},
+        {NOR_OPTION_ID, "Cold RAM->NOR", nor_snap_value, 1, &nor_snap_cb},
         ODROID_DIALOG_CHOICE_LAST,
     };
     abi->common_emu_input_loop(&pad, options, core_repaint);

@@ -72,6 +72,7 @@ int main(void)
     EMIT("CPU_REP_ZF_SENSE", offsetof(X86CPUState, rep_zf_sense));
     EMIT("CPU_REP_HANDLER",  offsetof(X86CPUState, rep_handler));
     EMIT("CPU_REP_BATCH",    offsetof(X86CPUState, rep_batch));
+    EMIT("CPU_NOR_PTR",      offsetof(X86CPUState, nor_ptr));
     EMIT("CPU_TABLE_BASE",       offsetof(X86CPUState, opcode_table_base));
     printf("\n    .equ %-24s, %zu\n", "CPU_STATE_SIZE", sizeof(X86CPUState));
 

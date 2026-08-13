@@ -237,7 +237,7 @@
         UBFX \tmp, R10, #12, #12
         LDR.W \tmp, [R9, \tmp, LSL #2]
         ADDS \tmp, \tmp, R10
-        BMI .mem_fault
+        MEM_TRAP_R \tmp                @ instruction stream: always a read
         TST.W R2, #ADDRSIZE_XOR
         BNE 9f
         LDRH \out, [\tmp]             @ 16-bit addressing: moffs16
@@ -295,7 +295,7 @@
         UBFX \tsp, \tptr, #12, #12
         LDR.W \tsp, [R9, \tsp, LSL #2]
         ADDS \tsp, \tsp, \tptr
-        BMI .mem_fault
+        MEM_TRAP_W \tsp
         ST_V \val, \tsp
     .endm
 
@@ -306,7 +306,7 @@
         UBFX \dest, \tptr, #12, #12
         LDR.W \dest, [R9, \dest, LSL #2]
         ADDS \dest, \dest, \tptr
-        BMI .mem_fault
+        MEM_TRAP_R \dest
         LD_V \dest, \dest
         SP_INC \tsp
         SP_WRAP \tsp
@@ -395,7 +395,7 @@ OP .op_mov_r32_imm32
     UBFX R3, R10, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R10
-    BMI .mem_fault
+    MEM_TRAP_R R3
     LD_V R3, R3
     EIP_ADV_V
     STREG_V R3, R2
@@ -405,7 +405,7 @@ OP_AGNOSTIC .op_alu_eb_gb
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -440,7 +440,7 @@ L(ALU_EB_GB_MEM):
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
-    BMI .mem_fault
+    MEM_TRAP_R R2
     LDRB R3, [R2, #0]
 L(ALU_DISPATCH_8_SUBOP):
     UBFX R12, R0, #3, #3
@@ -453,7 +453,7 @@ OP .op_alu_ev_gv
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -479,7 +479,7 @@ L(ALU_EV_GV_MEM):
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
-    BMI .mem_fault
+    MEM_TRAP_R R2
     LD_V R3, R2
 L(ALU_DISPATCH_32_SUBOP):
     UBFX R12, R0, #3, #3
@@ -492,7 +492,7 @@ OP_AGNOSTIC .op_alu_gb_eb
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -520,7 +520,7 @@ L(ALU_GB_EB_MEM):
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
-    BMI .mem_fault
+    MEM_TRAP_R R2
     LDRB R5, [R2, #0]
     UBFX R4, R1, #3, #3
     AND.W R3, R4, #3
@@ -541,7 +541,7 @@ OP .op_alu_gv_ev
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -563,7 +563,7 @@ L(ALU_GV_EV_MEM):
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
-    BMI .mem_fault
+    MEM_TRAP_R R2
     LD_V R5, R2
     UBFX R4, R1, #3, #3
     MOV.W R4, R4, LSL #2
@@ -581,7 +581,7 @@ OP_AGNOSTIC .op_alu_al_imm8
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     ADD.W R2, R8, #8
@@ -597,7 +597,7 @@ OP .op_alu_eax_imm32
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LD_V R5, R5
     EIP_ADV_V
     ADD.W R2, R8, #8
@@ -613,7 +613,7 @@ OP_AGNOSTIC .op_alu_eb_imm8_80
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     UBFX R12, R1, #3, #3
@@ -623,7 +623,7 @@ OP_AGNOSTIC .op_alu_eb_imm8_80
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     AND.W R2, R1, #7
@@ -641,13 +641,13 @@ L(ALU_EB_IMM8_80_MEM):
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
-    BMI .mem_fault
+    MEM_TRAP_R R2
     LDRB R3, [R2, #0]
 L(ALU_DISPATCH_EB_IMM8_80_SUBOP):
     UBFX R12, R1, #3, #3
@@ -660,7 +660,7 @@ OP .op_alu_ev_imm32_81
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     UBFX R12, R1, #3, #3
@@ -670,7 +670,7 @@ OP .op_alu_ev_imm32_81
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LD_V R5, R5
     EIP_ADV_V
     AND.W R2, R1, #7
@@ -685,13 +685,13 @@ L(ALU_EV_IMM32_81_MEM):
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LD_V R5, R5
     EIP_ADV_V
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
-    BMI .mem_fault
+    MEM_TRAP_R R2
     LD_V R3, R2
 L(ALU_DISPATCH_EV_IMM32_81_SUBOP):
     UBFX R12, R1, #3, #3
@@ -704,7 +704,7 @@ OP .op_alu_ev_imm8_83
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     UBFX R12, R1, #3, #3
@@ -714,7 +714,7 @@ OP .op_alu_ev_imm8_83
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     AND.W R2, R1, #7
@@ -729,13 +729,13 @@ L(ALU_EV_IMM8_83_MEM):
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
-    BMI .mem_fault
+    MEM_TRAP_R R2
     LD_V R3, R2
 L(ALU_DISPATCH_EV_IMM8_83_SUBOP):
     UBFX R12, R1, #3, #3
@@ -752,7 +752,7 @@ OP_AGNOSTIC .op_test_eb_gb_84
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -781,7 +781,7 @@ L(TEST_EB_GB_84_FLAGS):
 L(TEST_EB_GB_84_MEM):
     LDR.W R12, [R2, #REC_MODRM_FN]
     BLX R12
-    MEM_GET_PTR R12, R7
+    MEM_GET_PTR_R R12, R7
     LDRB R3, [R12]
     UBFX R4, R1, #3, #3
     AND.W R5, R4, #3
@@ -796,7 +796,7 @@ OP .op_test_ev_gv_85
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -820,7 +820,7 @@ L(TEST_EV_GV_85_FLAGS):
 L(TEST_EV_GV_85_MEM):
     LDR.W R12, [R2, #REC_MODRM_FN]
     BLX R12
-    MEM_GET_PTR R12, R7
+    MEM_GET_PTR_R R12, R7
     LD_V R3, R12
     UBFX R4, R1, #3, #3
     MOV.W R4, R4, LSL #2
@@ -832,7 +832,7 @@ OP_AGNOSTIC .op_xchg_eb_gb_86
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -875,7 +875,7 @@ OP .op_xchg_ev_gv_87
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -909,7 +909,7 @@ OP_AGNOSTIC .op_mov_eb_gb_88
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -947,7 +947,7 @@ L(MOV_EB_GB_MEM):
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
-    BMI .mem_fault
+    MEM_TRAP_W R2
     STRB R5, [R2, #0]
     B.W .fetch_decode_loop
 
@@ -955,7 +955,7 @@ OP .op_mov_ev_gv_89
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -985,7 +985,7 @@ L(MOV_EV_GV_MEM):
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
-    BMI .mem_fault
+    MEM_TRAP_W R2
     ST_V R5, R2
     B.W .fetch_decode_loop
 
@@ -993,7 +993,7 @@ OP .op_lea_8D
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -1027,7 +1027,7 @@ OP_AGNOSTIC .op_mov_gb_eb_8A
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -1056,7 +1056,7 @@ L(MOV_GB_EB_MEM):
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
-    BMI .mem_fault
+    MEM_TRAP_R R2
     LDRB R5, [R2, #0]
     UBFX R2, R1, #3, #3
     AND.W R3, R2, #3
@@ -1071,7 +1071,7 @@ OP .op_mov_gv_ev_8B
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -1094,7 +1094,7 @@ L(MOV_GV_EV_MEM):
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
-    BMI .mem_fault
+    MEM_TRAP_R R2
     LD_V R5, R2
     UBFX R2, R1, #3, #3
     MOV.W R2, R2, LSL #2
@@ -1106,7 +1106,7 @@ OP .op_pop_ev_8F
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -1187,14 +1187,14 @@ OP .op_popfd_9D
 
 OP_AGNOSTIC .op_mov_al_moffs8_A0
     MOFFS_ADDR R4, R3
-    MEM_GET_PTR R3, R4
+    MEM_GET_PTR_R R3, R4
     LDRB R3, [R3, #0]
     STRB.W R3, [R8, #REG_EAX]
     B.W .fetch_decode_loop
 
 OP .op_mov_eax_moffs32_A1
     MOFFS_ADDR R4, R3
-    MEM_GET_PTR R3, R4
+    MEM_GET_PTR_R R3, R4
     LD_V R3, R3
     STREG_V R3, #REG_EAX           @ 16-bit MOV must not clear the high half
     B.W .fetch_decode_loop
@@ -1217,7 +1217,7 @@ OP_AGNOSTIC .op_test_al_imm8_A8
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     LDRB.W R3, [R8, #8]
@@ -1230,7 +1230,7 @@ OP .op_test_eax_imm32_A9
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LD_V R5, R5
     EIP_ADV_V
     LDREG_V R3, #REG_EAX
@@ -1241,7 +1241,7 @@ OP .op_test_eax_imm32_A9
 
 OP_AGNOSTIC .op_movsb_A4
     STR_SRC R4, R3
-    MEM_GET_PTR R3, R4
+    MEM_GET_PTR_R R3, R4
     LDRB R3, [R3]
     STR_DST R5, R12
     MEM_GET_PTR R12, R5
@@ -1253,7 +1253,7 @@ OP_AGNOSTIC .op_movsb_A4
 
 OP .op_movsd_A5
     STR_SRC R4, R3
-    MEM_GET_PTR R3, R4
+    MEM_GET_PTR_R R3, R4
     LD_V R3, R3
     STR_DST R5, R12
     MEM_GET_PTR R12, R5
@@ -1265,10 +1265,10 @@ OP .op_movsd_A5
 
 OP_AGNOSTIC .op_cmpsb_A6
     STR_SRC R4, R3
-    MEM_GET_PTR R3, R4
+    MEM_GET_PTR_R R3, R4
     LDRB R3, [R3]
     STR_DST R5, R12
-    MEM_GET_PTR R12, R5
+    MEM_GET_PTR_R R12, R5
     LDRB R5, [R12]
     LSL.W R3, R3, #24
     LSL.W R5, R5, #24
@@ -1284,10 +1284,10 @@ OP_AGNOSTIC .op_cmpsb_A6
 
 OP .op_cmpsd_A7
     STR_SRC R4, R3
-    MEM_GET_PTR R3, R4
+    MEM_GET_PTR_R R3, R4
     LD_V R3, R3
     STR_DST R5, R12
-    MEM_GET_PTR R12, R5
+    MEM_GET_PTR_R R12, R5
     LD_V R5, R12
     VNORM(R3)
     VNORM(R5)
@@ -1321,7 +1321,7 @@ OP .op_stosd_AB
 
 OP_AGNOSTIC .op_lodsb_AC
     STR_SRC R4, R3
-    MEM_GET_PTR R3, R4
+    MEM_GET_PTR_R R3, R4
     LDRB R3, [R3]
     STRB.W R3, [R8, #REG_EAX]
     STR_DELTA R7, 1
@@ -1330,7 +1330,7 @@ OP_AGNOSTIC .op_lodsb_AC
 
 OP .op_lodsd_AD
     STR_SRC R4, R3
-    MEM_GET_PTR R3, R4
+    MEM_GET_PTR_R R3, R4
     LD_V R3, R3
     STREG_V R3, #REG_EAX
     STR_DELTA R7, OPSZ
@@ -1339,7 +1339,7 @@ OP .op_lodsd_AD
 
 OP_AGNOSTIC .op_scasb_AE
     STR_DST R5, R12
-    MEM_GET_PTR R12, R5
+    MEM_GET_PTR_R R12, R5
     LDRB R5, [R12]
     LDRB.W R3, [R8, #REG_EAX]
     LSL.W R3, R3, #24
@@ -1355,7 +1355,7 @@ OP_AGNOSTIC .op_scasb_AE
 
 OP .op_scasd_AF
     STR_DST R5, R12
-    MEM_GET_PTR R12, R5
+    MEM_GET_PTR_R R12, R5
     LD_V R5, R12
     LDREG_V R3, #REG_EAX
     VNORM(R3)
@@ -1379,7 +1379,7 @@ OP_AGNOSTIC .op_mov_r8_imm8
     UBFX R3, R10, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R10
-    BMI .mem_fault
+    MEM_TRAP_R R3
     LDRB R3, [R3, #0]
     ADD.W R10, R10, #1
     STRB.W R3, [R8, R2]
@@ -1395,7 +1395,7 @@ OP .op_ret_imm16_C2
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRH R5, [R5, #0]              @ bytes to drop; always 16 bits
     POP_V R4, R0, R12
     LDR.W R3, [R8, #SEG_CS_BASE]
@@ -1418,7 +1418,7 @@ OP_AGNOSTIC .op_mov_eb_imm8_C6
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -1427,7 +1427,7 @@ OP_AGNOSTIC .op_mov_eb_imm8_C6
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     AND.W R2, R1, #7
@@ -1447,7 +1447,7 @@ L(MOV_EB_IMM8_C6_MEM):
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     MEM_GET_PTR R12, R7
@@ -1458,7 +1458,7 @@ OP .op_mov_ev_imm32_C7
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -1467,7 +1467,7 @@ OP .op_mov_ev_imm32_C7
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LD_V R5, R5
     EIP_ADV_V
     AND.W R2, R1, #7
@@ -1481,7 +1481,7 @@ L(MOV_EV_IMM_C7_MEM):
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LD_V R5, R5
     EIP_ADV_V
     MEM_GET_PTR R12, R7
@@ -1498,7 +1498,7 @@ OP .op_shift_ev_imm8_C1
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -1512,7 +1512,7 @@ OP .op_shift_ev_imm8_C1
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     AND.W R5, R5, #31
@@ -1523,12 +1523,12 @@ L(SHIFT_EV_IMM8_C1_MEM):
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
-    BMI .mem_fault
+    MEM_TRAP_R R2
     LD_V R3, R2
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     AND.W R5, R5, #31
@@ -1538,7 +1538,7 @@ OP .op_shift_ev_1_D1
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     MOV.W R5, #1
@@ -1548,7 +1548,7 @@ OP .op_shift_ev_cl_D3
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     LDRB.W R5, [R8, #12]
@@ -1571,7 +1571,7 @@ L(SHIFT_EV_MEM):
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
-    BMI .mem_fault
+    MEM_TRAP_R R2
     LD_V R3, R2
 L(SHIFT_DISPATCH_32):
     UBFX R12, R1, #3, #3
@@ -1738,7 +1738,7 @@ OP_AGNOSTIC .op_shift_eb_imm8_C0
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -1755,7 +1755,7 @@ OP_AGNOSTIC .op_shift_eb_imm8_C0
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     AND.W R5, R5, #31
@@ -1766,12 +1766,12 @@ L(SHIFT_EB_IMM8_C0_MEM):
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
-    BMI .mem_fault
+    MEM_TRAP_R R2
     LDRB R3, [R2, #0]
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     AND.W R5, R5, #31
@@ -1781,7 +1781,7 @@ OP_AGNOSTIC .op_shift_eb_1_D0
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     MOV.W R5, #1
@@ -1791,7 +1791,7 @@ OP_AGNOSTIC .op_shift_eb_cl_D2
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     LDRB.W R5, [R8, #12]
@@ -1817,7 +1817,7 @@ L(SHIFT_EB_MEM):
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
-    BMI .mem_fault
+    MEM_TRAP_R R2
     LDRB R3, [R2, #0]
 L(SHIFT_DISPATCH_8):
     UBFX R12, R1, #3, #3
@@ -2236,7 +2236,7 @@ L(DECODE_MODRM_32):
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDR R5, [R5, #0]
     ADD.W R10, R10, #4
     ADD R7, R5
@@ -2248,7 +2248,7 @@ L(MODRM_MOD1):
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     ADD R7, R5
@@ -2260,7 +2260,7 @@ L(MODRM_MOD0):
     UBFX R7, R10, #12, #12
     LDR.W R7, [R9, R7, LSL #2]
     ADDS R7, R7, R10
-    BMI .mem_fault
+    MEM_TRAP_R R7
     LDR R7, [R7, #0]
     ADD.W R10, R10, #4
     B.N L(MODRM_SEG)
@@ -2270,7 +2270,7 @@ L(MODRM_SIB):
     UBFX R3, R10, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R10
-    BMI .mem_fault
+    MEM_TRAP_R R3
     LDRB R3, [R3, #0]
     ADD.W R10, R10, #1
     AND.W R4, R3, #7
@@ -2291,7 +2291,7 @@ L(SIB_BASE_DISP32):
     UBFX R7, R10, #12, #12
     LDR.W R7, [R9, R7, LSL #2]
     ADDS R7, R7, R10
-    BMI .mem_fault
+    MEM_TRAP_R R7
     LDR R7, [R7, #0]
     ADD.W R10, R10, #4
 L(SIB_DO_INDEX):
@@ -2314,7 +2314,7 @@ L(SIB_DISP8):
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     ADD R7, R5
@@ -2323,7 +2323,7 @@ L(SIB_DISP32):
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDR R5, [R5, #0]
     ADD.W R10, R10, #4
     ADD R7, R5
@@ -2360,7 +2360,7 @@ L(DECODE_MODRM_32):
     UBFX R7, R10, #12, #12
     LDR.W R7, [R9, R7, LSL #2]
     ADDS R7, R7, R10
-    BMI .mem_fault
+    MEM_TRAP_R R7
     LDRH R7, [R7, #0]
     ADD.W R10, R10, #2
     B.N L(MODRM_SEG)
@@ -2409,7 +2409,7 @@ L(M16_DISP):
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     ADD R7, R7, R5
@@ -2418,7 +2418,7 @@ L(M16_DISP16):
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRH R5, [R5, #0]
     ADD.W R10, R10, #2
     ADD R7, R7, R5
@@ -2441,7 +2441,7 @@ OP .op_call_rel32_E8
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDS_V R5, R5                   @ displacement is SIGNED
     EIP_ADV_V
     /* Push IP, not the linear EIP: R10 carries CS.base folded in, and the
@@ -2458,7 +2458,7 @@ OP .op_jmp_rel32_E9
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDS_V R5, R5                   @ displacement is SIGNED
     EIP_ADV_V
     ADD R10, R10, R5
@@ -2469,7 +2469,7 @@ OP_AGNOSTIC .op_jmp_rel8_EB
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     ADD R10, R5
@@ -2479,7 +2479,7 @@ OP_AGNOSTIC .op_grp4_FE
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -2500,7 +2500,7 @@ L(GRP4_MEM):
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
-    BMI .mem_fault
+    MEM_TRAP_R R2
     LDRB R3, [R2, #0]
 L(GRP4_DISPATCH):
     UBFX R12, R1, #3, #3
@@ -2537,7 +2537,7 @@ OP .op_grp5_FF
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -2568,7 +2568,7 @@ L(GRP5_MEM):
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
-    BMI .mem_fault
+    MEM_TRAP_R R2
     LD_V R3, R2
 L(GRP5_DISPATCH):
     UBFX R12, R1, #3, #3
@@ -2628,7 +2628,7 @@ OP_AGNOSTIC .op_jcc_rel8_7X
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     AND.W R2, R0, #15
@@ -2793,7 +2793,7 @@ OP .op_push_imm32_68
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LD_V R5, R5
     EIP_ADV_V
     PUSH_V R5, R4, R12
@@ -2803,7 +2803,7 @@ OP .op_imul_imm32_69
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -2821,13 +2821,13 @@ L(IMUL69_MEM):
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
-    BMI .mem_fault
+    MEM_TRAP_R R2
     LD_V R3, R2
 L(IMUL69_DO):
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LD_V R5, R5
     EIP_ADV_V
     MUL.W R3, R3, R5
@@ -2841,7 +2841,7 @@ OP .op_push_imm8_6A
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     PUSH_V R5, R4, R12
@@ -2851,7 +2851,7 @@ OP .op_imul_imm8_6B
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -2869,13 +2869,13 @@ L(IMUL6B_MEM):
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
-    BMI .mem_fault
+    MEM_TRAP_R R2
     LD_V R3, R2
 L(IMUL6B_DO):
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     MUL.W R3, R3, R5
@@ -2889,7 +2889,7 @@ OP .op_enter_C8
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRH R5, [R5, #0]
     ADD.W R10, R10, #2
     /* ENTER's nesting-level byte. The value is discarded (level nesting is not
@@ -2898,7 +2898,7 @@ OP .op_enter_C8
     UBFX R12, R10, #12, #12
     LDR.W R12, [R9, R12, LSL #2]
     ADDS R12, R12, R10
-    BMI .mem_fault
+    MEM_TRAP_R R12
     LDRB R12, [R12, #0]
     ADD.W R10, R10, #1
     LDR.W R3, [R8, #REG_EBP]
@@ -2933,7 +2933,7 @@ OP .op_retf_imm16_CA
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRH R5, [R5, #0]              @ bytes to drop; always 16 bits
     PUSH {R5, LR}
     POP_V R4, R3, R12              @ IP
@@ -2956,7 +2956,7 @@ OP_AGNOSTIC .op_aam_D4
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     CMP R5, #0
@@ -2972,7 +2972,7 @@ OP_AGNOSTIC .op_aad_D5
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     LDRB.W R3, [R8, #8]
@@ -3001,7 +3001,7 @@ OP_AGNOSTIC .op_xlat_D7
     UBFX R4, R3, #12, #12
     LDR.W R4, [R9, R4, LSL #2]
     ADDS R4, R4, R3
-    BMI .mem_fault
+    MEM_TRAP_R R4
     LDRB R4, [R4, #0]
     STRB.W R4, [R8, #8]
     B.W .fetch_decode_loop
@@ -3010,7 +3010,7 @@ OP_AGNOSTIC .op_loopnz_E0
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     CNT_LOAD R3
@@ -3030,7 +3030,7 @@ OP_AGNOSTIC .op_loopz_E1
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     CNT_LOAD R3
@@ -3050,7 +3050,7 @@ OP_AGNOSTIC .op_loop_E2
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     CNT_LOAD R3
@@ -3067,7 +3067,7 @@ OP_AGNOSTIC .op_jcxz_E3
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     CNT_LOAD R3
@@ -3156,7 +3156,7 @@ OP_AGNOSTIC .op_in_al_imm8_E4
     UBFX R0, R10, #12, #12
     LDR.W R0, [R9, R0, LSL #2]
     ADDS R0, R0, R10
-    BMI .mem_fault
+    MEM_TRAP_R R0
     LDRB R0, [R0, #0]
     ADD.W R10, R10, #1
 L(DO_IN_B):
@@ -3174,7 +3174,7 @@ OP .op_in_eax_imm8_E5
     UBFX R0, R10, #12, #12
     LDR.W R0, [R9, R0, LSL #2]
     ADDS R0, R0, R10
-    BMI .mem_fault
+    MEM_TRAP_R R0
     LDRB R0, [R0, #0]
     ADD.W R10, R10, #1
 L(DO_IN_V):
@@ -3192,7 +3192,7 @@ OP_AGNOSTIC .op_out_imm8_al_E6
     UBFX R0, R10, #12, #12
     LDR.W R0, [R9, R0, LSL #2]
     ADDS R0, R0, R10
-    BMI .mem_fault
+    MEM_TRAP_R R0
     LDRB R0, [R0, #0]
     ADD.W R10, R10, #1
 L(DO_OUT_B):
@@ -3210,7 +3210,7 @@ OP .op_out_imm8_eax_E7
     UBFX R0, R10, #12, #12
     LDR.W R0, [R9, R0, LSL #2]
     ADDS R0, R0, R10
-    BMI .mem_fault
+    MEM_TRAP_R R0
     LDRB R0, [R0, #0]
     ADD.W R10, R10, #1
 L(DO_OUT_V):
@@ -3234,7 +3234,7 @@ OP_AGNOSTIC .op_grp3_eb_F6
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -3255,7 +3255,7 @@ L(GRP3_F6_MEM):
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
-    BMI .mem_fault
+    MEM_TRAP_R R2
     LDRB R3, [R2, #0]
 L(GRP3_F6_DISPATCH):
     UBFX R12, R1, #3, #3
@@ -3284,7 +3284,7 @@ L(GRP3_F6_TEST):
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     AND.W R3, R3, R5               @ TEST sets flags and discards the result
@@ -3376,7 +3376,7 @@ OP .op_grp3_ev_F7
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
@@ -3394,7 +3394,7 @@ L(GRP3_F7_MEM):
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
-    BMI .mem_fault
+    MEM_TRAP_R R2
     LD_V R3, R2
 L(GRP3_F7_DISPATCH):
     UBFX R12, R1, #3, #3
@@ -3417,7 +3417,7 @@ L(GRP3_F7_TEST):
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
-    BMI .mem_fault
+    MEM_TRAP_R R5
     LD_V R5, R5
     EIP_ADV_V
     ANDS.W R3, R3, R5              @ TEST sets flags and discards the result
@@ -3649,7 +3649,7 @@ OP_AGNOSTIC .op_mov_seg_Ew_8E
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192
@@ -3666,7 +3666,7 @@ L(MOV_SREG_MEM):
     UBFX R3, R7, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R7
-    BMI .mem_fault
+    MEM_TRAP_R R3
     LDRH R5, [R3, #0]
 L(MOV_SREG_SET):
     UBFX R4, R1, #3, #3
@@ -3680,7 +3680,7 @@ OP_AGNOSTIC .op_mov_Ew_seg_8C
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192
@@ -3720,7 +3720,7 @@ L(LOAD_FAR_PTR):
     UBFX R1, R10, #12, #12
     LDR.W R1, [R9, R1, LSL #2]
     ADDS R1, R1, R10
-    BMI .mem_fault
+    MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R3, R1, #192
@@ -3732,13 +3732,13 @@ L(LOAD_FAR_PTR):
     UBFX R3, R7, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R7
-    BMI .mem_fault
+    MEM_TRAP_R R3
     LD_V R4, R3                    @ offset, operand-size wide
     ADD.W R7, R7, #OPSZ
     UBFX R3, R7, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R7
-    BMI .mem_fault
+    MEM_TRAP_R R3
     LDRH R5, [R3, #0]              @ selector, always 16 bits
     POP {R0, R1}
     UBFX R3, R1, #3, #3
@@ -3801,13 +3801,13 @@ L(FAR_IMM):
     UBFX R3, R10, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R10
-    BMI .mem_fault
+    MEM_TRAP_R R3
     LD_V R4, R3                    @ new offset
     EIP_ADV_V
     UBFX R3, R10, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R10
-    BMI .mem_fault
+    MEM_TRAP_R R3
     LDRH R5, [R3, #0]              @ new selector
     ADD.W R10, R10, #2
     CMP R0, #0
@@ -3933,7 +3933,7 @@ L(REP_ENTER):
     UBFX R3, R10, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R10
-    BMI .mem_fault
+    MEM_TRAP_R R3
     LDRB R0, [R3, #0]
 
     /* Only string opcodes repeat; on anything else the prefix is ignored,
@@ -4003,7 +4003,7 @@ OP_AGNOSTIC .op_hypercall_0F0B
     UBFX R3, R10, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R10
-    BMI .mem_fault
+    MEM_TRAP_R R3
     LDRB R3, [R3, #0]              @ service selector
     ADD.W R10, R10, #1
     LDR.W R4, [R8, #CPU_HLE_ENABLED]   @ CBZ needs a low register
@@ -4036,13 +4036,13 @@ L(GRP5_FAR_ENTRY):
     UBFX R3, R7, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R7
-    BMI .mem_fault
+    MEM_TRAP_R R3
     LD_V R4, R3                    @ new IP/EIP, operand-size wide
     ADD.W R7, R7, #OPSZ
     UBFX R3, R7, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R7
-    BMI .mem_fault
+    MEM_TRAP_R R3
     LDRH R5, [R3, #0]              @ new CS selector
     CMP R0, #0
     BEQ.N L(GRP5_FAR_SET)

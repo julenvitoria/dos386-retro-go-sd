@@ -37,6 +37,27 @@ FW_DIR = "references/game-and-watch-retro-go-sd/build"
 CORE_MAGIC = 0x54494E59   # 'TINY', set by src/main.c
 
 
+
+# Named watch sets, so a subsystem's whole story is one word on the command
+# line instead of a seventeen-symbol paste that goes stale the moment a counter
+# is added. Keep these in step with the tables in TOOLING.md.
+WATCH_GROUPS = {
+    "nor": [
+        # did the snapshot happen, and what did the firmware's flash cache do
+        "nor_snap_result", "nor_snap_ms", "nor_snap_addr", "nor_snap_cb_bytes",
+        # is the guest actually running out of NOR
+        "x86_nor_attached", "x86_nor_attach_err",
+        # the measurement: how much of guest RAM is genuinely read-only
+        "x86_nor_pages_total", "x86_nor_pages_nor", "x86_nor_pages_axi",
+        "x86_nor_axi_free",
+        # what it costs, and who is paying it
+        "x86_nor_reads", "x86_nor_writes", "x86_nor_cow_pulls",
+        "x86_nor_host_cow", "x86_nor_slow_cycles",
+        # the loud failures
+        "x86_nor_cow_failures", "x86_nor_unmapped",
+    ],
+}
+
 def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -49,7 +70,8 @@ def main():
     p.add_argument("--elf", default=None,
                    help="ELF for symbols (default depends on --retrogo)")
     p.add_argument("--watch", default="",
-                   help="comma-separated globals to read as uint32")
+                   help="comma-separated globals to read as uint32; a GROUP "
+                        f"name expands to a whole set ({', '.join(WATCH_GROUPS)})")
     p.add_argument("--dump", action="append", default=[],
                    metavar="SYM[:N][xG][=LABEL]",
                    help="hexdump N words of a symbol's own storage, grouped "
@@ -95,7 +117,9 @@ def main():
         fw_elf = None
 
     syms, maps = load_symbol_maps(fw_elf, elf)
-    watches = parse_watch(args.watch)
+    watches = []
+    for w in parse_watch(args.watch):
+        watches.extend(WATCH_GROUPS.get(w, [w]))
     derefs = [parse_deref(d) for d in args.deref]
     dumps = [parse_dump(d) for d in args.dump]
 

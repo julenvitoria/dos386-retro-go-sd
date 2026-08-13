@@ -19,6 +19,7 @@ src/main.c \
 x86_cpu.c \
 x86_io.c \
 x86_mem.c \
+x86_nor.c \
 x86_video.c \
 x86_osk.c \
 x86_hle.c \

@@ -40,7 +40,7 @@ LDFLAGS = -mcpu=cortex-m7 -mthumb -T STM32H7B0VBTx_SDCARD.ld -Wl,--gc-sections -
 
 PROGS = test_core.elf
 
-TEST_OBJS = x86_cpu.o x86_profile.o x86_io.o x86_mem.o x86_video.o x86_osk.o x86_hle.o x86_bios.o x86_dos.o cga_blit.o cpu_exec.o tests/main.o hw_accel.o x86_disk.o lib/FatFs/ff.o lib/FatFs/ffunicode.o
+TEST_OBJS = x86_cpu.o x86_nor.o x86_profile.o x86_io.o x86_mem.o x86_video.o x86_osk.o x86_hle.o x86_bios.o x86_dos.o cga_blit.o cpu_exec.o tests/main.o hw_accel.o x86_disk.o lib/FatFs/ff.o lib/FatFs/ffunicode.o
 
 all: $(PROGS)
 
