@@ -332,10 +332,12 @@ class GwemuTarget(Target):
 class HardwareTarget(Target):
     """Boot an Image on the real device over a debug probe."""
 
-    def __init__(self, image, physical_sdcard=None, no_flash=False):
+    def __init__(self, image, physical_sdcard=None, no_flash=False,
+                 hard_reset=False):
         super().__init__(image)
         self.physical_sdcard = physical_sdcard
         self.no_flash = no_flash
+        self.hard_reset = hard_reset
         self.gnw = None
 
     def start(self):
@@ -385,6 +387,21 @@ class HardwareTarget(Target):
         it ("Do NOT start gnwmanager") -- it reloads MSP and PC from the
         target bank's vector table before resuming.
         """
+        # A TRUE hardware reset, when asked for. The MSP/PC route below is a
+        # jump to the reset vector, NOT a reset: every peripheral (OCTOSPI,
+        # LTDC, SDMMC) keeps the configuration the previous session left, and
+        # SystemInit then reprograms the clocks underneath them. A write still
+        # buffered in a peripheral that way surfaces as an IMPRECISE bus fault
+        # at the first `dsb` in SystemInit's D-cache invalidate loop -- early
+        # enough that the backlight never comes on, and impossible to localise
+        # because imprecise faults do not report an address. Use this when the
+        # device must start from the same state a power cycle gives it.
+        if self.hard_reset:
+            print("hard reset: resetting the CPU and every peripheral")
+            self.gnw.reset_and_halt()
+            self.backend.resume()
+            return
+
         base = 0x08100000 if self.image.intflash_bank == 2 else 0x08000000
         self.gnw.reset_and_halt()
         self.backend.write_register("msp", self.gnw.read_uint32(base))
@@ -415,6 +432,11 @@ def add_target_args(parser):
                         help="input timeline to replay under gwemu")
     parser.add_argument("--physical-sdcard", default=None,
                         help="mounted SD path for bulk hardware copies")
+    parser.add_argument("--hard-reset", action="store_true",
+                        help="start the device with a REAL reset (CPU and "
+                             "peripherals) instead of jumping to the reset "
+                             "vector. Use when peripheral state left by a "
+                             "previous session may be poisoning the boot")
     parser.add_argument("--no-flash", action="store_true",
                         help="attach to hardware WITHOUT flashing or resetting "
                              "-- observe what is already running")
@@ -428,7 +450,8 @@ def open_target(args, image):
     """Build the Target an argparse namespace asks for."""
     if getattr(args, "target", "gwemu") == "hardware":
         return HardwareTarget(image, physical_sdcard=args.physical_sdcard,
-                              no_flash=getattr(args, "no_flash", False))
+                              no_flash=getattr(args, "no_flash", False),
+                              hard_reset=getattr(args, "hard_reset", False))
     return GwemuTarget(image, display=getattr(args, "gui", False),
                        audio=getattr(args, "audio", False),
                        icount=getattr(args, "icount", None),

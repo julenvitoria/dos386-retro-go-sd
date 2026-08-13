@@ -57,6 +57,13 @@ def main():
     p.add_argument("--content", default=DEFAULT_CONTENT,
                    help="firmware sd_content tree (fonts/lang/bios)")
     p.add_argument("--config-out", default="build/CONFIG")
+    p.add_argument("--oc-level", type=int, default=0, choices=[0, 1, 2, 3],
+                   help="retro-go CPU overclock level baked into /CONFIG: "
+                        "0=280MHz stock, 1=312, 2=340 (launcher max), "
+                        "3=353 (not offered in the menu; unstable under "
+                        "sustained load on some cores). NOTE /CONFIG is "
+                        "rewritten on every push, so omitting this RESETS a "
+                        "level set through the launcher UI")
     p.add_argument("--menu-timeout", type=int, default=0,
                    help="idle standby seconds; 0 disables (default)")
     p.add_argument("--no-config", action="store_true",
@@ -74,9 +81,12 @@ def main():
         os.makedirs(os.path.dirname(args.config_out) or ".", exist_ok=True)
         with open(args.config_out, "wb") as fh:
             fh.write(build_config(startup_file=startup,
-                                  menu_timeout_s=args.menu_timeout))
+                                  menu_timeout_s=args.menu_timeout,
+                                  cpu_oc_level=args.oc_level))
+        oc = {0: "280MHz stock", 1: "312MHz", 2: "340MHz", 3: "353MHz"}
         print(f"/CONFIG preselects {startup}"
-              f"{'  (standby off)' if args.menu_timeout == 0 else ''}")
+              f"{'  (standby off)' if args.menu_timeout == 0 else ''}"
+              f"  [cpu {oc[args.oc_level]}]")
         config = args.config_out
 
     if args.image:
