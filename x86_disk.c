@@ -30,6 +30,8 @@ static uint32_t disk_sectors;
 /* File backing. The reader is supplied by whoever owns the firmware's FatFs,
    so this file never has to know how to reach it. */
 static int (*file_read)(void *ctx, void *dst, uint32_t offset, uint32_t len);
+static int (*file_write)(void *ctx, const void *src, uint32_t offset,
+                         uint32_t len);
 static void *file_ctx;
 
 void x86_disk_set_memory(const void *base, uint32_t bytes)
@@ -37,6 +39,7 @@ void x86_disk_set_memory(const void *base, uint32_t bytes)
     mem_base = (const uint8_t *)base;
     disk_sectors = bytes / SECTOR_BYTES;
     file_read = 0;
+    file_write = 0;
     file_ctx = 0;
 }
 
@@ -47,6 +50,19 @@ void x86_disk_set_reader(int (*rd)(void *, void *, uint32_t, uint32_t),
     file_ctx = ctx;
     disk_sectors = bytes / SECTOR_BYTES;
     mem_base = 0;
+}
+
+/*
+ * Optional write-back for the file backing. Without it the guest floppy is
+ * read-only, and a DOS program that creates a file gets an error where it
+ * expects a handle -- TOPBENCH creates `topbench.log` before drawing its
+ * full-screen UI and dies with a Borland `Runtime error` if it cannot.
+ * Separate from the reader so a caller that cannot write (or does not want
+ * to) simply does not install one.
+ */
+void x86_disk_set_writer(int (*wr)(void *, const void *, uint32_t, uint32_t))
+{
+    file_write = wr;
 }
 
 int x86_disk_ready(void)
@@ -98,12 +114,20 @@ DRESULT disk_read(BYTE pdrv, BYTE *buff, LBA_t sector, UINT count)
 #if FF_FS_READONLY == 0
 DRESULT disk_write(BYTE pdrv, const BYTE *buff, LBA_t sector, UINT count)
 {
-    (void)buff; (void)sector; (void)count;
     if (pdrv != 0 || !x86_disk_ready())
         return RES_NOTRDY;
-    /* Writes are refused rather than silently dropped: a guest that saves and
-       is told it succeeded will lose the save and blame something else. */
-    return RES_WRPRT;
+    if (sector + count > disk_sectors)
+        return RES_PARERR;
+    /* Still refused rather than silently dropped when there is nowhere to put
+       the bytes: a guest that saves and is told it succeeded will lose the
+       save and blame something else. The memory backing is a const mapping of
+       extflash, so it is always in that position. */
+    if (!file_write)
+        return RES_WRPRT;
+    if (file_write(file_ctx, buff, (uint32_t)sector * SECTOR_BYTES,
+                   count * SECTOR_BYTES) != 0)
+        return RES_ERROR;
+    return RES_OK;
 }
 #endif
 

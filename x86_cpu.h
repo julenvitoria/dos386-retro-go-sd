@@ -150,6 +150,7 @@ extern X86CPUState *cpu_state_ptr;
 void x86_video_init(void *vram, void *lut8_palette);
 void x86_video_refresh_palette(void);
 extern uint32_t cga_clut_dirty;   /* frame loop re-pushes the CLUT when set */
+extern uint8_t x86_video_mode_byte;   /* current BIOS video mode */
 void x86_video_set_beam(uint32_t frac);
 void x86_video_set_mode(uint8_t mode);
 uint8_t x86_video_mode(void);
@@ -213,10 +214,15 @@ void x86_dos_arena_init(void);
 void x86_disk_set_memory(const void *base, uint32_t bytes);
 void x86_disk_set_reader(int (*rd)(void *, void *, uint32_t, uint32_t),
                          void *ctx, uint32_t bytes);
+/* Optional: makes the guest floppy writable. Without it disk_write refuses. */
+void x86_disk_set_writer(int (*wr)(void *, const void *, uint32_t, uint32_t));
 int x86_disk_ready(void);
 int x86_dos_exec(const char *path, const char *cmdline);
 uint16_t x86_dos_psp(void);
 extern uint32_t x86_dos_last_error;
+/* Last path the guest opened or created. Diagnostic only: an unserviced file
+   request is far easier to place with the name in hand. */
+extern char x86_dos_last_path[32];
 uint16_t dos_test_alloc(uint16_t paras, uint16_t *largest);
 uint16_t dos_test_free(uint16_t seg);
 uint16_t dos_test_resize(uint16_t seg, uint16_t paras, uint16_t *largest);

@@ -359,6 +359,32 @@ static int sd_sector_read(void *ctx, void *dst, uint32_t offset, uint32_t len)
 }
 
 /*
+ * The write side of the same aperture. There is no ranged SD write in the ABI,
+ * so this goes through the firmware's stdio, opening and closing per call to
+ * match the read path -- the core holds no handle on the .dsk between
+ * requests, which is what lets any image in /roms/dos be swapped in.
+ *
+ * The guest's floppy really is written. That is what a floppy does: TOPBENCH
+ * leaves a `topbench.log` on it and a game leaves its save, and telling the
+ * guest a write succeeded while dropping it is the failure mode this project
+ * refuses everywhere else.
+ */
+static int sd_sector_write(void *ctx, const void *src, uint32_t offset,
+                           uint32_t len)
+{
+    const gw_firmware_abi_t *abi = gw_firmware_abi();
+    FILE *f = abi->fopen((char *)ctx, "r+b");
+    if (!f)
+        return -1;
+    int rc = -1;
+    if (abi->fseek(f, (long)offset, SEEK_SET) == 0 &&
+        abi->fwrite(src, 1, len, f) == len)
+        rc = 0;
+    abi->fclose(f);
+    return rc;
+}
+
+/*
  * Work out what to run. The disk images are built to boot FreeDOS, so the
  * program to launch is named in AUTOEXEC.BAT rather than being guessable from
  * the .dsk name -- ALLEYCAT.dsk runs CAT.EXE. Reading it keeps this working
@@ -416,6 +442,7 @@ static int mount_guest_disk(void)
         return -1;
     strncpy(dsk_path, ACTIVE_FILE->path, sizeof(dsk_path) - 1);
     x86_disk_set_reader(sd_sector_read, dsk_path, ACTIVE_FILE->size);
+    x86_disk_set_writer(sd_sector_write);
     if (f_mount(&dsk_fs, "", 1) != FR_OK)
         return -1;
     dsk_mounted = 1;
@@ -480,7 +507,7 @@ static void guest_reset(void)
     if (dsk_mounted && find_startup_program(startup, sizeof(startup)) == 0) {
         dsk_startup_ok = 1;
         /* TOPBENCH wants "-l" (log/list mode) on its command tail. */
-        dsk_exec_rc = (uint32_t)x86_dos_exec(startup, "-l");
+        dsk_exec_rc = (uint32_t)x86_dos_exec(startup, "");
     }
     if (dsk_exec_rc != 0) {
         memcpy(guest_ram + 0x100, demo_guest, sizeof(demo_guest));

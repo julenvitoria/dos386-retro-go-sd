@@ -289,6 +289,67 @@ static FIL *handle_get(uint16_t h)
     return dos_file_used[h - 5] ? &dos_files[h - 5] : NULL;
 }
 
+/*
+ * Character devices.
+ *
+ * DOS programs open devices by name -- a full-screen UI typically does
+ * Rewrite() on 'CON' and then writes through AH=40h rather than AH=02h, and a
+ * report writer opens 'PRN' or 'NUL' the same way. There is no directory entry
+ * to find, so these can never come from FatFs; they get handles out of a
+ * reserved range instead, which cannot collide with the FatFs slots at 5..20.
+ *
+ * The standard handles are the same devices under their inherited numbers:
+ * 0/1/2 are CON, 3 (AUX) and 4 (PRN) are sinks. Reads and writes on handle 1
+ * previously fell into handle_get(), which rejects anything below 5, so a
+ * program printing through the handle API got an "invalid handle" error for
+ * every line it wrote.
+ */
+enum { DOS_DEV_NONE = 0, DOS_DEV_CON, DOS_DEV_NUL };
+#define DOS_DEV_HANDLE(d)  ((uint16_t)(0x00F0 + (d)))
+
+/* The name of the last file the guest asked us to create or open, for
+   diagnosis: an unhandled request is far easier to place with the path in
+   hand than with the function number alone. */
+char x86_dos_last_path[32];
+
+static int dos_name_is_device(const char *p)
+{
+    /* Compare the stem only: "CON", "CON:", "A:\CON" are all the device. */
+    const char *s = p;
+    for (const char *q = p; *q; q++)
+        if (*q == '\\' || *q == '/' || *q == ':')
+            s = q + 1;
+
+    char n[5];
+    unsigned i = 0;
+    while (i < 4 && s[i] && s[i] != ':' && s[i] != '.') {
+        char c = s[i];
+        n[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+        i++;
+    }
+    n[i] = 0;
+
+    if (!strcmp(n, "CON"))
+        return DOS_DEV_CON;
+    if (!strcmp(n, "NUL") || !strcmp(n, "PRN") || !strcmp(n, "AUX") ||
+        (i == 4 && (!strncmp(n, "LPT", 3) || !strncmp(n, "COM", 3))))
+        return DOS_DEV_NUL;
+    return DOS_DEV_NONE;
+}
+
+static int dos_handle_device(uint16_t h)
+{
+    if (h <= 2)
+        return DOS_DEV_CON;                     /* stdin/stdout/stderr */
+    if (h == 3 || h == 4)
+        return DOS_DEV_NUL;                     /* AUX, PRN */
+    if (h == DOS_DEV_HANDLE(DOS_DEV_CON))
+        return DOS_DEV_CON;
+    if (h == DOS_DEV_HANDLE(DOS_DEV_NUL))
+        return DOS_DEV_NUL;
+    return DOS_DEV_NONE;
+}
+
 /* Pull a NUL-terminated guest string out, one page at a time. */
 static void guest_str(uint32_t lin, char *out, unsigned max)
 {
@@ -449,6 +510,14 @@ int x86_dos_exec(const char *path, const char *cmdline)
  */
 int x86_dos_terminate(void)
 {
+    /* Real DOS closes the process's handles on exit, and it matters here:
+       FatFs is built FF_FS_TINY, so the last sector of a file the guest wrote
+       is still sitting in the filesystem window until something flushes it. */
+    for (int i = 0; i < DOS_MAX_FILES; i++)
+        if (dos_file_used[i]) {
+            f_close(&dos_files[i]);
+            dos_file_used[i] = 0;
+        }
     cpu_state_ptr->exit_reason = X86_EXIT_TERMINATE;
     return 1;
 }
@@ -603,9 +672,48 @@ int x86_dos_int21(uint8_t func)
     }
 
     /* ---- files ------------------------------------------------------ */
+    /*
+     * AH=3Ch, create/truncate. TOPBENCH's full-screen UI opens a stream and
+     * dies without one: unanswered, the default arm below reported "invalid
+     * function", which Borland's runtime prints as `Runtime error 001` -- and
+     * the half-drawn screen behind that message is what looked like a broken
+     * renderer.
+     *
+     * CX carries the file attributes; nothing here has an attribute to store,
+     * so it is ignored deliberately rather than by omission.
+     */
+    case 0x3C: {                                /* create / truncate */
+        char path[64];
+        guest_str(cpu_state_ptr->segs[3].base + dx, path, sizeof(path));
+        strncpy(x86_dos_last_path, path, sizeof(x86_dos_last_path) - 1);
+        int dev = dos_name_is_device(path);
+        if (dev) {
+            x86_set_ax(DOS_DEV_HANDLE(dev));
+            ok_clear_cf();
+            return 1;
+        }
+        int slot = handle_alloc();
+        if (slot < 0) { fail(0x04); return 1; }
+        if (f_open(&dos_files[slot], path,
+                   FA_CREATE_ALWAYS | FA_READ | FA_WRITE) != FR_OK) {
+            dos_file_used[slot] = 0;
+            fail(0x05);                         /* access denied */
+            return 1;
+        }
+        x86_set_ax((uint16_t)(slot + 5));
+        ok_clear_cf();
+        return 1;
+    }
     case 0x3D: {                                /* open */
         char path[64];
         guest_str(cpu_state_ptr->segs[3].base + dx, path, sizeof(path));
+        strncpy(x86_dos_last_path, path, sizeof(x86_dos_last_path) - 1);
+        int dev = dos_name_is_device(path);
+        if (dev) {
+            x86_set_ax(DOS_DEV_HANDLE(dev));
+            ok_clear_cf();
+            return 1;
+        }
         int slot = handle_alloc();
         if (slot < 0) { fail(0x04); return 1; }
         BYTE mode = ((uint8_t)r[0] & 3) == 0 ? FA_READ : FA_READ | FA_WRITE;
@@ -629,7 +737,7 @@ int x86_dos_int21(uint8_t func)
            is one of our FatFs handles, i.e. a file on drive A. */
         switch ((uint8_t)(r[0] & 0xFF)) {
         case 0x00:
-            if (bx <= 2)
+            if (dos_handle_device(bx))
                 x86_set_dx(0x80D3);
             else if (handle_get(bx))
                 x86_set_dx(0x0000);             /* file, drive A, not a device */
@@ -645,6 +753,7 @@ int x86_dos_int21(uint8_t func)
             return 1;
         }
     case 0x3E: {                                /* close */
+        if (dos_handle_device(bx)) { ok_clear_cf(); return 1; }
         FIL *f = handle_get(bx);
         if (!f) { fail(0x06); return 1; }
         f_close(f);
@@ -653,6 +762,38 @@ int x86_dos_int21(uint8_t func)
         return 1;
     }
     case 0x3F: {                                /* read */
+        int dev = dos_handle_device(bx);
+        if (dev == DOS_DEV_NUL) {               /* always at end of file */
+            x86_set_ax(0);
+            ok_clear_cf();
+            return 1;
+        }
+        if (dev == DOS_DEV_CON) {
+            /* The console, one line at a time. Blocking here would stop the
+               frame loop and with it the keyboard that would satisfy the
+               read, so an empty queue rewinds the INT instead (return 2). */
+            uint32_t lin = cpu_state_ptr->segs[3].base + dx;
+            uint16_t key;
+            uint32_t n = 0;
+            while (n < cx) {
+                if (!x86_kb_peek(&key))
+                    break;
+                x86_kb_get(&key);
+                uint8_t c = (uint8_t)key;
+                if (c == 0x0D) c = 0x0A;
+                x86_video_teletype(c);          /* DOS echoes a console read */
+                if (x86_guest_copy_in(lin + n, &c, 1) != 1)
+                    break;
+                n++;
+                if (c == 0x0A)
+                    break;
+            }
+            if (n == 0 && cx)
+                return 2;
+            x86_set_ax((uint16_t)n);
+            ok_clear_cf();
+            return 1;
+        }
         FIL *f = handle_get(bx);
         if (!f) { fail(0x06); return 1; }
         uint32_t lin = cpu_state_ptr->segs[3].base + dx;
@@ -673,6 +814,21 @@ int x86_dos_int21(uint8_t func)
         return 1;
     }
     case 0x40: {                                /* write */
+        int dev = dos_handle_device(bx);
+        if (dev) {
+            uint32_t lin = cpu_state_ptr->segs[3].base + dx;
+            if (dev == DOS_DEV_CON) {
+                for (uint32_t i = 0; i < cx; i++) {
+                    uint8_t *p = x86_guest_ptr(lin + i, 1);
+                    if (!p)
+                        break;
+                    x86_video_teletype(*p);
+                }
+            }
+            x86_set_ax(cx);                     /* a sink accepts everything */
+            ok_clear_cf();
+            return 1;
+        }
         FIL *f = handle_get(bx);
         if (!f) { fail(0x06); return 1; }
         uint32_t lin = cpu_state_ptr->segs[3].base + dx;
