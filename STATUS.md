@@ -1,7 +1,6 @@
 # Status
 
-Last verified 2026-08-13. Run instructions: [`TOOLING.md`](TOOLING.md).
-Roadmap and phase definitions: [`PLAN.md`](PLAN.md).
+Last verified 2026-08-13. How to run: [`TOOLING.md`](TOOLING.md). Roadmap: [`PLAN.md`](PLAN.md).
 
 ## Verification state
 
