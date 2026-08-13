@@ -13,6 +13,7 @@
 
 #include "cutils.h"   /* x86_cpu.h leans on BOOL/TRUE from here */
 #include "x86_cpu.h"
+#include "x86_probe.h"
 #include "x86_audio_wave.h"   /* the generator; <stdint.h> only, host-testable */
 
 /* ---------------------------------------------------------------------------
@@ -362,11 +363,24 @@ static uint8_t kbd_read_data(void)
 
 static uint32_t port_read_inner(uint32_t port);
 
+#if X86_PROBE
+/* Set by the fall-through arm of port_read_inner, cleared before each call.
+   The returned VALUE cannot carry this: 0xFF is both "open bus" and a perfectly
+   real answer from the DAC mask register, and conflating the two is how a
+   report would claim we model a port we have never heard of. */
+static unsigned port_read_unmodelled;
+#endif
+
 uint32_t x86_port_read(uint32_t port, uint32_t size)
 {
     (void)size;
+#if X86_PROBE
+    port_read_unmodelled = 0;
+#endif
     uint32_t v = port_read_inner(port);
     io_log(1, port, v);
+    X86_PROBE_PORT(X86_PROBE_KIND_IN, (uint16_t)port, v,
+                   port_read_unmodelled);
     return v;
 }
 
@@ -466,6 +480,9 @@ static uint32_t port_read_inner(uint32_t port)
     }
     /* An unassigned port floats high, which is what a real bus does and what
        DOS code probing for hardware expects to see. */
+#if X86_PROBE
+    port_read_unmodelled = 1;
+#endif
     return 0xFFFFFFFFu;
 }
 
@@ -473,6 +490,9 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
 {
     (void)size;
     io_log(2, port, value);
+#if X86_PROBE
+    unsigned unmodelled = 0;
+#endif
     switch (port) {
     case 0x42:
         pit_write_ch2((uint8_t)value);
@@ -556,6 +576,13 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
         x86_vga_dac_write((uint8_t)value);
         break;
     default:
+        /* A write to a port nothing models is DROPPED. That is usually right,
+           but it is not nothing: a guest programming a sound card or a mouse
+           gets silence and no error, and the report has to be able to name it.*/
+#if X86_PROBE
+        unmodelled = 1;
+#endif
         break;
     }
+    X86_PROBE_PORT(X86_PROBE_KIND_OUT, (uint16_t)port, value, unmodelled);
 }

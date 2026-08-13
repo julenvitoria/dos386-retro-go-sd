@@ -140,6 +140,98 @@ than pasting seventeen symbols that go stale the moment a counter is added.
 | `x86_nor_cow_failures` / `x86_nor_unmapped` | the loud failures: the COW pool empty (structurally impossible — it is exactly as large as the snapshot) and traps that were a genuine unmapped access. Both should be 0 |
 | `x86_nor_slow_cycles` | DWT cycles inside the slow path. Ranking only under gwemu |
 
+### `probe_report.py` — what did this title ask for, and how did we answer
+
+```bash
+python3 scripts/probe_report.py --title keen4
+python3 scripts/probe_report.py --title wolf3d --settle 30
+python3 scripts/probe_report.py --rom .../GAME.dsk --name mygame
+python3 scripts/probe_report.py --title keen4 --skip-build --skip-cost   # fast
+python3 scripts/probe_report.py --compare before.json after.json
+```
+
+Boots a named title, lets it run **from its first instruction** (no settle-then-
+reset — the startup probes *are* the subject), and writes one report to
+`build/artifacts/probe_<title>_<target>.md` plus the same content as JSON.
+Presets: `keen4`, `wolf3d`, `topbench`, `alleycat`.
+
+**The report leads with what we did NOT answer**, then with the hardware we
+answered *absent*, and only then lists everything that worked. The column that
+matters is `status`:
+
+| status | means |
+|---|---|
+| `unanswered` | nobody claimed it. The guest kept whatever was in AX |
+| `default-arm` | a catch-all produced a shaped, **invented** answer |
+| `unmodelled-port` | the access fell off the end of the switch in `x86_io.c` |
+| `unclassified` | answered, but nobody has vetted the answer — **ranked high** |
+| `stub` | returns success and does nothing |
+| `partial` | right for some inputs, falls through for the rest |
+| `absent-by-design` | we say "this hardware is not here", and that is TRUE of the machine we claim to be. Not a defect — but it *is* what a title may be dying on, so it gets its own section |
+| `implemented` | modelled |
+
+**Runtime evidence outranks the table.** `unanswered` and `unmodelled-port` are
+facts the target observed (`rc==0`, `x86_hle_unhandled_*` moving, the switch
+fall-through) and cannot drift. The curated table in
+`scripts/common/probe_expect.py` only classifies calls the target says *were*
+answered — which is exactly the case the target cannot see the difference in.
+Anything the table does not cover is `unclassified`, never quietly
+`implemented`: a new probe appearing in a title is the thing this tool exists to
+surface, and a table that swallowed it would defeat the tool.
+
+That distinction is the whole point. `INT 21h AH=44h` with `AL>=2` returns
+`CF=1 AX=0001` from a catch-all; a real handler returning the same thing is
+indistinguishable in every other trace in this tree. Here it is a column.
+
+It found, on its first three runs: Keen 4 and Wolf3D both stopping at the
+`INT 10h AH=12h BL=10h` EGA gate, and **Alley Cat reading PIT channel 0 (port
+`0x40`) 2,013,208 times in 28 s against a port nothing models** — a clock that,
+from the guest's side, never moves.
+
+`--compare A.json B.json` diffs two runs and reports answers that were **FIXED**
+or **REGRESSED**, probes that appeared or vanished, and counts that moved — so a
+fix can be shown to have changed an answer. Poll counts jitter run to run under
+a frame-paced emulator; the *classifications* are stable, which is why the
+compare leads with those.
+
+#### Cost, and why it is off by default
+
+`X86_PROBE=1`, off by default like every other instrument. **Every report prints
+the delta it measured by building the core both ways in that same run** — not an
+estimate, because RAM_EMU headroom in this tree has gone negative silently more
+than once. On this tree:
+
+| | |
+|---|---|
+| RAM_EMU | **+3,568 B** (the 2,848 B accumulator plus code) |
+| `dos.bin` | **+720 B** — code only. The block is deliberately uninitialised `.bss` so it does not *also* occupy the packed image |
+| hot path | **nothing.** One hash probe per INT service and per port access; never per guest instruction |
+
+`--skip-cost` skips the second clean build when the number is not wanted.
+
+#### Why an accumulator and not a tenth ring
+
+There are nine trace rings in this tree and all of them **wrap**, so the probe
+issued once at startup is gone by the time anyone looks — that is what cost an
+earlier investigation hours when entry 2 was overwritten by 81 identical later
+ones. `x86_probe` is keyed by `(kind, id, AH, sub)` and **never evicts**: a
+title making 400 calls to twelve services occupies twelve slots, so a longer run
+only ever adds. When the 128 entries are all claimed it **saturates and counts
+what it refused**, and the report says so rather than presenting a subset as the
+whole conversation.
+
+The existing rings are untouched and still the right tool for **order**, which
+an accumulator throws away. Reach for `probe.py --dos-log` / `--io-log` when the
+question is "in what sequence"; reach for this when it is "what, and did we
+answer it".
+
+Two caveats the report states itself: **INT 15h is not dispatched at all**, so a
+guest calling it never reaches the accumulator and its absence from a report is
+not evidence nothing called it (check `x86_int_vec_log`). And the per-port
+"distinct values" figure is a fold of the low 5 bits — enough to separate a
+polled status register from a programmed register file, which is the question a
+port row raises, and not more than that.
+
 ### `watch_memory.py` — catch whatever is writing to an address
 
 ```bash
@@ -485,6 +577,7 @@ standby. Called automatically by `make retrogo_media`.
 | `x86_disk.c` | the block device under our FatFs, plus the .dsk sector cache: 4 x 16 KB LRU windows from the **AHB heap** (D2 SRAM -- DMA-reachable, and the only ABI pool with a real `free()`), which are the read-ahead AND the cache. Geometry is a build-time tunable (`X86_DISK_WINDOW_SECTORS` / `_COUNT`) |
 | `x86_zones.c/.h` | frame-loop PHASE accounting (`X86_ZONES=1` only): a push/pop zone stack over the emulator loop, exclusive self-time per zone, and the root zone as an honest unaccounted residual. The instrumentation points are in `src/main.c` |
 | `x86_disk.c` | the block device under our FatFs, plus the .dsk sector cache: 4 x 16 KB LRU windows from the bonus pool, which are the read-ahead AND the cache |
+| `x86_probe.c/.h` | the probe ACCUMULATOR (`X86_PROBE=1` only): every service and port the guest touched, keyed and never evicted, with the flags that say how each was answered. Hooked at exactly two funnels — `x86_hle_service()` and `x86_port_read`/`x86_port_write` — so no handler needs an annotation macro. Read it with `scripts/probe_report.py` |
 | `x86_mem.c` | guest page pool, fold mapping, guest↔host copies |
 | `x86_io.c` | port dispatch, PIT ch2 + speaker, CGA registers |
 | `x86_audio_wave.h` | PC-speaker square-wave generator: PIT divisor -> phase increment -> samples. `<stdint.h>` only, deliberately — that is what lets `tests/host_audio.c` build it natively. Vendored from the author's earlier DOS core |
@@ -704,6 +797,8 @@ Importable support only — no CLIs.
 | `zones.py` | Host side of the frame-loop zone accounting: locate the block, ask the TARGET to reset it at its own frame boundary (a host-side memset would race the stack marks), read it back, and derive the shares, the residual and the instrument's own overhead. Layout mirrors `x86_zones.h` |
 | `opcode_profile.py` | Host side of the per-opcode DWT profile: locate/reset/read the DTCM table, resolve slots to handler symbols off the live dispatch tables, render table/JSON/CSV. Layout and the on-target half live in `x86_profile.h` / `cpu_exec.S` |
 | `probe.py` | Sample PC, globals, pointer derefs and array dumps on a running target; `read_faults` decodes CFSR/HFSR/BFAR |
+| `probe_acc.py` | Host side of the probe accumulator: locate `x86_probe`, ask the target to reset it, read it back, and JOIN runtime evidence with the expectations table into one status per row. The precedence rule is the module's whole correctness argument — **runtime evidence wins**, and the table only classifies calls the target says WERE answered. Layout mirrors `x86_probe.h` |
+| `probe_expect.py` | The curated "what SHOULD we have returned" table — RBIL-shaped (vector, AH, subfunction, what a real BIOS/DOS does) plus what OUR handler does about it. This is the oracle, and the module docstring records why it is a table rather than a port-capable `refdos.py` or a DOSBox capture |
 | `watchpoint.py` | Z2/Z3 data watchpoints over the GDB remote protocol, and the unsolicited stop reply that follows a resume |
 | `fat12.py` | Builds a 64 KB FAT12 volume in memory with named files and known contents. A test that asserts on a shipped `.dsk` is asserting on someone else's data; this lets `test_dos.py` write the bytes it then expects to read back |
 | `dosimage.py` | FAT12 reader + MZ loader that mirrors `x86_dos_exec`, so a reference emulator starts from OUR entry state |
