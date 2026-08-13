@@ -314,10 +314,13 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
     if (guest_vram) {
         /* The CLUT the LCD scans out through. LUT8 gives 256 entries; CGA
          * mode 4 uses four and the palette registers pick which. */
-        /* ARGB8888, and only the four CGA colours: lcd_set_clut() caps the
-         * count at 32 and reads 32-bit entries. */
+        /* ARGB8888; lcd_set_clut() caps the count at 32 and reads 32-bit
+         * entries. All SIXTEEN are pushed, not four: mode 4 uses only entries
+         * 0-3, but text attributes index the whole CGA palette, and pushing
+         * four left 4-15 holding whatever retro-go's menu had -- so every
+         * bright or coloured attribute drew in a stale colour or in black. */
         x86_video_init(guest_vram, core_clut);
-        abi->lcd_ctl(GW_LCD_SET_CLUT, (uintptr_t)core_clut, 4, 0);
+        abi->lcd_ctl(GW_LCD_SET_CLUT, (uintptr_t)core_clut, 16, 0);
         cga_clut_dirty = 0;
     }
 
@@ -672,7 +675,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         /* A guest write to 0x3D9 changes the palette; the firmware holds its
          * own copy, so push ours again when it moves. */
         if (cga_clut_dirty) {
-            abi->lcd_ctl(GW_LCD_SET_CLUT, (uintptr_t)core_clut, 4, 0);
+            abi->lcd_ctl(GW_LCD_SET_CLUT, (uintptr_t)core_clut, 16, 0);
             cga_clut_dirty = 0;
         }
 
