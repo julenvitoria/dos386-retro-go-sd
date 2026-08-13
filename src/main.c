@@ -98,6 +98,7 @@ static uint8_t *upper_filler;
    black screen. */
 volatile uint32_t guest_ram_bytes = 0;
 volatile uint32_t guest_vram_ok = 0;
+volatile uint32_t upper_filler_ok = 0;   /* 0xA0000-0xFFFFF backed at all */
 volatile uint32_t frames_rendered = 0;
 /*
  * ===========================================================================
@@ -168,9 +169,15 @@ volatile uint32_t frames_rendered = 0;
 #define KIPS_286_12        1200u   /* 286 @ 12 MHz                    */
 #define KIPS_386SX_16      2500u   /* 386SX @ 16 MHz                  */
 #define KIPS_386_33        6000u   /* 386DX @ 33 MHz                  */
-volatile uint32_t guest_kips = KIPS_286_12;   /* default: a period-correct
-                                                 machine the H7 can actually
-                                                 sustain. 0 = unthrottled. */
+/*
+ * DEFAULT: unthrottled. The emulated machine runs as fast as the silicon
+ * delivers, and the number that describes it is guest_ips_achieved, not a
+ * deficit -- with no target there is nothing to be short OF, so the deficit
+ * counter is held at zero in this mode rather than left showing a stale value
+ * from a paced one. A period-correct machine is one menu entry away
+ * (cpu_profile_*, below), and the choice persists across a restart.
+ */
+volatile uint32_t guest_kips = KIPS_MAX;      /* 0 = unthrottled */
 volatile uint32_t guest_slice_now  = 0;  /* instructions this iteration got   */
 volatile uint32_t guest_insn_debt  = 0;  /* owed but not yet run              */
 volatile uint32_t guest_insn_deficit = 0;/* owed and WRITTEN OFF -- the loud   */
@@ -179,6 +186,7 @@ volatile uint32_t guest_fps_achieved = 0;/* measured iterations per second    */
 volatile uint32_t guest_insns_total = 0; /* instructions run since boot       */
 volatile uint32_t frame_ms_last    = 0;  /* last iteration, host ms           */
 volatile uint32_t panel_ms_min     = 0;  /* shortest iteration seen = the panel*/
+volatile uint32_t frame_10us_avg = 8u * 1667u; /* mean iteration, 8x, 10us units */
 volatile uint32_t guest_exec_ms    = 0;  /* host ms spent RUNNING the guest    */
 static uint32_t   max_slice = 20000u;    /* unthrottled mode's working slice  */
 static uint32_t   rate_window_ms;        /* start of the achieved-rate window */
@@ -475,8 +483,25 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
 
     guest_ram = (uint8_t *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM,
                                         1, GUEST_RAM_SIZE);
-    upper_filler = (uint8_t *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM, 1, 4096);
     guest_ram_bytes = guest_ram ? GUEST_RAM_SIZE : 0;
+
+    /* The open-bus filler comes from the BONUS POOL, not from RAM_EMU.
+     *
+     * RAM_EMU headroom past our BSS is a few hundred bytes (see TOOLING.md),
+     * and this page is the last thing allocated, so it is the first casualty
+     * of any growth in the core -- silently, because the region it backs is
+     * only ever PROBED by option-ROM scans. The bonus pool is 150 KB of AXI we
+     * claim and do not use, and uncached is irrelevant for a page that is
+     * written once and read rarely.
+     *
+     * ram_malloc() returns NULL rather than overrunning, so a failure here is
+     * a missing mapping, not corruption -- but it must still be visible. */
+    if (bonus && bonus_sz >= 4096)
+        upper_filler = bonus;
+    else
+        upper_filler = (uint8_t *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM,
+                                               1, 4096);
+    upper_filler_ok = upper_filler ? 1 : 0;
 
     if (guest_vram) {
         /* The CLUT the LCD scans out through. LUT8 gives 256 entries; CGA
@@ -763,6 +788,102 @@ static const uint8_t pad_scancode[8] = {
 };
 
 /*
+ * ===========================================================================
+ * The emulated CPU's speed, as a Retro-Go game-options entry.
+ * ===========================================================================
+ *
+ * common_emu_input_loop() takes an options array and shows it in the PAUSE/SET
+ * menu; we used to pass NULL, so guest_kips was reachable only over the debug
+ * probe. The rungs are the KIPS_* profiles above, MAX first because that is the
+ * default.
+ *
+ * Three things here are load-bearing, each of them a hardfault or a wrong
+ * reading if got wrong:
+ *
+ *   - `value` must point at MUTABLE, caller-owned storage. The callback writes
+ *     the rendered value into option->value, so a string literal there is a
+ *     write to flash. It is static rather than automatic so it also outlives
+ *     the dialog, which keeps the pointer.
+ *   - the array is terminated with ODROID_DIALOG_CHOICE_LAST, and the repaint
+ *     callback is NEVER NULL (see core_repaint).
+ *   - the value is re-rendered on EVERY event, including the plain repaint,
+ *     because the dialog draws from the buffer rather than from our state.
+ */
+/*
+ * The settings key is NOT free-form. odroid_settings_app_int32_get/set match
+ * the key against a fixed whitelist ("Palette", "SpriteLimit", "Region",
+ * "DispScaling", "DispFilter", "DispOverscan", "DistRotation") and SILENTLY
+ * ignore anything else -- a set with our own name would store nothing and the
+ * get would hand back the default forever, which reads exactly like "the
+ * setting does not persist". The slot is per-app (core_cfg_slot()), so
+ * "Palette" is ours alone; nothing in this core has a palette setting.
+ */
+#define CPU_PROFILE_KEY   "Palette"
+#define CPU_OPTION_ID     100
+
+static const uint16_t cpu_profile_kips[] = {
+    KIPS_MAX, KIPS_8088_477, KIPS_286_8, KIPS_286_12, KIPS_386SX_16, KIPS_386_33,
+};
+static const char *const cpu_profile_name[] = {
+    "Max", "8088 4.77", "286 8MHz", "286 12MHz", "386SX 16", "386DX 33",
+};
+#define CPU_PROFILE_COUNT ((int)(sizeof(cpu_profile_kips) / sizeof(cpu_profile_kips[0])))
+
+volatile uint32_t cpu_profile_persisted = 0xFF;  /* what the settings store kept */
+volatile uint32_t cpu_profile_events = 0;        /* dialog callbacks seen      */
+volatile uint32_t cpu_profile_last_event = 0xFF; /* last odroid_dialog_event_t */
+static int  cpu_profile_idx;
+static char cpu_profile_value[16];
+
+/* Changing the emulated CPU's speed invalidates every number measured against
+   the old one. Clearing them is what keeps "am I getting what I asked for?"
+   answerable straight after a change instead of a minute later. */
+static void cpu_profile_apply(int idx)
+{
+    if (idx < 0 || idx >= CPU_PROFILE_COUNT)
+        idx = 0;
+    cpu_profile_idx = idx;
+    guest_kips = cpu_profile_kips[idx];
+    guest_insn_debt = 0;
+    guest_insn_deficit = 0;
+    strcpy(cpu_profile_value, cpu_profile_name[idx]);
+}
+
+static bool cpu_profile_cb(odroid_dialog_choice_t *option,
+                           odroid_dialog_event_t event, uint32_t repeat)
+{
+    (void)repeat;
+    /* The menu path has no other witness: a malformed array simply never
+       reaches us, which looks identical to a menu that never opened. */
+    cpu_profile_events++;
+    cpu_profile_last_event = (uint32_t)event;
+
+    int idx = cpu_profile_idx;
+    int max = CPU_PROFILE_COUNT - 1;
+
+    if (event == ODROID_DIALOG_PREV) idx = idx > 0 ? idx - 1 : max;
+    if (event == ODROID_DIALOG_NEXT) idx = idx < max ? idx + 1 : 0;
+
+    if (event == ODROID_DIALOG_PREV || event == ODROID_DIALOG_NEXT) {
+        const gw_firmware_abi_t *abi = gw_firmware_abi();
+        cpu_profile_apply(idx);
+        abi->odroid_settings_app_int32_set(CPU_PROFILE_KEY, idx);
+        /* Read it straight back. A settings key the firmware does not know is
+           ignored in silence, and "it did not persist" is only visible a
+           reboot later -- this makes the round trip measurable now. */
+        cpu_profile_persisted =
+            (uint32_t)abi->odroid_settings_app_int32_get(CPU_PROFILE_KEY, 0xFF);
+    }
+    strcpy(option->value, cpu_profile_name[cpu_profile_idx]);
+    return event == ODROID_DIALOG_ENTER;
+}
+
+static void cpu_profile_init(const gw_firmware_abi_t *abi)
+{
+    cpu_profile_apply(abi->odroid_settings_app_int32_get(CPU_PROFILE_KEY, 0));
+}
+
+/*
  * Repaint the guest frame under the overlay.
  *
  * NOT optional. Retro-Go's repaint_overlay() calls this callback
@@ -794,7 +915,14 @@ static void poll_input(const gw_firmware_abi_t *abi)
        brightness, volume and exit. Reading the gamepad directly and stopping
        there -- which is what this did -- leaves the core running inside
        Retro-Go with no way to get back out of it. */
-    abi->common_emu_input_loop(&pad, NULL, core_repaint);
+    /* The array lives on this stack frame and the menu runs INSIDE the call,
+       so it is alive for exactly as long as it is used; only the value buffer
+       has to outlive the call, and it is static. */
+    odroid_dialog_choice_t options[] = {
+        {CPU_OPTION_ID, "CPU Speed", cpu_profile_value, 1, &cpu_profile_cb},
+        ODROID_DIALOG_CHOICE_LAST,
+    };
+    abi->common_emu_input_loop(&pad, options, core_repaint);
 
     input_polls++;
     {
@@ -846,6 +974,8 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
        start of its buffer (the old point-sampled behaviour). */
     x86_io_time_ms = abi->HAL_GetTick;
 
+    cpu_profile_init(abi);
+
     guest_reset();
     guest_halted = 0;
     tick_last_ms = abi->HAL_GetTick();
@@ -859,7 +989,49 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
     uint32_t audio_frames = (uint32_t)abi->audio_ctl(GW_AUDIO_GET_LENGTH, 0);
     abi->audio_ctl(GW_AUDIO_START, audio_frames);
 
+    /*
+     * =======================================================================
+     * WHO PACES THE DISPLAY -- one answer, deliberately.
+     * =======================================================================
+     *
+     * CLOCK 1 (the panel's swap signal, at the bottom of this loop) OWNS
+     * display pacing. It is the hardware's own period, it is what the learned
+     * panel_ms_min is measured from, and it is what sizes the unthrottled
+     * slice. Nothing here replaces it.
+     *
+     * The firmware's common_emu_frame_loop() is a full pacer too -- it decides
+     * draw/skip from its own frame_time_10us integrator. Running both would be
+     * exactly the two-driver bug that wrecked the BIOS tick. So it DEFERS:
+     *
+     *   - we call it once per iteration for its BOOKKEEPING half, which is the
+     *     only reason the overlay's fps and busy% readouts exist at all
+     *     (odroid_system_tick(!draw_frame, 0, cpumon_stats.busy_ms)). Never
+     *     calling it is why they read 0.0 (0.0) fps and busy 0.0%.
+     *   - we IGNORE its draw_frame verdict; we always draw, and the panel wait
+     *     is what regulates us.
+     *   - we feed it the MEASURED display period, so its integrator agrees
+     *     with the pacer that is actually running and it does not report
+     *     phantom skipped frames into the fps the user reads.
+     *
+     * busy%: cpumon_stats.busy_ms must accumulate BETWEEN frame_loop calls
+     * (frame_loop cpumon_reset()s immediately after reading it). cpumon_sleep()
+     * is the idle marker -- it closes the busy interval, WFIs, and opens a
+     * sleep interval -- so it goes in the panel wait, the only place this loop
+     * is genuinely idle. Calling neither leaves busy_ms 0 forever.
+     */
+    abi->common_emu_frame_loop_reset();
+
     while (1) {
+        /* Feed the observer the period we are ACTUALLY running at, smoothed.
+           NOT panel_ms_min: that is the shortest iteration ever completed, and
+           handing the firmware a period shorter than the real one makes its
+           integrator saturate and mark three frames in four as skipped -- which
+           we then render anyway, so the overlay's skipped-fps figure was pure
+           fiction (measured: 768 "skipped" of 1032 drawn). */
+        common_emu_state.frame_time_10us = (int16_t)(frame_10us_avg / 8u);
+        /* Bookkeeping only -- see above. The verdict is deliberately unused. */
+        (void)abi->common_emu_frame_loop();
+
         /* The host can still ask for the CPU benchmark: it is how tiers 2 and
          * 3 stay comparable with tier 1, and it must not disappear just
          * because there is now a frame loop around it. It reprograms guest
@@ -944,6 +1116,11 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
             if (kips == 0u) {
                 slice = max_slice;
                 guest_insn_debt = 0;           /* no target, so nothing owed */
+                /* And nothing CAN be owed, so the deficit is not merely
+                   uninteresting here, it is undefined. Held at zero so the
+                   readout means the same thing in both modes: in MAX the
+                   number to read is guest_ips_achieved. */
+                guest_insn_deficit = 0;
             } else {
                 uint32_t debt = guest_insn_debt + dt * kips;
                 uint32_t debt_max = kips * GUEST_DEBT_MAX_MS;
@@ -1098,10 +1275,19 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
            Whether we had to wait here is also the only honest measure of
            headroom, so it is what sizes the unthrottled slice. */
         abi->lcd_ctl(GW_LCD_SWAP, 0, 0, 0);
-        for (unsigned spins = 0;
-             spins < 100000u && abi->lcd_ctl(GW_LCD_IS_SWAP_PENDING, 0, 0, 0);
-             spins++) {
-            /* bounded: never trade a black screen for a hang */
+        {
+            /* This wait is the loop's ONLY idle, so it is where the CPU
+               monitor is told so -- cpumon_sleep() closes the busy interval
+               (which is what the overlay's busy% reads) and WFIs until the
+               next interrupt. A WFI can rest until the next SysTick, so the
+               bound here is wall clock rather than a spin count: a swap that
+               never completes must cost one frame, not 100000 sleeps. */
+            uint32_t wait_start = abi->HAL_GetTick();
+            while (abi->lcd_ctl(GW_LCD_IS_SWAP_PENDING, 0, 0, 0)) {
+                if ((uint32_t)(abi->HAL_GetTick() - wait_start) > 100u)
+                    break;   /* never trade a black screen for a hang */
+                abi->cpumon_sleep();
+            }
         }
         frames_rendered++;
         guest_insns_total += slice;
@@ -1110,6 +1296,13 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         /* What this iteration really cost. */
         uint32_t frame_end_ms = abi->HAL_GetTick();
         frame_ms_last = frame_end_ms - frame_start_ms;
+
+        /* The AVERAGE period, 8x oversampled, for the frame-loop observer. A
+           mean, unlike panel_ms_min, is what an integrator comparing elapsed
+           time against a period needs to sit at zero. */
+        frame_10us_avg += (frame_ms_last * 100u) - (frame_10us_avg / 8u);
+        if (frame_10us_avg > 8u * 30000u)
+            frame_10us_avg = 8u * 30000u;   /* int16_t 10us units: 300 ms cap */
 
         /* The display period, learned rather than declared. It creeps upward
            so a panel that slows down (or an overclock that goes away) is
