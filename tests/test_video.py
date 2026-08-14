@@ -1241,6 +1241,88 @@ def ega_checks(b, syms):
     return True
 
 
+MODEY_CACHE_BASE = 0xC300       # X86_MODEY_CACHE
+WINDOW_OFFSETS = 0x10000        # the A segment decodes 64 KB per plane
+
+
+def modeyfit_checks(b, syms):
+    """The Mode Y off-screen cache, fitted against the real arena layout.
+
+    Wolfenstein 3D caches its pictures off-screen and blits them out with latch
+    copies, so text (drawn straight to the visible page) stayed perfect while
+    every cached picture turned to noise: the cache was a fixed 8,192 offsets
+    ending at 0xE2FF and the title writes up to 0xFFFF. The core fits it now,
+    and this asserts the fit on the layout the core actually claims -- the
+    arithmetic working out is NOT evidence that a contiguous run exists,
+    which is exactly the fragmentation trap the EGA work found.
+    """
+    for n in ("run_modeyfit_flag", "modeyfit_r"):
+        if n not in syms:
+            print(f"missing symbol {n}")
+            return False
+    b.write_uint32(syms["run_modeyfit_flag"], 1)
+    if not wait_flag(b, syms["run_modeyfit_flag"], 0, "Mode Y fit arm hung"):
+        return False
+    r = [b.read_uint32(syms["modeyfit_r"] + 4 * i) for i in range(16)]
+    top = MODEY_CACHE_BASE + r[4]
+    print(f"  claims={r[0]}{r[1]} largest_before={r[2]} mode={r[3]:#04x} "
+          f"cache={r[4]} (0x{MODEY_CACHE_BASE:04x}..0x{top - 1:04x}) "
+          f"cga_held={r[5]} largest_after={r[6]} | back: mode={r[7]:#04x} "
+          f"cga_held={r[8]} cell={r[9]:#06x} cache={r[10]} | "
+          f"control: mode={r[11]:#04x} cache={r[12]}")
+
+    if not (r[0] and r[1]):
+        print("FAIL: the harness could not make the core's own two claims")
+        return False
+    if r[2] != 45056:
+        print(f"FAIL: expected 45,056 bytes free before the loan, got {r[2]}")
+        return False
+    if r[3] != 0x13:
+        print(f"FAIL: mode 13h was not adopted (mode {r[3]:#x})")
+        return False
+    if top != WINDOW_OFFSETS:
+        print(f"FAIL: the cache is {r[4]} plane offsets and reaches "
+              f"0x{top:04x}, not 0x{WINDOW_OFFSETS:04x}. Everything from there "
+              f"to the top of the window is DISCARDED, and Wolfenstein 3D "
+              f"writes cached pictures over that whole range -- measured "
+              f"0xEF00..0xFFFF under gwemu. {4 * r[4]} bytes is not enough; "
+              f"{4 * (WINDOW_OFFSETS - MODEY_CACHE_BASE)} is.")
+        return False
+    if r[5]:
+        print("FAIL: the CGA claim is still held while 13h is up, so the "
+              "cache got only what was left over. Lending it is what makes "
+              "the full window fit.")
+        return False
+    if r[7] != 0x03 or not r[8] or r[10]:
+        print(f"FAIL: returning to text did not give the CGA claim back and "
+              f"release the cache (mode {r[7]:#x}, held {r[8]}, cache {r[10]})")
+        return False
+    if r[9] != 0x0720:
+        print(f"FAIL: the text buffer came back as {r[9]:#06x}, not blank "
+              f"(0x0720). Its pages held cache bytes and were not cleared, so "
+              f"the guest's screen is cache data read as glyphs.")
+        return False
+    # ---- the negative control: a small arena. A cache is not worth refusing a
+    # whole mode over, so the right answer is a SMALLER cache, not a refusal.
+    if r[11] != 0x13:
+        print(f"FAIL: 13h was refused ({r[11]:#x}) because the full cache did "
+              f"not fit. 13h renders from the aperture and does not need the "
+              f"cache at all; only Mode Y's off-screen writes do.")
+        return False
+    if not (0 < r[12] < r[4]):
+        print(f"FAIL: against a small arena the fit gave {r[12]} offsets, "
+              f"expected something smaller than {r[4]} and non-zero. The walk "
+              f"down is what makes a tight arena degrade instead of refuse.")
+        return False
+    print(f"PASS: Mode Y cache 8,192 -> {r[4]} plane offsets ({4 * r[4]} B) "
+          f"covering 0x{MODEY_CACHE_BASE:04x}..0x{top - 1:04x}, the whole "
+          f"off-screen window; CGA lent and returned blank; a tight arena "
+          f"degrades to {r[12]} offsets rather than refusing the mode")
+    b.write_uint32(syms["run_planar_flag"], 3)
+    wait_flag(b, syms["run_planar_flag"], 0, "planar unmap hung")
+    return True
+
+
 def egafit_checks(b, syms):
     """The ENLARGED EGA card: the CGA loan, the compaction, and the refusal.
 
@@ -1474,6 +1556,11 @@ def main(args):
             # guest program, so nothing else has to run first.
             time.sleep(0.5)
             return present_checks(b, syms)
+        if getattr(args, "modeyfit_only", False):
+            # The fit arm alone, for the CACHE control. It builds its own arena
+            # and its own video buffers, so nothing has to run before it.
+            time.sleep(0.5)
+            return modeyfit_checks(b, syms)
         if getattr(args, "modey_only", False):
             # The single arm scripts/run_planar_controls.py builds and re-runs
             # once per control. Nothing else runs, so a control's verdict is
@@ -1545,7 +1632,11 @@ def main(args):
         # LAST: it re-points the video layer at arena blocks of its own and
         # rebuilds the arena around them, so nothing may run after it that
         # expects the harness's standard buffers still to be claimed.
-        return egafit_checks(b, syms)
+        if not egafit_checks(b, syms):
+            return False
+        # LAST for the same reason egafit is: it rebuilds the arena around
+        # blocks of its own.
+        return modeyfit_checks(b, syms)
     finally:
         runner.stop()
 
@@ -1558,6 +1649,9 @@ if __name__ == "__main__":
                    help="run only the Mode Y arm (the controls driver uses this)")
     p.add_argument("--present-only", action="store_true",
                    help="run only the Mode Y presentation-policy arm")
+    p.add_argument("--modeyfit-only", action="store_true",
+                   help="run only the Mode Y off-screen-cache FIT arm (the "
+                        "CACHE control in scripts/run_planar_controls.py)")
     p.add_argument("--quiet", action="store_true",
                    help="suppress the PASS chatter; the exit code is the verdict")
     args = p.parse_args()

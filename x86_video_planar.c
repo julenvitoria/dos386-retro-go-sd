@@ -186,8 +186,9 @@ volatile uint32_t x86_vga_latch_loads;
  * the discard: 2,688 of 59,616 cache latch loads, all in one cold one-off
  * region at 0xE100-0xECFF") and one lump sum cannot be compared with it.
  *
- *   _CACHE  a store at or above 0xE300 -- past the 8,192 offsets of off-screen
- *           cache that exist. The reference measured this region as cold and
+ *   _CACHE  a store past the end of the off-screen cache that was actually
+ *           fitted (x86_vga_modey_cache_offs above 0xC300; 0xE300 with the old
+ *           fixed 8,192). The reference measured this region as cold and
  *           one-off, and rebuilding with a 48 KB cache gave a byte-identical
  *           frame, so a LARGE number here that keeps CLIMBING during gameplay
  *           would contradict the reference and is the first thing to look at.
@@ -204,6 +205,16 @@ volatile uint32_t x86_vga_modey_lost_nocache;
 /* Host-visible proof that the off-screen cache is CLAIMED and non-NULL: this is
    X86_MODEY_CACHE_OFFSETS when it is live and 0 when the arena refused it. */
 volatile uint32_t x86_vga_modey_cache_offs;
+/*
+ * The HIGHEST window offset a store was thrown away at, and the lowest one
+ * above the cache. "How much cache does this title need?" cannot be answered
+ * by a discard COUNT -- 16,896 discards is the same number whether they are all
+ * one offset past the end or spread over 8 KB -- and sizing the cache by
+ * guessing is what left Wolf3D's pictures as noise through two attempts. These
+ * two say exactly where to put the top of the cache: it must reach _hi + 1.
+ */
+volatile uint32_t x86_vga_modey_lost_hi;
+volatile uint32_t x86_vga_modey_lost_lo = 0xFFFFFFFFu;
 volatile uint32_t x86_vga_latch_miss;
 
 static uint8_t  *ega_planes;        /* 0Dh interleaved plane storage (arena) */
@@ -236,6 +247,9 @@ int x86_vga_planar_active(void)  { return (int)(x86_vga_modey_armed | x86_vga_eg
 
 const uint8_t *x86_vga_ega_planes(void)      { return ega_planes; }
 uint32_t       x86_vga_ega_plane_offsets(void) { return ega_plane_size; }
+/* For the harness only: the fit arm scribbles the cache so a text buffer that
+   came back holding cache bytes cannot pass by being incidentally zero. */
+const uint8_t *x86_vga_modey_cache_ptr(void) { return modey_cache; }
 
 void x86_vga_ega_set_planes(void *p, uint32_t plane_offsets)
 {
@@ -435,6 +449,10 @@ static void modey_lost(uint32_t a)
             x86_vga_modey_lost_nocache++;
         else
             x86_vga_modey_lost_cache++;
+        if (a > x86_vga_modey_lost_hi)
+            x86_vga_modey_lost_hi = a;
+        if (a < x86_vga_modey_lost_lo)
+            x86_vga_modey_lost_lo = a;
     } else {
         x86_vga_modey_lost_tail++;
     }

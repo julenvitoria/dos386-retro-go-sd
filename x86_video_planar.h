@@ -72,6 +72,11 @@ int  x86_vga_planar_active(void);
    bytes, so a block of N offsets costs 4N bytes of arena. Quoting the two
    quantities in the same units is how a card comes out four times too small. */
 #define X86_EGA_PLANE_OFFSETS   0x2000u   /* 8,192 -> a 32 KB card, 32,768 B  */
+/* The Mode Y off-screen cache is FITTED, not fixed: x86_video.c walks down
+   from what the mode can address until the arena takes the claim, so read
+   x86_vga_modey_cache_offs for what actually exists. This constant survives
+   only as the old shipping size, which is the size Wolf3D's cached pictures
+   came out as noise at (16,896 stores discarded above 0xE300 on hardware). */
 #define X86_MODEY_CACHE_OFFSETS 0x2000u   /* 8,192 off-screen, 32,768 B       */
 /* The aliased Mode Y page: 4 * 0x4000 == 0x10000, the aperture exactly. */
 #define X86_MODEY_PLANE_OFFSETS 0x4000u
@@ -80,6 +85,7 @@ void x86_vga_ega_set_planes(void *planes, uint32_t plane_offsets);
 void x86_vga_modey_set_cache(void *cache, uint32_t offsets);
 
 const uint8_t *x86_vga_ega_planes(void);
+const uint8_t *x86_vga_modey_cache_ptr(void);
 uint32_t       x86_vga_ega_plane_offsets(void);
 
 /* ---- the blit's half of the address model -------------------------------
@@ -144,9 +150,15 @@ extern volatile uint32_t x86_vga_latch_miss;      /* ...from an absent cell    *
 extern volatile uint32_t x86_vga_modey_lost_cache;   /* stores at/above 0xE300 */
 extern volatile uint32_t x86_vga_modey_lost_tail;    /* a page's rows 205+     */
 extern volatile uint32_t x86_vga_modey_lost_nocache; /* arena refused the cache*/
-/* Plane offsets of off-screen cache actually claimed: X86_MODEY_CACHE_OFFSETS
-   when live, 0 when the arena refused it. The one read that settles "is the
-   0xC300 cache genuinely there". */
+/* Plane offsets of off-screen cache actually claimed -- whatever the arena
+   would give, 0 when it refused. The one read that settles both "is the
+   0xC300 cache genuinely there" and "how far up does it reach": the cache
+   covers 0xC300 .. 0xC300 + this - 1, and a store past that is counted in
+   x86_vga_modey_lost_cache and lost. */
 extern volatile uint32_t x86_vga_modey_cache_offs;
+/* Highest and lowest window offset a cache store was discarded at. A count
+   cannot say how much bigger the cache needs to be; these can. */
+extern volatile uint32_t x86_vga_modey_lost_hi;
+extern volatile uint32_t x86_vga_modey_lost_lo;
 
 #endif /* X86_VIDEO_PLANAR_H */

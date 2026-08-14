@@ -81,6 +81,8 @@ FW_DIR = "references/game-and-watch-retro-go-sd/build"
 WITNESS = ("x86_video_mode_byte", "frames_rendered", "guest_insns_total",
            "x86_vga_modey_lost_cache", "x86_vga_modey_lost_nocache",
            "x86_vga_latch_miss", "x86_vga_planar_lost",
+           "x86_vga_modey_cache_offs", "x86_vga_modey_lost_hi",
+           "x86_vga_modey_lost_lo",
            "x86_vga_ega_card_offsets", "x86_arena_largest")
 
 
