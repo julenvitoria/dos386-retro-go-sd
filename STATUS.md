@@ -1631,3 +1631,59 @@ end-to-end confirmation of the 140 Hz rate at tier 2. It loops on `INT 21h` AH=2
 error and exiting over and over), with `x86_vga_dac_writes` 0. **Measured
 identically on unmodified master**, so it is not this change — but it is a live
 regression somebody owns.
+
+## The DOS launch path, re-landed in pieces -- and why the environment block is still out
+
+The reverted `07ca738` fixed five real defects and broke WOLF3D. Three of them
+are back (`fix/dos-launch-path`), each verified BY PICTURE at every step, and
+the fifth is deliberately still out with the measurement that says why.
+
+**The baseline nobody had.** WOLF3D on today's master reaches its **title
+screen** -- the logo, two guards, the id credit -- 57,874 of 76,800 non-zero
+pixels. (The note above, "Wolf3D does not currently reach its title screen on
+master", is stale; PIT ch0 and the EGA/Mode-Y work landed since.) ALLEYCAT
+shows its joystick prompt in CGA mode 4, 64,000. KEEN4 shows its EGA 0Dh MAIN
+MENU console, 60,463. Those three numbers, and the three pictures, are the
+non-regression test for anything in the launch path. **An instruction counter
+is not**: the break this section is about executed 64.7 M instructions "and
+still running" while printing rubbish, and that is how it got merged.
+
+**Landed and verified:** the fallback that wrote the demo to the page POOL
+instead of guest 0x100 (`src/main.c`); `parse_batch()` following `CD` and one
+level of `.BAT`; a current directory (`x86_dos_set_cwd`) applied to relative
+paths only; `INT 21h AH=47h` answering with it. All three titles pixel-identical
+after each. Dark Forces goes from "MZ-load a batch file, fail, execute the IVT"
+to `dsk_exec_rc=0` with DOS/4GW's stub running its handle probes.
+
+**NOT landed: the environment block.** It is what breaks WOLF3D, and bisecting
+it says the cause is not DOS semantics at all:
+
+| what | WOLF3D |
+|---|---|
+| master / this branch | title screen, **57,874** |
+| + env block, 16 paras, `PSP+2Ch` set | text garbage, 16,436 |
+| + env block, 16 paras, `PSP+2Ch` left **0** | text garbage, 17,105 |
+| + program-block `owner = psp`, **no** env block | title screen, **57,874** |
+| + env block **255 paras** (shift = exactly 4096 B) | title screen, **57,874** |
+| + env block 15 paras (shift = 256 B) | mode 13h orange noise, 64,000 |
+
+So: the PSP+2Ch pointer is innocent, the MCB `owner` fix is innocent and SAFE,
+and **the program's load address is only allowed to move by whole 4 KB
+granules**. The env block is a red herring -- it is simply the first thing that
+ever shifted the arena. Master's PSP is linear 0x710; 0x1710 works, 0x810 and
+0x820 do not.
+
+**That is a guest-memory bug of ours, not a DOS one, and it is unfound.** The
+DOS loader itself is granule-aware (`x86_guest_copy_in` walks pages;
+`psp_build` copies granule-aware; WOLF3D.EXE has zero relocations). Something
+downstream is sensitive to a load's offset within a 4 KB page. Until it is
+found, ANY change to the low-memory layout -- an environment block, a bigger
+arena base, a device driver stub -- is a loaded gun, and the failure is silent
+and looks like a game bug.
+
+The corrupted screen is the diagnostic: `screenshot.py --text` shows one
+repeating pattern (`«Æ..rÆ..8.«Æ..rÆ...J.ù....R.`) shifting one column per row,
+and `probe.py --dos-log` shows WOLF3D doing one `findfirst *.WL1` and then
+**184,293** identical 14-byte `AH=40h` writes to stderr -- an error message on
+a loop. `tests/test_dos.py`'s new MZ-load arm cannot see this class: tier 1
+maps guest memory flat.
