@@ -64,6 +64,13 @@ is exactly how the palette stream was cleared of a channel rotation.
 `--bytes-save SYM[:N]:FILE` writes the range out for a byte compare against a
 reference. **For GUEST memory use `--guest`, never `--bytes`.**
 
+`--artifacts [DIR]` (default `build/artifacts`) copies the `.png`/`.ppm` that a
+timeline's `screenshot` events produced out of the run directory **before**
+`stop()` deletes it. gwemu resolves those paths against its own cwd, which is
+the per-run temp directory, so without this the pictures a timeline exists to
+take are written and then thrown away -- which reads exactly like gwemu
+ignoring the events.
+
 ```bash
 # the 768 DAC bytes behind the pointer, as r,g,b triples
 python3 scripts/probe.py --retrogo --wait-magic \
@@ -972,10 +979,50 @@ python3 scripts/make_retrogo_config.py --out build/CONFIG --rom dos ALLEYCAT.dsk
 Preselects a ROM (so no launcher navigation is needed) and disables idle
 standby. Called automatically by `make retrogo_media`.
 
+### `gwemu_run.py` — an INTERACTIVE session the harness cannot close
+
+```bash
+# boot to the retro-go menu and drive it yourself (no ROM preselected)
+python3 scripts/sdcard.py --image build/sd-menu.img \
+    --rom references/game-and-watch-retro-go-sd/roms/dos/KEEN4.dsk \
+    --core dos.bin --no-config
+python3 scripts/gwemu_run.py --sd build/sd-menu.img
+
+# same, sampling counters every 3 s while you play
+python3 scripts/gwemu_run.py --sd build/sd-menu.img \
+    --watch guest_insns_total,core_ready,x86_pg_exhausted --interval 3
+```
+
+**Use this, not `probe.py --gui`, whenever a HUMAN is going to touch the
+emulator.** `GwemuTarget` starts gwemu with `-S` (halted) and only the GDB
+backend's `resume()` runs it, then `atexit` tears the process down when the
+harness exits. That is right for a measurement — boot, sample to a
+deterministic point, stop — and exactly wrong for someone sitting in front of
+the window: every sampling harness kills the emulator the moment it finishes
+booting, which on a slow boot is the moment it becomes useful. This script owns
+the process for as long as the WINDOW is open and exits when you close it.
+
+`--watch` is optional and off by default, because sampling halts the CPU;
+leave it off if you are judging responsiveness.
+
+**Confirm CONFIG is really absent rather than trusting `--no-config`:**
+
+```bash
+mdir -i build/sd-menu.img@@1M -/ :: | grep -i config
+```
+
 ### Vendored
 
 `make_sdcard_image.py` (partitioned SD image), `sync_from_firmware.sh`
 (re-vendor `sdk/` from a firmware checkout, then update `SDK_VERSION`).
+
+**Re-vendoring is not done until it is COMMITTED.** Agent worktrees share
+`.git` but have their own working trees, so an uncommitted `sdk/include/`
+leaves every agent compiling against the OLD ABI while the main checkout uses
+the new one — invisible from both sides. That skew cost two agents a wrong
+diagnosis of tier 2, one of them concluding the harness was broken. It also
+does not announce itself: the core still BUILDS and then refuses to start,
+with retro-go spinning in `show_corrupted_installation_screen()`.
 
 ## Source layout (emulator side)
 
@@ -1003,8 +1050,33 @@ standby. Called automatically by `make retrogo_media`.
 ## Harnesses (`tests/`)
 
 ```bash
-python3 tests/test_opcodes.py            # 162 cases: EFLAGS, segmentation,
+python3 tests/test_opcodes.py            # 273 cases: EFLAGS, segmentation,
                                          # 16-bit, 66/67, interrupts, speaker
+python3 tests/test_alu_fuzz.py           # DIFFERENTIAL fuzz vs Unicorn, 16-bit
+python3 tests/test_alu_fuzz.py --cases 20000 --seed 7
+python3 tests/test_alu_fuzz.py --group grp2
+
+### `tests/test_alu_fuzz.py` — the arithmetic, graded against Unicorn
+
+`test_opcodes.py` is hand-written and therefore only covers behaviours somebody
+thought of. This generates RANDOM operands for the instructions a 16-bit program
+actually lives on -- Grp2 shifts/rotates in all three count forms, Grp3
+MUL/IMUL/DIV/IDIV/NEG/NOT/TEST, the ADC/SBB carry chain, INC/DEC, CBW/CWD,
+AAM/AAD, SHLD/SHRD -- runs each one instruction under our core and under
+Unicorn, and diffs the eight registers and the DEFINED flags.
+
+Flags x86 leaves undefined are not compared (AF after shifts/rotates/logic and
+MUL/DIV, OF after a multi-bit shift), and an opcode with no handler is reported
+as a GAP (`exit_reason=UNIMPLEMENTED`, currently SHLD/SHRD) rather than graded
+as a wrong answer -- otherwise one real bug drowns in forty known holes. The
+seed is fixed and printed, so a failure is reproducible.
+
+**It found the Wolfenstein 3-D defect four hand-written INC/DEC cases had
+walked past**: `INC r16`/`DEC r16` (0x40-0x4F) took SF, ZF and OF off bit 31 of
+an un-normalized 32-bit add. It also caught `TEST Ev,Iv` at 16 bits, AAM/AAD
+setting no flags at all, and ROR/RCR computing OF as `MSB ^ MSB` (identically
+zero). Needs `pip install unicorn`; it SKIPs cleanly without it.
+
 python3 tests/test_benchmark.py
 python3 tests/test_game.py
 python3 tests/test_dos.py                # MCB arena, walked from the host, plus

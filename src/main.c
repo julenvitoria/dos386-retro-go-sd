@@ -88,7 +88,7 @@ static void dma2d_selftest(void);
  * The LCD pool is statically sized at 300 KB for the largest mode (2x RGB565).
  * Switching to LUT8 halves the framebuffer requirement and the firmware frees
  * the upper half as a bonus pool -- so the reclaimed AXI is NOT extra RAM_EMU,
- * it is a separate region fetched at runtime via GW_LCD_GET_BONUS_POOL.
+ * it is a separate region fetched at runtime via lcd_get_bonus_pool().
  *
  * The spike's benchmark needs only a few KB (code at 0, IDT at 0x1000, ISR at
  * 0x2000, stack at 0x3000), so it runs in 64 KB; the bonus pool is claimed and
@@ -247,7 +247,7 @@ volatile uint32_t frames_rendered = 0;
  * hardcoded 60:
  *
  *   1. DISPLAY RATE -- follows the hardware. The loop renders, asks for a
- *      swap, and waits on GW_LCD_IS_SWAP_PENDING. That is the panel's own
+ *      swap, and waits on lcd_is_swap_pending(). That is the panel's own
  *      signal, so an overclocked device or a different refresh rate paces us
  *      correctly with no constant to update. Nothing here assumes 60 fps.
  *
@@ -835,12 +835,11 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
     /* Run the LCD in LUT8 so the upper half of the 300 KB framebuffer pool is
      * released as a bonus pool. This is where the AXI that docs/01 budgets as
      * "~870 KB" actually comes from -- RAM_EMU alone is only 724 KB. */
-    abi->lcd_ctl(GW_LCD_SETUP_FB, LCD_MODE_LUT8, 0, 0);
+    abi->lcd_setup_framebuffers(LCD_MODE_LUT8);
 
     uint8_t *bonus = NULL;
     size_t bonus_sz = 0;
-    abi->lcd_ctl(GW_LCD_GET_BONUS_POOL, (uintptr_t)&bonus,
-                 (uintptr_t)&bonus_sz, 0);
+    abi->lcd_get_bonus_pool(&bonus, &bonus_sz);
     bonus_pool_base = (uint32_t)bonus;
     bonus_pool_size = (uint32_t)bonus_sz;
 
@@ -861,7 +860,7 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
      * NEGATIVE (-2,024 B) when mode 13h landed, and the only symptom of that
      * is core_ready staying 0 with no message.
      *
-     * Ordering matters: GW_LCD_SETUP_FB above zeroes the pool and rewrites the
+     * Ordering matters: lcd_setup_framebuffers() above zeroes the pool and rewrites the
      * MPU regions, so nothing may be placed in the bonus area before it.
      */
     /* The arena gets the whole bonus pool between the two fixed 4 KB pages and
@@ -896,15 +895,35 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
     }
     guest_vram_ok = guest_vram ? 1 : 0;
 
-    /* Over-allocated by a page and aligned UP, because guest RAM is a pool of
-       4 KB frames now. ram_malloc() aligns to 4 bytes, and MEASURED on target
-       the block came back misaligned: x86_pg_frames_total read 159 instead of
-       160, one whole frame lost to a partial page at each end. The spare page
-       comes out of RAM_EMU headroom, which had 24,672 bytes doing nothing. */
+    /* Guest RAM is a pool of 4 KB frames, so the block must be 4 KB ALIGNED --
+       ram_malloc() only aligns to 4, and MEASURED on target an unaligned block
+       cost a whole frame (x86_pg_frames_total read 159 instead of 160).
+
+       It used to over-allocate a full spare page and align up inside it. That
+       page is no longer affordable: upstream's SPI1 SD DMA (5e19e392e) takes
+       SPI_DMA_BLOCK*2+31 = 1,055 bytes of RAM_EMU on the first sector read,
+       which happens while the CORE ITSELF is being loaded -- before any of our
+       code runs -- and this request is the last big claim in a bump pool with
+       ~660 KB in it. That left us 488 bytes short and guest_ram came back NULL:
+       core_ready 0, black screen, no error. So PAY ONLY THE REAL PADDING: one
+       1-byte probe reveals where the bump pointer is, and the pad after it is
+       whatever alignment actually costs (792 bytes as measured, not 4,096). */
     {
-        uint8_t *raw = (uint8_t *)abi->mem_ctl(
-            GW_MEM_OP_ALLOC, GW_MEM_RAM, 1,
-            X86_PG_POOL_BYTES(GUEST_RAM_SIZE / 4096u) + 4096u);
+        uint8_t *probe = (uint8_t *)abi->mem_ctl(GW_MEM_OP_ALLOC,
+                                                 GW_MEM_RAM, 1, 1);
+        uint8_t *raw = NULL;
+        if (probe) {
+            /* ram_malloc() rounds its bump up to 4, so the next block starts
+               here; pad that up to the frame boundary and take it. */
+            uint32_t next = ((uint32_t)(uintptr_t)probe + 1u + 3u) & ~3u;
+            uint32_t pad  = (0u - next) & 4095u;
+            if (!pad || abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM, 1, pad))
+                raw = (uint8_t *)abi->mem_ctl(
+                    GW_MEM_OP_ALLOC, GW_MEM_RAM, 1,
+                    X86_PG_POOL_BYTES(GUEST_RAM_SIZE / 4096u));
+        }
+        /* The align-up is a no-op when the pad worked and the only recovery
+           when it did not, so it stays. */
         guest_ram = raw ? (uint8_t *)(((uint32_t)(uintptr_t)raw + 4095u)
                                       & ~4095u) : NULL;
     }
@@ -1041,8 +1060,7 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
            the guest drawing into the open-bus filler. */
         x86_video_set_aperture(vga_aperture,
                                vga_aperture ? bonus + BONUS_VGAPAL_OFF : NULL);
-        abi->lcd_ctl(GW_LCD_SET_CLUT, (uintptr_t)core_clut,
-                     CORE_CLUT_ENTRIES, 0);
+        abi->lcd_set_clut(core_clut, CORE_CLUT_ENTRIES);
         cga_clut_dirty = 0;
     }
 
@@ -2087,7 +2105,7 @@ static void dma2d_sync(void);       /* defined with the hook, below */
 static void core_repaint(void)
 {
     const gw_firmware_abi_t *abi = gw_firmware_abi();
-    uint8_t *fb = (uint8_t *)abi->lcd_ctl(GW_LCD_BUFFER, GW_LCD_BUF_ACTIVE, 0, 0);
+    uint8_t *fb = (uint8_t *)abi->lcd_get_active_buffer();
     if (fb) {
         x86_video_render(fb, FRAME_W);
         /* We are inside the retro-go overlay here, which is also the ONLY other
@@ -2139,7 +2157,7 @@ volatile uint32_t x86_modey_presents;   /* host-visible: flips actually painted 
  * Paint BOTH buffers. This is the whole of Mode Y's presentation and it is not
  * belt and braces.
  *
- * The frame loop calls GW_LCD_SWAP unconditionally, every iteration, whether or
+ * The frame loop calls lcd_swap() unconditionally, every iteration, whether or
  * not it painted -- and it must, because the swap is also the loop's pacing.
  * So the panel alternates between the two buffers at the panel rate, and any
  * Mode Y paint that touched only the ACTIVE one leaves the two holding
@@ -2231,10 +2249,10 @@ static int dma2d_blit_hook(uint8_t *dst, const uint8_t *src, uint32_t bytes)
     dcache_clean_range(src, bytes);
 
     uint32_t px = bytes / (2u * X86_VGA13_HEIGHT);   /* 160 */
-    if (gw_firmware_abi()->dma2d_ctl(GW_DMA2D_M2M_RGB565_START,
-                                     (uint32_t)(uintptr_t)src,
-                                     (uint32_t)(uintptr_t)dst,
-                                     (px << 16) | X86_VGA13_HEIGHT) != 0) {
+    if (gw_firmware_abi()->dma2d_m2m_rgb565_start((uint32_t)(uintptr_t)src,
+                                                  (uint32_t)(uintptr_t)dst,
+                                                  (uint16_t)px,
+                                                  X86_VGA13_HEIGHT) != 0) {
         x86_dma2d_fallback++;
         return -1;                       /* caller does the row loop instead */
     }
@@ -2259,7 +2277,7 @@ static void dma2d_sync(void)
         return;
     dma2d_pending = 0;
     x86_dma2d_waits++;
-    (void)gw_firmware_abi()->dma2d_ctl(GW_DMA2D_POLL, 20u, 0, 0);
+    (void)gw_firmware_abi()->dma2d_poll(20u);
 }
 
 /*
@@ -2292,14 +2310,13 @@ static void dma2d_selftest(void)
         dma2d_st_dst[i] = 0;
     }
     dcache_clean_range(dma2d_st_src, sizeof dma2d_st_src);
-    if (gw_firmware_abi()->dma2d_ctl(GW_DMA2D_M2M_RGB565_START,
-                                     (uint32_t)(uintptr_t)dma2d_st_src,
-                                     (uint32_t)(uintptr_t)dma2d_st_dst,
-                                     (32u << 16) | 1u) != 0) {
+    if (gw_firmware_abi()->dma2d_m2m_rgb565_start(
+            (uint32_t)(uintptr_t)dma2d_st_src,
+            (uint32_t)(uintptr_t)dma2d_st_dst, 32u, 1u) != 0) {
         x86_dma2d_selftest = 2;
         return;
     }
-    (void)gw_firmware_abi()->dma2d_ctl(GW_DMA2D_POLL, 20u, 0, 0);
+    (void)gw_firmware_abi()->dma2d_poll(20u);
     /* The engine wrote AXI behind the D-cache, so this core's view of the
        destination is stale until it is invalidated. DCIMVAC, same raw-SCS
        idiom; the buffer is ours and was never dirty, so nothing is lost. */
@@ -2325,9 +2342,8 @@ static void dma2d_sync(void) { }
 static void modey_paint_both(const gw_firmware_abi_t *abi)
 {
     for (unsigned which = 0; which < 2; which++) {
-        uint8_t *fb = (uint8_t *)abi->lcd_ctl(GW_LCD_BUFFER,
-                                              which ? GW_LCD_BUF_INACTIVE
-                                                    : GW_LCD_BUF_ACTIVE, 0, 0);
+        uint8_t *fb = (uint8_t *)(which ? abi->lcd_get_inactive_buffer()
+                                        : abi->lcd_get_active_buffer());
         if (!fb)
             continue;
         x86_video_render(fb, FRAME_W);
@@ -2363,7 +2379,7 @@ static void poll_input(const gw_firmware_abi_t *abi)
 {
     odroid_gamepad_state_t pad;
     memset(&pad, 0, sizeof(pad));
-    abi->input_ctl(GW_INPUT_READ_GAMEPAD, &pad);
+    abi->odroid_input_read_gamepad(&pad);
 
     /* Hand the frame to the firmware before consuming it ourselves. This is
        what makes PAUSE/SET open the Retro-Go overlay, and it owns save states,
@@ -2522,13 +2538,13 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
     rate_window_insns = guest_insns_total;
     rate_window_frames = frames_rendered;
 
-    abi->audio_ctl(GW_AUDIO_INIT, SAMPLE_RATE);
+    abi->odroid_audio_init(SAMPLE_RATE);
     /* START sets the half-buffer length; GET_LENGTH only reports whatever it
        was last set to (1077 by default), so asking first and starting with the
        answer is how the mismatch above stayed invisible. Start with the length
        we want, then read it back so the number we render is the firmware's. */
-    abi->audio_ctl(GW_AUDIO_START, SPEAKER_FRAMES);
-    uint32_t audio_frames = (uint32_t)abi->audio_ctl(GW_AUDIO_GET_LENGTH, 0);
+    abi->audio_start_playing(SPEAKER_FRAMES);
+    uint32_t audio_frames = (uint32_t)abi->audio_get_buffer_length();
     if (audio_frames > SPEAKER_FRAMES)
         audio_frames = SPEAKER_FRAMES;
 
@@ -2951,8 +2967,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
            polling for vertical retrace sees it arrive about once per frame. */
         X86_ZONE_ENTER(X86_ZONE_VIDEO);             /* ZONES */
         x86_video_set_beam(0xE000);
-        uint8_t *fb = (uint8_t *)abi->lcd_ctl(GW_LCD_BUFFER,
-                                              GW_LCD_BUF_ACTIVE, 0, 0);
+        uint8_t *fb = (uint8_t *)abi->lcd_get_active_buffer();
         fb_addr = (uint32_t)fb;
         if (fb) {
             /* A Mode Y title paints itself on its own page flips, so the frame
@@ -2993,11 +3008,11 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
          * firmware holds its own copy, so push ours again when it moves.
          *
          * WHICH op is not a count argument, it is a different firmware path.
-         * GW_LCD_SET_CLUT stages into a 68-entry cache and writes a 40%
+         * lcd_set_clut() stages into a 68-entry cache and writes a 40%
          * darkened TWIN of entry i at count+i, which is how retro-go's overlay
          * dims the screen (it ORs LCD_DARKEN_BIT = 0x20 into every pixel). 256
          * entries would need 512 hardware slots against the LTDC's 256, so a
-         * 256-colour mode has to own the whole table: GW_LCD_SET_CLUT_EXT
+         * 256-colour mode has to own the whole table: lcd_set_clut_ext()
          * takes a CALLER-OWNED array and bypasses the cache entirely.
          *
          * Accepted cost, and it is visible: while a 256-colour mode is up the
@@ -3013,18 +3028,16 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         if (ext != clut256_pushed) {
             /* Entering or leaving a 256-colour mode. */
             if (ext)
-                abi->lcd_ctl(GW_LCD_SET_CLUT_EXT, (uintptr_t)ext, 256, 0);
+                abi->lcd_set_clut_ext(ext, 256);
             else
-                abi->lcd_ctl(GW_LCD_SET_CLUT, (uintptr_t)core_clut,
-                             CORE_CLUT_ENTRIES, 0);
+                abi->lcd_set_clut(core_clut, CORE_CLUT_ENTRIES);
             clut256_pushed = ext;
             cga_clut_dirty = 0;
         } else if (cga_clut_dirty) {
             if (ext)
-                abi->lcd_ctl(GW_LCD_SET_CLUT_EXT, (uintptr_t)ext, 256, 0);
+                abi->lcd_set_clut_ext(ext, 256);
             else
-                abi->lcd_ctl(GW_LCD_SET_CLUT, (uintptr_t)core_clut,
-                             CORE_CLUT_ENTRIES, 0);
+                abi->lcd_set_clut(core_clut, CORE_CLUT_ENTRIES);
             cga_clut_dirty = 0;
         }
         X86_ZONE_EXIT();                            /* ZONES: end VIDEO */
@@ -3037,7 +3050,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
          * tama core uses for its own square wave -- a PC-speaker square is
          * full-swing with no envelope, so it carries more energy than that. */
         X86_ZONE_ENTER(X86_ZONE_AUDIO);             /* ZONES */
-        int16_t *abuf = (int16_t *)abi->audio_ctl(GW_AUDIO_GET_ACTIVE, 0);
+        int16_t *abuf = abi->audio_get_active_buffer();
         if (abuf && audio_frames) {
             int16_t amp = (int16_t)(((int32_t)abi->common_emu_sound_get_volume()
                                      * INT16_MAX) >> 11);
@@ -3045,7 +3058,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         }
         X86_ZONE_EXIT();                            /* ZONES: end AUDIO */
 
-        /* Pace the loop. GW_LCD_WAIT_VBLANK is NOT usable here: gwemu does
+        /* Pace the loop. lcd_wait_for_vblank() is NOT usable here: gwemu does
            not model vblank, so it never returns and the core never draws --
            the screen stays black and nothing reaches the host. Wait on the
            swap the firmware has already queued instead, which is modelled and
@@ -3057,7 +3070,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
            HEADROOM, not a cost -- which is why it must be its own zone and not
            part of the residual. */
         X86_ZONE_ENTER(X86_ZONE_SWAP);
-        abi->lcd_ctl(GW_LCD_SWAP, 0, 0, 0);
+        abi->lcd_swap();
         {
             /* This wait is the loop's ONLY idle, so it is where the CPU
                monitor is told so -- cpumon_sleep() closes the busy interval
@@ -3066,7 +3079,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                bound here is wall clock rather than a spin count: a swap that
                never completes must cost one frame, not 100000 sleeps. */
             uint32_t wait_start = abi->HAL_GetTick();
-            while (abi->lcd_ctl(GW_LCD_IS_SWAP_PENDING, 0, 0, 0)) {
+            while (abi->lcd_is_swap_pending()) {
                 if ((uint32_t)(abi->HAL_GetTick() - wait_start) > 100u)
                     break;   /* never trade a black screen for a hang */
                 abi->cpumon_sleep();

@@ -190,7 +190,7 @@ static void text_render_wide(uint8_t *dst, uint32_t stride);
  *
  * This is a HOOK and not a call into the firmware, for two reasons. The core is
  * a loadable plugin -- it may not link the HAL, so only src/main.c can reach
- * dma2d_ctl() through the ABI -- and tests/test_video.py builds this file for
+ * dma2d_m2m_rgb565_start() through the ABI -- and tests/test_video.py builds this file for
  * the host, where there is no engine and the hook stays NULL. A NULL hook is
  * the shipping default and costs the chained path one load and one compare
  * against a 64,000-byte copy.
@@ -711,8 +711,8 @@ static void vga_clut_rebuild(void)
 /*
  * The 256-entry CLUT, or NULL if a 256-colour mode is not up.
  *
- * The frame loop uses non-NULL to choose GW_LCD_SET_CLUT_EXT over the ordinary
- * 32-entry GW_LCD_SET_CLUT. They are different firmware paths, not a count
+ * The frame loop uses non-NULL to choose lcd_set_clut_ext() over the ordinary
+ * 32-entry lcd_set_clut(). They are different firmware paths, not a count
  * argument: lcd_set_clut() stores a 40%-darkened TWIN of entry i at count+i so
  * retro-go's overlay can dim the screen by OR-ing LCD_DARKEN_BIT (0x20), and
  * 256 entries would need 512 hardware slots against the LTDC's 256. A

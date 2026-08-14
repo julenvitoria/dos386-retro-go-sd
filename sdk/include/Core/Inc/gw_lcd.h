@@ -100,28 +100,15 @@ void lcd_get_bonus_pool(uint8_t **out_ptr, size_t *out_size);
  * entries internally so lcd_pack_color() can do nearest-match lookups. */
 void lcd_set_clut(const uint32_t *clut, uint16_t count);
 
-/* Program the LTDC CLUT from a CALLER-OWNED palette of up to 256 RGB888
- * entries, bypassing the darkened-twin cache.
+/* Hand the LTDC a CALLER-OWNED palette of up to 256 entries, for cores whose
+ * mode owns the whole table -- a 256-colour mode cannot use the 32-entry cache
+ * above, because its darkened twins would need 512 hardware slots against the
+ * LTDC's 256. NULL/0 returns the table to the cached path.
  *
- * Why a second entry point rather than raising LCD_CLUT_CACHE_MAX: the twin
- * model cannot survive a 256-colour cart at all. lcd_set_clut() stores a
- * darkened twin of entry i at count+i, so 256 cart entries would need 512
- * hardware slots and the LTDC has 256. A 256-colour core therefore has to own
- * the whole table, and the only question is where the copy lives. Keeping it in
- * the caller costs 4 bytes of firmware state instead of the ~1.8 KB of DTCM a
- * 256-entry active_clut[] would take, and DTCM is firmware's and tight.
- *
- * Consequences, all documented rather than worked around:
- *  - LCD_DARKEN_BIT does not work. odroid_overlay_darken_all()'s |= 0x20 maps a
- *    pixel to an unrelated guest colour, so the background behind a menu shifts
- *    colour instead of dimming. The menu box and its text are drawn AFTER the
- *    darken and are unaffected.
- *  - lcd_pack_color() searches this palette instead of the cart cache, so menu
- *    colours still resolve to a real nearest match.
- *  - `clut` must stay valid until lcd_set_clut() or an LCD mode switch clears
- *    it. Both do so automatically.
- *
- * Passing NULL (or count 0) returns control to the normal cached path. */
+ * The array must stay valid until it is replaced: the firmware keeps the
+ * POINTER, not a copy, which is the whole point (4 bytes of state instead of
+ * ~1.8 KB). LCD_DARKEN_BIT stops dimming while such a palette is live -- see
+ * the note on lcd_set_clut_ext() in gw_lcd.c. */
 void lcd_set_clut_ext(const uint32_t *clut, uint16_t count);
 
 /* Fixed-size snapshot of the active cart CLUT as RGB565, used by the

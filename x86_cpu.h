@@ -303,7 +303,7 @@ extern volatile uint32_t x86_vga_ega_card_offsets;
 extern volatile uint32_t x86_vga_dac_writes;
 /* 256 ARGB8888 entries built from the guest's DAC. Non-NULL only while a
    256-colour mode is up; the frame loop pushes it through
-   GW_LCD_SET_CLUT_EXT instead of the 32-entry GW_LCD_SET_CLUT. */
+   lcd_set_clut_ext() instead of the 32-entry lcd_set_clut(). */
 const uint32_t *x86_video_clut256(void);
 /* VGA DAC, ports 0x3C6-0x3C9. 0x3C9 is a STREAM, not a latch: a guest sets the
    index once and writes 768 consecutive bytes, so this cannot be modelled as

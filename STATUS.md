@@ -41,7 +41,7 @@ positive control.
 | Wolf3D's cached pictures render as noise (off-screen VRAM cache too small) | [`docs/13`](docs/13_title_status.md) |
 | Wolf3D paints mid-draw frames in gameplay (`x86_modey_mid_draw`) | [`docs/08`](docs/08_vga_mode13h.md) §4 |
 | The planar store path halves the interpreter for graphics titles | [`docs/09`](docs/09_frame_pacing_and_clocks.md) §7 |
-| **Pager eviction is not implemented** — the header documents it, nothing does it | [`docs/12`](docs/12_memory_tiers.md) §2 |
+| **KEEN4 is unobservable by the harness** — `golden_screens.py capture` dies with `GDBError: Connection closed`, `probe.py` reports `core_ready=0, guest_insns_total=0`. Reproduced on a clean baseline, so it is the tooling, not a core change. WOLF3D and ALLEYCAT capture fine through the same harness | [`TOOLING.md`](TOOLING.md) |
 | Retro-go's Pause overlay is unreadable over 256-colour modes | [`docs/08`](docs/08_vga_mode13h.md) §1 |
 | Keen's watchdog reset and half-height intro | [`docs/13`](docs/13_title_status.md) |
 | A segment override before `REP` survives only the first element | `rep_resume` records the repeat prefix, not the START of the prefix run |
