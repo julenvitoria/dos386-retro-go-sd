@@ -77,8 +77,16 @@ Evidence in `STATUS.md`; the verdicts, so they are not re-opened by guess:
    104/160 and 134/160 frames. **New defect found: eviction is not implemented
    at all** — eight documented `x86_pg_*` counters and `x86_livemap_holds()`
    have no callers and are GC'd out of the ELF.
-5. ~~Keen 4 levels.~~ **NOT FIXABLE, settled**: 262,144 B of card wanted against
-   `x86_arena_bytes=143,360` measured 100% used, `x86_arena_free=0`.
+5. **Keen 4 levels: REACHABLE. The "not fixable" verdict was WRONG and is
+   retracted.** It quoted the prior port's budget (~24.9 KB of headroom, COW
+   spare 0) and not ours. Measured here: the arena is 143,360 B, and KEEN4
+   peaks at **134 of 160 pager frames**, leaving 26 frames = 106,496 B idle.
+   `11-ega-planar.md`'s own table puts a correct picture at 48 KB/plane =
+   196,608 B, so the deficit is 53,248 B = 13 pages against 26 spare. The
+   mechanism is already designed in — `x86_pg_donated` ("frames given to the
+   arena"), `x86_arena_add_region()`, and Phase 3's "borrowed from the guest
+   RAM AXI pool". Being implemented alongside eviction, because donating frames
+   without eviction turns a shortfall into a hard `X86_EXIT_MEM_FAULT`.
 
 **Queue B — rendering, then the interpreter**
 1. A **golden-screenshot gate** with programmatic comparison. Two "runs fine,

@@ -1516,7 +1516,35 @@ loads art and runs, but there is no visible frame to confirm a menu), and how
 much of the 32,768-byte card is ever written (only the first 8,192 bytes were
 dumped; the frame's 0 non-zero pixels covers the rest indirectly).
 
-## Keen 4's LEVELS ARE NOT FIXABLE ON THIS DEVICE — settled, do not re-propose
+## RETRACTED — Keen 4's levels ARE reachable. Read this before the section below.
+
+The verdict below is **wrong** and is kept only so the error is visible. It
+reasons from `x86_arena_free=0` to "there is no allocation, policy or eviction
+change that closes the gap", and that step does not follow: **the arena is not
+the only AXI on this device.**
+
+Measured on this tree, same run: KEEN4 peaks at **134 of 160 pager frames**, so
+**26 frames — 106,496 B — of guest RAM sit idle**. `11-ega-planar.md`'s own
+table puts a correct picture at **48 KB/plane = 196,608 B** (64 KB/plane is
+where discards reach zero, not where the picture becomes correct). Against a
+143,360 B arena the deficit is **53,248 B = 13 pages, against 26 spare.**
+
+The route is designed in and was overlooked, not refuted: `x86_pg_donated` is
+documented as *"frames given to the arena"*, `x86_arena_add_region()` takes
+extents, and `PLAN.md` Phase 3 says outright *"For EGA 256KB mode, the extra
+224KB is dynamically borrowed from the guest RAM AXI pool."* The prior port's
+COW-spare route was refuted **for the prior port**, whose spare was 0; ours is
+not that machine.
+
+**The transferable error:** the section below quotes a budget (~24.9 KB of
+headroom) computed for a different memory layout and treats it as a property of
+the hardware. Check an inherited number against this tree before concluding
+anything is impossible.
+
+Being implemented with eviction, because donating frames without eviction turns
+a later shortfall into a hard `X86_EXIT_MEM_FAULT` instead of a page-out.
+
+## Keen 4's levels — the original, WRONG verdict (superseded above)
 
 The arithmetic is `references/8086tiny/docs/video/11-ega-planar.md:299-330` and
 is not re-derived here. The reference measured, over a 1.2 G-instruction run at
