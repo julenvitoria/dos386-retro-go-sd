@@ -98,37 +98,36 @@ void x86_video_page_flip(void);
 
 /* ---- the presentation policy, and why it is HERE and not in the frame loop -
  *
- * It has to be testable without an LCD: the artefact it fixes (a timed blit
- * catching the one aliased page mid-redraw) is a question about WHICH FRAMES
- * ARE PAINTED, which a pixel test cannot ask and a device cannot be asked
- * safely. So the decision lives in the core beside the store counter it reads,
- * and the frame loop only obeys it. tests/test_video.py drives it directly.
+ * It has to be testable without an LCD: WHICH FRAMES ARE PAINTED is a question
+ * no pixel test can ask and no device can be asked safely. So the decision
+ * lives in the core beside the store counter it reads, and the frame loop only
+ * obeys it. tests/test_video.py drives it directly.
+ *
+ * The policy itself is a PORT of references/dos_port_prior/dos_video.c:1529
+ * -1656; see the block comment on it in x86_video_planar.c.
  */
 /* Called once per frame-loop iteration. Non-zero: the loop must paint. In
-   Mode Y that is only when the guest's page is QUIET (hence complete), or when
-   the last-resort staleness bound fires. Every other mode: always. */
+   Mode Y that is only after DOS_MODEY_IDLE_FRAMES (8) frames with no page
+   flip -- the reference's escape hatch, ported verbatim; the guest's own flip
+   is what normally presents. Every other mode: always. */
 int  x86_video_modey_paint_due(void);
-/* "A frame has just been put on the panel." from_flip distinguishes the
-   guest's own page flip from the loop's fallback, for the gap counters. */
+/* "A frame has just been put on the panel." Only from_flip != 0 changes policy
+   state; a loop paint is deliberately inert, exactly as in dos_video.c, which
+   keeps painting every frame until the guest flips again. */
 void x86_video_modey_presented(int from_flip);
-/* Forget everything the policy learned about the PREVIOUS title -- its quiet
-   run and, crucially, whether it flipped. Called from x86_vga_modey_arm(). */
+/* Forget the previous title's flip state and start with the hold ABANDONED, so
+   a title that never flips is painted from its first frame. From modey_arm(). */
 void x86_video_modey_policy_reset(void);
 
-extern volatile uint32_t x86_modey_fallbacks;
-extern volatile uint32_t x86_modey_stale_paints;
+extern volatile uint32_t x86_modey_fallbacks;     /* frames the LOOP painted   */
 extern volatile uint32_t x86_modey_flip_gap;
 extern volatile uint32_t x86_modey_flip_gap_max;
-/* Loop paints taken with stores banked since the last flip: mid-draw paints,
-   which is the split-viewport defect counted. Zero during gameplay or the
-   policy is showing half-drawn pages again. */
+/* Loop paints taken with stores banked since the last flip -- half-drawn pages
+   on the panel. Under the ported policy these are EXPECTED above 8 idle frames
+   (15-mode-y.md section 4: "the visible artefact is TEARING"); the counter says
+   how much, and is the baseline any future change is graded against. */
 extern volatile uint32_t x86_modey_mid_draw;
 extern volatile uint32_t x86_modey_mid_draw_max;
-/* The longest store-free pause this guest has been seen to take in the MIDDLE
-   of a redraw, in frame-loop iterations. It is what a mid-redraw quiet paint
-   must now exceed, so it is also this title's menu latency -- read it off a
-   target before arguing about whether the menus are slow. */
-extern volatile uint32_t x86_modey_inframe_gap;
 
 /* ---- host-visible witnesses; all of this is the deliverable -------------- */
 extern volatile uint32_t x86_vga_planar_stores;   /* stores that took the hook */
@@ -140,5 +139,14 @@ extern volatile uint32_t x86_vga_ega_armed;       /* 1 while 0Dh is armed      *
 extern volatile uint32_t x86_vga_ega_refused;     /* 0Dh claims refused        */
 extern volatile uint32_t x86_vga_latch_loads;     /* latch reloads at a store  */
 extern volatile uint32_t x86_vga_latch_miss;      /* ...from an absent cell    */
+/* x86_vga_planar_lost, split by SOURCE -- one lump sum cannot be reconciled
+   with the reference's per-region measurement. See x86_video_planar.c. */
+extern volatile uint32_t x86_vga_modey_lost_cache;   /* stores at/above 0xE300 */
+extern volatile uint32_t x86_vga_modey_lost_tail;    /* a page's rows 205+     */
+extern volatile uint32_t x86_vga_modey_lost_nocache; /* arena refused the cache*/
+/* Plane offsets of off-screen cache actually claimed: X86_MODEY_CACHE_OFFSETS
+   when live, 0 when the arena refused it. The one read that settles "is the
+   0xC300 cache genuinely there". */
+extern volatile uint32_t x86_vga_modey_cache_offs;
 
 #endif /* X86_VIDEO_PLANAR_H */

@@ -38,20 +38,18 @@ at a display start of 0 and an Offset of 40 the correct de-interleave IS the
 linear read. A mutation that is a no-op at the geometry under test cannot grade
 anything.
 
-  TIMER    -DX86_MODEY_TIMER_NEGCTL=1   the frame loop's escape hatch goes back
-                                        to a plain timer -- paint every 8 frames
-                                        without a flip, with no test for whether
-                                        the guest had FINISHED drawing. Mode Y
-                                        aliases every page into one page of
-                                        storage, so a timed blit lands mid
-                                        redraw: on hardware that was a raycast
-                                        viewport split in half and a menu
-                                        highlight showing the old item and the
-                                        new one at once. No pixel test can see
-                                        it -- it is a question about WHICH
-                                        FRAMES are painted -- so it is graded
-                                        here, by tests/test_video.py
-                                        --present-only.
+  FLIP     -DX86_MODEY_PRESENT_ON_FLIP=0  the reference's own switch
+                                        (-DDOS_MODEY_PRESENT_ON_FLIP=0), which
+                                        takes the whole scheme back to the
+                                        TEARING model: no hold after a page
+                                        flip, paint every frame. Mode Y aliases
+                                        every page into one page of storage, so
+                                        a frame-boundary blit lands mid-redraw
+                                        -- on hardware a raycast viewport split
+                                        in half. No pixel test can see it: it is
+                                        a question about WHICH FRAMES are
+                                        painted, so it is graded here, by
+                                        tests/test_video.py --present-only.
 
   LEARN    -DX86_MODEY_PAGE0=16384      the POSITIVE control. The same 64,000
                                         pixels must still come out from a WRONG
@@ -75,7 +73,7 @@ ARMS = [
     ("STRIDE", "-DX86_MODEY_STRIDE_NEGCTL=1", False, "--modey-only"),
     ("BLIT",   "-DX86_MODEY_BLIT_NEGCTL=1",   False, "--modey-only"),
     ("PAGE",   "-DX86_MODEY_PAGE_NEGCTL=1",   False, "--modey-only"),
-    ("TIMER",  "-DX86_MODEY_TIMER_NEGCTL=1",  False, "--present-only"),
+    ("FLIP",   "-DX86_MODEY_PRESENT_ON_FLIP=0", False, "--present-only"),
     ("LEARN",  "-DX86_MODEY_PAGE0=16384",     True,  "--modey-only"),
 ]
 

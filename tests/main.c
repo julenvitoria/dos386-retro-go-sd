@@ -211,15 +211,15 @@ volatile uint32_t planar_r[12];
  * MODE Y PRESENTATION POLICY -- which frames the loop paints.
  *
  * This is not a pixel question and no pixel test can ask it: at 64000/64000
- * exact, the shipped defect was that the frame loop blitted the ONE aliased
- * page WHILE THE GUEST WAS STILL DRAWING INTO IT, every 8 frames, because the
- * escape hatch was a timer. On the device that is half a raycast viewport, and
- * a menu highlight caught between its erase and its redraw.
+ * exact, WHICH FRAMES the loop paints is still free. The policy is a PORT of
+ * references/dos_port_prior/dos_video.c:1529-1656 -- present on the guest's
+ * page flip, hold for at most 8 frames, then paint every frame -- so these arms
+ * grade that and nothing more.
  *
- * So the harness drives x86_video_modey_paint_due() directly, one call per
- * modelled frame, against a modelled guest: x86_vga_planar_stores is the signal
- * the policy reads and "the guest drew this frame" is exactly an increment of
- * it. No LCD, no CPU, no timing -- three scenarios and a count of paints.
+ * The harness drives x86_video_modey_paint_due() directly, one call per
+ * modelled frame, against a modelled guest: a flip is x86_video_modey_presented
+ * (1) and "the guest drew this frame" is an increment of x86_vga_planar_stores.
+ * No LCD, no CPU, no timing -- five scenarios and a count of paints.
  */
 volatile uint32_t run_present_flag = 0;
 volatile uint32_t present_r[8];
@@ -599,53 +599,31 @@ static int present_frame(unsigned stores, int flipped)
 }
 
 /*
- * A RAYCASTER'S REDRAW, AS A STORE PATTERN: 20 frame-loop slices of stores and
- * then a PAUSE -- the vislist sort, the page manager, the tic wait -- and the
- * pauses are NOT ALL THE SAME LENGTH.
+ * THE ARMS, AND WHAT EACH ONE PINS.
  *
- * That variety is the whole point and it is why the first version of this model
- * was worthless as a control. With every gap the same, a doubling back-off
- * takes ONE paint, doubles once, and is silent for ever after; the model said
- * the doubling was fine and hardware said the intro froze for half a second.
- * Varied gaps ratchet it 2 -> 4 -> 8 -> 16 -> 32, which is what actually
- * happened, and a rule that MEASURES the worst gap instead settles at 7.
+ * The policy under test is the reference's (dos_video.c:1529-1656), so the
+ * arms grade the reference's behaviour and not an invention's: present on the
+ * guest's flip, hold for at most X86_MODEY_IDLE_FRAMES frames, then paint every
+ * frame. There is no inference about whether the guest "has finished drawing"
+ * -- that inference is what four rounds of local policy got wrong -- so no arm
+ * asserts one.
+ *
+ * The previous suite's arms (a 300-frame flip gap, a bursty raycaster, a
+ * six-screen intro ratchet) were models of the INVENTED rules' failure modes
+ * and went with them. What survives is the property the hold actually has:
+ * nothing is painted in the 8 frames after a flip, and everything after that.
  */
-static const unsigned bursty_gaps[4] = { 2u, 3u, 5u, 7u };
-static unsigned bursty_drawn, bursty_left, bursty_which;
-
-static void bursty_reset(void)
-{
-    bursty_drawn = 0;
-    bursty_left = 0;
-    bursty_which = 0;
-}
-
-/* Stores for the next modelled frame. */
-static unsigned bursty_next(void)
-{
-    if (bursty_left) {
-        bursty_left--;
-        return 0u;
-    }
-    if (bursty_drawn < 20u) {
-        bursty_drawn++;
-        return 1000u;
-    }
-    bursty_drawn = 0;
-    bursty_left = bursty_gaps[bursty_which++ & 3u] - 1u;
-    return 0u;
-}
+#define PRESENT_HOLD 8u     /* must equal X86_MODEY_IDLE_FRAMES */
 
 static void present_test_run(uint32_t which)
 {
-    unsigned i, paints = 0, s2 = 0, first = 0;
+    unsigned i, paints = 0;
 
     for (i = 0; i < 8; i++)
         present_r[i] = 0;
     /* The witnesses are cumulative on the device and must not be cumulative
        ACROSS scenarios here, or each arm reads the one before it. */
     x86_modey_fallbacks = 0;
-    x86_modey_stale_paints = 0;
     x86_modey_flip_gap = 0;
     x86_modey_flip_gap_max = 0;
     x86_modey_mid_draw = 0;
@@ -655,227 +633,86 @@ static void present_test_run(uint32_t which)
     present_r[7] = x86_vga_modey_armed;
 
     if (which == 1) {
-        /* GAMEPLAY. WOLF3D draws a whole frame and flips, and the guest is far
-           slower than the panel, so a flip arrives every 20 modelled frames
-           with stores in every one of them. The page is NEVER complete except
-           at the flip, so the loop must paint EXACTLY NEVER: the flip path is
-           the only present. The timer hatch painted 2 of every 20 here, and
-           each was a half-drawn raycast. */
-        for (i = 0; i < 200; i++)
-            paints += (unsigned)present_frame(1000u, (i % 20u) == 19u);
+        /* GAMEPLAY, flipping every 20 frames with stores in every one. The
+           guest is slower than the hold, so the reference tears: the 8 frames
+           after each flip are held and the remaining 11 are painted. The HOLD
+           is what is graded -- a paint inside it is a page the guest has only
+           just started redrawing -- plus the tearing itself, as a number. */
+        unsigned in_hold = 0;
+        for (i = 0; i < 200; i++) {
+            int flipped = (i % 20u) == 19u;
+            int paint = present_frame(1000u, flipped);
+            paints += (unsigned)paint;
+            /* The 8 frames after a flip are i%20 == 0..7, once the first flip
+               has happened at i == 19. */
+            if (i > 19u && (i % 20u) < PRESENT_HOLD && paint)
+                in_hold++;
+        }
         present_r[0] = paints;
-        present_r[1] = x86_modey_fallbacks;
-        present_r[2] = x86_modey_stale_paints;
-        present_r[3] = x86_modey_flip_gap_max;
-        present_r[4] = x86_modey_mid_draw;
+        present_r[1] = in_hold;                 /* must be 0                 */
+        present_r[2] = x86_modey_fallbacks;     /* == paints                 */
+        present_r[3] = x86_modey_flip_gap_max;  /* 20                        */
+        present_r[4] = x86_modey_mid_draw;      /* the tearing, counted      */
     } else if (which == 4) {
-        /*
-         * GAMEPLAY AT THE SPEED THE DEVICE ACTUALLY RUNS IT -- the case the
-         * `which == 1` model does NOT cover, and the reason hardware was still
-         * a house of mirrors while this file was green.
-         *
-         * That model flips every 20 frames against a 60-frame staleness bound
-         * that every flip resets, so the bound could never fire and the arm
-         * proved only that the QUIET rule stays out of the way. On silicon a
-         * WOLF3D gameplay frame is far LONGER than the loop's 60 frames, the
-         * bound fired inside the redraw, and no test asked.
-         *
-         * Three phases, in the order a player meets them:
-         *   MENU      100 frames flipping every 20, which is what leaves the
-         *             policy's idea of this guest's frame time far too short.
-         *   ENTERING  1500 frames of continuous drawing flipping every 300. The
-         *             estimate is wrong here and cannot be right -- nothing
-         *             distinguishes a slow frame from a stopped one -- so the
-         *             bound may fire, but the back-off must make it converge.
-         *   THE LEVEL the same 1500 frames again, with the counters zeroed.
-         *             This one must be PERFECTLY clean: no loop paint at all.
-         */
-        for (i = 0; i < 100; i++)
-            paints += (unsigned)present_frame(200u, (i % 20u) == 19u);
-        paints = 0;
-        for (i = 0; i < 1500; i++)
-            paints += (unsigned)present_frame(1000u, (i % 300u) == 299u);
-        present_r[0] = paints;                  /* transition: <= 2 allowed  */
-        present_r[1] = x86_modey_mid_draw;
+        /* A TITLE FLIPPING FASTER THAN THE HOLD -- the case the hold exists
+           for, and the one the FLIP negative control must fail. 5 frames per
+           flip against a hold of 8, so the loop must paint EXACTLY NEVER and
+           every frame on the panel is one the guest called complete. */
+        /* One cycle of warm-up: before the FIRST flip the hold has never been
+           armed and the loop correctly paints, which is the anti-freeze
+           property, not a defect. Graded on the flipping steady state. */
+        for (i = 0; i < 5; i++)
+            (void)present_frame(1000u, (i % 5u) == 4u);
         x86_modey_fallbacks = 0;
-        x86_modey_stale_paints = 0;
         x86_modey_mid_draw = 0;
-        paints = 0;
-        for (i = 0; i < 1500; i++)
-            paints += (unsigned)present_frame(1000u, (i % 300u) == 299u);
-        present_r[2] = paints;                  /* steady state: must be 0   */
-        present_r[3] = x86_modey_mid_draw;      /* must be 0                 */
-        present_r[4] = x86_modey_fallbacks;     /* must be 0: never quiet    */
-        present_r[5] = x86_modey_flip_gap_max;  /* 30, as hardware measured  */
-        /* ANTI-FREEZE, in the same arm, because the fix that makes those zero
-           is exactly the fix that could freeze this: the guest now STOPS
-           flipping and keeps drawing forever. It must still be rescued --
-           late, in units of its OWN frame time, but rescued. */
-        paints = 0;
-        for (i = 0; i < 12000; i++)
-            paints += (unsigned)present_frame(1000u, 0);
-        present_r[6] = paints;
-    } else if (which == 5) {
-        /*
-         * GAMEPLAY AS A RAYCASTER ACTUALLY DRIVES THE ADAPTER -- the case
-         * `which == 4` does NOT cover, and the reason hardware was still a
-         * house of mirrors with `x86_modey_mid_draw` reading zero.
-         *
-         * `which == 4` stores in EVERY modelled frame, so `modey_quiet` can
-         * never reach 2 and the quiet rule is structurally unable to fire; its
-         * own assertion is "must be 0: never quiet". A real guest frame is not
-         * one unbroken run of stores. WOLF3D casts rays, sorts its vislist,
-         * pulls texture pages through its page manager and waits on the tic
-         * counter, all with the aperture untouched, and any of those gaps that
-         * spans two loop slices is indistinguishable from a menu that has
-         * finished drawing. On hardware that is 62 quiet fallbacks against 94
-         * flips -- two thirds as many half-drawn pages as complete ones.
-         *
-         * So this arm draws in BURSTS -- see bursty_next(): 20 frames of
-         * stores, then a pause of 2, 3, 5 or 7, right through a 300-frame guest
-         * frame, flipping every 30 -- hardware's measured flip_gap_max is 34,
-         * not the 300 `which == 4` models. Everything else is `which == 4`.
-         */
-        bursty_reset();
-        for (i = 0; i < 100; i++)
-            paints += (unsigned)present_frame(200u, (i % 20u) == 19u);
-        paints = 0;
-        for (i = 0; i < 1500; i++)
-            paints += (unsigned)present_frame(bursty_next(), (i % 30u) == 29u);
-        /* One paint per NEW worst gap while the policy measures the guest --
-           four distinct gap lengths, so at most four, plus the staleness
-           bound's own transition allowance. */
-        present_r[0] = paints;                  /* transition: <= 6 allowed  */
-        present_r[1] = x86_modey_mid_draw;
-        x86_modey_fallbacks = 0;
-        x86_modey_stale_paints = 0;
-        x86_modey_mid_draw = 0;
-        paints = 0;
-        for (i = 0; i < 1500; i++)
-            paints += (unsigned)present_frame(bursty_next(), (i % 30u) == 29u);
-        present_r[2] = paints;                  /* steady state: must be 0   */
-        present_r[3] = x86_modey_mid_draw;      /* must be 0                 */
-        present_r[4] = x86_modey_fallbacks;     /* must be 0                 */
-        present_r[5] = x86_modey_flip_gap_max;  /* 30, as hardware measured  */
-        /* The same anti-freeze obligation as `which == 4`, and it is sharper
-           here: the guest now has quiet gaps AND has stopped flipping, so the
-           rule that refuses those gaps must not be the rule that freezes it. */
-        paints = 0;
-        for (i = 0; i < 12000; i++)
-            paints += (unsigned)present_frame(bursty_next(), 0);
-        present_r[6] = paints;
+        for (i = 0; i < 200; i++)
+            paints += (unsigned)present_frame(1000u, (i % 5u) == 4u);
+        present_r[0] = paints;                  /* must be 0                 */
+        present_r[1] = x86_modey_mid_draw;      /* must be 0                 */
+        present_r[2] = x86_modey_flip_gap_max;  /* 5                         */
     } else if (which == 6) {
-        /*
-         * PROMPTNESS -- the arm whose absence let a half-second freeze ship.
-         *
-         * Every other arm in this file asserts that a paint did NOT happen.
-         * None asserted that one happened SOON, so a rule that simply refused
-         * to paint for 32 frames was green everywhere while hardware reported
-         * "press a button in the intro and it freezes, then jumps to where you
-         * tried to get to". This one measures LATENCY: frames from the guest
-         * going quiet to the loop painting it.
-         *
-         * It runs the menu AFTER a level, deliberately, and it flips every 30
-         * frames there because that is what HARDWARE measured -- flip_gap_max
-         * was 34, not the 300 `which == 4` models. WOLF3D's intro and menus do
-         * not flip at all (flips=2 across the whole signon/title phase against
-         * 94 by the end of a level), so they depend entirely on the quiet rule
-         * AND they inherit whatever the raycaster taught the policy, because
-         * `modey_flipper` used to be sticky for ever. A menu must not pay
-         * gameplay's bill.
-         *
-         * Four phases, and the third is the one the report is about:
-         *   LEVEL    1500 bursty frames flipping every 30. Teaches the policy.
-         *   MENU A   drawn immediately after, while the last flip is still
-         *            recent. The measured in-frame gap applies; the paint must
-         *            still be PROMPT.
-         *   MENU B   drawn once this guest has not flipped for long enough to
-         *            stop being a title that flips. The flat two-frame rule
-         *            must be back, or an intro screen is drawn invisibly and
-         *            appears all at once -- "freezes, then jumps".
-         *   LEVEL 2  the raycaster again, which must still be protected.
-         */
-        bursty_reset();
+        /* PROMPTNESS. WOLF3D's intro and menus DO NOT FLIP -- flips=2 across
+           the whole signon/title phase against 94 by the end of a level -- so
+           they are drawn straight into the page being displayed and the hatch
+           is their only presentation path. Its latency is their frame time,
+           and a policy that refuses to paint them is the reported "press a
+           button to skip and it freezes, then jumps to where you tried to get
+           to". A level is played first, so the menu inherits whatever the level
+           left behind: under the ported policy that is nothing but the hold,
+           which is precisely the property being pinned. */
         for (i = 0; i < 100; i++)
-            paints += (unsigned)present_frame(200u, (i % 20u) == 19u);
-        for (i = 0; i < 1500; i++)
-            (void)present_frame(bursty_next(), (i % 30u) == 29u);
-        present_r[5] = x86_modey_inframe_gap;   /* what gameplay taught it */
-
-        /* ---- MENU A: draws, then goes quiet, with the last flip recent. */
-        x86_modey_stale_paints = 0;
-        for (i = 0; i < 4; i++)
-            if (present_frame(500u, 0))
-                present_r[0]++;             /* must be 0: it is still drawing */
-        present_r[1] = 0xFFFFFFFFu;         /* latency, in frames            */
-        paints = 0;
-        for (i = 0; i < 400; i++) {
-            if (present_frame(0u, 0)) {
+            (void)present_frame(1000u, (i % 20u) == 19u);
+        /* The guest stops flipping and keeps drawing in pieces. */
+        present_r[0] = 0xFFFFFFFFu;
+        for (i = 0; i < 60; i++)
+            if (present_frame((i % 4u) < 2u ? 500u : 0u, 0)) {
                 paints++;
-                if (present_r[1] == 0xFFFFFFFFu)
-                    present_r[1] = i + 1u;  /* frames from quiet to painted  */
+                if (present_r[0] == 0xFFFFFFFFu)
+                    present_r[0] = i + 1u;      /* frames to the first reveal */
             }
-        }
-        present_r[2] = paints;              /* must be exactly 1             */
-
-        /* ---- MENU B: SEVERAL intro screens in a row, which is what the
-           player is actually doing when he mashes a button through them. Each
-           is drawn in pieces (blit, pause, blit, pause) straight into the page
-           being displayed -- there is no flip coming -- and then looked at for
-           a while. The reveal latency of the LAST one is the measurement.
-
-           Several, and not one, because the failure is a RATCHET: while the
-           policy believes this guest is mid-redraw, every screen it paints late
-           doubles a floor, so the next screen is later still. One screen cannot
-           see that, and the staleness bound rescues a single screen anyway --
-           which is exactly how a control can pass while the panel is frozen. */
-        for (s2 = 0; s2 < 6u; s2++) {
-            first = 0xFFFFFFFFu;
-            for (i = 0; i < 30u; i++)
-                if (present_frame((i % 4u) < 2u ? 500u : 0u, 0)
-                    && first == 0xFFFFFFFFu)
-                    first = i + 1u;     /* frames from the first store */
-            for (i = 0; i < 120u; i++)
-                (void)present_frame(0u, 0);
-        }
-        present_r[3] = first;           /* the LAST screen's reveal    */
-
-        /* ---- LEVEL 2: the raycaster must still be protected. The first guest
-           frame is unavoidably unguarded -- this guest has just spent hundreds
-           of frames not flipping, so nothing yet says it flips again -- which is
-           the same bounded transition the staleness bound documents. Graded on
-           the frames AFTER it. */
-        for (i = 0; i < 120; i++)
-            (void)present_frame(bursty_next(), (i % 30u) == 29u);
-        x86_modey_fallbacks = 0;
-        x86_modey_mid_draw = 0;
-        paints = 0;
-        for (i = 0; i < 1500; i++)
-            paints += (unsigned)present_frame(bursty_next(), (i % 30u) == 29u);
-        present_r[4] = paints;              /* must be 0                     */
-        present_r[6] = x86_modey_mid_draw;  /* must be 0                     */
+        present_r[1] = paints;                  /* it keeps being revealed    */
     } else if (which == 2) {
-        /* MENU. The guest redraws the highlight -- erase, then draw, over a
-           few frames -- and then WAITS for a key, flipping nothing. Nothing may
-           be painted while it is drawing; once it is quiet it must be painted,
-           ONCE, and not again while nothing changes. */
+        /* A MENU: four frames of drawing, then quiet, and it never flips. The
+           reference reveals it AS IT DRAWS (modey_idle starts at the limit, so
+           the very first frame paints) and goes on repainting while it is
+           quiet. Both halves matter: the first is the anti-freeze property,
+           the second is that no state accumulates to suppress a later screen. */
         for (i = 0; i < 4; i++)
             paints += (unsigned)present_frame(500u, 0);
-        present_r[0] = paints;              /* must be 0: drawing */
+        present_r[0] = paints;              /* must be 4: revealed as drawn   */
         paints = 0;
         for (i = 0; i < 30; i++)
             paints += (unsigned)present_frame(0u, 0);
-        present_r[1] = paints;              /* must be 1: quiet, painted once */
-        present_r[2] = x86_modey_stale_paints;
+        present_r[1] = paints;              /* must be 30                     */
+        present_r[2] = x86_modey_mid_draw;  /* must be 0: it never flipped    */
     } else {
-        /* PATHOLOGICAL. A title that stores forever and never flips must not
-           be a frozen screen: the staleness bound is the only thing that may
-           fire, and it must, at about once a second and no faster. */
+        /* PATHOLOGICAL. A title that stores forever and never flips must not be
+           a frozen screen -- under this policy it is simply painted every
+           frame, which is what every non-Mode-Y mode does. */
         for (i = 0; i < 180; i++)
             paints += (unsigned)present_frame(1u, 0);
-        present_r[0] = paints;
-        present_r[1] = x86_modey_fallbacks;
-        present_r[2] = x86_modey_stale_paints;
+        present_r[0] = paints;              /* must be 180                    */
+        present_r[1] = x86_modey_fallbacks; /* must be 180                    */
     }
     x86_vga_modey_arm(0);
 }
