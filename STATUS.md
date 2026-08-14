@@ -613,6 +613,42 @@ supply is wrong.** At the two machines' respective stopping points:
 `SoundMode` 0 vs **2**, `TimeCount` 0 vs 0x39, INT 08h/09h our stubs vs the
 game's own.
 
+#### The 81 seeks on handle 0, run to ground
+
+`X86_TRACE_EIPREG` (new: freeze the ring at a guest EIP with a masked register
+value — here the INT 21h stub at linear 0x624 with `AH == 0x42`) names the
+caller, which no log in this tree records. The first `AH=42h` is at instruction
+**2,522,002 — the exact instruction the stack leak starts.** The chain is:
+
+```
+0x1620C..0x16259   a grstarts-table lookup through ES:[0xE0EF]
+0x17144..0x1715F   push 0 / offset / PUSH [0xD8F3]  <- THE FILE HANDLE
+0x1DC6 ..0x1DE2    the C library lseek wrapper -> INT 21h AH=42h
+```
+
+**`[0xD8F3]` is the file handle, and it has exactly ONE writer in the image:
+`a3 f3 d8` at 0x16B1F, inside the open routine at 0x16986** — which builds the
+name from the extension string at `DS:0x9691`, calls `open()` at
+`0x0081:0x39AC`, stores the result and compares it against −1. `X86_TRACE_ATEIP`
+gives that store a hit count of **0: the open is never even attempted**, so the
+handle stays 0 from BSS and every read seeks on stdin forever.
+
+```
+                      OURS      DOSBox (at the menu)
+   handle [0xD8F3]    0x0000    0x0007
+```
+
+Two things this rules out. The extension string at `DS:0x9691` reads **`"WL1"`**,
+so `CheckForEpisodes()` ran and **our FindFirst answer was usable** — the DTA
+hypothesis is dead. And 0x16986 is called **unconditionally** from 0x16E8E,
+inside `CA_Startup()` at 0x16E86 (three `push cs`/`call near` setups in a row,
+no branch between them), so nothing *decided* to skip the open: that whole
+function never ran, while the file-READING code above it did.
+
+**That inversion is the defect's signature**: cache-read code running before the
+setup that opens its file. The code is byte-identical to DOSBox's, so a value we
+supplied sent the guest down a path that reaches the readers without the opens.
+
 **Phase map of our 2.65 M instructions**, from the now-deterministic sampler:
 the LZEXE unpacker to 1.70 M; then ONE loop at 0x1D9DB for 585 k — a
 planar→linear byte copy of ~64,000 pixels at ~9 instructions each, i.e. the

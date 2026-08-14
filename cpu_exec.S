@@ -325,7 +325,23 @@ x86_cpu_interp_asm:
     CMP R3, R2
     BLO.N 2f
 #endif
-#ifdef X86_TRACE_MEMEQ
+#ifdef X86_TRACE_EIPREG
+    /* "The guest reached THIS instruction with THIS value in a register."
+       Aimed at an HLE entry stub: freezing the ring on the first INT 21h whose
+       AH is a chosen function names the CALLER, which no existing log records --
+       x86_dos_file_log says what was asked and what we answered, never who
+       asked. Mask + value, so a single byte of a register can be selected. */
+    MOVW R1, #(X86_TRACE_EIPREG & 0xFFFF)
+    MOVT R1, #(X86_TRACE_EIPREG >> 16)
+    CMP R10, R1
+    BNE.W 2f
+    LDR.W R1, [R8, #X86_TRACE_ODDREG]
+    MOVW R2, #(X86_TRACE_REGMASK & 0xFFFF)
+    ANDS R1, R1, R2
+    MOVW R2, #(X86_TRACE_MEMVAL & 0xFFFF)
+    CMP R1, R2
+    BNE.W 2f
+#elif defined(X86_TRACE_MEMEQ)
     /* "Something wrote THIS value to THIS guest address." A hardware
        watchpoint cannot do this job here: the host address of a guest page is
        only known once the fold entry is live, and this guest halts about a
