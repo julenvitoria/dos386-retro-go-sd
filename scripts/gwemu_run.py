@@ -51,6 +51,11 @@ def main():
                    help="comma-separated globals to sample while you play")
     p.add_argument("--interval", type=float, default=3.0)
     p.add_argument("--audio", action="store_true")
+    p.add_argument("--record", metavar="FILE.tl",
+                   help="RECORD your session to a timeline. gwemu writes the "
+                        "file when it EXITS CLEANLY, so close the window "
+                        "normally -- a killed process writes nothing. Replay "
+                        "it later on gwemu OR hardware with --timeline")
     p.add_argument("--keep-temp", action="store_true")
     args = p.parse_args()
 
@@ -63,10 +68,20 @@ def main():
                   intflash_bank=1)
 
     target = GwemuTarget(image, display=True, audio=args.audio,
-                         keep_temp=args.keep_temp)
+                         record=args.record, keep_temp=args.keep_temp)
     target.start()
     print("gwemu is up and RUNNING. It will stay up until you close the "
           "window (Ctrl-C here also stops it).", flush=True)
+    if args.record:
+        print(f"RECORDING -> {args.record}. Close the gwemu WINDOW to save it; "
+              f"Ctrl-C here kills gwemu and writes nothing.", flush=True)
+
+    if args.record and args.watch:
+        # Sampling HALTS the CPU to read a symbol. A recorded timeline stores
+        # wall-clock offsets, so every halt shifts every later event -- the
+        # file would replay out of step with what you actually did.
+        sys.exit("--record and --watch cannot be combined: sampling halts the "
+                 "CPU and would skew the recorded timings")
 
     watches = [w.strip() for w in args.watch.split(",") if w.strip()]
     syms = get_symbols(args.core_elf) if watches else {}
