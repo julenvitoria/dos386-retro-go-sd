@@ -302,6 +302,17 @@ void x86_nor_slow_r(uint32_t bad)
     uint32_t t0 = DWT_CYCCNT;
     uint32_t lin;
 
+    /* The VGA aperture's fold sentinel. The interpreter's own trap stubs
+       recognise it inline and never get here; this is for the paths that
+       reach the C helpers instead -- and it must exist, because otherwise a
+       0xAxxxxxxx pointer would be read as a NOR offset and answered with
+       nonsense. See X86_FOLD_VGA_K in x86_cpu.h. */
+    if (X86_FOLD_IS_VGA(bad)) {
+        cpu_state_ptr->nor_ptr = X86_FOLD_VGA_HOST(bad);
+        cpu_state_ptr->vga_latch = cpu_state_ptr->nor_ptr;
+        return;
+    }
+
     if (is_fold_miss(bad, &lin)) {
         cpu_state_ptr->nor_ptr = x86_pager_fault(lin, 0);
         if (!cpu_state_ptr->nor_ptr)
@@ -352,6 +363,15 @@ void x86_nor_slow_w(uint32_t bad)
 {
     uint32_t t0 = DWT_CYCCNT;
     uint32_t lin;
+
+    /* The aperture sentinel, as above -- but NO latch record: the adapter
+       loads its read latches on a READ, and a store that overwrote the latch
+       with its own destination would break the `mov al,[si] / mov [di],al`
+       copy Mode Y is built on. */
+    if (X86_FOLD_IS_VGA(bad)) {
+        cpu_state_ptr->nor_ptr = X86_FOLD_VGA_HOST(bad);
+        return;
+    }
 
     if (is_fold_miss(bad, &lin)) {
         cpu_state_ptr->nor_ptr = x86_pager_fault(lin, 1);

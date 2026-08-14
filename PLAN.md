@@ -85,7 +85,9 @@ Verdicts only; evidence in [`docs/12`](docs/12_memory_tiers.md) and
    suite can see a picture. A golden captured from a broken build blesses the
    bug, so each must be eye-verified once and that verification recorded.
 2. Wolf3D's off-screen VRAM cache is too small — discards above `0xE300`.
-3. Fold-trap the VGA aperture check so non-planar titles pay nothing for it.
+3. **DONE** -- the VGA aperture is a fold trap; non-planar titles pay nothing
+   for it. `docs/08` says what it cost and what freeing the read shadow would
+   buy B4.
 4. Keen's watchdog reset and half-height intro.
 5. A/B the DMA2D blit on hardware — merged, off, unverified.
 6. Retro-go overlay legibility over 256-colour modes.

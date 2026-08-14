@@ -20,6 +20,7 @@
 #include "x86_cpu.h"
 #include "x86_arena.h"
 #include "x86_pager.h"
+#include "x86_video_planar.h"
 
 #define PAGE_SIZE 4096u
 
@@ -111,6 +112,13 @@ int x86_map_fixed(uint32_t guest, void *host, uint32_t bytes)
             return -1;
         guest_page_table_ptr[idx] = FOLD_K((uint8_t *)host + i * PAGE_SIZE, idx);
     }
+    /* A plain mapping over the VGA aperture DISARMS the fold trap, because the
+       trap IS a fold entry. The store hook would stay armed and the read latch
+       would quietly stop being recorded -- so ask the planar layer to put its
+       sentinel back. Costs a call and a test on a path that runs at mode
+       changes, not on any hot path. */
+    if (guest < 0xB0000u && guest + bytes > 0xA0000u)
+        x86_vga_planar_fold_refresh();
     return 0;
 }
 
@@ -177,6 +185,16 @@ void *x86_guest_ptr(uint32_t lin, uint32_t bytes)
     x86_livemap_note(idx);
 
     uint32_t host = lin + k;
+    /* The VGA aperture's fold sentinel (x86_cpu.h). A host-side service that
+       resolves an aperture address -- an INT 21h read landing in VRAM, a
+       screenshot -- wants the memory, not the trap: strip the tag. It is
+       checked BEFORE the NOR branch because a tagged pointer would otherwise
+       be handed to x86_nor_cow() as an offset into the snapshot.
+       Host-side stores through this pointer are RAW, exactly as they were
+       before the trap existed: the planar write modes are the interpreter's
+       business and no HLE service writes planes. */
+    if (X86_FOLD_IS_VGA(host))
+        return (void *)X86_FOLD_VGA_HOST(host);
     if (x86_nor_attached && (host & 0x80000000u)) {
         uint32_t axi = x86_nor_cow(host);
         if (!axi)

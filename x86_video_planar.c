@@ -27,9 +27,12 @@
  *  1. THE LATCHES ARE EXACT FOR PLAIN READS, not only for read-modify-writes.
  *     The reference is a C interpreter whose read path never surfaced a plain
  *     load, so it could only latch where it could see a read: inside a
- *     read-modify-write store, from the DESTINATION. Our VGA_LATCH macro sits
- *     on 47 real load sites and records the window offset of the last guest
- *     read in `cpu->vga_latch`, so `mov al,[si] / mov [di],al` -- the write
+ *     read-modify-write store, from the DESTINATION. The APERTURE'S FOLD TRAP
+ *     records the last guest read in `cpu->vga_latch` -- every load in the
+ *     interpreter, at no cost to a title that never arms a planar mode, since
+ *     the trap is the ADDS/BMI every access already runs (X86_FOLD_VGA_K in
+ *     x86_cpu.h). It replaced VGA_LATCH, which was five instructions at 47
+ *     load sites, armed or not. So `mov al,[si] / mov [di],al` -- the write
  *     mode 1 block copy that is most of the reason to unchain at all -- latches
  *     from SI, which is where the hardware latches from.
  *
@@ -97,6 +100,14 @@
    -DX86_MODEY_PRESENT_ON_FLIP=0, defined with the policy further down. The
    three that used to live here -- TIMER, QUIET and BACKOFF -- were controls for
    three successive LOCAL inventions and went with them. */
+
+/* The VGA aperture's fold trap. 0 is its NEGATIVE CONTROL: the sentinel is
+   never installed, so no aperture read traps and cpu->vga_latch is never
+   recorded -- every latch-fed write mode then draws from stale latches and
+   tests/test_video.py's Mode Y and 0Dh arms must fail. See fold_trap_set(). */
+#ifndef X86_VGA_FOLD_TRAP
+#define X86_VGA_FOLD_TRAP 1
+#endif
 
 /* Plane offsets alias into one 16 KB page: 4 * 0x4000 == 0x10000, the aperture
    exactly. A 320x200 page needs 16,000 of those 16,384, so the top 384 are
@@ -479,10 +490,22 @@ static void latch_reload(void)
     if (!cpu)
         return;
     x86_vga_latch_loads++;
-    /* The recorded offset is a WINDOW offset. In 0Dh that is the plane offset;
-       in Mode Y the window offset and the plane offset are the same number too,
-       because the guest addresses planes directly there. */
-    p = vga_cell(cpu->vga_latch);
+    /* cpu->vga_latch is the HOST POINTER the trap recovered; the window offset
+       is its distance from the aperture base. In 0Dh that offset is the plane
+       offset; in Mode Y the window offset and the plane offset are the same
+       number too, because the guest addresses planes directly there.
+       A pointer from before the aperture existed, or from another mode, lands
+       outside the window and is a latch MISS rather than a wild index. */
+    {
+        uint32_t off = cpu->vga_latch - (uint32_t)(uintptr_t)x86_vga_planar_aperture;
+        if (!x86_vga_planar_aperture || off >= X86_VGA_APERTURE_BYTES) {
+            x86_vga_latch_miss++;
+            if (x86_vga_modey_armed)
+                latch[0] = latch[1] = latch[2] = latch[3] = 0;
+            return;
+        }
+        p = vga_cell(off);
+    }
     if (p) {
         latch[0] = p[0]; latch[1] = p[1];
         latch[2] = p[2]; latch[3] = p[3];
@@ -711,15 +734,80 @@ void x86_vga_planar_store(uint32_t off, uint32_t val, uint32_t size)
  * ARMING
  */
 
-/* The hook is armed by giving the interpreter the aperture base; 0 disarms it,
-   and 0 is safe because host pointers are 0x24xxxxxx. One store, no special
-   case anywhere else. */
+/*
+ * Arming, in two halves.
+ *
+ * THE STORE HALF is cpu->vga_base, tested per store site by VGA_ST: 0 disarms
+ * it, and 0 is safe because host pointers are 0x24xxxxxx. One store, no
+ * special case anywhere else.
+ *
+ * THE READ HALF IS THE FOLD TABLE. The sixteen entries covering 0xA0000 are
+ * re-pointed at the sentinel X86_FOLD_VGA_K, so an aperture access resolves to
+ * `0x80000000 | host` and trips the ADDS/BMI every access already runs; the
+ * trap stub recovers the pointer and records the read latch. A title that
+ * never enters a planar mode therefore pays NOTHING for the aperture -- the
+ * old VGA_LATCH check was five instructions at every guest load in the
+ * interpreter, armed or not.
+ *
+ * If the aperture is not where the sentinel encoding needs it (AXI or DTCM,
+ * 0x2xxxxxxx), the sentinel is REFUSED and counted rather than installed: a
+ * colliding tag would be read as a NOR address by x86_nor_slow_r. The store
+ * half still arms, so a refusal costs the read latch on unhooked read sites,
+ * not correctness of the picture.
+ *
+ * x86_seam.c's x86_pager_slack() already answers NULL for the aperture (it is
+ * a fixed mapping, not a pager frame), so a straddling access is refused and
+ * counted exactly as it was before.
+ */
+volatile uint32_t x86_vga_fold_trap_refused;
+volatile uint32_t x86_vga_fold_trap_armed;
+
+static void fold_trap_set(int on)
+{
+    const uint32_t first = 0xA0000u >> FOLD_SHIFT;
+    const uint32_t n = X86_VGA_APERTURE_BYTES >> FOLD_SHIFT;
+    uint8_t *ap = x86_vga_planar_aperture;
+
+    if (!guest_page_table_ptr || !ap)
+        return;
+#if X86_VGA_FOLD_TRAP
+    if (on && !X86_FOLD_VGA_OK(ap)) {
+        x86_vga_fold_trap_refused++;
+        on = 0;
+    }
+#else
+    /* The NEGATIVE CONTROL for the whole mechanism: never install the
+       sentinel, so no read ever traps and the latch is never recorded.
+       tests/test_video.py's latch arms must FAIL under it. */
+    on = 0;
+#endif
+    for (uint32_t i = 0; i < n; i++)
+        guest_page_table_ptr[first + i] =
+            on ? X86_FOLD_VGA_K(ap + (i << FOLD_SHIFT), first + i)
+               : FOLD_K(ap + (i << FOLD_SHIFT), first + i);
+    x86_vga_fold_trap_armed = (uint32_t)on;
+}
+
+/* Re-install the sentinel after something has rewritten the aperture's fold
+   entries. x86_map_fixed() calls this: a mode set or an arena re-claim maps
+   0xA0000 afresh, and without this the sentinel is silently dropped while the
+   store hook stays armed -- reads then stop trapping, cpu->vga_latch freezes
+   and every latch-fed write mode draws from a stale latch. That is not a
+   theoretical ordering worry: it is what took Wolfenstein 3-D's Mode Y screen
+   out on the first attempt at this. */
+void x86_vga_planar_fold_refresh(void)
+{
+    if (x86_vga_fold_trap_armed)
+        fold_trap_set(1);
+}
+
 static void hook_set(int on)
 {
     if (cpu_state_ptr)
         cpu_state_ptr->vga_base =
             (on && x86_vga_planar_aperture)
                 ? (uint32_t)(uintptr_t)x86_vga_planar_aperture : 0u;
+    fold_trap_set(on && x86_vga_planar_aperture != NULL);
 }
 
 /*
