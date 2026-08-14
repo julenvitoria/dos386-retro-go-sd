@@ -7,6 +7,7 @@
 #include "../x86_arena.h"
 #include "../x86_video_planar.h"
 #include "../x86_pager.h"
+#include "../x86_xms.h"
 #include "../x86_profile.h"
 #include "../x86_osk.h"
 
@@ -2646,6 +2647,346 @@ static void pager_test_run(void)
     x86_pager_reset();
 }
 
+/* ===========================================================================
+ * XMS, driven by GUEST CODE doing the real sequence.
+ *
+ * INT 2Fh AX=4300h -> AX=4310h -> CALL FAR the entry point -> allocate -> move
+ * a pattern up -> move it back down -> free -> query. Nothing here calls
+ * x86_xms_control() directly, because the thing most likely to be wrong is not
+ * the arithmetic inside a function -- it is the entry point being a real
+ * address with a stub that returns by RETF, and a guest is the only witness to
+ * that.
+ *
+ * THE BUFFERS STRADDLE A GRANULE BOUNDARY, IN BOTH DIRECTIONS, and they are in
+ * PAGER-OWNED pages whose frames are primed OUT OF ORDER on purpose. `host =
+ * lin + k` with one k per granule, so with the frames shuffled guest page N+1
+ * is genuinely not the host memory after page N -- which is the only condition
+ * under which the seam can be seen at all (see the seam arm's note below on why
+ * every other tier-1 fold hides it). The source of the up-move spans one
+ * boundary and the destination of the down-move spans another.
+ *
+ * The store is a plain RAM buffer standing in for the pagefile, exactly as the
+ * pager arm's pgf_read/pgf_write do, and for the same reason: the whole
+ * interface is provable with no card, no FatFs and no firmware.
+ * ===========================================================================
+ */
+volatile uint32_t run_xms_flag = 0;
+volatile uint32_t xms_r[48];
+
+/* Reuses the pagefile buffer's 32 KB -- the arms never run at the same time,
+   and test_ram has no spare region (it is 752 KB and fully spoken for). */
+#define XMS_STORE_OFF  PGF_OFF
+#define XMS_STORE_KB   32u
+#define XMS_STORE_BYTES (XMS_STORE_KB * 1024u)
+
+static uint32_t xmsb_opens, xmsb_fail;
+static int xmsb_open(int write)   { (void)write; xmsb_opens++; return 0; }
+static void xmsb_close(void)      { }
+static int xmsb_read(uint32_t off, void *dst, uint32_t bytes)
+{
+    if (off > XMS_STORE_BYTES || XMS_STORE_BYTES - off < bytes)
+        { xmsb_fail++; return -1; }
+    memcpy(dst, test_ram + XMS_STORE_OFF + off, bytes);
+    return 0;
+}
+static int xmsb_write(uint32_t off, const void *src, uint32_t bytes)
+{
+    if (off > XMS_STORE_BYTES || XMS_STORE_BYTES - off < bytes)
+        { xmsb_fail++; return -1; }
+    memcpy(test_ram + XMS_STORE_OFF + off, src, bytes);
+    return 0;
+}
+
+#define XMS_CODE_A   0x3000u
+#define XMS_CODE_B   0x3100u
+#define XMS_CODE_C   0x3180u
+#define XMS_RES      0x3200u        /* 32 result words */
+#define XMS_ENTRY    0x3300u        /* the far pointer the guest CALLs         */
+#define XMS_S1       0x3310u        /* move: conventional -> XMS               */
+#define XMS_S2       0x3330u        /* move: XMS -> conventional               */
+#define XMS_S3       0x3350u        /* the two moves that must FAIL            */
+
+/* The guest buffers. 0xC0FE0 runs into page 0xC1, 0xC2FE0 into page 0xC3. */
+#define XMS_SRC_LIN  0xC0FE0u
+#define XMS_DST_LIN  0xC2FE0u
+#define XMS_PAT_LEN  64u
+
+static const uint8_t xms_code_a[] = {
+    0xB8, 0x00, 0x43,             /* MOV AX,4300h                            */
+    0xCD, 0x2F,                   /* INT 2Fh    -- detect                    */
+    0xA3, 0x00, 0x32,             /* MOV [3200],AX   r0: AL must be 80h      */
+    0xB8, 0x10, 0x43,             /* MOV AX,4310h                            */
+    0xCD, 0x2F,                   /* INT 2Fh    -- get the entry point       */
+    0x89, 0x1E, 0x00, 0x33,       /* MOV [3300],BX   the far pointer we CALL */
+    0x8C, 0x06, 0x02, 0x33,       /* MOV [3302],ES                           */
+    0x8C, 0x06, 0x02, 0x32,       /* MOV [3202],ES   r1                      */
+    0x89, 0x1E, 0x04, 0x32,       /* MOV [3204],BX   r2                      */
+    0xB4, 0x00,                   /* MOV AH,00h -- version                   */
+    0xFF, 0x1E, 0x00, 0x33,       /* CALL FAR [3300]                         */
+    0xA3, 0x06, 0x32,             /* r3: 0200h                               */
+    0x89, 0x16, 0x08, 0x32,       /* r4: HMA flag, 0                         */
+    0xB4, 0x08,                   /* MOV AH,08h -- free memory BEFORE        */
+    0xFF, 0x1E, 0x00, 0x33,
+    0xA3, 0x0A, 0x32,             /* r5: largest KB                          */
+    0x89, 0x16, 0x0C, 0x32,       /* r6: total KB                            */
+    0xB4, 0x09,                   /* MOV AH,09h -- allocate 8 KB             */
+    0xBA, 0x08, 0x00,
+    0xFF, 0x1E, 0x00, 0x33,
+    0xA3, 0x0E, 0x32,             /* r7: 1                                   */
+    0x89, 0x16, 0x10, 0x32,       /* r8: the handle                          */
+    0x89, 0x16, 0x1A, 0x33,       /* patch S1 destination handle             */
+    0x89, 0x16, 0x34, 0x33,       /* patch S2 source handle                  */
+    0xB4, 0x0B,                   /* MOV AH,0Bh -- move UP                   */
+    0xBE, 0x10, 0x33,             /* MOV SI,3310h                            */
+    0xFF, 0x1E, 0x00, 0x33,
+    0xA3, 0x12, 0x32,             /* r9: 1                                   */
+    0x88, 0x1E, 0x14, 0x32,       /* r10: BL, 0                              */
+    0xB4, 0x0B,                   /* MOV AH,0Bh -- move DOWN                 */
+    0xBE, 0x30, 0x33,             /* MOV SI,3330h                            */
+    0xFF, 0x1E, 0x00, 0x33,
+    0xA3, 0x16, 0x32,             /* r11: 1                                  */
+    0x88, 0x1E, 0x18, 0x32,       /* r12: BL, 0                              */
+    0xB4, 0x0E,                   /* MOV AH,0Eh -- handle information        */
+    0x8B, 0x16, 0x10, 0x32,
+    0xFF, 0x1E, 0x00, 0x33,
+    0xA3, 0x1A, 0x32,             /* r13: 1                                  */
+    0x89, 0x1E, 0x1C, 0x32,       /* r14: BH locks, BL free handles          */
+    0x89, 0x16, 0x1E, 0x32,       /* r15: block size, 8 KB                   */
+    0xB4, 0x08,                   /* MOV AH,08h -- free memory WHILE held    */
+    0xFF, 0x1E, 0x00, 0x33,
+    0xA3, 0x20, 0x32,             /* r16                                     */
+    0x89, 0x16, 0x22, 0x32,       /* r17                                     */
+    0xB4, 0x03,                   /* MOV AH,03h -- global enable A20         */
+    0xFF, 0x1E, 0x00, 0x33,
+    0xB4, 0x07,                   /* MOV AH,07h -- query A20                 */
+    0xFF, 0x1E, 0x00, 0x33,
+    0xA3, 0x24, 0x32,             /* r18: 1                                  */
+    0xB4, 0x04,                   /* MOV AH,04h -- global disable A20        */
+    0xFF, 0x1E, 0x00, 0x33,
+    0xB4, 0x07,
+    0xFF, 0x1E, 0x00, 0x33,
+    0xA3, 0x26, 0x32,             /* r19: 0                                  */
+    0xF4,                         /* HLT                                     */
+};
+
+/* Phase B: the SAME down-move again, after the host has corrupted one byte of
+   the store. The negative control -- it must come back different. */
+static const uint8_t xms_code_b[] = {
+    0xB4, 0x0B,
+    0xBE, 0x30, 0x33,
+    0xFF, 0x1E, 0x00, 0x33,
+    0xA3, 0x28, 0x32,             /* r20: still reports success              */
+    0xF4,
+};
+
+/* Phase C: the refusals, then free, then the queries that must show the memory
+   come back, then an allocation bigger than the store. */
+static const uint8_t xms_code_c[] = {
+    0xC7, 0x06, 0x50, 0x33, 0x03, 0x00,   /* S3 length = 3 -- ODD           */
+    0xB4, 0x0B,
+    0xBE, 0x50, 0x33,
+    0xFF, 0x1E, 0x00, 0x33,
+    0xA3, 0x2A, 0x32,             /* r21: 0                                  */
+    0x88, 0x1E, 0x2C, 0x32,       /* r22: A7h invalid length                 */
+    0xC7, 0x06, 0x50, 0x33, 0x40, 0x00,   /* S3 length = 64                  */
+    0xC7, 0x06, 0x54, 0x33, 0x09, 0x00,   /* S3 source handle = 9, unissued  */
+    0xB4, 0x0B,
+    0xBE, 0x50, 0x33,
+    0xFF, 0x1E, 0x00, 0x33,
+    0xA3, 0x2E, 0x32,             /* r23: 0                                  */
+    0x88, 0x1E, 0x30, 0x32,       /* r24: A3h invalid source handle          */
+    0xB4, 0x0C,                   /* MOV AH,0Ch -- lock, which we refuse     */
+    0x8B, 0x16, 0x10, 0x32,
+    0xFF, 0x1E, 0x00, 0x33,
+    0xA3, 0x32, 0x32,             /* r25: 0                                  */
+    0x88, 0x1E, 0x34, 0x32,       /* r26: ADh lock failed                    */
+    0xB4, 0x0A,                   /* MOV AH,0Ah -- free                      */
+    0x8B, 0x16, 0x10, 0x32,
+    0xFF, 0x1E, 0x00, 0x33,
+    0xA3, 0x36, 0x32,             /* r27: 1                                  */
+    0xB4, 0x08,                   /* MOV AH,08h -- free memory AFTER         */
+    0xFF, 0x1E, 0x00, 0x33,
+    0xA3, 0x38, 0x32,             /* r28: largest, back to the whole store   */
+    0x89, 0x16, 0x3A, 0x32,       /* r29: total                              */
+    0xB4, 0x09,                   /* MOV AH,09h -- ask for more than exists  */
+    0xBA, 0x00, 0x10,             /* MOV DX,4096                             */
+    0xFF, 0x1E, 0x00, 0x33,
+    0xA3, 0x3C, 0x32,             /* r30: 0                                  */
+    0x88, 0x1E, 0x3E, 0x32,       /* r31: A0h all extended memory allocated  */
+    0xF4,
+};
+
+static void xms_put32(uint32_t off, uint32_t v)
+{
+    test_ram[off + 0] = (uint8_t)v;
+    test_ram[off + 1] = (uint8_t)(v >> 8);
+    test_ram[off + 2] = (uint8_t)(v >> 16);
+    test_ram[off + 3] = (uint8_t)(v >> 24);
+}
+static void xms_put16(uint32_t off, uint16_t v)
+{
+    test_ram[off + 0] = (uint8_t)v;
+    test_ram[off + 1] = (uint8_t)(v >> 8);
+}
+
+/* Fault a page in, in an order the caller chooses. Frames are handed out in
+   FAULT order, so this is how the shuffle is arranged. */
+static void xms_prime(uint32_t lin)
+{
+    uint8_t *p = (uint8_t *)x86_guest_ptr(lin, 1);
+    if (p)
+        *p = 0;
+}
+
+static void xms_test_run(void)
+{
+    static const uint8_t hle_vectors[] = {
+        0x08, 0x09, 0x10, 0x11, 0x12, 0x15, 0x16, 0x1A, 0x20, 0x21, 0x2F,
+    };
+    uint8_t pat[XMS_PAT_LEN], got[XMS_PAT_LEN];
+
+    for (uint32_t i = 0; i < 48; i++)
+        xms_r[i] = 0;
+
+    /* ---- the store, and the guest pages the moves run against ---------- */
+    memset(test_ram + XMS_STORE_OFF, 0xEE, XMS_STORE_BYTES);
+    xmsb_opens = xmsb_fail = 0;
+    x86_xms_set_backing(xmsb_open, xmsb_close, xmsb_read, xmsb_write,
+                        XMS_STORE_KB);
+
+    x86_pager_reset();
+    x86_pager_set_backing(NULL, NULL);    /* four frames, four pages: no
+                                             eviction is possible, so nothing
+                                             can reach the store but XMS */
+    x86_livemap_clear();
+    x86_pager_own(PGT_FIRST, PGT_PAGES);
+    x86_pager_add_frames(test_ram + PGT_MEM_OFF, X86_PG_POOL_BYTES(4));
+    for (uint32_t i = 0; i < PGT_PAGES; i++)
+        guest_page_table[PGT_FIRST + i] = FOLD_INVALID;
+
+    /* OUT OF ORDER, deliberately: 0xC1 before 0xC0 and 0xC3 before 0xC2, so
+       each buffer's second granule sits BELOW its first in host memory. */
+    xms_prime(0xC1000u);
+    xms_prime(0xC0000u);
+    xms_prime(0xC3000u);
+    xms_prime(0xC2000u);
+    /* The premise this whole arm rests on, asserted rather than assumed. */
+    xms_r[32] = (guest_page_table[0xC0] != guest_page_table[0xC1]
+                 && guest_page_table[0xC2] != guest_page_table[0xC3]);
+
+    for (uint32_t i = 0; i < XMS_PAT_LEN; i++)
+        pat[i] = (uint8_t)(i * 7u + 3u);
+    memset(got, 0, sizeof(got));
+    x86_guest_copy_in(XMS_SRC_LIN, pat, XMS_PAT_LEN);
+    x86_guest_copy_in(XMS_DST_LIN, got, XMS_PAT_LEN);
+
+    /* ---- low memory: the stubs, the structures, the code --------------- */
+    memset(test_ram + XMS_RES, 0, 0x180);
+    x86_video_init(cga_test_vram, cga_test_palette);
+    x86_video_set_aperture(vga_test_aperture, vga_test_pal);
+    x86_bios_init();
+    x86_hle_install(hle_vectors, sizeof(hle_vectors));
+
+    /* S1: 64 bytes, conventional 0xC0FE:0000 -> handle (patched), offset 0. */
+    xms_put32(XMS_S1 + 0,  XMS_PAT_LEN);
+    xms_put16(XMS_S1 + 4,  0);
+    xms_put32(XMS_S1 + 6,  ((XMS_SRC_LIN >> 4) << 16));
+    xms_put16(XMS_S1 + 10, 0);
+    xms_put32(XMS_S1 + 12, 0);
+    /* S2: 64 bytes, handle (patched) offset 0 -> conventional 0xC2FE:0000. */
+    xms_put32(XMS_S2 + 0,  XMS_PAT_LEN);
+    xms_put16(XMS_S2 + 4,  0);
+    xms_put32(XMS_S2 + 6,  0);
+    xms_put16(XMS_S2 + 10, 0);
+    xms_put32(XMS_S2 + 12, ((XMS_DST_LIN >> 4) << 16));
+    /* S3: filled in by the guest for each refusal it provokes. */
+    memset(test_ram + XMS_S3, 0, 16);
+    xms_put32(XMS_S3 + 12, ((XMS_DST_LIN >> 4) << 16));
+
+    memcpy(&test_ram[XMS_CODE_A], xms_code_a, sizeof(xms_code_a));
+    memcpy(&test_ram[XMS_CODE_B], xms_code_b, sizeof(xms_code_b));
+    memcpy(&test_ram[XMS_CODE_C], xms_code_c, sizeof(xms_code_c));
+
+    uint32_t a20_0 = x86_a20_changes;
+
+    /* ---- phase A ------------------------------------------------------- */
+    kbd_test_reset_cpu(XMS_CODE_A);
+    xms_r[33] = 0;
+    if (kbd_test_run_to_halt() != X86_EXIT_HALT)
+        return;                            /* every result stays 0: LOUD */
+
+    /* THE ASSERTION THIS ARM EXISTS FOR: the pattern went up and came back
+       down byte for byte, across a granule boundary at each end. */
+    x86_guest_copy_out(got, XMS_DST_LIN, XMS_PAT_LEN);
+    xms_r[33] = (memcmp(got, pat, XMS_PAT_LEN) == 0);
+    /* And nothing outside the 64 bytes was written -- a move that overran its
+       block would pass the compare above and still be wrong. */
+    {
+        int clean = 1;
+        for (uint32_t i = XMS_PAT_LEN; i < 256u; i++)
+            if (test_ram[XMS_STORE_OFF + i] != 0xEE)
+                clean = 0;
+        xms_r[44] = clean;
+    }
+
+    /* ---- phase B: the negative control --------------------------------- */
+    /* One byte of the store, flipped. If the compare in xms_r[33] is real,
+       the same move must now bring back something that does NOT match. */
+    test_ram[XMS_STORE_OFF + 40] ^= 0xFF;
+    kbd_test_reset_cpu(XMS_CODE_B);
+    if (kbd_test_run_to_halt() == X86_EXIT_HALT) {
+        x86_guest_copy_out(got, XMS_DST_LIN, XMS_PAT_LEN);
+        xms_r[34] = (memcmp(got, pat, XMS_PAT_LEN) != 0);
+    }
+    test_ram[XMS_STORE_OFF + 40] ^= 0xFF;
+
+    /* ---- phase C ------------------------------------------------------- */
+    kbd_test_reset_cpu(XMS_CODE_C);
+    (void)kbd_test_run_to_halt();
+
+    /*
+     * THE SECOND NEGATIVE CONTROL, and it is the bug this implementation had to
+     * avoid: resolve ONE host pointer for the whole 64 bytes and memcpy through
+     * it, exactly as `memcpy(guest_ram + offset, ...)` would. With the frames
+     * shuffled the tail of that copy lands in another page's frame, so reading
+     * the range back through the granule-aware accessor CANNOT match. If this
+     * ever reports a match, the arm's fold is contiguous and every seam claim
+     * above it is vacuous.
+     */
+    {
+        uint8_t zero[XMS_PAT_LEN];
+        memset(zero, 0, sizeof(zero));
+        x86_guest_copy_in(XMS_DST_LIN, zero, XMS_PAT_LEN);
+        uint8_t *p = (uint8_t *)x86_guest_ptr(XMS_DST_LIN, 1);
+        if (p) {
+            memcpy(p, pat, XMS_PAT_LEN);
+            x86_guest_copy_out(got, XMS_DST_LIN, XMS_PAT_LEN);
+            xms_r[35] = (memcmp(got, pat, XMS_PAT_LEN) != 0);
+        }
+    }
+
+    for (uint32_t i = 0; i < 32; i++)
+        xms_r[i] = (uint32_t)(test_ram[XMS_RES + i * 2]
+                              | (test_ram[XMS_RES + i * 2 + 1] << 8));
+
+    xms_r[36] = x86_xms_moves;
+    xms_r[37] = x86_xms_move_up;
+    xms_r[38] = x86_xms_move_down;
+    xms_r[39] = x86_xms_io_errors + xmsb_fail;
+    xms_r[40] = x86_xms_guest_errors;
+    xms_r[41] = xmsb_opens;
+    xms_r[42] = x86_a20_changes - a20_0;
+    xms_r[43] = x86_xms_total_kb;
+    xms_r[45] = x86_xms_handles_used;
+    xms_r[46] = x86_xms_detects;
+    xms_r[47] = x86_xms_entry_reqs;
+
+    x86_xms_set_backing(NULL, NULL, NULL, NULL, 0);
+    for (uint32_t i = 0; i < PGT_PAGES; i++)
+        guest_page_table[PGT_FIRST + i] = FOLD_INVALID;
+    x86_pager_reset();
+}
+
 /* ---- the granule seam ----------------------------------------------------
  *
  * host = lin + k, and k is per 4 KB granule. Two adjacent guest granules are
@@ -3217,6 +3558,11 @@ void Reset_Handler(void) {
         if (run_arena_flag == 1) {
             arena_test_run();
             run_arena_flag = 0;
+        }
+
+        if (run_xms_flag == 1) {
+            xms_test_run();
+            run_xms_flag = 0;
         }
 
         if (run_pager_flag == 1) {

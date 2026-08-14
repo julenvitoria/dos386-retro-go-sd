@@ -1199,6 +1199,24 @@ python3 tests/test_paging.py             # the guest memory ARCHITECTURE, as
                                          # deficit. Two arms (0x110000 and
                                          # 0x200000 not aliased) fail on the
                                          # pre-fix whole-space wrap
+python3 tests/test_xms.py                # XMS, driven by GUEST code doing the
+                                         # real sequence: INT 2Fh AX=4300h ->
+                                         # AX=4310h -> CALL FAR the returned
+                                         # entry -> allocate -> move a pattern
+                                         # up -> move it back down -> free.
+                                         # The buffers STRADDLE a granule
+                                         # boundary in both directions, in
+                                         # pager pages primed OUT OF ORDER so
+                                         # the shuffle is real, and the arm
+                                         # asserts the shuffle rather than
+                                         # assuming it. Three negative controls,
+                                         # each seen to fail: a corrupted store
+                                         # byte, the naive one-pointer memcpy,
+                                         # and the guest's own refusals (odd
+                                         # length, unissued handle, lock,
+                                         # over-allocation). The store is a
+                                         # plain RAM buffer standing in for the
+                                         # pagefile -- no card, no FatFs
 python3 tests/test_seam.py               # THE GRANULE SEAM. host = lin + k with
                                          # one k per 4 KB page, so two adjacent
                                          # GUEST granules are adjacent in HOST

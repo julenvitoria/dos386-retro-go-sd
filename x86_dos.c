@@ -18,6 +18,7 @@
 
 #include "cutils.h"
 #include "x86_cpu.h"
+#include "x86_pager.h"          /* X86_PG_SIZE -- the granule XMS moves split on */
 #include "lib/FatFs/ff.h"
 
 #define SEG(x)          ((uint32_t)(x) << 4)
@@ -1446,4 +1447,566 @@ static int dos_int21_dispatch(uint8_t func)
         fail(0x01);                             /* invalid function */
         return 0;
     }
+}
+
+/* ===========================================================================
+ * XMS 2.0 -- the HIMEM interface. Rationale, the storage model and the two
+ * things we refuse are all in x86_xms.h; this file is the mechanism.
+ *
+ * It lives in x86_dos.c rather than a file of its own because it is the same
+ * kind of thing as the MCB arena above -- a memory manager the guest talks to
+ * through an HLE entry -- and because a new translation unit is a Makefile
+ * change this branch has no other reason to make.
+ * ===========================================================================
+ */
+#include "x86_xms.h"
+
+volatile uint32_t x86_xms_total_kb;
+volatile uint32_t x86_xms_used_kb;
+volatile uint32_t x86_xms_handles_used;
+volatile uint32_t x86_xms_detects;
+volatile uint32_t x86_xms_entry_reqs;
+volatile uint32_t x86_xms_calls;
+volatile uint32_t x86_xms_moves;
+volatile uint32_t x86_xms_move_up;
+volatile uint32_t x86_xms_move_down;
+volatile uint32_t x86_xms_move_xx;
+volatile uint32_t x86_xms_io_errors;
+volatile uint32_t x86_xms_guest_errors;
+volatile uint32_t x86_xms_last_err;
+volatile uint32_t x86_xms_unhandled;
+
+/* Error codes, spelled out because the numbers are the interface. */
+#define XMSE_NOFUNC     0x80u   /* function not implemented                 */
+#define XMSE_NOHMA      0x90u   /* the HMA does not exist                   */
+#define XMSE_NOTALLOC   0x93u   /* HMA not allocated                        */
+#define XMSE_NOMEM      0xA0u   /* all extended memory is allocated         */
+#define XMSE_NOHANDLE   0xA1u   /* all handles are in use                   */
+#define XMSE_BADHANDLE  0xA2u
+#define XMSE_BADSRCH    0xA3u
+#define XMSE_BADSRCO    0xA4u
+#define XMSE_BADDSTH    0xA5u
+#define XMSE_BADDSTO    0xA6u
+#define XMSE_BADLEN     0xA7u
+#define XMSE_OVERLAP    0xA8u
+#define XMSE_PARITY     0xA9u   /* what a driver returns for a store failure */
+#define XMSE_NOTLOCKED  0xAAu
+#define XMSE_LOCKED     0xABu
+#define XMSE_LOCKFAIL   0xADu
+
+typedef struct {
+    uint8_t  used;
+    uint8_t  locks;
+    uint32_t kb_off;            /* offset into the store, in KB  */
+    uint32_t kb;                /* size, in KB                   */
+} xms_handle_t;
+
+static xms_handle_t xms_h[X86_XMS_HANDLES];
+static x86_xms_open_fn  xms_open;
+static x86_xms_close_fn xms_close;
+static x86_xms_rd_fn    xms_rd;
+static x86_xms_wr_fn    xms_wr;
+static uint32_t         xms_kb;         /* the whole store, in KB */
+static uint32_t         xms_a20_local;  /* AH=05h/06h nesting count */
+
+/* The ONLY buffer this interface owns, and it is 256 bytes because the two
+   paths that need one are rare: an XMS->XMS move and the copy inside a growing
+   AH=0Fh. Guest<->XMS moves need no buffer at all -- x86_guest_ptr() hands out
+   a host pointer for one page-run and the store reads or writes straight
+   through it, so the common path is zero-copy. */
+#define XMS_CHUNK 256u
+static uint8_t xms_buf[XMS_CHUNK];
+
+void x86_xms_set_backing(x86_xms_open_fn op, x86_xms_close_fn cl,
+                         x86_xms_rd_fn rd, x86_xms_wr_fn wr, uint32_t kb)
+{
+    xms_open = op;
+    xms_close = cl;
+    xms_rd = rd;
+    xms_wr = wr;
+    /* No store means no memory, and we say so rather than handing out bytes we
+       cannot keep. See x86_xms.h. */
+    xms_kb = (rd && wr) ? kb : 0u;
+    x86_xms_reset();
+}
+
+void x86_xms_reset(void)
+{
+    for (unsigned i = 0; i < X86_XMS_HANDLES; i++) {
+        xms_h[i].used = 0;
+        xms_h[i].locks = 0;
+        xms_h[i].kb_off = 0;
+        xms_h[i].kb = 0;
+    }
+    xms_a20_local = 0;
+    x86_xms_total_kb = xms_kb;
+    x86_xms_used_kb = 0;
+    x86_xms_handles_used = 0;
+}
+
+/* ---- the allocator -------------------------------------------------------
+ * KB units throughout, because the interface is in KB and any other unit needs
+ * a rounding rule that AH=08h and AH=0Eh would then have to agree on. First
+ * fit over the live blocks: sixteen handles, so walking them is cheaper than
+ * any structure that would keep them sorted.
+ */
+#define XMS_NO_OFF 0xFFFFFFFFu
+
+static uint32_t xms_find_gap(uint32_t kb)
+{
+    uint32_t cand = 0;
+    for (;;) {
+        if (cand > xms_kb || xms_kb - cand < kb)
+            return XMS_NO_OFF;
+        uint32_t bump = 0;
+        for (unsigned i = 0; i < X86_XMS_HANDLES; i++) {
+            if (!xms_h[i].used)
+                continue;
+            uint32_t s = xms_h[i].kb_off, e = s + xms_h[i].kb;
+            if (cand < e && s < cand + kb) {
+                if (e > bump)
+                    bump = e;
+            }
+        }
+        if (!bump)
+            return cand;
+        cand = bump;
+    }
+}
+
+/* The largest block AH=08h may promise. Not "total free" -- a guest that asks
+   for the total and gets a fragmented refusal is the failure mode AX and DX
+   are two separate registers to prevent. */
+static uint32_t xms_largest_free(void)
+{
+    uint32_t best = 0;
+    /* Every gap starts either at 0 or at the end of some live block. */
+    for (unsigned i = 0; i <= X86_XMS_HANDLES; i++) {
+        uint32_t start = 0;
+        if (i < X86_XMS_HANDLES) {
+            if (!xms_h[i].used)
+                continue;
+            start = xms_h[i].kb_off + xms_h[i].kb;
+        }
+        if (start >= xms_kb)
+            continue;
+        uint32_t end = xms_kb;
+        for (unsigned j = 0; j < X86_XMS_HANDLES; j++) {
+            if (!xms_h[j].used)
+                continue;
+            uint32_t s = xms_h[j].kb_off;
+            if (s >= start && s < end)
+                end = s;
+        }
+        if (end - start > best)
+            best = end - start;
+    }
+    return best;
+}
+
+static uint32_t xms_free_kb(void)
+{
+    uint32_t used = 0;
+    for (unsigned i = 0; i < X86_XMS_HANDLES; i++)
+        if (xms_h[i].used)
+            used += xms_h[i].kb;
+    return xms_kb - used;
+}
+
+static void xms_account(void)
+{
+    uint32_t used = 0, n = 0;
+    for (unsigned i = 0; i < X86_XMS_HANDLES; i++)
+        if (xms_h[i].used) { used += xms_h[i].kb; n++; }
+    x86_xms_used_kb = used;
+    x86_xms_handles_used = n;
+    x86_xms_total_kb = xms_kb;
+}
+
+static xms_handle_t *xms_get(uint16_t handle)
+{
+    if (handle == 0 || handle > X86_XMS_HANDLES)
+        return NULL;
+    xms_handle_t *h = &xms_h[handle - 1];
+    return h->used ? h : NULL;
+}
+
+/* ---- results -------------------------------------------------------------
+ * AX=1/BL=0 for success, AX=0/BL=code for failure. There is NO CF here: the
+ * control function is entered by CALL FAR, so there is no FLAGS word on the
+ * stack to edit (x86_xms.h). Touching one would corrupt the caller's stack.
+ */
+static void xms_bl_set(uint8_t v)
+{
+    cpu_state_ptr->regs[3] = (cpu_state_ptr->regs[3] & 0xFFFFFF00u) | v;
+}
+static void xms_bh_set(uint8_t v)
+{
+    cpu_state_ptr->regs[3] = (cpu_state_ptr->regs[3] & 0xFFFF00FFu)
+                             | ((uint32_t)v << 8);
+}
+static int xms_ok(void)   { x86_set_ax(1); xms_bl_set(0); return 1; }
+static int xms_err(uint8_t code)
+{
+    x86_set_ax(0);
+    xms_bl_set(code);
+    x86_xms_last_err = code;
+    return 1;
+}
+
+/* ---- the store -----------------------------------------------------------
+ * One open per OPERATION, not per page-run: the pagefile is open-per-call and
+ * ~25 ms of that is the open (docs/12 §1a), so bracketing the whole move is
+ * the difference between one open and twenty-six for a 102 KB transfer.
+ */
+static int xms_store_begin(int write)
+{
+    if (!xms_rd || !xms_wr)
+        return -1;
+    if (xms_open && xms_open(write) != 0) {
+        x86_xms_io_errors++;
+        return -1;
+    }
+    return 0;
+}
+static void xms_store_end(void)
+{
+    if (xms_close)
+        xms_close();
+}
+
+/*
+ * Move one contiguous run between the store and GUEST memory.
+ *
+ * PAGE-RUN AT A TIME, and that is not an optimisation, it is the granule seam
+ * (CLAUDE.md, docs/10). `host = lin + k` with one k per 4 KB granule and frames
+ * handed out in FAULT order, so guest page N+1 is almost never the host memory
+ * after page N -- one memcpy over `x86_guest_ptr(lin, bytes)` for a range that
+ * spans a boundary runs off the top of a frame into an unrelated page. That is
+ * the bug shape that made the exec fallback execute the IVT. x86_guest_ptr()
+ * refuses a spanning request, so this splits at every boundary itself.
+ */
+static int xms_guest_run(uint32_t lin, uint32_t off, uint32_t bytes, int to_xms)
+{
+    while (bytes) {
+        uint32_t page_off = lin & (X86_PG_SIZE - 1u);
+        uint32_t run = X86_PG_SIZE - page_off;
+        if (run > bytes)
+            run = bytes;
+        void *p = x86_guest_ptr(lin, run);
+        if (!p) {
+            x86_xms_guest_errors++;
+            return -1;
+        }
+        int rc = to_xms ? xms_wr(off, p, run) : xms_rd(off, p, run);
+        if (rc != 0) {
+            x86_xms_io_errors++;
+            return -1;
+        }
+        lin += run;
+        off += run;
+        bytes -= run;
+    }
+    return 0;
+}
+
+/* Store to store. The only path that needs the buffer, and the only one where
+   overlap is possible -- the spec allows a move within one handle, so an
+   overlapping one is copied backwards rather than refused. */
+static int xms_store_run(uint32_t dst, uint32_t src, uint32_t bytes)
+{
+    int back = (dst > src && dst < src + bytes);
+    uint32_t done = 0;
+    while (done < bytes) {
+        uint32_t run = bytes - done;
+        if (run > XMS_CHUNK)
+            run = XMS_CHUNK;
+        uint32_t s = back ? src + bytes - done - run : src + done;
+        uint32_t d = back ? dst + bytes - done - run : dst + done;
+        if (xms_rd(s, xms_buf, run) != 0 || xms_wr(d, xms_buf, run) != 0) {
+            x86_xms_io_errors++;
+            return -1;
+        }
+        done += run;
+    }
+    return 0;
+}
+
+/* ---- AH=0Bh --------------------------------------------------------------
+ * DS:SI points at the move structure.
+ *
+ *   +0  dd  length in BYTES, must be even
+ *   +4  dw  source handle, 0 = the source is a real-mode SEG:OFF
+ *   +6  dd  source offset -- into the block, or (seg << 16) | off
+ *   +10 dw  destination handle
+ *   +12 dd  destination offset
+ */
+static int xms_move(void)
+{
+    uint8_t st[16];
+    uint32_t lin = cpu_state_ptr->segs[3].base
+                   + (cpu_state_ptr->regs[6] & 0xFFFFu);
+
+    if (x86_guest_copy_out(st, lin, sizeof(st)) != sizeof(st)) {
+        x86_xms_guest_errors++;
+        return xms_err(XMSE_PARITY);
+    }
+    uint32_t len = (uint32_t)st[0] | ((uint32_t)st[1] << 8)
+                 | ((uint32_t)st[2] << 16) | ((uint32_t)st[3] << 24);
+    uint16_t sh  = (uint16_t)(st[4] | (st[5] << 8));
+    uint32_t so  = (uint32_t)st[6] | ((uint32_t)st[7] << 8)
+                 | ((uint32_t)st[8] << 16) | ((uint32_t)st[9] << 24);
+    uint16_t dh  = (uint16_t)(st[10] | (st[11] << 8));
+    uint32_t dof = (uint32_t)st[12] | ((uint32_t)st[13] << 8)
+                 | ((uint32_t)st[14] << 16) | ((uint32_t)st[15] << 24);
+
+    if (len & 1u)
+        return xms_err(XMSE_BADLEN);
+    if (len == 0)
+        return xms_ok();                    /* a legal no-op */
+
+    /* Resolve both ends. A handle end is bounds-checked against the block; a
+       conventional end is a seg:off that x86_guest_ptr() validates a run at a
+       time, so a bad one fails as a guest error and not as a wild write. */
+    uint32_t s_lin = 0, d_lin = 0, s_off = 0, d_off = 0;
+    if (sh) {
+        xms_handle_t *h = xms_get(sh);
+        if (!h)
+            return xms_err(XMSE_BADSRCH);
+        if (so > (h->kb << 10) || (h->kb << 10) - so < len)
+            return xms_err(XMSE_BADSRCO);
+        s_off = (h->kb_off << 10) + so;
+    } else {
+        s_lin = ((so >> 16) << 4) + (so & 0xFFFFu);
+    }
+    if (dh) {
+        xms_handle_t *h = xms_get(dh);
+        if (!h)
+            return xms_err(XMSE_BADDSTH);
+        if (dof > (h->kb << 10) || (h->kb << 10) - dof < len)
+            return xms_err(XMSE_BADDSTO);
+        d_off = (h->kb_off << 10) + dof;
+    } else {
+        d_lin = ((dof >> 16) << 4) + (dof & 0xFFFFu);
+    }
+    if (!sh && !dh) {
+        /* Both ends conventional. The spec permits it; nothing in this project
+           needs it, and doing it wrong is worse than saying no. */
+        x86_xms_unhandled = 0x0B;
+        return xms_err(XMSE_OVERLAP);
+    }
+
+    if (xms_store_begin(1) != 0)
+        return xms_err(XMSE_PARITY);
+    int rc;
+    if (sh && dh) {
+        rc = xms_store_run(d_off, s_off, len);
+        if (rc == 0) x86_xms_move_xx += len;
+    } else if (dh) {
+        rc = xms_guest_run(s_lin, d_off, len, 1);
+        if (rc == 0) x86_xms_move_up += len;
+    } else {
+        rc = xms_guest_run(d_lin, s_off, len, 0);
+        if (rc == 0) x86_xms_move_down += len;
+    }
+    xms_store_end();
+    if (rc != 0)
+        return xms_err(XMSE_PARITY);
+    x86_xms_moves++;
+    return xms_ok();
+}
+
+/* ---- the control function ------------------------------------------------ */
+int x86_xms_control(void)
+{
+    uint8_t func = (uint8_t)(cpu_state_ptr->regs[0] >> 8);
+    uint16_t dx = (uint16_t)cpu_state_ptr->regs[2];
+    uint16_t bx = (uint16_t)cpu_state_ptr->regs[3];
+
+    x86_xms_calls++;
+    switch (func) {
+    case 0x00:                                  /* get version */
+        /* 2.00, and the function set below IS the 2.0 set. Claiming 3.0 would
+           advertise the super-extended calls (88h/89h/8Eh/8Fh) we do not have,
+           and a guest picks its path from this number. */
+        x86_set_ax(0x0200);
+        x86_set_bx(0x0001);                     /* internal revision */
+        x86_set_dx(0x0000);                     /* no HMA -- see x86_xms.h */
+        return 1;
+
+    case 0x01:                                  /* request the HMA */
+    case 0x02:                                  /* release the HMA */
+        return xms_err(XMSE_NOHMA);
+    case 0x03:                                  /* global enable A20 */
+        x86_a20_set(1);
+        return xms_ok();
+    case 0x04:                                  /* global disable A20 */
+        if (xms_a20_local)
+            return xms_err(XMSE_NOTALLOC);
+        x86_a20_set(0);
+        return xms_ok();
+    case 0x05:                                  /* local enable A20 */
+        /* Nesting, because a driver that enables locally twice and disables
+           once expects the gate to still be open. One state, the machine's --
+           x86_a20_set() and x86_a20_changes, the same gate the 8042 path in
+           x86_io.c drives. There is no second A20 model here. */
+        xms_a20_local++;
+        x86_a20_set(1);
+        return xms_ok();
+    case 0x06:                                  /* local disable A20 */
+        if (xms_a20_local)
+            xms_a20_local--;
+        if (!xms_a20_local)
+            x86_a20_set(0);
+        return xms_ok();
+    case 0x07:                                  /* query A20 state */
+        x86_set_ax((uint16_t)x86_a20_state);
+        xms_bl_set(0);
+        return 1;
+
+    case 0x08: {                                /* query free extended memory */
+        uint32_t largest = xms_largest_free(), total = xms_free_kb();
+        x86_set_ax((uint16_t)(largest > 0xFFFFu ? 0xFFFFu : largest));
+        x86_set_dx((uint16_t)(total > 0xFFFFu ? 0xFFFFu : total));
+        if (largest == 0) {
+            xms_bl_set(XMSE_NOMEM);
+            x86_xms_last_err = XMSE_NOMEM;
+        } else {
+            xms_bl_set(0);
+        }
+        return 1;
+    }
+
+    case 0x09: {                                /* allocate */
+        unsigned i;
+        for (i = 0; i < X86_XMS_HANDLES; i++)
+            if (!xms_h[i].used)
+                break;
+        if (i == X86_XMS_HANDLES)
+            return xms_err(XMSE_NOHANDLE);
+        uint32_t off = xms_find_gap(dx);
+        if (off == XMS_NO_OFF)
+            return xms_err(XMSE_NOMEM);
+        xms_h[i].used = 1;
+        xms_h[i].locks = 0;
+        xms_h[i].kb_off = off;
+        xms_h[i].kb = dx;
+        xms_account();
+        xms_ok();
+        x86_set_dx((uint16_t)(i + 1));
+        return 1;
+    }
+
+    case 0x0A: {                                /* free */
+        xms_handle_t *h = xms_get(dx);
+        if (!h)
+            return xms_err(XMSE_BADHANDLE);
+        if (h->locks)
+            return xms_err(XMSE_LOCKED);
+        h->used = 0;
+        h->kb = 0;
+        xms_account();
+        return xms_ok();
+    }
+
+    case 0x0B:
+        return xms_move();
+
+    case 0x0C:                                  /* lock a block */
+        if (!xms_get(dx))
+            return xms_err(XMSE_BADHANDLE);
+        /* Honest refusal: a lock exists to yield a 32-bit LINEAR address, and
+           our bytes are in a file. See x86_xms.h. */
+        return xms_err(XMSE_LOCKFAIL);
+    case 0x0D:                                  /* unlock */
+        if (!xms_get(dx))
+            return xms_err(XMSE_BADHANDLE);
+        return xms_err(XMSE_NOTLOCKED);
+
+    case 0x0E: {                                /* get handle information */
+        xms_handle_t *h = xms_get(dx);
+        if (!h)
+            return xms_err(XMSE_BADHANDLE);
+        unsigned free_h = 0;
+        for (unsigned i = 0; i < X86_XMS_HANDLES; i++)
+            if (!xms_h[i].used)
+                free_h++;
+        uint32_t kb = h->kb;
+        x86_set_ax(1);
+        xms_bh_set(h->locks);
+        xms_bl_set((uint8_t)free_h);
+        x86_set_dx((uint16_t)kb);
+        return 1;
+    }
+
+    case 0x0F: {                                /* reallocate */
+        xms_handle_t *h = xms_get(dx);
+        if (!h)
+            return xms_err(XMSE_BADHANDLE);
+        if (h->locks)
+            return xms_err(XMSE_LOCKED);
+        if (bx <= h->kb) {                      /* shrink in place */
+            h->kb = bx;
+            xms_account();
+            return xms_ok();
+        }
+        /* Grow. Search with this block taken out of the picture, so growing in
+           place is found first; only a move costs a store-to-store copy. */
+        uint32_t want = bx;
+        uint32_t old_off = h->kb_off, old_kb = h->kb;
+        h->used = 0;
+        uint32_t off = xms_find_gap(want);
+        h->used = 1;
+        if (off == XMS_NO_OFF)
+            return xms_err(XMSE_NOMEM);
+        if (off != old_off && old_kb) {
+            if (xms_store_begin(1) != 0)
+                return xms_err(XMSE_PARITY);
+            int rc = xms_store_run(off << 10, old_off << 10, old_kb << 10);
+            xms_store_end();
+            if (rc != 0)
+                return xms_err(XMSE_PARITY);
+        }
+        h->kb_off = off;
+        h->kb = want;
+        xms_account();
+        return xms_ok();
+    }
+
+    default:
+        /* Loud, like every other unimplemented service in this tree. */
+        x86_xms_unhandled = func;
+        return xms_err(XMSE_NOFUNC);
+    }
+}
+
+/* ---- INT 2Fh -------------------------------------------------------------
+ * ONLY AX=4300h and AX=4310h. Every other multiplex subfunction returns with
+ * the guest's registers exactly as they arrived, which is what the bare IRET
+ * this replaces did and what "no handler" is defined to look like.
+ */
+int x86_xms_int2f(void)
+{
+    uint16_t ax = (uint16_t)cpu_state_ptr->regs[0];
+
+    if (ax == 0x4300) {
+        /* AL=80h is the whole detection protocol. With no store we are NOT
+           present -- advertising a driver with nothing behind it is worse than
+           being absent, because the guest then stops looking elsewhere. */
+        if (!xms_kb)
+            return 1;
+        x86_set_al(0x80);
+        x86_xms_detects++;
+        return 1;
+    }
+    if (ax == 0x4310) {
+        if (!xms_kb)
+            return 1;
+        cpu_state_ptr->segs[0].sel  = X86_XMS_ENTRY_SEG;   /* ES */
+        cpu_state_ptr->segs[0].base = SEG(X86_XMS_ENTRY_SEG);
+        x86_set_bx(X86_XMS_ENTRY_OFF);
+        x86_xms_entry_reqs++;
+        return 1;
+    }
+    return 1;
 }
