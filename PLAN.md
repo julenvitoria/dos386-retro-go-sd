@@ -16,10 +16,12 @@ regions**.
   unmapped pages hold `FOLD_INVALID` so one `ADDS`+`BMI` validates every access
   at zero cost. Entries are offsets, not bases.
 - **Done**: the granule seam — [`docs/10`](docs/10_granule_seam.md).
-- **In progress**: pager eviction, and donating spare guest frames to the arena
-  — [`docs/12`](docs/12_memory_tiers.md).
-- **Measurement-gated**: NOR backing. Re-measure the code-vs-data split first;
-  it is currently 100% write, which kills the premise
+- **Done**: eviction, the SD pagefile, and donating spare guest frames to the
+  arena — [`docs/12`](docs/12_memory_tiers.md). This is the groundwork Queue C
+  depends on; the 8 MB space `X86_PG_PAGES` declares is now actually backed.
+- **Dead, measured**: NOR backing. 100% of residency is via writes, and XIP
+  from flash needs a read-mostly set. It says nothing about the pagefile, whose
+  FILE tier exists precisely for written pages
   ([`docs/12`](docs/12_memory_tiers.md) §3).
 - Eviction *policy* is not the lever: LRU was measured capped at 2.1x over FIFO
   while the pool-size cliff is 350x. Spend effort on bytes, not policy.
