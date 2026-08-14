@@ -14,10 +14,12 @@ produced them does not live anywhere.
 |---|---|
 | 1. gwemu bare-metal | `test_opcodes` **273/273**; `test_video` all arms with Mode Y and EGA 0Dh **64000/64000**; `test_seam`, `test_pit`, `test_dos`, `test_paging`, `test_nor`, `test_sysinfo`, `test_xms` **47/47**, `test_ems` **40/40**, `test_text`, `test_keyboard`, `test_osk`, `test_disk_cache` |
 | 2. gwemu + retro-go | `core_dtcm_ok=1`, bonus pool 153,600 B, 1,000,001 insns — matches tier 1. **XMS is live and a shipped title uses it**: WOLF3D detects it, allocates and moves 430,636 B in 278 moves, `xms_opens=1`, 0 errors, at a 4% frame cost ([`docs/12`](docs/12_memory_tiers.md) §6) |
-| 3. Hardware | ~**2.8 M insn/s** stock, ~**3.8 M** overclocked, 59 fps, ~1.3 frame overruns/s |
+| 3. Hardware | ~**2.8 M insn/s** stock, ~**3.8 M** overclocked, 59 fps, ~1.3 frame overruns/s. **The reworked (direct-pointer) firmware ABI is VERIFIED on silicon**: core registers, `core_ready=1`, `x86_vga13_ok=1`, guest advancing. KEEN4 ~1.37 M insn/s in 0Dh |
 
 `scripts/run_planar_controls.py`: all negative controls caught + the LEARN
-positive control.
+positive control. **Golden gate: WOLF3D 0.000%** (which is what proves
+`lcd_set_clut_ext` against the reworked ABI), ALLEYCAT 0.874% pre-existing,
+KEEN4 known-bad.
 
 **Known-failing, pre-existing, not news:**
 
@@ -40,8 +42,12 @@ positive control.
 |---|---|
 | Wolf3D's cached pictures render as noise (off-screen VRAM cache too small) | [`docs/13`](docs/13_title_status.md) |
 | Wolf3D paints mid-draw frames in gameplay (`x86_modey_mid_draw`) | [`docs/08`](docs/08_vga_mode13h.md) §4 |
+| Retro-go's `/CONFIG` magic is cleared by a probe reset (`Expected 0xcafef00d, got 0`) | cosmetic; settings return on the next clean boot |
 | The planar store path halves the interpreter for graphics titles | [`docs/09`](docs/09_frame_pacing_and_clocks.md) §7 |
-| **KEEN4 is unobservable by the harness** — `golden_screens.py capture` dies with `GDBError: Connection closed`, `probe.py` reports `core_ready=0, guest_insns_total=0`. Reproduced on a clean baseline, so it is the tooling, not a core change. WOLF3D and ALLEYCAT capture fine through the same harness | [`TOOLING.md`](TOOLING.md) |
+| **Wolf3D's WEAPON SPRITE is corrupt** — a stable band of wrong pixels across the pistol at the level-1 spawn. DETERMINISTIC (byte-identical in successive captures), so it is gradeable, unlike the "rare" stage-select corruption it may share a cause with | Queue B1 |
+| **KEEN4 hangs, then the WATCHDOG resets the device** — measured on HARDWARE: `guest_insns_total` reaches 34,707,122 over 944 frames, then stops advancing; `boot_magic=0xbad00005 Watchdog`. It runs first and wedges partway in | [`docs/13`](docs/13_title_status.md) |
+| **KEEN4 gives 60 of 160 pager frames to the arena** (`x86_pg_frames_total` 160 → 100 once 0Dh is up), so it runs on 100. EMS pins 16 more when used — a much tighter budget than the 144 the EMS work assumed | [`docs/12`](docs/12_memory_tiers.md) |
+| ALLEYCAT renders CYAN where the golden has MAGENTA (worst pixel `rgb(0,170,170)` vs `rgb(170,0,170)`), 0.874% of pixels. A CGA palette-register selection difference, not noise. Pre-existing and stable; the golden itself was blessed on a stuck first frame | Queue B1 |
 | Retro-go's Pause overlay is unreadable over 256-colour modes | [`docs/08`](docs/08_vga_mode13h.md) §1 |
 | Keen's watchdog reset and half-height intro | [`docs/13`](docs/13_title_status.md) |
 | A segment override before `REP` survives only the first element | `rep_resume` records the repeat prefix, not the START of the prefix run |
@@ -60,6 +66,14 @@ One line each, because their value is stopping a wrong answer being re-derived.
 - **Do not derive the frame period from `guest_fps_achieved`.** It is a runaway:
   overrun lowers fps, which raises the period, which raises the budget.
   [`docs/09`](docs/09_frame_pacing_and_clocks.md) §2.
+- **Wolf3D's split/mirrored gameplay was NOT a video bug.** It was `INC r16`/
+  `DEC r16` never normalising their operand — SF/ZF/OF came off bit 31 of a
+  32-bit add — which corrupted `finetangent[]` and so the raycaster. Three
+  sessions were spent in the planar path. `tests/test_alu_fuzz.py` grades this
+  against Unicorn now; it is what should have been written first.
+- **A pager counter read while no core is loaded is NOISE, not evidence.**
+  Overlay addresses alias, so `x86_pg_exhausted` climbing to 527 was read as a
+  thrash when the core had never started. Check `core_ready` FIRST.
 - **`MPU_TEX_LEVEL1` on the framebuffer measured no gain** and was not the
   corruption it was tried for. Patch kept at
   `build/artifacts/mpu_level1.patch`.
