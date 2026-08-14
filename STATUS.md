@@ -649,6 +649,21 @@ function never ran, while the file-READING code above it did.
 setup that opens its file. The code is byte-identical to DOSBox's, so a value we
 supplied sent the guest down a path that reaches the readers without the opens.
 
+`CA_Startup()` at 0x16E86 has an ATEIP hit count of **0 as well** — it is never
+entered, so this is not a call returning past its siblings. The guest reaches
+`CAL_GetGrChunkLength` (0x171xx, via the `GRFILEPOS` lookup at 0x1620C, which
+`retf`s back to 0x17132) **without `CA_Startup` ever having been called**, and
+nothing in Wolf3D calls the cache before `CA_Startup`. Every far call in this
+region goes to segment **0x0081**, the C runtime — `open()` at `0x0081:0x39AC`,
+`lseek()` at `0x0081:0x15B6`, and `0x0081:0x43BF` from 0x1D41D.
+
+**The remaining question is one hop wide:** between the signon-screen draw
+ending at 2.42 M and the first seek at 2.522 M, the guest passes 0x1D41D and
+enters the cache code. Put `X86_TRACE_ATEIP` on 0x1D41D and on the `InitGame`
+call sites to find the last startup function that DID run, then diff that anchor
+against DOSBox — which `ref_dos.py --engine dosbox` answers at an arbitrary
+point.
+
 **Phase map of our 2.65 M instructions**, from the now-deterministic sampler:
 the LZEXE unpacker to 1.70 M; then ONE loop at 0x1D9DB for 585 k — a
 planar→linear byte copy of ~64,000 pixels at ~9 instructions each, i.e. the
