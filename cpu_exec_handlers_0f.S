@@ -139,7 +139,12 @@ L(HANDLE_INTERRUPT):
 
     /* Which vector, and what it is about to install. x86_cs_log says an
        interrupt happened; only this says which one, which is the question the
-       moment a guest hooks a vector and then walks off. */
+       moment a guest hooks a vector and then walks off.
+       Behind X86_CS_LOG with the CS ring, and off by default for the same
+       reason -- note the four-instruction IVT RE-READ below, which exists only
+       because this block needed R0 as scratch. Twelve instructions of logging
+       cost sixteen. */
+#if X86_CS_LOG
     MOVW R3, #:lower16:x86_int_vec_log_idx
     MOVT R3, #:upper16:x86_int_vec_log_idx
     LDR R12, [R3]
@@ -155,6 +160,7 @@ L(HANDLE_INTERRUPT):
     ADD.W R3, R3, R4, LSL #2
     MEM_GET_PTR_R R12, R3
     LDRH R0, [R12]                 @ new IP (reloaded: R0 was used above)
+#endif
 
     PUSH {R0, LR}
     MOV.W R4, #1                   @ CS
@@ -227,17 +233,15 @@ OP .op_0f_setcc
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R4, R1, #192
-    CMP R4, #192
-    BNE.N L(OP_0F_SETCC_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(OP_0F_SETCC_MEM)
     PUSH {R2}
     BL L(EVAL_COND)
     POP {R2}
     AND.W R4, R1, #7
     AND.W R5, R4, #3
-    MOV.W R5, R5, LSL #2
     MOV.W R4, R4, LSR #2
-    ADD R4, R5
+    ADD.W R4, R4, R5, LSL #2
     ADD.W R4, R4, #8
     STRB.W R3, [R8, R4]
     B.W .fetch_decode_loop
@@ -305,14 +309,12 @@ OP .op_0f_movzx_gv_eb
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R2, R1, #192
-    CMP R2, #192
-    BNE.N L(OP_0F_MOVZX_GV_EB_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(OP_0F_MOVZX_GV_EB_MEM)
     AND.W R4, R1, #7
     AND.W R5, R4, #3
-    MOV.W R5, R5, LSL #2
     MOV.W R4, R4, LSR #2
-    ADD R4, R5
+    ADD.W R4, R4, R5, LSL #2
     ADD.W R4, R4, #8
     LDRB.W R4, [R8, R4]
     B.N L(OP_0F_MOVZX_GV_EB_WRITE)
@@ -340,9 +342,8 @@ OP .op_0f_movzx_gv_ew
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R2, R1, #192
-    CMP R2, #192
-    BNE.N L(OP_0F_MOVZX_GV_EW_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(OP_0F_MOVZX_GV_EW_MEM)
     AND.W R4, R1, #7
     MOV.W R4, R4, LSL #2
     ADD.W R4, R4, #8
@@ -373,14 +374,12 @@ OP .op_0f_movsx_gv_eb
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R2, R1, #192
-    CMP R2, #192
-    BNE.N L(OP_0F_MOVSX_GV_EB_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(OP_0F_MOVSX_GV_EB_MEM)
     AND.W R4, R1, #7
     AND.W R5, R4, #3
-    MOV.W R5, R5, LSL #2
     MOV.W R4, R4, LSR #2
-    ADD R4, R5
+    ADD.W R4, R4, R5, LSL #2
     ADD.W R4, R4, #8
     LDRSB.W R4, [R8, R4]
     B.N L(OP_0F_MOVSX_GV_EB_WRITE)
@@ -408,9 +407,8 @@ OP .op_0f_movsx_gv_ew
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R2, R1, #192
-    CMP R2, #192
-    BNE.N L(OP_0F_MOVSX_GV_EW_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(OP_0F_MOVSX_GV_EW_MEM)
     AND.W R4, R1, #7
     MOV.W R4, R4, LSL #2
     ADD.W R4, R4, #8

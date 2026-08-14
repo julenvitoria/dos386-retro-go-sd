@@ -93,12 +93,19 @@ X86_ZONES ?= 0
 # builds with it and prints the measured link delta in every report.
 X86_PROBE ?= 0
 
+# CS / interrupt-vector trace rings (x86_cs_log, x86_int_vec_log). Diagnostic,
+# and they live inside L(SET_SREG) -- the path EVERY far CALL, RETF, IRET and
+# interrupt takes. See the Makefile for the measured cost. Off by default;
+# scripts/trace_diff.py and `probe.py --dump x86_cs_log:16x4` need it on.
+X86_CS_LOG ?= 0
+
 CORE_C_DEFS := \
 -DX86_SEAM_FIX=$(X86_SEAM_FIX) \
 -DX86_DOS_PSP_SHIFT=$(X86_DOS_PSP_SHIFT) \
 -DX86_PROFILE=$(X86_PROFILE) \
 -DX86_ZONES=$(X86_ZONES) \
 -DX86_PROBE=$(X86_PROBE) \
+-DX86_CS_LOG=$(X86_CS_LOG) \
 -DX86_TEXT_AA=$(X86_TEXT_AA) \
 -DX86_TEXT_BILEVEL_FONT=$(X86_TEXT_BILEVEL_FONT) \
 -DPROJECT_KIND_CORE=1 \

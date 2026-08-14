@@ -72,7 +72,7 @@ python3 scripts/probe.py --retrogo --wait-magic \
     --bytes-save '*vga_dac:768:build/artifacts/ours_dac.bin'
 python3 scripts/probe.py --retrogo --wait-magic \
     --watch core_ready,core_dtcm_ok,benchmark_insns --deref cpu_state_ptr+8=EAX
-python3 scripts/probe.py --dump x86_cs_log:16x4=CSLOG  # array contents
+python3 scripts/probe.py --dump x86_cs_log:16x4=CSLOG  # needs X86_CS_LOG=1
 python3 scripts/probe.py --dump 0x2408bf48:16x4=STACK  # or a raw address
 python3 scripts/probe.py --target hardware --watch run_flag,benchmark_cycles
 python3 scripts/probe.py --retrogo --set run_benchmark_flag=1 --watch benchmark_insns
@@ -341,7 +341,7 @@ python3 scripts/probe.py --retrogo --wait-magic --set guest_kips=330     # 8088
 | `x86_disk_us_total` / `x86_disk_us_worst` / `x86_disk_errors` | time in the backend, and the worst single call. **Meaningless under gwemu** (`docs/04`: SD busy state is not modelled) and the reason the timing claim needs silicon |
 | `frame_hist` / `frame_ms_worst` / `frame_overruns` | the frame-time TAIL, which is what "stutter" means. Buckets are multiples of the learned panel period, so `frame_hist[0]` is on-time and anything else is a missed deadline. A mean or a minimum cannot show a hitch; only this can. Write `frame_stats_reset=1` to open a window around a specific event. `--dump frame_hist:8x4` |
 | `x86_video_mode_log` / `_idx` | the last 16 events that can change what the renderer draws, as `(tag << 24) \| (aux << 8) \| value`: **1** mode adopted (value = mode, aux = columns), **2** a port 0x3D8 write, **3** the renderer following a change (aux = is_text), **5** a mode REFUSED because nothing renders it, **6** an INT 10h AH=00 set-mode REQUEST, logged before the decision (a set to the mode already up adopts nothing and so has no tag 1, yet it still CLEARS the display -- which is how Commander Keen 4's banner disappears, and without tag 6 that wipe has no cause in the ring at all). A sampled mode byte cannot tell "never switched" from "switched and the renderer did not follow" — both read as a constant — and this can. `--dump x86_video_mode_log:16x4` |
-| `x86_int_vec_log` | the last 16 interrupts dispatched through the real-mode IVT, as `(vector << 16) \| the CS installed`. `x86_cs_log` says only "LR was `HANDLE_INTERRUPT_16`" -- it cannot name the vector, and a guest that derails after its own code has touched low memory is exactly the case where that is the whole question. `0x00080000` (INT 08h into CS=0x0000) is what named Commander Keen 4's failure in one dump. `--dump x86_int_vec_log:16x4` |
+| `x86_int_vec_log` | **needs `X86_CS_LOG=1`** (see below). The last 16 interrupts dispatched through the real-mode IVT, as `(vector << 16) \| the CS installed`. `x86_cs_log` says only "LR was `HANDLE_INTERRUPT_16`" -- it cannot name the vector, and a guest that derails after its own code has touched low memory is exactly the case where that is the whole question. `0x00080000` (INT 08h into CS=0x0000) is what named Commander Keen 4's failure in one dump. `--dump x86_int_vec_log:16x4` |
 | `x86_hle_log` | the last 32 services as `(vector << 8) \| AH`, bit 16 set if nobody answered. This is what says whether a guest is polling INT 16h AH=00 or AH=01 -- a distinction the two paths do not share a symptom for. `--dump x86_hle_log:32x8` |
 
 Guest time must not move with render rate. The measurement that proves it is
@@ -546,7 +546,8 @@ real time here:
   a REP is off by one and it reads as "the target left the loop early".
 - Anything we execute that the reference cannot know about — HLE stub
   instructions after an interrupt — shifts our index against theirs.
-  `x86_cs_log_idx` says whether any interrupt was taken at all.
+  `x86_cs_log_idx` says whether any interrupt was taken at all -- but only in
+  a build with `X86_CS_LOG=1`; see below.
 
 ### `ref_trace.py` — run the same guest under a reference x86
 
@@ -1397,6 +1398,18 @@ Importable support only — no CLIs.
   8 KB of RAM_EMU). The firmware's separate instance reads the `.dsk` off the
   card and keeps LFN. Code that walks a `FILINFO` must use `DOS_SHORT_NAME()`,
   because `altname` does not exist without LFN.
+- **The CS and interrupt-vector trace rings are OFF by default: `X86_CS_LOG=1`.**
+  `x86_cs_log`, `x86_cs_log_idx` and `x86_int_vec_log` are written from inside
+  `L(SET_SREG)` in `cpu_exec_handlers.S`, which is the single path every far
+  `CALL`, `RETF`, `IRET` and interrupt takes -- fourteen instructions and five
+  stores per far transfer, plus a four-instruction IVT re-read in the interrupt
+  path that exists only because the logging needed R0. TOPBENCH takes 1.22 M far
+  transfers per 25 s window, so that was ~17 M instructions of logging against
+  56.6 M dispatches. `--gc-sections` drops the storage in a default build, so
+  `probe.py --dump x86_cs_log:16x4` and `trace_diff.py` report the symbol as
+  MISSING rather than reading zeros. Rebuild (clean -- flags are not
+  dependencies) with `X86_CS_LOG=1` when you need either ring.
+
 - **Measure `__CORE_BSS_END__` after any change to the core.** The core's TEXT
   lives in RAM_EMU too, so code growth counts. Overshooting is SILENT: the
   guest RAM allocation returns NULL, `core_ready` stays 0 and the emulator

@@ -409,23 +409,19 @@ OP_AGNOSTIC .op_alu_eb_gb
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(ALU_EB_GB_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(ALU_EB_GB_MEM)
     UBFX R4, R1, #3, #3
     AND.W R5, R4, #3
-    MOV.W R5, R5, LSL #2
     MOV.W R4, R4, LSR #2
-    ADD R4, R5
+    ADD.W R4, R4, R5, LSL #2
     ADD.W R4, R4, #8
     LDRB.W R5, [R8, R4]
     AND.W R2, R1, #7
     AND.W R3, R2, #3
-    MOV.W R3, R3, LSL #2
-    MOV.W R2, R2, LSR #2
-    ADD R2, R3
+    ADD.W R3, R8, R3, LSL #2
+    ADD.W R2, R3, R2, LSR #2
     ADD.W R2, R2, #8
-    ADD R2, R8
     LDRB R3, [R2, #0]
     B.N L(ALU_DISPATCH_8_SUBOP)
 L(ALU_EB_GB_MEM):
@@ -433,9 +429,8 @@ L(ALU_EB_GB_MEM):
     BLX R12
     UBFX R4, R1, #3, #3
     AND.W R5, R4, #3
-    MOV.W R5, R5, LSL #2
     MOV.W R4, R4, LSR #2
-    ADD R4, R5
+    ADD.W R4, R4, R5, LSL #2
     ADD.W R4, R4, #8
     LDRB.W R5, [R8, R4]
     UBFX R2, R7, #12, #12
@@ -458,17 +453,15 @@ OP .op_alu_ev_gv
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(ALU_EV_GV_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(ALU_EV_GV_MEM)
     UBFX R4, R1, #3, #3
     MOV.W R4, R4, LSL #2
     ADD.W R4, R4, #8
     LDREG_V R5, R4
     AND.W R2, R1, #7
-    MOV.W R2, R2, LSL #2
+    ADD.W R2, R8, R2, LSL #2
     ADD.W R2, R2, #8
-    ADD R2, R8
     LD_V R3, R2
     B.N L(ALU_DISPATCH_32_SUBOP)
 L(ALU_EV_GV_MEM):
@@ -499,21 +492,18 @@ OP_AGNOSTIC .op_alu_gb_eb
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(ALU_GB_EB_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(ALU_GB_EB_MEM)
     AND.W R2, R1, #7
     AND.W R3, R2, #3
-    MOV.W R3, R3, LSL #2
     MOV.W R2, R2, LSR #2
-    ADD R2, R3
+    ADD.W R2, R2, R3, LSL #2
     ADD.W R2, R2, #8
     LDRB.W R5, [R8, R2]
     UBFX R4, R1, #3, #3
     AND.W R3, R4, #3
-    MOV.W R3, R3, LSL #2
     MOV.W R4, R4, LSR #2
-    ADD R4, R3
+    ADD.W R4, R4, R3, LSL #2
     ADD.W R4, R4, #8
     ADD.W R2, R8, R4
     LDRB R3, [R2, #0]
@@ -529,9 +519,8 @@ L(ALU_GB_EB_MEM):
     LDRB R5, [R2, #0]
     UBFX R4, R1, #3, #3
     AND.W R3, R4, #3
-    MOV.W R3, R3, LSL #2
     MOV.W R4, R4, LSR #2
-    ADD R4, R3
+    ADD.W R4, R4, R3, LSL #2
     ADD.W R4, R4, #8
     ADD.W R2, R8, R4
     LDRB R3, [R2, #0]
@@ -549,9 +538,8 @@ OP .op_alu_gv_ev
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(ALU_GV_EV_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(ALU_GV_EV_MEM)
     AND.W R2, R1, #7
     MOV.W R2, R2, LSL #2
     ADD.W R2, R2, #8
@@ -625,9 +613,8 @@ OP_AGNOSTIC .op_alu_eb_imm8_80
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     UBFX R12, R1, #3, #3
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(ALU_EB_IMM8_80_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(ALU_EB_IMM8_80_MEM)
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -636,11 +623,9 @@ OP_AGNOSTIC .op_alu_eb_imm8_80
     ADD.W R10, R10, #1
     AND.W R2, R1, #7
     AND.W R3, R2, #3
-    MOV.W R3, R3, LSL #2
-    MOV.W R2, R2, LSR #2
-    ADD R2, R3
+    ADD.W R3, R8, R3, LSL #2
+    ADD.W R2, R3, R2, LSR #2
     ADD.W R2, R2, #8
-    ADD R2, R8
     LDRB R3, [R2, #0]
     B.N L(ALU_DISPATCH_EB_IMM8_80_SUBOP)
 L(ALU_EB_IMM8_80_MEM):
@@ -673,9 +658,8 @@ OP .op_alu_ev_imm32_81
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     UBFX R12, R1, #3, #3
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(ALU_EV_IMM32_81_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(ALU_EV_IMM32_81_MEM)
     SEAM_CHECK R5, R10
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
@@ -684,9 +668,8 @@ OP .op_alu_ev_imm32_81
     LD_V R5, R5
     EIP_ADV_V
     AND.W R2, R1, #7
-    MOV.W R2, R2, LSL #2
+    ADD.W R2, R8, R2, LSL #2
     ADD.W R2, R2, #8
-    ADD R2, R8
     LD_V R3, R2
     B.N L(ALU_DISPATCH_EV_IMM32_81_SUBOP)
 L(ALU_EV_IMM32_81_MEM):
@@ -721,9 +704,8 @@ OP .op_alu_ev_imm8_83
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     UBFX R12, R1, #3, #3
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(ALU_EV_IMM8_83_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(ALU_EV_IMM8_83_MEM)
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -731,9 +713,8 @@ OP .op_alu_ev_imm8_83
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     AND.W R2, R1, #7
-    MOV.W R2, R2, LSL #2
+    ADD.W R2, R8, R2, LSL #2
     ADD.W R2, R2, #8
-    ADD R2, R8
     LD_V R3, R2
     B.N L(ALU_DISPATCH_EV_IMM8_83_SUBOP)
 L(ALU_EV_IMM8_83_MEM):
@@ -770,21 +751,18 @@ OP_AGNOSTIC .op_test_eb_gb_84
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(TEST_EB_GB_84_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(TEST_EB_GB_84_MEM)
     UBFX R4, R1, #3, #3            @ Gb: high byte registers are regs 4-7
     AND.W R5, R4, #3
-    MOV.W R5, R5, LSL #2
     MOV.W R4, R4, LSR #2
-    ADD R4, R5
+    ADD.W R4, R4, R5, LSL #2
     ADD.W R4, R4, #8
     LDRB.W R5, [R8, R4]
     AND.W R2, R1, #7               @ Eb
     AND.W R3, R2, #3
-    MOV.W R3, R3, LSL #2
     MOV.W R2, R2, LSR #2
-    ADD R2, R3
+    ADD.W R2, R2, R3, LSL #2
     ADD.W R2, R2, #8
     LDRB.W R3, [R8, R2]
 L(TEST_EB_GB_84_FLAGS):
@@ -801,9 +779,8 @@ L(TEST_EB_GB_84_MEM):
     LDRB R3, [R12]
     UBFX R4, R1, #3, #3
     AND.W R5, R4, #3
-    MOV.W R5, R5, LSL #2
     MOV.W R4, R4, LSR #2
-    ADD R4, R5
+    ADD.W R4, R4, R5, LSL #2
     ADD.W R4, R4, #8
     LDRB.W R5, [R8, R4]
     B.N L(TEST_EB_GB_84_FLAGS)
@@ -815,9 +792,8 @@ OP .op_test_ev_gv_85
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(TEST_EV_GV_85_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(TEST_EV_GV_85_MEM)
     UBFX R4, R1, #3, #3            @ reg operand
     MOV.W R4, R4, LSL #2
     ADD.W R4, R4, #8
@@ -852,21 +828,18 @@ OP_AGNOSTIC .op_xchg_eb_gb_86
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(XCHG_EB_GB_86_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(XCHG_EB_GB_86_MEM)
     UBFX R4, R1, #3, #3
     AND.W R5, R4, #3
-    MOV.W R5, R5, LSL #2
     MOV.W R4, R4, LSR #2
-    ADD R4, R5
+    ADD.W R4, R4, R5, LSL #2
     ADD.W R4, R4, #8
     LDRB.W R5, [R8, R4]
     AND.W R2, R1, #7
     AND.W R3, R2, #3
-    MOV.W R3, R3, LSL #2
     MOV.W R2, R2, LSR #2
-    ADD R2, R3
+    ADD.W R2, R2, R3, LSL #2
     ADD.W R2, R2, #8
     LDRB.W R3, [R8, R2]
     STRB.W R5, [R8, R2]
@@ -877,9 +850,8 @@ L(XCHG_EB_GB_86_MEM):
     BLX R12
     UBFX R4, R1, #3, #3            @ Gb, decoded after the call
     AND.W R5, R4, #3
-    MOV.W R5, R5, LSL #2
     MOV.W R4, R4, LSR #2
-    ADD R4, R5
+    ADD.W R4, R4, R5, LSL #2
     ADD.W R4, R4, #8
     LDRB.W R5, [R8, R4]
     MEM_GET_PTR R12, R7
@@ -896,9 +868,8 @@ OP .op_xchg_ev_gv_87
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(XCHG_EV_GV_87_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(XCHG_EV_GV_87_MEM)
     UBFX R4, R1, #3, #3
     MOV.W R4, R4, LSL #2
     ADD.W R4, R4, #8
@@ -931,21 +902,18 @@ OP_AGNOSTIC .op_mov_eb_gb_88
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.W L(MOV_EB_GB_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.W L(MOV_EB_GB_MEM)
     UBFX R4, R1, #3, #3
     AND.W R5, R4, #3
-    MOV.W R5, R5, LSL #2
     MOV.W R4, R4, LSR #2
-    ADD R4, R5
+    ADD.W R4, R4, R5, LSL #2
     ADD.W R4, R4, #8
     LDRB.W R5, [R8, R4]
     AND.W R2, R1, #7
     AND.W R3, R2, #3
-    MOV.W R3, R3, LSL #2
     MOV.W R2, R2, LSR #2
-    ADD R2, R3
+    ADD.W R2, R2, R3, LSL #2
     ADD.W R2, R2, #8
     STRB.W R5, [R8, R2]
     B.W .fetch_decode_loop
@@ -958,9 +926,8 @@ L(MOV_EB_GB_MEM):
     BLX R12
     UBFX R4, R1, #3, #3
     AND.W R5, R4, #3
-    MOV.W R5, R5, LSL #2
     MOV.W R4, R4, LSR #2
-    ADD R4, R5
+    ADD.W R4, R4, R5, LSL #2
     ADD.W R4, R4, #8
     LDRB.W R5, [R8, R4]
     UBFX R2, R7, #12, #12
@@ -977,9 +944,8 @@ OP .op_mov_ev_gv_89
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.W L(MOV_EV_GV_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.W L(MOV_EV_GV_MEM)
     UBFX R4, R1, #3, #3
     MOV.W R4, R4, LSL #2
     ADD.W R4, R4, #8
@@ -1016,13 +982,11 @@ OP .op_lea_8D
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BEQ.W .exit_loop
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BHS.W .exit_loop
     UBFX R4, R1, #3, #3
-    MOV.W R4, R4, LSL #2
+    ADD.W R4, R8, R4, LSL #2
     ADD.W R4, R4, #8
-    ADD R4, R8
     PUSH {R2, R4}
     LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
     BLX R12
@@ -1050,21 +1014,18 @@ OP_AGNOSTIC .op_mov_gb_eb_8A
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.W L(MOV_GB_EB_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.W L(MOV_GB_EB_MEM)
     AND.W R4, R1, #7
     AND.W R5, R4, #3
-    MOV.W R5, R5, LSL #2
     MOV.W R4, R4, LSR #2
-    ADD R4, R5
+    ADD.W R4, R4, R5, LSL #2
     ADD.W R4, R4, #8
     LDRB.W R5, [R8, R4]
     UBFX R2, R1, #3, #3
     AND.W R3, R2, #3
-    MOV.W R3, R3, LSL #2
     MOV.W R2, R2, LSR #2
-    ADD R2, R3
+    ADD.W R2, R2, R3, LSL #2
     ADD.W R2, R2, #8
     STRB.W R5, [R8, R2]
     B.W .fetch_decode_loop
@@ -1081,9 +1042,8 @@ L(MOV_GB_EB_MEM):
     LDRB R5, [R2, #0]
     UBFX R2, R1, #3, #3
     AND.W R3, R2, #3
-    MOV.W R3, R3, LSL #2
     MOV.W R2, R2, LSR #2
-    ADD R2, R3
+    ADD.W R2, R2, R3, LSL #2
     ADD.W R2, R2, #8
     STRB.W R5, [R8, R2]
     B.W .fetch_decode_loop
@@ -1095,9 +1055,8 @@ OP .op_mov_gv_ev_8B
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.W L(MOV_GV_EV_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.W L(MOV_GV_EV_MEM)
     AND.W R4, R1, #7
     MOV.W R4, R4, LSL #2
     ADD.W R4, R4, #8
@@ -1132,9 +1091,8 @@ OP .op_pop_ev_8F
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(POP_EV_8F_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(POP_EV_8F_MEM)
     AND.W R2, R1, #7
     MOV.W R2, R2, LSL #2
     ADD.W R2, R2, #8
@@ -1210,7 +1168,7 @@ OP .op_popfd_9D
 
 OP_AGNOSTIC .op_mov_al_moffs8_A0
     MOFFS_ADDR R4, R3
-    MEM_GET_PTR_R R3, R4
+    MEM_GET_PTR_RB R3, R4
     VGA_LATCH R3, R4
     LDRB R3, [R3, #0]
     STRB.W R3, [R8, #REG_EAX]
@@ -1227,7 +1185,7 @@ OP .op_mov_eax_moffs32_A1
 OP_AGNOSTIC .op_mov_moffs8_al_A2
     MOFFS_ADDR R4, R3
     LDRB.W R3, [R8, #REG_EAX]
-    MEM_GET_PTR R12, R4
+    MEM_GET_PTR_WB R12, R4
     VGA_ST_B R3, R12, R4
     B.W .fetch_decode_loop
 
@@ -1267,11 +1225,11 @@ OP .op_test_eax_imm32_A9
 
 OP_AGNOSTIC .op_movsb_A4
     STR_SRC R4, R3
-    MEM_GET_PTR_R R3, R4
+    MEM_GET_PTR_RB R3, R4
     VGA_LATCH R3, R12
     LDRB R3, [R3]
     STR_DST R5, R12
-    MEM_GET_PTR R12, R5
+    MEM_GET_PTR_WB R12, R5
     VGA_ST_B R3, R12, R5
     STR_DELTA R7, 1
     STR_ADV REG_ESI, R7, R4
@@ -1293,11 +1251,11 @@ OP .op_movsd_A5
 
 OP_AGNOSTIC .op_cmpsb_A6
     STR_SRC R4, R3
-    MEM_GET_PTR_R R3, R4
+    MEM_GET_PTR_RB R3, R4
     VGA_LATCH R3, R12
     LDRB R3, [R3]
     STR_DST R5, R12
-    MEM_GET_PTR_R R12, R5
+    MEM_GET_PTR_RB R12, R5
     VGA_LATCH R12, R4
     LDRB R5, [R12]
     LSL.W R3, R3, #24
@@ -1335,7 +1293,7 @@ OP .op_cmpsd_A7
 
 OP_AGNOSTIC .op_stosb_AA
     STR_DST R5, R12
-    MEM_GET_PTR R12, R5
+    MEM_GET_PTR_WB R12, R5
     LDRB.W R3, [R8, #REG_EAX]
     VGA_ST_B R3, R12, R5
     STR_DELTA R7, 1
@@ -1353,7 +1311,7 @@ OP .op_stosd_AB
 
 OP_AGNOSTIC .op_lodsb_AC
     STR_SRC R4, R3
-    MEM_GET_PTR_R R3, R4
+    MEM_GET_PTR_RB R3, R4
     VGA_LATCH R3, R12
     LDRB R3, [R3]
     STRB.W R3, [R8, #REG_EAX]
@@ -1373,7 +1331,7 @@ OP .op_lodsd_AD
 
 OP_AGNOSTIC .op_scasb_AE
     STR_DST R5, R12
-    MEM_GET_PTR_R R12, R5
+    MEM_GET_PTR_RB R12, R5
     VGA_LATCH R12, R4
     LDRB R5, [R12]
     LDRB.W R3, [R8, #REG_EAX]
@@ -1435,7 +1393,7 @@ OP_AGNOSTIC .op_insb_6C
     MOV R2, R4
     MOV R1, R0
     STR_DST R5, R12
-    MEM_GET_PTR R12, R5
+    MEM_GET_PTR_WB R12, R5
     VGA_ST_B R1, R12, R4
     STR_DELTA R7, 1
     STR_ADV REG_EDI, R7, R5
@@ -1458,7 +1416,7 @@ OP .op_insv_6D
 
 OP_AGNOSTIC .op_outsb_6E
     STR_SRC R4, R3
-    MEM_GET_PTR_R R3, R4
+    MEM_GET_PTR_RB R3, R4
     VGA_LATCH R3, R12
     LDRB R1, [R3]
     STR_DELTA R7, 1
@@ -1489,9 +1447,8 @@ OP .op_outsv_6F
 OP_AGNOSTIC .op_mov_r8_imm8
     AND.W R2, R0, #7
     AND.W R3, R2, #3
-    MOV.W R3, R3, LSL #2
     MOV.W R2, R2, LSR #2
-    ADD R2, R3
+    ADD.W R2, R2, R3, LSL #2
     ADD.W R2, R2, #8
     UBFX R3, R10, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
@@ -1539,9 +1496,8 @@ OP_AGNOSTIC .op_mov_eb_imm8_C6
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(MOV_EB_IMM8_C6_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(MOV_EB_IMM8_C6_MEM)
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -1550,9 +1506,8 @@ OP_AGNOSTIC .op_mov_eb_imm8_C6
     ADD.W R10, R10, #1
     AND.W R2, R1, #7
     AND.W R3, R2, #3
-    MOV.W R3, R3, LSL #2
     MOV.W R2, R2, LSR #2
-    ADD R2, R3
+    ADD.W R2, R2, R3, LSL #2
     ADD.W R2, R2, #8
     STRB.W R5, [R8, R2]
     B.W .fetch_decode_loop
@@ -1579,9 +1534,8 @@ OP .op_mov_ev_imm32_C7
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(MOV_EV_IMM_C7_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(MOV_EV_IMM_C7_MEM)
     SEAM_CHECK R5, R10
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
@@ -1621,13 +1575,11 @@ OP .op_shift_ev_imm8_C1
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(SHIFT_EV_IMM8_C1_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(SHIFT_EV_IMM8_C1_MEM)
     AND.W R2, R1, #7
-    MOV.W R2, R2, LSL #2
+    ADD.W R2, R8, R2, LSL #2
     ADD.W R2, R2, #8
-    ADD R2, R8
     LD_V R3, R2
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
@@ -1676,13 +1628,11 @@ OP .op_shift_ev_cl_D3
     LDRB.W R5, [R8, #12]
     AND.W R5, R5, #31
 L(SHIFT_EV_DECODE):
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(SHIFT_EV_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(SHIFT_EV_MEM)
     AND.W R2, R1, #7
-    MOV.W R2, R2, LSL #2
+    ADD.W R2, R8, R2, LSL #2
     ADD.W R2, R2, #8
-    ADD R2, R8
     LD_V R3, R2
     B.N L(SHIFT_DISPATCH_32)
 L(SHIFT_EV_MEM):
@@ -1865,16 +1815,13 @@ OP_AGNOSTIC .op_shift_eb_imm8_C0
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(SHIFT_EB_IMM8_C0_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(SHIFT_EB_IMM8_C0_MEM)
     AND.W R2, R1, #7
     AND.W R3, R2, #3
-    MOV.W R3, R3, LSL #2
-    MOV.W R2, R2, LSR #2
-    ADD R2, R3
+    ADD.W R3, R8, R3, LSL #2
+    ADD.W R2, R3, R2, LSR #2
     ADD.W R2, R2, #8
-    ADD R2, R8
     LDRB R3, [R2, #0]
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
@@ -1922,16 +1869,13 @@ OP_AGNOSTIC .op_shift_eb_cl_D2
     LDRB.W R5, [R8, #12]
     AND.W R5, R5, #31
 L(SHIFT_EB_DECODE):
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(SHIFT_EB_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(SHIFT_EB_MEM)
     AND.W R2, R1, #7
     AND.W R3, R2, #3
-    MOV.W R3, R3, LSL #2
-    MOV.W R2, R2, LSR #2
-    ADD R2, R3
+    ADD.W R3, R8, R3, LSL #2
+    ADD.W R2, R3, R2, LSR #2
     ADD.W R2, R2, #8
-    ADD R2, R8
     LDRB R3, [R2, #0]
     B.N L(SHIFT_DISPATCH_8)
 L(SHIFT_EB_MEM):
@@ -2344,21 +2288,26 @@ L(DECODE_MODRM_32):
        DS unless the base register is (E)BP or (E)SP, which default to SS. An
        explicit override prefix has already put its own descriptor in R6 and
        wins over both -- see L(MODRM_SEG). */
+    /* `mod` is NOT extracted. The ModRM byte is a byte, so mod==0 is
+       `modrm < 0x40`, mod==1 is `< 0x80` and mod==3 is `>= 0xC0` -- the AND
+       that used to build it in R2 is dead weight, and comparing R1 directly
+       encodes as 16-bit CMP instead of 32-bit AND.W + CMP. R1 survives the
+       decoder by contract, so every later mod test can use it too.
+       `rm` is kept UNSCALED in R3 so the BP test is `CMP R3,#5` and the base
+       load folds the scale into the addressing mode. */
     MOV.W R12, #SEG_DS_SEL
-    AND.W R2, R1, #192
-    AND.W R4, R1, #7
-    CMP R4, #4
+    AND.W R3, R1, #7
+    CMP R3, #4
     BEQ.N L(MODRM_SIB)
-    MOV.W R4, R4, LSL #2
-    ADD.W R4, R4, #8
-    LDR.W R7, [R8, R4]
-    CMP R2, #0
-    BEQ.N L(MODRM_MOD0)
-    CMP R2, #64
-    BEQ.N L(MODRM_MOD1)
-    CMP R4, #28                    @ rm==5 -> [(E)BP+disp], default SS
+    ADD.W R4, R8, R3, LSL #2
+    LDR R7, [R4, #8]
+    CMP R1, #64
+    BLO.N L(MODRM_MOD0)
+    CMP R3, #5                     @ rm==5 -> [(E)BP+disp], default SS
     IT EQ
     MOVEQ R12, #SEG_SS_SEL
+    CMP R1, #128
+    BLO.N L(MODRM_MOD1)
     SEAM_CHECK R5, R10
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
@@ -2369,9 +2318,8 @@ L(DECODE_MODRM_32):
     ADD R7, R5
     B.N L(MODRM_SEG)
 L(MODRM_MOD1):
-    CMP R4, #28                    @ rm==5 -> [(E)BP+disp], default SS
-    IT EQ
-    MOVEQ R12, #SEG_SS_SEL
+    /* The rm==5 -> SS default is hoisted above the mod1/mod2 split: both arms
+       need it and neither mod0 nor the SIB path does. */
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -2381,9 +2329,8 @@ L(MODRM_MOD1):
     ADD R7, R5
     B.N L(MODRM_SEG)
 L(MODRM_MOD0):
-    AND.W R4, R1, #7
-    CMP R4, #5
-    BNE.N L(MODRM_DONE_MOD0)
+    CMP R3, #5                     @ rm still unscaled in R3
+    BNE.N L(MODRM_SEG)
     SEAM_CHECK R7, R10
     UBFX R7, R10, #12, #12
     LDR.W R7, [R9, R7, LSL #2]
@@ -2391,8 +2338,6 @@ L(MODRM_MOD0):
     MEM_TRAP_R R7
     LDR R7, [R7, #0]
     ADD.W R10, R10, #4
-    B.N L(MODRM_SEG)
-L(MODRM_DONE_MOD0):
     B.N L(MODRM_SEG)
 L(MODRM_SIB):
     UBFX R3, R10, #12, #12
@@ -2404,16 +2349,15 @@ L(MODRM_SIB):
     AND.W R4, R3, #7
     CMP R4, #5
     BNE.N L(SIB_HAS_BASE)
-    CMP R2, #0
-    BEQ.N L(SIB_BASE_DISP32)
+    CMP R1, #64                    @ mod==0 -> no base, disp32 instead
+    BLO.N L(SIB_BASE_DISP32)
 L(SIB_HAS_BASE):
     SUB R5, R4, #4                 @ 0 for ESP, 1 for EBP
     CMP R5, #2
     IT LO
     MOVLO R12, #SEG_SS_SEL         @ stack-relative base -> default SS
-    MOV.W R4, R4, LSL #2
-    ADD.W R4, R4, #8
-    LDR.W R7, [R8, R4]
+    ADD.W R4, R8, R4, LSL #2
+    LDR R7, [R4, #8]
     B.N L(SIB_DO_INDEX)
 L(SIB_BASE_DISP32):
     SEAM_CHECK R7, R10
@@ -2427,18 +2371,17 @@ L(SIB_DO_INDEX):
     UBFX R5, R3, #3, #3
     CMP R5, #4
     BEQ.N L(SIB_ADD_DISP)
-    MOV.W R5, R5, LSL #2
-    ADD.W R5, R5, #8
-    LDR.W R5, [R8, R5]
+    ADD.W R5, R8, R5, LSL #2
+    LDR R5, [R5, #8]
     UBFX R4, R3, #6, #2
     LSL.W R5, R5, R4
     ADD R7, R5
 L(SIB_ADD_DISP):
-    CMP R2, #64
-    BEQ.N L(SIB_DISP8)
-    CMP R2, #128
-    BEQ.N L(SIB_DISP32)
-    B.N L(MODRM_SEG)
+    CMP R1, #64                    @ mod straight off the ModRM byte
+    BLO.N L(MODRM_SEG)             @ mod==0: no displacement
+    CMP R1, #128
+    BLO.N L(SIB_DISP8)
+    B.N L(SIB_DISP32)
 L(SIB_DISP8):
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
@@ -2478,14 +2421,15 @@ L(SIB_DISP32):
     .global decode_modrm_addr16
 decode_modrm_addr16:
 L(DECODE_MODRM_32):
+    /* mod is read straight off the ModRM byte: it is a byte, so mod==0 is
+       `< 0x40` and mod==1 is `< 0x80`. See the 32-bit decoder. */
     MOV.W R12, #SEG_DS_SEL
-    AND.W R2, R1, #192             @ mod
     AND.W R4, R1, #7               @ rm
 
     CMP R4, #6
     BNE.N L(M16_NOT_RM6)
-    CMP R2, #0
-    BNE.N L(M16_RM6_BP)
+    CMP R1, #64
+    BHS.N L(M16_RM6_BP)
     /* mod=00 rm=110: disp16, no base register at all, segment stays DS. */
     SEAM_CHECK R7, R10
     UBFX R7, R10, #12, #12
@@ -2510,9 +2454,8 @@ L(M16_NOT_RM6):
     BEQ.N L(M16_BX_ONLY)
     /* rm 4 = [SI], rm 5 = [DI] */
     SUB.W R5, R4, #4
-    LSLS R5, R5, #2
-    ADD.W R5, R5, #REG_ESI
-    LDRH.W R7, [R8, R5]
+    ADD.W R5, R8, R5, LSL #2
+    LDRH R7, [R5, #REG_ESI]
     B.N L(M16_DISP)
 L(M16_BX_ONLY):
     LDRH.W R7, [R8, #REG_EBX]
@@ -2526,17 +2469,19 @@ L(M16_PAIR):
 L(M16_BASE_BX):
     LDRH.W R7, [R8, #REG_EBX]
 L(M16_INDEX):
-    TST R4, #1                     @ odd rm uses DI, even uses SI
-    ITE EQ
-    LDRHEQ.W R5, [R8, #REG_ESI]
-    LDRHNE.W R5, [R8, #REG_EDI]
+    /* Odd rm uses DI, even SI, and REG_EDI is REG_ESI+4 -- so the choice is
+       address arithmetic, not an IT block. docs/02 s4: IT serializes on the M7
+       and this one gated a load. */
+    AND.W R5, R4, #1
+    ADD.W R5, R8, R5, LSL #2
+    LDRH R5, [R5, #REG_ESI]
     ADD R7, R7, R5
 
 L(M16_DISP):
-    CMP R2, #0
-    BEQ.N L(M16_WRAP)
-    CMP R2, #64
-    BNE.N L(M16_DISP16)
+    CMP R1, #64
+    BLO.N L(M16_WRAP)
+    CMP R1, #128
+    BHS.N L(M16_DISP16)
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -2616,16 +2561,13 @@ OP_AGNOSTIC .op_grp4_FE
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(GRP4_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(GRP4_MEM)
     AND.W R2, R1, #7
     AND.W R3, R2, #3
-    MOV.W R3, R3, LSL #2
-    MOV.W R2, R2, LSR #2
-    ADD R2, R3
+    ADD.W R3, R8, R3, LSL #2
+    ADD.W R2, R3, R2, LSR #2
     ADD.W R2, R2, #8
-    ADD R2, R8
     LDRB R3, [R2, #0]
     B.N L(GRP4_DISPATCH)
 L(GRP4_MEM):
@@ -2675,9 +2617,8 @@ OP .op_grp5_FF
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(GRP5_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(GRP5_MEM)
     /* Register form. /3 (CALL FAR) and /5 (JMP FAR) have NO register
        encoding: their operand is a POINTER IN MEMORY, so mod=11 is #UD.
        Falling through into the far handlers instead let them read the far
@@ -2692,9 +2633,8 @@ OP .op_grp5_FF
     CMP R12, #5
     BEQ.W .exit_loop
     AND.W R2, R1, #7
-    MOV.W R2, R2, LSL #2
+    ADD.W R2, R8, R2, LSL #2
     ADD.W R2, R2, #8
-    ADD R2, R8
     LD_V R3, R2
     B.N L(GRP5_DISPATCH)
 L(GRP5_MEM):
@@ -2944,13 +2884,11 @@ OP .op_imul_imm32_69
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(IMUL69_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(IMUL69_MEM)
     AND.W R2, R1, #7
-    MOV.W R2, R2, LSL #2
+    ADD.W R2, R8, R2, LSL #2
     ADD.W R2, R2, #8
-    ADD R2, R8
     LD_V R3, R2
     B.N L(IMUL69_DO)
 L(IMUL69_MEM):
@@ -2995,13 +2933,11 @@ OP .op_imul_imm8_6B
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(IMUL6B_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(IMUL6B_MEM)
     AND.W R2, R1, #7
-    MOV.W R2, R2, LSL #2
+    ADD.W R2, R8, R2, LSL #2
     ADD.W R2, R2, #8
-    ADD R2, R8
     LD_V R3, R2
     B.N L(IMUL6B_DO)
 L(IMUL6B_MEM):
@@ -3383,16 +3319,13 @@ OP_AGNOSTIC .op_grp3_eb_F6
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(GRP3_F6_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(GRP3_F6_MEM)
     AND.W R2, R1, #7
     AND.W R3, R2, #3
-    MOV.W R3, R3, LSL #2
-    MOV.W R2, R2, LSR #2
-    ADD R2, R3
+    ADD.W R3, R8, R3, LSL #2
+    ADD.W R2, R3, R2, LSR #2
     ADD.W R2, R2, #8
-    ADD R2, R8
     LDRB R3, [R2, #0]
     B.N L(GRP3_F6_DISPATCH)
 L(GRP3_F6_MEM):
@@ -3526,13 +3459,11 @@ OP .op_grp3_ev_F7
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192             @ R2 stays live: it is the mode record
-    CMP R3, #192
-    BNE.N L(GRP3_F7_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(GRP3_F7_MEM)
     AND.W R2, R1, #7
-    MOV.W R2, R2, LSL #2
+    ADD.W R2, R8, R2, LSL #2
     ADD.W R2, R2, #8
-    ADD R2, R8
     LD_V R3, R2
     B.N L(GRP3_F7_DISPATCH)
 L(GRP3_F7_MEM):
@@ -3767,7 +3698,12 @@ L(SET_SREG):
     /* Trace CS loads. Every far transfer and every interrupt installs CS
        here, so this one place names them all. LR is logged too: it is the
        return address into whichever handler called us, which identifies the
-       instruction type without a tag at each call site. */
+       instruction type without a tag at each call site.
+       ...which is also why it is BEHIND A FLAG and off by default: "every far
+       transfer" is 1.22 M of them per 25 s of TOPBENCH, each paying fourteen
+       instructions and five stores for a sixteen-entry ring nobody is reading.
+       Build with X86_CS_LOG=1 to get it back (see the Makefile). */
+#if X86_CS_LOG
     CMP R4, #1
     BNE.N L(SET_SREG_NOLOG)
     MOVW R3, #:lower16:x86_cs_log_idx
@@ -3785,6 +3721,7 @@ L(SET_SREG):
     LDR.W R12, [R8, #CPU_ESP]
     STR R12, [R3, #12]             @ SP, to tell a stack pop from an immediate
 L(SET_SREG_NOLOG):
+#endif
     MOV.W R3, #SEG_STRIDE
     MLA R3, R4, R3, R8
     STRH.W R5, [R3, #SEG_ES_SEL]
@@ -3802,9 +3739,8 @@ OP_AGNOSTIC .op_mov_seg_Ew_8E
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192
-    CMP R3, #192
-    BNE.N L(MOV_SREG_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(MOV_SREG_MEM)
     AND.W R5, R1, #7
     MOV.W R5, R5, LSL #2
     ADD.W R5, R5, #8
@@ -3835,9 +3771,8 @@ OP_AGNOSTIC .op_mov_Ew_seg_8C
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192
-    CMP R3, #192
-    BNE.N L(MOV_EW_SREG_MEM)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(MOV_EW_SREG_MEM)
     UBFX R4, R1, #3, #3
     MOV.W R3, #SEG_STRIDE
     MLA R3, R4, R3, R8
@@ -3875,9 +3810,8 @@ L(LOAD_FAR_PTR):
     MEM_TRAP_R R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    AND.W R3, R1, #192
-    CMP R3, #192
-    BEQ.W .exit_loop               @ a register source is #UD for these
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BHS.W .exit_loop               @ a register source is #UD for these
     LDR.W R12, [R2, #REC_MODRM_FN]
     BLX R12
     PUSH {R0, R1}

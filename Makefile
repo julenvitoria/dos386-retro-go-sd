@@ -74,6 +74,18 @@ CFLAGS += -DX86_ZONES=$(X86_ZONES)
 X86_PROBE ?= 0
 CFLAGS += -DX86_PROBE=$(X86_PROBE)
 
+# The CS / interrupt-vector trace rings (x86_cs_log, x86_int_vec_log). These are
+# DIAGNOSTIC and they sit inside L(SET_SREG), which every far CALL, RETF, IRET
+# and interrupt goes through -- 14 instructions and five stores per far
+# transfer, plus a redundant IVT re-read in the interrupt path that exists only
+# because the logging clobbers R0. TOPBENCH takes 1.22 M far transfers in 25 s,
+# so this was ~17 M instructions of pure logging in a 56.6 M-dispatch window.
+# Off by default, like every other instrument here; the storage stays linked so
+# probe.py still resolves the symbols (they simply read zero).
+# scripts/trace_diff.py and `probe.py --dump x86_cs_log:16x4` need X86_CS_LOG=1.
+X86_CS_LOG ?= 0
+CFLAGS += -DX86_CS_LOG=$(X86_CS_LOG)
+
 LDFLAGS = -mcpu=cortex-m7 -mthumb -T STM32H7B0VBTx_SDCARD.ld -Wl,--gc-sections --specs=nosys.specs
 
 PROGS = test_core.elf

@@ -182,6 +182,29 @@
         MEM_TRAP_W \dest_ptr
     .endm
 
+    /* ONE-BYTE variants. A single byte cannot straddle a 4 KB boundary, so the
+       seam prologue can only ever be a false positive there -- three
+       instructions and a never-taken branch on every LODSB, STOSB, MOVSB,
+       SCASB, CMPSB, INSB, OUTSB and MOV AL,[moffs]. The width is a property of
+       the SITE, exactly as read-vs-write is, so it is a separate macro rather
+       than a runtime test. Use these ONLY where the access through the returned
+       pointer is a single LDRB/STRB; anything wider needs the checked form or
+       it is silently wrong at one address in 2,048 (CLAUDE.md, the granule
+       seam). */
+    .macro MEM_GET_PTR_RB dest_ptr, vaddr
+        UBFX \dest_ptr, \vaddr, #12, #12
+        LDR \dest_ptr, [R9, \dest_ptr, LSL #2]
+        ADDS \dest_ptr, \dest_ptr, \vaddr
+        MEM_TRAP_R \dest_ptr
+    .endm
+
+    .macro MEM_GET_PTR_WB dest_ptr, vaddr
+        UBFX \dest_ptr, \vaddr, #12, #12
+        LDR \dest_ptr, [R9, \dest_ptr, LSL #2]
+        ADDS \dest_ptr, \dest_ptr, \vaddr
+        MEM_TRAP_W \dest_ptr
+    .endm
+
     /* Unqualified = WRITE, i.e. the safe answer. A site that only ever loads
        through the pointer should say MEM_GET_PTR_R and get to stay in NOR;
        forgetting to only costs it a needless pull-back into AXI. */
