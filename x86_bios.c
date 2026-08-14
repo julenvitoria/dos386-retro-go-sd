@@ -550,7 +550,7 @@ int x86_bios_video(uint8_t func)
          * restores the banner exactly, so this line is the whole cause.
          * The trade is still the right one -- Wolf3D hard-stops without it --
          * but it is a trade, not a free win, and mode 0Dh is what pays it off.
-         * See STATUS.md, "Keen 4 on HEAD".
+         * See docs/13_title_status.md.
          */
         x86_set_al(0x1A);
         /* BX must be written, both halves. A BIOS that answers AL=1Ah and
