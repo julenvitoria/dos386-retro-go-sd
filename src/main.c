@@ -2805,8 +2805,28 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         }
         frame_hist_add(frame_ms_last, panel_ms_min);
 
+        /*
+         * FLOORED AT THE LATCH, not just where the budget reads it.
+         *
+         * This is "the shortest iteration ever completed" standing in for the
+         * PANEL PERIOD, and during boot -- and any frame the guest spent
+         * halted, or a mode with nothing to draw -- an iteration genuinely
+         * finishes in 6-9 ms. It then leaks back up at 1 ms per 512 frames and
+         * everything derived from it is wrong in the meantime.
+         *
+         * Measured on silicon: a fresh boot re-latched 7 ms, so frame_overruns
+         * (iterations over 1.5x this) counted 1,733 "overruns" in 20 s while
+         * guest_fps_achieved sat at a steady 59 -- ordinary 16.7 ms frames
+         * being reported as dropped. frame_hist's buckets are in units of this
+         * value too, so the whole tail was skewed by the same factor.
+         *
+         * Flooring it here fixes the statistic AND the budget at once, and the
+         * floor is safe because no panel this firmware drives runs faster than
+         * PANEL_MS_MIN_SANE.
+         */
         if (!panel_ms_min || frame_ms_last < panel_ms_min)
-            panel_ms_min = frame_ms_last;
+            panel_ms_min = frame_ms_last < PANEL_MS_MIN_SANE
+                         ? PANEL_MS_MIN_SANE : frame_ms_last;
         else if ((frames_rendered & 511u) == 0u)
             panel_ms_min++;
 
