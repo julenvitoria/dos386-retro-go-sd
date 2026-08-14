@@ -28,6 +28,241 @@
 
 X86IOState x86_io;
 
+/* ---------------------------------------------------------------------------
+ * A PIT WHOSE COUNTERS CAN BE READ BACK, AND WHICH ARE COUNTING.
+ *
+ * Until this existed, `IN 0x40` was not in the read switch at all (it fell
+ * through to the open-bus 0xFF) and `IN 0x42` returned the static reload byte.
+ * A clock that never moves is not a small inaccuracy: Michael Abrash's
+ * Precision Zen Timer -- which is what TOPBENCH times every one of its five
+ * suites with (references/TOPBENCH/_MBLOCK.INC:13, _EA.INC:8,
+ * _OPCODES.INC:27, _VIDMEM.INC:14, _3DGAMES.INC:107) -- programs CHANNEL 0 to
+ * mode 2 with a count of 0, latches it with `OUT 43h,00h`, and reads the two
+ * bytes back off port 0x40 (references/TOPBENCH/ZTIMER11/PZTIMER.ASM:246-266).
+ * Alley Cat reads port 0x40 two million times in 28 seconds for the same
+ * reason. This is a general gap, not a benchmark's quirk.
+ *
+ * WHAT TIME IS, HERE. The interpreter has no cycle counter; what it has is
+ * `pit_counter`, the per-slice INSTRUCTION budget it decrements once per
+ * instruction. So guest time is instructions converted at the emulated CPU's
+ * declared speed -- guest_kips, the same knob the pacing loop uses (main.c
+ * "TWO PACING MODES"). In a paced profile that is exact by construction: the
+ * machine claims to be a 386DX-33 and its PIT agrees. Unthrottled (kips == 0)
+ * there is no declared speed, so a fixed nominal stands in; see below.
+ *
+ * The alternative -- driving the counter off HOST wall-clock time -- was
+ * rejected. The Zen Timer overflows past 54.9 ms and reports a sentinel, and
+ * an emulated suite that takes a real 386 two milliseconds takes this machine
+ * far longer than that. Wall-clock would have been "honest" only in the sense
+ * of reporting how slow the EMULATOR is, which is not what a guest benchmark
+ * is asking. What it asks is how fast the machine it is running on claims to
+ * be, and guest_kips is that number.
+ */
+#define PIT_NOMINAL_KIPS 5500u  /* measured silicon rate; see main.c KIPS_* */
+
+uint32_t x86_pit_kips = 0;      /* published by main.c from guest_kips      */
+
+static uint64_t pit_frac;           /* insns*PIT_HZ not yet worth a tick    */
+static uint32_t pit_now;            /* free-running 1.193182 MHz tick count */
+static uint32_t pit_last_counter;   /* pit_counter at the last accounting   */
+
+/*
+ * Fold everything the guest has executed since the last call into `pit_now`.
+ *
+ * The delta has to tolerate a RELOAD, because the interpreter reloads
+ * pit_counter from pit_reload in-guest when it delivers an IRQ
+ * (cpu_exec.S .handle_pit_or_irq) and carries on inside the same slice. A
+ * counter that went UP therefore means "it wrapped", and the instructions run
+ * are what was left before the wrap plus what has gone since it.
+ *
+ * Every host write to pit_counter that is NOT the guest spending its budget --
+ * arming an IRQ drops it to 1 -- must go through x86_pit_counter_forced(),
+ * or that drop is counted as a whole slice of guest time that never ran.
+ */
+void x86_pit_sync(void)
+{
+    uint32_t cur    = cpu_state_ptr->pit_counter;
+    uint32_t reload = cpu_state_ptr->pit_reload;
+    uint32_t d;
+
+    if (cur <= pit_last_counter)
+        d = pit_last_counter - cur;
+    else if (reload >= cur)
+        d = pit_last_counter + (reload - cur);
+    else
+        d = 0;                       /* incoherent: charge nothing */
+    pit_last_counter = cur;
+    if (!d)
+        return;
+    /* A slice is bounded (main.c's MAX_SLICE_CEIL); this bound only stops a
+       stale reload of 0xFFFFFFFF at reset banking an hour of guest time. */
+    if (d > 1000000u)
+        d = 1000000u;
+
+    uint32_t kips = x86_pit_kips ? x86_pit_kips : PIT_NOMINAL_KIPS;
+    if (kips < 100u)     kips = 100u;
+    if (kips > 100000u)  kips = 100000u;
+
+    pit_frac += (uint64_t)d * (uint64_t)PIT_HZ;
+    uint64_t den = (uint64_t)kips * 1000u;
+    pit_now += (uint32_t)(pit_frac / den);
+    pit_frac %= den;
+}
+
+void x86_pit_counter_forced(uint32_t v)
+{
+    x86_pit_sync();
+    cpu_state_ptr->pit_counter = v;
+    pit_last_counter = v;
+}
+
+uint32_t x86_pit_ticks(void)
+{
+    x86_pit_sync();
+    return pit_now;
+}
+
+/* Per-channel counter state. Channel 1 (DRAM refresh) is carried so the array
+   indexes by channel number and nothing has to remember that 2 is really 1. */
+static uint32_t pit_ch_start[3];    /* pit_now when the count was loaded   */
+static uint16_t pit_ch_latch[3];    /* the frozen count from OUT 43h,xx00b */
+static uint8_t  pit_ch_latched[3];  /* a latch is pending                  */
+static uint8_t  pit_ch_rdphase[3];  /* lo/hi READ phase (its own, not the
+                                       write phase -- a guest may be part way
+                                       through a write pair and still latch) */
+/*
+ * A BOOTED MACHINE, not a blank one. These defaults are load-bearing: a guest
+ * that never writes a control word -- Alley Cat reads port 0x40 six million
+ * times in one run and programs it never -- still expects the counter the BIOS
+ * left running. Zeroed, pit_ch_mode[0] would be mode 0, the one-shot: the
+ * count would reach terminal count after one period and read 0 forever after,
+ * which is a clock that stopped rather than one that never started, and just
+ * as useless. Channel 0 is mode 3 at 65536, channel 1 is the mode 2 refresh
+ * counter, and channel 2 is stopped because its gate is (port 0x61 bit 0).
+ */
+static uint8_t  pit_ch_mode[3]    = { 3, 2, 3 };
+static uint8_t  pit_ch_running[3] = { 1, 1, 0 };
+static uint16_t pit_ch_frozen[3]  = { 0xFFFF, 0xFFFF, 0xFFFF };
+
+static uint32_t pit_ch_reload(unsigned ch)
+{
+    if (ch == 0)
+        return x86_io.pit0_reload ? x86_io.pit0_reload : 65536u;
+    return x86_io.pit2_reload ? x86_io.pit2_reload : 65536u;
+}
+
+/*
+ * The counter as the guest would read it right now.
+ *
+ * Modes 0 and 1 are one-shots: they count down to zero and STOP there, which
+ * is the terminal count software polls for. Everything else is treated as
+ * periodic (mode 2/3), which is what a divisor is for -- the count wraps back
+ * to the reload value and keeps going.
+ *
+ * THE RANGE IS R-1 DOWN TO 0, not R down to 1, and that is not a rounding
+ * choice. A reload of 0 means 65536, so "R" is 0x0000 in sixteen bits -- and
+ * a guest that latches immediately after loading the count would read 0x0000
+ * and then, a few instructions later, 0xFC9A. To software the counter appears
+ * to have jumped UP by 64666, which is precisely the "counter going backwards"
+ * a Zen Timer cannot survive. The part loads the count on the first CLK after
+ * the write and the first value software can observe is already one below it,
+ * so R-1 is both what hardware shows and the value that has no wrap artefact.
+ */
+static uint16_t pit_count(unsigned ch)
+{
+    uint32_t R = pit_ch_reload(ch);
+
+    if (!pit_ch_running[ch])
+        return pit_ch_frozen[ch];
+
+    uint32_t el = pit_now - pit_ch_start[ch];
+    if (pit_ch_mode[ch] == 0 || pit_ch_mode[ch] == 1) {
+        if (el >= R - 1u)
+            return 0;                /* terminal count, and it stays there */
+        return (uint16_t)((R - 1u) - el);
+    }
+    return (uint16_t)((R - 1u) - (el % R));
+}
+
+/* A completed count load restarts the channel. */
+static void pit_ch_loaded(unsigned ch)
+{
+    x86_pit_sync();
+    pit_ch_start[ch] = pit_now;
+    pit_ch_frozen[ch] = (uint16_t)((pit_ch_reload(ch) - 1u) & 0xFFFFu);
+    pit_ch_running[ch] = (ch == 2) ? (uint8_t)(x86_io.port61 & 1u) : 1u;
+}
+
+static uint32_t pit_read_data(unsigned ch)
+{
+    x86_pit_sync();
+    uint16_t c = pit_ch_latched[ch] ? pit_ch_latch[ch] : pit_count(ch);
+    uint8_t acc = (ch == 0) ? x86_io.pit0_access : x86_io.pit2_access;
+    uint8_t v;
+    int done;
+
+    if (acc == 1) {
+        v = (uint8_t)(c & 0xFFu); done = 1;
+    } else if (acc == 2) {
+        v = (uint8_t)(c >> 8); done = 1;
+    } else if (!pit_ch_rdphase[ch]) {
+        v = (uint8_t)(c & 0xFFu); pit_ch_rdphase[ch] = 1; done = 0;
+    } else {
+        v = (uint8_t)(c >> 8); pit_ch_rdphase[ch] = 0; done = 1;
+    }
+    if (done)
+        pit_ch_latched[ch] = 0;
+    return v;
+}
+
+/* Channel 2's gate, driven by port 0x61 bit 0. A rising edge restarts the
+   count (which is what a real 8253 does in the modes a speaker uses); a
+   falling edge freezes it where it stands, so a guest that gates the channel
+   off and reads it back sees a stable value rather than a running one. */
+static void pit_ch2_gate(unsigned on)
+{
+    on = on ? 1u : 0u;
+    if (on == pit_ch_running[2])
+        return;
+    x86_pit_sync();
+    if (on) {
+        pit_ch_start[2] = pit_now;
+        pit_ch_running[2] = 1;
+    } else {
+        pit_ch_frozen[2] = pit_count(2);
+        pit_ch_running[2] = 0;
+    }
+}
+
+/*
+ * The 8259A, as far as a READ of it is concerned.
+ *
+ * This is the other half of the 65535 story and, on its own, the whole of it.
+ * PZTimerOff decides whether the timed interval OVERFLOWED by asking the PIC
+ * whether IRQ 0 is pending: `OUT 20h,0Ah` selects the Interrupt Request
+ * register and `IN AL,20h` reads it (PZTIMER.ASM:238-247). Port 0x20 was not
+ * in the read switch, so it floated to 0xFF, bit 0 came back set, and
+ * PZTimerCount() took its overflow path and returned 0xFFFFFFFF
+ * (PZTIMER.ASM:488-493) -- which TOPBENCH stores into a `word`
+ * (TOPB_DAT.PAS:31-35) and prints as 65535, for every suite, always.
+ *
+ * The IMR at 0x21 is stored and returned for a different reason: code that
+ * saves the mask, masks an IRQ and restores it reads 0x21 first, and 0xFF told
+ * it every line was already masked -- which it then wrote back. It is NOT
+ * enforced here; delivery is still the one-deep hard_int_pending slot.
+ */
+static uint8_t pic_ocw3_read = 2;   /* 2 = IRR, 3 = ISR */
+static uint8_t pic_imr = 0xB8;      /* the mask a booted PC/AT BIOS leaves  */
+
+static uint32_t pic_read_irr(void)
+{
+    uint32_t pending = cpu_state_ptr->hard_int_pending;
+    uint32_t r = 0;
+    if (pending == 0x08u) r |= 1u;
+    if (pending == 0x09u) r |= 2u;
+    return r;
+}
+
 /* The last 32 writes that can move the tone, as (port << 24) | value, so a
    guest whose beeps come out at the wrong pitch can be read rather than
    guessed at. scripts/probe.py --dump x86_spk_log:32x4 */
@@ -231,9 +466,29 @@ static void pit_write_control(uint8_t v)
        freezes the count for reading and leaves the programmed mode alone.
        Storing it as the mode put the next 0x42 write through the lo/hi path
        with a stale half-pair flag, which is one way a tone comes out an octave
-       or more off. */
-    if (access == 0)
+       or more off.
+
+       LATCHING IS WHAT MAKES THE COUNTER READABLE AT ALL. The two reads that
+       follow must see ONE consistent 16-bit value, not a counter that moved
+       between the low byte and the high byte -- a Zen Timer reading a lo/hi
+       pair straddling a borrow computes a count that is off by 256. A second
+       latch before the pair has been consumed is ignored, as on the part. */
+    if (access == 0) {
+        x86_pit_sync();
+        if (!pit_ch_latched[ch]) {
+            pit_ch_latch[ch] = pit_count(ch);
+            pit_ch_latched[ch] = 1;
+            pit_ch_rdphase[ch] = 0;
+        }
         return;
+    }
+    /* Modes 6 and 7 alias 2 and 3 on the part. */
+    unsigned mode = (v >> 1) & 7u;
+    if (mode > 5u)
+        mode -= 4u;
+    pit_ch_mode[ch] = (uint8_t)mode;
+    pit_ch_rdphase[ch] = 0;
+    pit_ch_latched[ch] = 0;
     if (ch == 0) {
         x86_io.pit0_access = (uint8_t)access;
         x86_io.pit0_latched = 0;
@@ -248,6 +503,7 @@ static void pit_write_control(uint8_t v)
    where the guest's tick rate actually comes from. */
 static void pit_write_ch0(uint8_t v)
 {
+    int loaded = 1;                  /* the count is complete after this byte */
     switch (x86_io.pit0_access) {
     case 1:                          /* lo byte only: the HIGH byte STAYS */
         x86_io.pit0_reload = (uint16_t)((x86_io.pit0_reload & 0xFF00) | v);
@@ -259,12 +515,15 @@ static void pit_write_ch0(uint8_t v)
         if (!x86_io.pit0_latched) {
             x86_io.pit0_reload = (uint16_t)((x86_io.pit0_reload & 0xFF00) | v);
             x86_io.pit0_latched = 1;
+            loaded = 0;              /* half a count is not a count */
         } else {
             x86_io.pit0_reload = (uint16_t)((v << 8) | (x86_io.pit0_reload & 0xFF));
             x86_io.pit0_latched = 0;
         }
         break;
     }
+    if (loaded)
+        pit_ch_loaded(0);
     x86_pit0_writes++;
 }
 
@@ -282,6 +541,7 @@ uint32_t x86_pit0_divisor(void)
 
 static void pit_write_ch2(uint8_t v)
 {
+    int loaded = 1;
     switch (x86_io.pit2_access) {
     case 1:                          /* lo byte only: the HIGH byte STAYS */
         x86_io.pit2_reload = (uint16_t)((x86_io.pit2_reload & 0xFF00) | v);
@@ -293,12 +553,15 @@ static void pit_write_ch2(uint8_t v)
         if (!x86_io.pit2_latched) {
             x86_io.pit2_reload = (x86_io.pit2_reload & 0xFF00) | v;
             x86_io.pit2_latched = 1;
+            loaded = 0;
         } else {
             x86_io.pit2_reload = (uint16_t)((v << 8) | (x86_io.pit2_reload & 0xFF));
             x86_io.pit2_latched = 0;
         }
         break;
     }
+    if (loaded)
+        pit_ch_loaded(2);
 }
 
 /*
@@ -497,7 +760,7 @@ int x86_kbd_raise_irq(X86CPUState *cpu)
         return 0;
     cpu->hard_int_pending = 0x09;
     if (cpu->eflags & 0x200u)
-        cpu->pit_counter = 1;
+        x86_pit_counter_forced(1);   /* NOT a raw store: see x86_pit_sync() */
     return 1;
 }
 
@@ -557,8 +820,15 @@ uint32_t x86_port_read(uint32_t port, uint32_t size)
 static uint32_t port_read_inner(uint32_t port)
 {
     switch (port) {
+    /* The counters. Not the reload value: see the PIT clock block above. */
+    case 0x40:
+        return pit_read_data(0);
     case 0x42:
-        return x86_io.pit2_reload & 0xFF;
+        return pit_read_data(2);
+    case 0x20:
+        return (pic_ocw3_read == 3) ? 0u : pic_read_irr();
+    case 0x21:
+        return pic_imr;
     case 0x60:
         /* 0x64 command 0xD0 is "read output port", and its answer comes back
            HERE, not on 0x64. A guest that reads the port, flips bit 1 and
@@ -616,14 +886,15 @@ static uint32_t port_read_inner(uint32_t port)
         if (elapsed & 0x10u)
             v |= 0x10u;                    /* refresh toggle */
         if ((x86_io.port61 & 1u) && x86_io.pit2_reload) {
-            /* Half the programmed period high, half low -- mode 3, which is
-               what every speaker routine programs. The divisor is in PIT ticks
-               and `elapsed` is in guest instructions, so this is a SHAPE, not a
-               frequency; the audible tone comes from x86_speaker_divisor() and
-               is unaffected. What matters to a prober is that it moves, and
-               that it moves at a rate that follows the divisor it wrote. */
-            uint32_t half = x86_io.pit2_reload >> 1;
-            if (half && ((elapsed / half) & 1u))
+            /* Now taken from the CHANNEL 2 COUNTER rather than from a shape
+               fitted to the instruction budget: OUT is high for the first half
+               of the period in mode 3, and the counter that decides which half
+               we are in is the same one the guest can read back on 0x42. A
+               detection routine that ungates the channel and waits for bit 5
+               to toggle is therefore watching the real thing. */
+            x86_pit_sync();
+            uint32_t R = pit_ch_reload(2);
+            if (pit_count(2) > (R >> 1))
                 v |= 0x20u;
         } else {
             v |= 0x20u;                    /* gate low: OUT idles high */
@@ -764,10 +1035,19 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
         break;
     case 0x61:
         x86_io.port61 = (uint8_t)value;
+        pit_ch2_gate(value & 1u);    /* bit 0 IS channel 2's gate */
         spk_event(port, value);
         break;
-    case 0x20:                       /* PIC end-of-interrupt: nothing to model
-                                        while only one IRQ source exists */
+    case 0x20:
+        /* EOI still has nothing to model while delivery is a one-deep slot.
+           OCW3 does: bit 3 set with bit 4 clear selects which register the
+           NEXT read of this port returns, and reading the IRR is how the Zen
+           Timer detects overflow. */
+        if ((value & 0x18u) == 0x08u)
+            pic_ocw3_read = (uint8_t)(value & 3u);
+        break;
+    case 0x21:                       /* IMR: stored and read back, not enforced */
+        pic_imr = (uint8_t)value;
         break;
 
     /*

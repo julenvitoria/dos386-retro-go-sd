@@ -543,6 +543,12 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size);
    millisecond of host time owes -- see the three-clock block in src/main.c. */
 uint32_t x86_pit0_divisor(void);
 extern volatile uint32_t x86_pit0_writes;
+/* The PIT's free-running counter, in 1.193182 MHz ticks of GUEST time. See the
+   block comment in x86_io.c: guest time is instructions at x86_pit_kips. */
+extern uint32_t x86_pit_kips;         /* main.c publishes guest_kips here */
+void     x86_pit_sync(void);          /* accrue what the guest has just run */
+void     x86_pit_counter_forced(uint32_t v);  /* host write to pit_counter  */
+uint32_t x86_pit_ticks(void);         /* reporting and tier-1 assertions    */
 uint32_t x86_speaker_divisor(void);   /* the signal path's pitch source */
 uint32_t x86_speaker_hz(void);        /* reporting only */
 void x86_speaker_render(int16_t *dst, unsigned frames, unsigned sample_rate,

@@ -277,21 +277,29 @@ NOTE_INT15 = (
 # Ports. Exact port first, then a range. Same status vocabulary.
 # ---------------------------------------------------------------------------
 PORT = {
-    0x20: _e("stub", "PIC end-of-interrupt: accepted, nothing to model"),
-    0x21: _e("unmodelled-port", "PIC interrupt mask -- in neither switch",
-             "masking IRQ 0 or IRQ 1 has no effect here; the frame loop keeps "
+    0x20: _e("partial", "8259A: EOI on write, IRR/ISR on read",
+             "OCW3 selects which register the next read returns, which is how "
+             "the Precision Zen Timer detects overflow -- unanswered, this "
+             "port floated 0xFF and every TOPBENCH sub-timing came back 65535. "
+             "The EOI itself still has nothing to model: delivery is a "
+             "one-deep pending slot, not a priority stack"),
+    0x21: _e("partial", "PIC interrupt mask: stored and read back",
+             "code that saves the mask, masks a line and restores it reads "
+             "this first, and 0xFF told it every line was already masked -- "
+             "which it then wrote back. NOT enforced: the frame loop keeps "
              "delivering ticks and keys regardless"),
-    0x40: _e("partial", "PIT channel 0 reload: the SYSTEM TIMER's rate",
-             "the WRITE is modelled -- the divisor drives how many IRQ 0s the "
-             "frame loop owes, which is what makes Wolfenstein 3D's 140 Hz "
-             "(0x214B) run at 140 Hz instead of 18.2. The READ is not: the "
-             "counter floats 0xFF, i.e. a clock that never moves, and Alley "
-             "Cat reads it past 65,535 times in 28 s as a fine clock or an "
-             "entropy source"),
+    0x40: _e("implemented", "PIT channel 0: the SYSTEM TIMER, counter and all",
+             "the WRITE divisor drives how many IRQ 0s the frame loop owes, "
+             "which is what makes Wolfenstein 3D's 140 Hz (0x214B) run at "
+             "140 Hz instead of 18.2. The READ is the COUNTER, latchable and "
+             "counting down in guest time -- it used to float 0xFF, a clock "
+             "that never moves, and Alley Cat spun on it six million times in "
+             "one run rather than the 49 k it takes now"),
     0x41: _e("unmodelled-port", "PIT channel 1 (DRAM refresh)"),
-    0x43: _e("partial", "PIT control word: channels 0 and 2 keep their access "
-                        "mode; channel 1 and the latch command are dropped"),
-    0x42: _e("implemented", "PIT channel 2 reload: the speaker's tone"),
+    0x43: _e("implemented", "PIT control word: access mode, counting mode and "
+                            "the counter latch command, channels 0 and 2"),
+    0x42: _e("implemented", "PIT channel 2: the speaker's tone, and a counter "
+                            "that can be latched and read back"),
     0x60: _e("implemented", "8042 keyboard data"),
     0x61: _e("implemented", "speaker gate + data"),
     0x64: _e("partial", "reads status; writes are accepted and ignored"),

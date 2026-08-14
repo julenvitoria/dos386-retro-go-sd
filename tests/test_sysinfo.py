@@ -122,7 +122,7 @@ def main(args):
         # in BH. Both conditions, or the bit is stuck -- and a stuck bit is
         # what turns "wait until it flips" into a program that never returns.
         ever_high, ever_low = spk & 0xFF, (~(spk >> 8)) & 0xFF
-        print("PC speaker feedback on port 0x61, 1024 guest samples:")
+        print("PC speaker feedback on port 0x61, 8192 guest samples:")
         check("bit 5 (PIT ch2 OUT) ever high", (ever_high >> 5) & 1, 1, "{}")
         check("bit 5 (PIT ch2 OUT) ever low", (ever_low >> 5) & 1, 1, "{}")
         check("bit 4 (refresh toggle) ever high", (ever_high >> 4) & 1, 1, "{}")
