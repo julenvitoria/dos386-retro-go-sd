@@ -823,7 +823,7 @@ uint32_t x86_pager_fault(uint32_t lin, int write)
                       ? guest_page_table_ptr[page + 1u] : FOLD_INVALID;
         if (nk != FOLD_INVALID)
             memcpy(host + X86_PG_SIZE,
-                   (const void *)(uintptr_t)(((page + 1u) << X86_PG_SHIFT) + nk),
+                   x86_fold_ptr((page + 1u) << X86_PG_SHIFT, nk),
                    X86_PG_SLACK);
         else
             memset(host + X86_PG_SIZE, 0, X86_PG_SLACK);

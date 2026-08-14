@@ -85,11 +85,58 @@
      * "genuinely unmapped", and then the stub takes the old .mem_fault exit --
      * an absent page is still a clean, reported fault, not a hard fault.
      * ---------------------------------------------------------------- */
-    .macro MEM_TRAP ptr, wr
+    /* ---------------------------------------------------------------- *
+     * THE VGA APERTURE, FOLD-TRAPPED.
+     *
+     * While a planar mode is armed the sixteen fold entries covering
+     * 0xA0000-0xAFFFF hold X86_FOLD_VGA_K, so `lin + k` comes out as
+     * `0x80000000 | host` -- NEGATIVE, and therefore caught by the ADDS/BMI
+     * that every access already executes. The aperture check costs a
+     * non-planar title NOTHING, because there is no check: it is the fold
+     * trap, and the fold trap was already there.
+     *
+     * The sentinel encoding is ordered, so telling the three cases apart is
+     * ONE compare with no scratch register and no table load:
+     *
+     *   0x80000000-0x80FFFFFF   fold miss (0x80000000 + lin, lin < 16 MB)
+     *   0x90000000-0x9xxxxxxx   NOR, XIP and readable
+     *   >= 0xA0000000           the VGA aperture: 0x80000000 | host, and the
+     *                           host pointer is AXI/DTCM (0x2xxxxxxx), so the
+     *                           tagged value lands in 0xA0000000-0xBFFFFFFF
+     *                           and cannot collide with either of the above.
+     *                           x86_video_planar_arm() REFUSES to install the
+     *                           sentinel if the aperture is not in that range.
+     *
+     * The stub recovers the host pointer with one BIC and hands the site the
+     * pointer it would have had, so the site's own load or store runs
+     * unchanged. THE STORE IS STILL COMPLETED BY VGA_ST, which is per-site and
+     * knows the value and the size at assembly time -- the trap fires at
+     * pointer RESOLUTION and has neither. What moves is the READ side: the
+     * latch record is the trap's job now, so VGA_LATCH is gone from every site
+     * in the interpreter and a guest load pays nothing for the aperture.
+     *
+     * `latch` says whether this site READS through the pointer. Reads record
+     * it, writes must NOT: the adapter loads its four latches on a read, and a
+     * pure store that overwrote cpu->vga_latch with its own DESTINATION would
+     * break the `mov al,[si] / mov [di],al` latch copy that Mode Y is built on.
+     * An RMW site both reads and writes and so asks for the write trap WITH the
+     * latch record (MEM_GET_PTR_RMW).
+     *
+     * cpu->vga_latch is a HOST POINTER now, not a window offset: subtracting
+     * the base needs a base, and that subtraction belongs on the cold side.
+     * ---------------------------------------------------------------- */
+    .macro MEM_TRAP ptr, wr, latch=0
         BMI 99f
 98:
         .pushsection .itcram_hot.norslow, "ax", %progbits
-99:     PUSH {R0-R3, R12, LR}
+99:     CMP \ptr, #0xA0000000
+        BLO 1f
+        BIC \ptr, \ptr, #0x80000000
+    .if \latch
+        STR \ptr, [R8, #CPU_VGA_LATCH]
+    .endif
+        B 98b
+1:      PUSH {R0-R3, R12, LR}
         MOV R0, \ptr                  @ PUSH stores, it does not clobber
     .if \wr
         BL x86_nor_slow_w
@@ -105,11 +152,18 @@
     .endm
 
     .macro MEM_TRAP_R ptr
-        MEM_TRAP \ptr, 0
+        MEM_TRAP \ptr, 0, 1
     .endm
 
     .macro MEM_TRAP_W ptr
-        MEM_TRAP \ptr, 1
+        MEM_TRAP \ptr, 1, 0
+    .endm
+
+    /* Read-modify-write: a WRITE as far as the pager is concerned (COW up
+       front is correct, merely pessimistic), and a READ as far as the VGA
+       latches are concerned. */
+    .macro MEM_TRAP_RMW ptr
+        MEM_TRAP \ptr, 1, 1
     .endm
 
     /* Translate a guest linear address to a host pointer, CHECKED.
@@ -217,7 +271,17 @@
         BMI 89f
 88:
         .pushsection .itcram_hot.norslow, "ax", %progbits
-89:     PUSH {R0-R3, R12, LR}
+        /* Executing out of the VGA aperture. Exotic, but it must not become a
+           fault the moment a planar mode arms: recover the pointer, thread the
+           granule's k exactly as the NOR path below does, and no latch record
+           -- an instruction fetch is not a guest data read. */
+89:     CMP \ptr, #0xA0000000
+        BLO 1f
+        BIC \ptr, \ptr, #0x80000000
+        SUB.W R12, \ptr, \lin
+        STR.W R12, [R8, #CPU_CODE_K]
+        B 88b
+1:      PUSH {R0-R3, R12, LR}
         MOV R0, \ptr
         BL x86_nor_slow_r
         POP {R0-R3, R12, LR}
@@ -244,6 +308,27 @@
         LDR \dest_ptr, [R9, \dest_ptr, LSL #2]
         ADDS \dest_ptr, \dest_ptr, \vaddr
         MEM_TRAP_W \dest_ptr
+    .endm
+
+    /* A site that LOADS and then STORES through one pointer. Identical code to
+       the write form; the only difference is that the aperture trap records
+       the VGA read latch, which the load half of the site would otherwise
+       lose. Use it wherever a VGA_ST is preceded by a load through the same
+       pointer -- ADD/OR/.../XCHG Eb,Gb, the GRP1/GRP2/GRP3/GRP4/GRP5 memory
+       forms and BTS/BTR/BTC. */
+    .macro MEM_GET_PTR_RMW dest_ptr, vaddr
+        SEAM_CHECK \dest_ptr, \vaddr
+        UBFX \dest_ptr, \vaddr, #12, #12
+        LDR \dest_ptr, [R9, \dest_ptr, LSL #2]
+        ADDS \dest_ptr, \dest_ptr, \vaddr
+        MEM_TRAP_RMW \dest_ptr
+    .endm
+
+    .macro MEM_GET_PTR_RMWB dest_ptr, vaddr
+        UBFX \dest_ptr, \vaddr, #12, #12
+        LDR \dest_ptr, [R9, \dest_ptr, LSL #2]
+        ADDS \dest_ptr, \dest_ptr, \vaddr
+        MEM_TRAP_RMW \dest_ptr
     .endm
 
     /* ONE-BYTE variants. A single byte cannot straddle a 4 KB boundary, so the
@@ -354,17 +439,10 @@
         VGA_ST STRH, 2, \src, \ptr, \t
     .endm
 
-    /* Load: record the window offset of a guest read that lands in the
-       aperture, then let the site's own load run unchanged. Width-agnostic --
-       the latch is an OFFSET, so there is nothing per-size about it, and the
-       caller keeps its own LDRB/LDRH/LD_V. */
-    .macro VGA_LATCH ptr, t
-        LDR \t, [R8, #CPU_VGA_BASE]
-        SUBS \t, \ptr, \t
-        CMP \t, #0x10000
-        IT LO
-        STRLO \t, [R8, #CPU_VGA_LATCH]
-    .endm
+    /* THE LOAD SIDE IS GONE. It used to be VGA_LATCH -- LDR + SUBS + CMP +
+       IT/STR at every guest load in the interpreter, armed or not. The fold
+       trap records the latch now (MEM_TRAP above), so a load site is exactly
+       the four instructions the fold always cost and the aperture is free. */
 
 /* ------------------------------------------------------------------ *
  * Per-opcode DWT cycle profiling. OFF unless built with X86_PROFILE=1.

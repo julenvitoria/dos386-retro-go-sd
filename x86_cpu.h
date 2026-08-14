@@ -112,10 +112,16 @@ struct X86CPUState {
        against 0x10000: host pointers live at 0x24xxxxxx, so with a zero base
        the difference is never below 64 KB and the check can never fire. That
        is why 0 is the disarmed sentinel and why reset needs no special case.
-       `vga_latch` is the window offset (0..0xFFFF) of the last guest READ that
-       landed inside the aperture -- the adapter's four read latches are
-       indexed by it and the planar write modes consume them. Both sit next to
-       nor_ptr so each is one LDR off R8 in DTCM. */
+       Only STORE sites test it now (VGA_ST): the READ side is the fold trap,
+       which costs a non-planar title nothing at all -- see X86_FOLD_VGA_K
+       below and the MEM_TRAP comment in cpu_exec.S.
+       `vga_latch` is the HOST POINTER of the last guest READ that landed
+       inside the aperture -- the adapter's four read latches are loaded from
+       it and the planar write modes consume them. It is a pointer rather than
+       a window offset because the trap stub recovers the pointer with one BIC
+       and has no register to spare for subtracting a base; x86_video_planar.c
+       does the subtraction on the cold side. Both sit next to nor_ptr so each
+       is one LDR off R8 in DTCM. */
     uint32_t vga_base;
     uint32_t vga_latch;
     /* THE SEAM. How many granule boundaries the instruction in flight has
@@ -599,6 +605,40 @@ extern volatile uint32_t x86_code_relocs;       /* instructions staged        */
 extern volatile uint32_t x86_code_reloc_faults; /* bytes that would not fold  */
 
 #define FOLD_K(host, idx)  ((uint32_t)(host) - ((uint32_t)(idx) << FOLD_SHIFT))
+
+/* ---- the VGA aperture's fold sentinel ------------------------------------
+ *
+ * While a planar mode is armed the aperture's sixteen entries fold to
+ * `0x80000000 | host`, so every access to 0xA0000-0xAFFFF trips the ADDS/BMI
+ * the interpreter already runs and NOTHING is spent on the aperture by a title
+ * that never enters a planar mode. The three trap causes stay separable by a
+ * single unsigned compare -- fold miss 0x80xxxxxx, NOR 0x9xxxxxxx, aperture
+ * >= 0xA0000000 -- which is only true while the aperture is in 0x20000000-
+ * 0x3FFFFFFF (AXI/DTCM). X86_FOLD_VGA_OK() is that condition, and arming
+ * REFUSES the sentinel rather than installing a colliding one.
+ */
+#define X86_FOLD_VGA_TAG   0x80000000u
+#define X86_FOLD_VGA_MIN   0xA0000000u
+#define X86_FOLD_VGA_OK(host) \
+    (((uint32_t)(uintptr_t)(host) & 0xE0000000u) == 0x20000000u)
+#define X86_FOLD_VGA_K(host, first_idx) \
+    (FOLD_K(host, first_idx) + X86_FOLD_VGA_TAG)
+/* Is a trapped pointer an aperture access, and what host address is it? */
+#define X86_FOLD_IS_VGA(bad)   ((uint32_t)(bad) >= X86_FOLD_VGA_MIN)
+#define X86_FOLD_VGA_HOST(bad) ((uint32_t)(bad) & ~X86_FOLD_VGA_TAG)
+/* Resolve `lin` through fold constant `k` the way the interpreter's trap stubs
+   do, tag stripped. EVERY C-side walk of the fold table must use this: a raw
+   `lin + k` over an aperture page yields 0xAxxxxxxx, which is not memory, and
+   dereferencing it is a hard fault. That is not hypothetical -- the pager's
+   slack prime (x86_pager.c) and the seam's neighbour pull (x86_seam.c) both do
+   exactly this walk, and the pager one took Wolfenstein 3-D down. */
+static inline void *x86_fold_ptr(uint32_t lin, uint32_t k)
+{
+    uint32_t host = lin + k;
+    if (X86_FOLD_IS_VGA(host))
+        host = X86_FOLD_VGA_HOST(host);
+    return (void *)(uintptr_t)host;
+}
 
 /* get_reg/set_reg additional constants */
 #define X86_CPU_REG_EIP 8

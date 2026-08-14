@@ -149,6 +149,14 @@ extern volatile uint32_t x86_modey_mid_draw;
 extern volatile uint32_t x86_modey_mid_draw_max;
 
 /* ---- host-visible witnesses; all of this is the deliverable -------------- */
+/* Put the aperture's fold sentinel back after something remapped 0xA0000.
+   Called by x86_map_fixed(); a no-op unless the trap is armed. */
+void x86_vga_planar_fold_refresh(void);
+/* The fold trap's state, for a harness to read: refused means the aperture was
+   not where the sentinel encoding needs it (x86_cpu.h, X86_FOLD_VGA_OK). */
+extern volatile uint32_t x86_vga_fold_trap_armed;
+extern volatile uint32_t x86_vga_fold_trap_refused;
+
 extern volatile uint32_t x86_vga_planar_stores;   /* stores that took the hook */
 /* Stores by write class: the CPU byte straight into the enabled planes, the
    write-mode-1 latched page copy, and everything else. The mix is what says

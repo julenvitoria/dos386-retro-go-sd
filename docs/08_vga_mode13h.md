@@ -189,7 +189,7 @@ This section previously listed three missing subsystems. All three exist:
 
 | was missing | is now |
 |---|---|
-| a store-side hook | `VGA_ST`/`VGA_LATCH` in `cpu_exec.S` (landed separately) driving `x86_vga_planar_store()` |
+| a store-side hook | `VGA_ST` in `cpu_exec.S` driving `x86_vga_planar_store()`, plus the aperture's FOLD TRAP for the read side |
 | a Sequencer/CRTC register file with effects | `x86_io.c`'s register file, which was already a faithful store, now feeds `x86_video_planar.c` through `x86_video_planar.h`. Nothing is duplicated |
 | page storage that does not exist | it still does not exist. Pages are FOLDED. See "what that costs" below |
 
@@ -317,13 +317,72 @@ before it is adopted rather than accepted and not rendered, and the refusal is
 loud: `x86_video_mode_log` tag 5 plus `x86_vga_ega_refused`, with
 `x86_arena_deficit` holding the byte count.
 
+### The aperture is a FOLD TRAP, not a range check (Queue B3)
+
+The read side used to be `VGA_LATCH`: `LDR cpu->vga_base` + `SUBS` + `CMP` +
+`IT/STRLO`, five instructions at **47 load sites**, executed by every title
+whether a planar mode was armed or not. It is gone. While a planar mode is
+armed the sixteen fold entries covering `0xA0000`-`0xAFFFF` hold
+`X86_FOLD_VGA_K` = `0x80000000 | host - 0xA0000`, so an aperture access comes
+out NEGATIVE and trips the `ADDS`/`BMI` that every guest access already runs.
+A non-planar title now pays **nothing** for the aperture.
+
+The three trap causes stay separable by ONE unsigned compare with no scratch
+register and no table load, because their encodings are ordered: fold miss
+`0x80000000+lin` (lin < 16 MB), NOR `0x9xxxxxxx`, aperture `>= 0xA0000000`
+(host is `0x2xxxxxxx`, so the tag lands in `0xA0000000`-`0xBFFFFFFF`). Arming
+refuses the sentinel rather than installing a colliding one if the aperture is
+not in AXI/DTCM (`X86_FOLD_VGA_OK`), and `x86_vga_fold_trap_refused` says so.
+
+**The store side is UNCHANGED and that is not an oversight.** The trap fires at
+pointer RESOLUTION, where neither the stored value nor the operand size exists;
+`VGA_ST` is per-site and has both at assembly time. The trap stub therefore
+hands the site the untagged pointer and `VGA_ST` completes the store exactly as
+before. A read-modify-write site asks for `MEM_GET_PTR_RMW`, which is the write
+trap *with* the latch record — a pure store must never record the latch, or the
+`mov al,[si] / mov [di],al` copy would latch from its own destination.
+
+**Two things this cost, both found by running it:**
+
+1. **Every C-side walk of the fold table must strip the tag.** `x86_fold_ptr()`
+   in `x86_cpu.h` is that walk. The pager's slack prime
+   (`x86_pager.c`, "prime the slack from the neighbour") dereferences the
+   NEIGHBOUR's fold constant, so faulting in guest page `0x9F` dereferenced
+   `0xA4xxxxxx` and **hard-faulted Wolfenstein 3-D**, with the tier-1 suite
+   entirely green. The seam's neighbour pull and push-back are the same shape.
+2. **`x86_map_fixed()` over `0xA0000` silently disarms the trap**, because the
+   trap IS a fold entry: a mode set or an arena re-claim maps the aperture
+   afresh. It calls `x86_vga_planar_fold_refresh()` now.
+
+Cost: **+608 instructions / +2,184 B of ITCM** (48,016 -> 50,200), all of it in
+out-of-line stubs that only an aperture access executes, against five
+instructions removed from the inline path of every guest load in the
+interpreter. Negative control: `-DX86_VGA_FOLD_TRAP=0` never installs the
+sentinel; `tests/test_video.py`'s Mode Y arm then reports `latch=6000/6000`
+misses and fails with 16,000 of 64,000 pixels wrong in the latch-copy band.
+
+### What it does NOT yet buy, and what would
+
+Queue B4 wants the 64 KB aperture back: in 0Dh the aperture is only a **read
+shadow** (its bottom 16 KB) and the planes live in the arena, so if a read were
+SERVED BY THE TRAP -- `ega_read_byte()` into an eight-byte staging buffer,
+which is the widest thing one folded pointer is ever read through -- the 65,536
+bytes would be free for the EGA card. That is 77,824 + 65,536 = **143,360 B =
+35,840 plane offsets**, against the 28,160 (start 15,360 + 200 rows x 64)
+Keen 4's intro needs. **Keen's intro would fit, with 7,680 offsets to spare.**
+The work is per-site: the trap must own the LOAD (its width is a property of
+the site), which is the same fusion the store side needs and the same reason it
+has not happened yet -- roughly half the store sites are shared tails where the
+effective address is already dead. Mode Y is NOT affected: there the aperture
+IS the plane storage.
+
 ### Two improvements over the reference, both from the hook's shape
 
 1. **Latches are exact for PLAIN reads**, not only for read-modify-writes. The
    reference is a C interpreter whose read path never surfaced a plain load, so
-   it could only latch from a store's destination. `VGA_LATCH` sits on 47 real
-   load sites and records the window offset of the last guest read in
-   `cpu->vga_latch`, so `mov al,[si] / mov [di],al` — the write-mode-1 block copy
+   it could only latch from a store's destination. The aperture's FOLD TRAP
+   records the last guest read in `cpu->vga_latch` at every load in the
+   interpreter, so `mov al,[si] / mov [di],al` — the write-mode-1 block copy
    that is most of the reason to unchain at all — latches from SI, which is where
    the hardware latches from. Measured on Wolf3D: 107,721 latch reloads, **zero**
    misses through the setup and title screens.

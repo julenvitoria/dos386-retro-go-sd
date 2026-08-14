@@ -192,7 +192,7 @@ void x86_seam_sync(uint32_t lin)
     x86_livemap_note(page + 1u);
 
     const uint8_t *nb =
-        (const uint8_t *)(uintptr_t)(((page + 1u) << FOLD_SHIFT) + k1);
+        (const uint8_t *)x86_fold_ptr((page + 1u) << FOLD_SHIFT, k1);
 
     memcpy(slack, nb, X86_PG_SLACK);
     memcpy(seam_slot[n].orig, slack, X86_PG_SLACK);
@@ -217,7 +217,7 @@ void x86_seam_flush(void)
             x86_seam_overflow++;
             continue;
         }
-        uint8_t *dst = (uint8_t *)(uintptr_t)(nb + k1);
+        uint8_t *dst = (uint8_t *)x86_fold_ptr(nb, k1);
         for (uint32_t i = 0; i < X86_PG_SLACK; i++)
             if (seam_slot[s].slack[i] != seam_slot[s].orig[i]) {
                 dst[i] = seam_slot[s].slack[i];
