@@ -878,6 +878,16 @@ uint32_t x86_dos_file_calls;
 char x86_dos_path_log[16][32];
 static uint32_t dos_path_log_idx;
 
+/* The MEMORY calls are traced too, but they are not FILE calls: they get a
+   slot in the log and are NOT counted in x86_dos_file_calls, whose meaning
+   other reports depend on. For these, slot+3 carries (ES << 16) | DX rather
+   than CX:DX -- ES is the block for 49h/4Ah and DX is meaningless there, and
+   "which block" is the whole question a failing resize loop asks. */
+static int dos_func_is_mem(uint8_t f)
+{
+    return f == 0x48 || f == 0x49 || f == 0x4A;
+}
+
 static int dos_func_is_file(uint8_t f)
 {
     switch (f) {
@@ -906,10 +916,12 @@ static int dos_int21_dispatch(uint8_t func);
 
 int x86_dos_int21(uint8_t func)
 {
-    if (!dos_func_is_file(func))
+    int is_mem = dos_func_is_mem(func);
+    if (!is_mem && !dos_func_is_file(func))
         return dos_int21_dispatch(func);
 
-    x86_dos_file_calls++;
+    if (!is_mem)
+        x86_dos_file_calls++;
     if (x86_dos_file_log_idx >= DOS_FILE_LOG_SLOTS)
         return dos_int21_dispatch(func);
 
@@ -917,9 +929,11 @@ int x86_dos_int21(uint8_t func)
     x86_dos_file_log[slot] =
         ((uint32_t)func << 8) | (uint8_t)(cpu_state_ptr->regs[0] & 0xFF);
     x86_dos_file_log[slot + 2] = (uint16_t)(cpu_state_ptr->regs[3] & 0xFFFF);
-    x86_dos_file_log[slot + 3] =
-        ((uint32_t)(cpu_state_ptr->regs[1] & 0xFFFFu) << 16) |
-        (uint16_t)(cpu_state_ptr->regs[2] & 0xFFFFu);
+    x86_dos_file_log[slot + 3] = is_mem ?
+        (((uint32_t)cpu_state_ptr->segs[0].sel << 16) |
+         (uint16_t)(cpu_state_ptr->regs[2] & 0xFFFFu)) :
+        (((uint32_t)(cpu_state_ptr->regs[1] & 0xFFFFu) << 16) |
+         (uint16_t)(cpu_state_ptr->regs[2] & 0xFFFFu));
     int rc = dos_int21_dispatch(func);
     uint16_t *fl = x86_hle_flags_on_stack();
     x86_dos_file_log[slot + 1] =

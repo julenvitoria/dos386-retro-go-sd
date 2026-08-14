@@ -308,7 +308,13 @@ DOS_FUNCS = {
     0x45: "dup", 0x46: "dup2", 0x47: "getcwd", 0x4E: "findfirst",
     0x4F: "findnext", 0x56: "rename", 0x57: "file date",
     0x5A: "mktemp", 0x5B: "create new", 0x68: "commit", 0x6C: "extopen",
+    0x48: "mem alloc", 0x49: "mem free", 0x4A: "mem resize",
 }
+
+# The memory calls share the file log's slots but not its field meanings:
+# slot+3 is (ES << 16) | DX for these, because ES is the BLOCK for 49h/4Ah and
+# a resize loop's question is "which block, to how many paragraphs".
+DOS_MEM_FUNCS = (0x48, 0x49, 0x4A)
 
 DOS_ERRS = {
     1: "invalid function", 2: "file not found", 3: "path not found",
@@ -343,8 +349,11 @@ def dump_dos_log(target, syms, out=print):
         name = DOS_FUNCS.get(func, "?")
         res = (f"CF=1 AX={ax:#06x} {DOS_ERRS.get(ax, '')}".rstrip()
                if cf else f"ok AX={ax:#06x}")
-        out(f"    [{i:3d}] {func:02X}h/{al:02X} {name:<14} "
-            f"BX={bx:#06x} CX:DX={cxdx:#010x}  -> {res}")
+        if func in DOS_MEM_FUNCS:
+            args = f"BX={bx:#06x} paras ES={(w[3] >> 16) & 0xFFFF:#06x}"
+        else:
+            args = f"BX={bx:#06x} CX:DX={cxdx:#010x}"
+        out(f"    [{i:3d}] {func:02X}h/{al:02X} {name:<14} {args}  -> {res}")
     if "x86_dos_path_log" in syms:
         pbase = syms["x86_dos_path_log"]
         out("  paths (ring of 16, oldest position unknown):")
