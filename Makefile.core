@@ -115,14 +115,20 @@ X86_VIDEO_DMA2D ?= 0
 # aliased fold. Grade any rung on the WOLF3D golden AND
 # x86_vga_modey_alias_hits, never on frame rate alone.
 #
-# RUNG 1 IS NOT FREE, AND THE ATTEMPT TO MAKE IT FREE IS RECORDED. The plan was
-# to move the 65,536-byte 13h aperture into DTCM, leaving the arena a run big
-# enough for one extra page with NO frames donated. The aperture does not fit
-# in DTCM -- short by 2,300 bytes, measured; see dtcm_state_init() in
-# src/main.c. So rung 1 still costs 16 donated frames (160 -> 142) and still
-# takes x86_vga_modey_alias_hits from 0 to ~13 M, which is the doubled-walls
-# defect. Rung 2 stays the default on the same grounds PLAN.md Queue A4 gives.
-X86_MODEY_EXTRA_PAGES ?= 2
+# RUNG 1 IS NOW FREE, AND THAT IS WHY IT IS THE DEFAULT.
+#
+# The 65,536-byte 13h aperture now lives in DTCM (dtcm_state_init(), funded by
+# allocating the mode records first and exactly), so the arena keeps that run:
+# x86_arena_largest 12,288 -> 77,824, MEASURED on hardware, which places one
+# extra page with NO frames donated. x86_pg_frames_total stays 160 and
+# x86_pg_evictions stays 0 -- i.e. Wolf3D fits in conventional memory and does
+# not page, which is what removed its level-load stalls.
+#
+# DO NOT RAISE THIS TO 2 WITHOUT CHECKING x86_arena_largest FIRST. Two extra
+# pages want 131,072 B against the 77,824 that exist, so the shortfall comes
+# out of the pager as donated frames -- silently, and the stalls come back.
+# That is the trade this knob exists to make visible.
+X86_MODEY_EXTRA_PAGES ?= 1
 
 CORE_C_DEFS := \
 -DX86_MODEY_EXTRA_PAGES=$(X86_MODEY_EXTRA_PAGES) \
