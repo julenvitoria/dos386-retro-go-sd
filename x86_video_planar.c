@@ -93,6 +93,10 @@
 #define X86_MODEY_PAGE_NEGCTL 0     /* fixed 16 KB mask, cache inside the     */
 #endif                              /* alias -- the state before the stride   */
                                     /* work                                   */
+#ifndef X86_MODEY_TIMER_NEGCTL
+#define X86_MODEY_TIMER_NEGCTL 0    /* the frame loop paints on a TIMER, with */
+#endif                              /* no test for whether the guest had      */
+                                    /* finished drawing -- the shipped bug    */
 
 /* Plane offsets alias into one 16 KB page: 4 * 0x4000 == 0x10000, the aperture
    exactly. A 320x200 page needs 16,000 of those 16,384, so the top 384 are
@@ -580,6 +584,11 @@ void x86_vga_modey_arm(int on)
     if (modey_cache)
         memset(modey_cache, 0, 4u * modey_cache_offs);
 
+    /* The presentation policy is per-arming state too: a stale quiet run from
+       whatever ran before must not authorise a paint of a page this mode has
+       not drawn yet. */
+    x86_video_modey_presented(0);
+
     x86_vga_modey_armed = 1;
     hook_set(1);
 #endif
@@ -708,6 +717,113 @@ void x86_vga_planar_start_write(void)
      */
     x86_vga_modey_flips++;
     x86_video_page_flip();
+    x86_video_modey_presented(1);
+}
+
+/* ---------------------------------------------------------------------------
+ * WHEN THE FRAME LOOP MAY PAINT A MODE Y SCREEN BY ITSELF.
+ *
+ * The escape hatch this policy replaces was a plain "paint anyway every 8
+ * frames without a flip", and it is what put the reported artefacts on the
+ * panel: the ONE page of storage holds whatever the guest is drawing RIGHT NOW,
+ * so a timed blit lands mid-redraw. WOLF3D flips once per GUEST frame and the
+ * guest runs far below the panel rate, so the hatch fired between essentially
+ * every pair of flips -- half a raycast viewport in gameplay, an erase-then-draw
+ * menu highlight caught between its two halves in the menus.
+ *
+ * The fix is not a longer timer, it is a better question. A guest that is
+ * drawing is STORING; the store counter is already maintained on the hot path.
+ * So the frame loop may paint only when the aperture has been QUIET for two
+ * whole guest slices -- which is a completed picture by construction, and is
+ * exactly the case the hatch exists for (a menu that draws once and then waits
+ * for a key, a title screen, a pause). A guest that stores forever and never
+ * flips would otherwise never be shown at all, so a long stale bound remains;
+ * at one second it cannot fire inside a title that is flipping, because every
+ * flip resets it.
+ */
+#define X86_MODEY_IDLE_FRAMES   2u    /* frames since the last present         */
+#define X86_MODEY_QUIET_FRAMES  2u    /* consecutive frames with NO store      */
+#define X86_MODEY_STALE_FRAMES  60u   /* ~1 s: nothing may freeze indefinitely */
+
+volatile uint32_t x86_modey_fallbacks;    /* quiet-page paints by the loop    */
+volatile uint32_t x86_modey_stale_paints; /* the last-resort bound firing     */
+volatile uint32_t x86_modey_flip_gap;     /* frames between the last 2 flips  */
+volatile uint32_t x86_modey_flip_gap_max;
+
+static uint32_t modey_idle;        /* frames since the last present           */
+static uint32_t modey_stale;       /* frames since the last paint of any kind */
+static uint32_t modey_quiet;       /* consecutive frames with no planar store */
+static uint32_t modey_stores_seen; /* x86_vga_planar_stores a frame ago       */
+static uint32_t modey_dirty;       /* stores since the last frame put on show */
+
+void x86_video_modey_presented(int from_flip)
+{
+    if (from_flip) {
+        x86_modey_flip_gap = modey_idle;
+        if (modey_idle > x86_modey_flip_gap_max)
+            x86_modey_flip_gap_max = modey_idle;
+    }
+    modey_idle = 0;
+    modey_stale = 0;
+    modey_quiet = 0;
+    modey_dirty = 0;
+    modey_stores_seen = x86_vga_planar_stores;
+}
+
+int x86_video_modey_paint_due(void)
+{
+    uint32_t stores;
+
+    /* Every other mode owes a paint every frame: its storage is not aliased,
+       so there is no half-drawn page to catch. */
+    if (!x86_vga_modey_armed)
+        return 1;
+
+    stores = x86_vga_planar_stores;
+    if (stores == modey_stores_seen) {
+        modey_quiet++;
+    } else {
+        modey_quiet = 0;
+        modey_dirty = 1;    /* there is something NEW to show, once it settles */
+    }
+    modey_stores_seen = stores;
+
+    modey_idle++;
+    modey_stale++;
+
+#if X86_MODEY_TIMER_NEGCTL
+    /* THE NEGATIVE CONTROL: the escape hatch as it shipped -- a timer, with no
+       question asked about whether the guest had finished drawing. This is the
+       artefact, compiled back in, and the presentation test must fail here or
+       it is grading nothing. */
+    if (modey_idle >= 8u) {
+        x86_modey_fallbacks++;
+        modey_idle = 0;
+        modey_stale = 0;
+        modey_dirty = 0;
+        return 1;
+    }
+    return 0;
+#endif
+
+    /* Nothing has been drawn since the last present: both LCD buffers already
+       hold it, so there is nothing to paint and repainting it every other frame
+       is the whole frame budget spent on a static picture. */
+    if (!modey_dirty)
+        return 0;
+
+    if (modey_quiet >= X86_MODEY_QUIET_FRAMES
+        && modey_idle >= X86_MODEY_IDLE_FRAMES) {
+        x86_modey_fallbacks++;
+    } else if (modey_stale >= X86_MODEY_STALE_FRAMES) {
+        x86_modey_stale_paints++;
+    } else {
+        return 0;
+    }
+    modey_idle = 0;
+    modey_stale = 0;
+    modey_dirty = 0;
+    return 1;
 }
 
 /* "The page you were displaying is finished; show it." Overridden by the

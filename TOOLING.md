@@ -931,12 +931,26 @@ python3 tests/test_video.py              # CGA mode 4 blitter, pixel-exact, plus
                                          # pattern, driven by GUEST code so the
                                          # store hook and the word `out dx,ax`
                                          # register writes are on the path.
-                                         # --modey-only runs just the Mode Y arm
-python3 scripts/run_planar_controls.py   # grades that Mode Y arm: four negative
+                                         # --modey-only runs just the Mode Y arm.
+                                         # A THIRD Mode Y arm asks a question no
+                                         # pixel test can: WHICH FRAMES ARE
+                                         # PAINTED. Mode Y aliases every page
+                                         # into one page of storage, so a blit
+                                         # on a timer lands mid-redraw -- a
+                                         # split raycast viewport, a menu
+                                         # highlight showing the old item and
+                                         # the new one. It drives
+                                         # x86_video_modey_paint_due() directly
+                                         # against three modelled guests, with
+                                         # no LCD and no CPU.
+                                         # --present-only runs just that arm
+python3 scripts/run_planar_controls.py   # grades those arms: FIVE negative
                                          # controls that must FAIL (chain-4
                                          # inert, a 40-offset blit stride, four
                                          # FLAT planes, the fixed 16 KB page
-                                         # mask) and one POSITIVE control --
+                                         # mask, and the presentation escape
+                                         # hatch back on a plain TIMER) and one
+                                         # POSITIVE control --
                                          # -DX86_MODEY_PAGE0=16384 must still
                                          # produce the same 64,000 pixels,
                                          # because the shipped default equals

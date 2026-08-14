@@ -210,6 +210,71 @@ per-row source offset; the chained path is byte-identical and
 | present-on-page-flip | `src/main.c`, `x86_video_page_flip()` |
 | the tier-1 evidence | `tests/test_video.py`, `scripts/run_planar_controls.py` |
 
+### Presentation: WHEN the screen is painted, and the two bugs that were in it
+
+Because pages alias, the one page of storage holds **whatever the guest is
+drawing right now**. So the screen is presented on the guest's page flip — the
+only instant it is a complete picture — and the frame loop owes a Mode Y title
+nothing at its own frame boundary. That much shipped and is right. Two things
+around it were wrong, and both were reported from hardware:
+
+> "moving the selection between menu items, the selection appears DOUBLED and
+> pops back and forth before settling"; "in gameplay the viewport is SPLIT IN
+> HALF, house of mirrors while rotating".
+
+**Bug 1 — the escape hatch was a TIMER.** A title that stops flipping must not
+be a frozen screen, so the loop painted anyway every 8 frames without a flip. A
+timer has no idea whether the guest has finished drawing, and WOLF3D flips once
+per *guest* frame while running far below the panel rate — so the hatch fired
+**between essentially every pair of flips**, blitting the page mid-redraw. That
+is the split viewport (the raycaster partway across) and the doubled menu
+highlight (id's menu code erases the old item and draws the new one as two
+operations). Measured with the timer compiled back in, on the modelled gameplay
+case: **20 of 200 frames painted mid-draw**.
+
+The hatch now asks a better question. A guest that is drawing is **storing**,
+and `x86_vga_planar_stores` is already maintained on the hot path. The frame
+loop may paint only when the aperture has been **quiet for two whole slices**
+and something has been drawn since the last present — quiet is a completed
+picture by construction, and it is exactly the case the hatch exists for (a menu
+that draws once and waits for a key). A 60-frame staleness bound remains so that
+a guest which stores forever and never flips cannot freeze the screen; every
+flip resets it, so it cannot fire inside a title that is flipping.
+
+**Bug 2 — the fallback painted ONE buffer.** The frame loop calls
+`GW_LCD_SWAP` **unconditionally every iteration**, because the swap is also its
+pacing; the panel therefore alternates between the two buffers. The flip path
+always painted both. The fallback painted only the active one, which left the
+two holding different pictures — and the swap then showed each in turn. That, on
+its own, is "pops back and forth before settling": not a compositing artefact
+at all, two buffers disagreeing. **Every Mode Y paint now paints both buffers**
+(`modey_paint_both()` in `src/main.c`). Every other mode paints the active one
+and lets the swap carry it, which is correct because it repaints every frame.
+
+The decision lives in the **core** (`x86_video_modey_paint_due()` in
+`x86_video_planar.c`), not in the frame loop, because "which frames are
+painted" is not a pixel question: `tests/test_video.py` was at 64000/64000 with
+this defect shipping. The core function is drivable with no LCD and no CPU, and
+`tests/test_video.py --present-only` grades it against three modelled guests —
+gameplay (flips, stores every frame: **0 of 200** loop paints), a menu (draws,
+then waits: exactly **1** paint, and not one while it is drawing), and a
+pathological non-flipping guest (only the staleness bound may fire, and must).
+`-DX86_MODEY_TIMER_NEGCTL=1` compiles the timer back in and is the fifth arm of
+`scripts/run_planar_controls.py`.
+
+Counters, on WOLF3D under gwemu through the signon and title screens, 30 s:
+`flips=2 presents=2 fallbacks=3 stale_paints=2 flip_gap_max=14`, and all of them
+**stop growing** once the guest goes quiet — a static screen is painted once and
+then not repainted at all, where the timer repainted it 8 times a second.
+
+**What is left, and it is accepted.** The 60-frame staleness bound is the one
+remaining path that can put a half-drawn page on the panel: a title that draws
+for over a second without flipping gets one stale frame per second, corrected on
+the next paint. It is the price of "nothing may freeze", it fired twice in the
+30 s run above, and removing it needs a signal for "the guest has finished" that
+does not exist. Nothing here is fixed by more memory; a second real page is
+66,560 bytes that do not exist.
+
 ### The arena arithmetic that actually held
 
 Modes are mutually exclusive, so the peak demand is the largest mode and not the
@@ -297,6 +362,9 @@ Under gwemu, `scripts/probe.py --retrogo`, with the ROM preselected:
 | `x86_vga_planar_stores` | 136,168 | stores that took the adapter |
 | `x86_vga_latch_loads` / `_miss` | 136,168 / 256 | latch reloads, and how many found no cell |
 | `x86_vga_planar_lost` | 17,920 | stores past the fitted card, discarded rather than aliased |
+| `x86_modey_fallbacks` | 3 | frames the LOOP painted, each with a quiet (hence complete) page |
+| `x86_modey_stale_paints` | 2 | the 60-frame liveness bound firing — the only path that can still show a half-drawn page |
+| `x86_modey_flip_gap_max` | 14 | loop frames between two flips; anything above 8 is a frame the old TIMER hatch would have painted mid-redraw |
 
 **16,640 is the whole design confirming itself against the real title.** It is
 the id Galaxy engine's `SCREENSIZE`, it is what the reference measured, and our

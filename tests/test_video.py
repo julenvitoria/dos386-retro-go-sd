@@ -1241,12 +1241,104 @@ def ega_checks(b, syms):
     return True
 
 
+def present_checks(b, syms):
+    """The Mode Y PRESENTATION POLICY -- which frames the loop paints.
+
+    The artefact this pins is invisible to every pixel test in this file, and
+    that is the point of having it. Mode Y aliases all pages into ONE page of
+    storage, so that storage holds whatever the guest is drawing at this
+    instant; the screen is presented on the guest's page flip because that is
+    the only moment it is a complete picture. The escape hatch that keeps a
+    non-flipping title from being a frozen screen used to be a TIMER -- paint
+    anyway every 8 frames -- and a timer fires mid-redraw. On hardware that was
+    a raycast viewport split in half in gameplay and a menu highlight showing
+    both the old item and the new one.
+
+    The policy is now "paint when the aperture has gone QUIET", i.e. when the
+    guest stored nothing for two whole slices, which is a completed picture by
+    construction. Three scenarios, driven on the target with no LCD and no CPU.
+    """
+    if "run_present_flag" not in syms:
+        print("FAIL: no run_present_flag; the target predates the policy test")
+        return False
+
+    def run(which):
+        b.write_uint32(syms["run_present_flag"], which)
+        if not wait_flag(b, syms["run_present_flag"], 0, "present policy hung"):
+            return None
+        return [b.read_uint32(syms["present_r"] + 4 * i) for i in range(8)]
+
+    r = run(1)
+    if r is None:
+        return False
+    if not r[7]:
+        print("FAIL: Mode Y did not arm for the presentation policy test")
+        return False
+    # 200 frames, stores in every one, a flip every 20th. The page is complete
+    # only at a flip, so the frame loop must paint on NONE of them.
+    if r[0] != 0 or r[1] != 0:
+        print(f"FAIL: the frame loop painted {r[0]} of 200 frames while the "
+              f"guest was drawing ({r[1]} quiet-fallbacks). Each is the one "
+              f"aliased page caught mid-redraw -- a split viewport on silicon.")
+        return False
+    if r[2] != 0:
+        print(f"FAIL: the staleness bound fired {r[2]} times inside a title "
+              f"that is flipping every 20 frames; it must never.")
+        return False
+    if r[3] != 20:
+        print(f"FAIL: flip gap measured {r[3]}, expected 20")
+        return False
+
+    r = run(2)
+    if r is None:
+        return False
+    # A menu: four frames of drawing, then quiet. Nothing while it draws; once,
+    # and only once, after it stops.
+    if r[0] != 0:
+        print(f"FAIL: painted {r[0]} times while the menu was redrawing -- "
+              f"that is the erase and the redraw both on the panel.")
+        return False
+    if r[1] != 1:
+        print(f"FAIL: a quiet, non-flipping screen was painted {r[1]} times "
+              f"in 30 frames; expected exactly 1 (0 is a FROZEN screen, more "
+              f"is the whole frame wasted repainting a static picture).")
+        return False
+    if r[2] != 0:
+        print(f"FAIL: the staleness bound fired {r[2]} times; the quiet path "
+              f"should have presented long before it.")
+        return False
+
+    r = run(3)
+    if r is None:
+        return False
+    # A guest that stores forever and never flips. Only the last-resort bound
+    # may fire, and it must, or the screen is frozen for good.
+    if r[1] != 0:
+        print(f"FAIL: {r[1]} quiet-fallbacks in a guest that stored every "
+              f"frame; the quiet test is not reading the store counter.")
+        return False
+    if r[2] != 3 or r[0] != 3:
+        print(f"FAIL: 180 frames of unflipped drawing gave {r[0]} paints "
+              f"({r[2]} from the staleness bound), expected 3 -- one per 60.")
+        return False
+
+    print("PASS: Mode Y presentation policy "
+          "(0/200 mid-draw paints, 1 quiet paint, 3 stale paints)")
+    return True
+
+
 def main(args):
     runner = build_and_create_runner(args)
     try:
         runner.start()
         b = runner.backend
         syms = get_symbols(getattr(args, "elf", None) or "test_core.elf")
+        if getattr(args, "present_only", False):
+            # The presentation-policy arm on its own, for the TIMER control in
+            # scripts/run_planar_controls.py. It touches no pixels and needs no
+            # guest program, so nothing else has to run first.
+            time.sleep(0.5)
+            return present_checks(b, syms)
         if getattr(args, "modey_only", False):
             # The single arm scripts/run_planar_controls.py builds and re-runs
             # once per control. Nothing else runs, so a control's verdict is
@@ -1311,6 +1403,8 @@ def main(args):
         # does and what the other arms do not expect.
         if not modey_checks(b, syms):
             return False
+        if not present_checks(b, syms):
+            return False
         return ega_checks(b, syms)
     finally:
         runner.stop()
@@ -1322,6 +1416,8 @@ if __name__ == "__main__":
     add_runner_args(p)
     p.add_argument("--modey-only", action="store_true",
                    help="run only the Mode Y arm (the controls driver uses this)")
+    p.add_argument("--present-only", action="store_true",
+                   help="run only the Mode Y presentation-policy arm")
     p.add_argument("--quiet", action="store_true",
                    help="suppress the PASS chatter; the exit code is the verdict")
     args = p.parse_args()

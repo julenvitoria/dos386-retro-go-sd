@@ -38,6 +38,21 @@ at a display start of 0 and an Offset of 40 the correct de-interleave IS the
 linear read. A mutation that is a no-op at the geometry under test cannot grade
 anything.
 
+  TIMER    -DX86_MODEY_TIMER_NEGCTL=1   the frame loop's escape hatch goes back
+                                        to a plain timer -- paint every 8 frames
+                                        without a flip, with no test for whether
+                                        the guest had FINISHED drawing. Mode Y
+                                        aliases every page into one page of
+                                        storage, so a timed blit lands mid
+                                        redraw: on hardware that was a raycast
+                                        viewport split in half and a menu
+                                        highlight showing the old item and the
+                                        new one at once. No pixel test can see
+                                        it -- it is a question about WHICH
+                                        FRAMES are painted -- so it is graded
+                                        here, by tests/test_video.py
+                                        --present-only.
+
   LEARN    -DX86_MODEY_PAGE0=16384      the POSITIVE control. The same 64,000
                                         pixels must still come out from a WRONG
                                         default, because the core is supposed to
@@ -54,18 +69,20 @@ import os
 import subprocess
 import sys
 
+# (name, flag, must_pass, which arm of tests/test_video.py grades it)
 ARMS = [
-    ("CORE",   "-DX86_MODEY_CORE_NEGCTL=1",   False),
-    ("STRIDE", "-DX86_MODEY_STRIDE_NEGCTL=1", False),
-    ("BLIT",   "-DX86_MODEY_BLIT_NEGCTL=1",   False),
-    ("PAGE",   "-DX86_MODEY_PAGE_NEGCTL=1",   False),
-    ("LEARN",  "-DX86_MODEY_PAGE0=16384",     True),
+    ("CORE",   "-DX86_MODEY_CORE_NEGCTL=1",   False, "--modey-only"),
+    ("STRIDE", "-DX86_MODEY_STRIDE_NEGCTL=1", False, "--modey-only"),
+    ("BLIT",   "-DX86_MODEY_BLIT_NEGCTL=1",   False, "--modey-only"),
+    ("PAGE",   "-DX86_MODEY_PAGE_NEGCTL=1",   False, "--modey-only"),
+    ("TIMER",  "-DX86_MODEY_TIMER_NEGCTL=1",  False, "--present-only"),
+    ("LEARN",  "-DX86_MODEY_PAGE0=16384",     True,  "--modey-only"),
 ]
 
 
-def run_arm(flag, target):
+def run_arm(flag, target, arm):
     env = dict(os.environ, X86_VIDEO_NEGCTL=flag)
-    cmd = [sys.executable, "tests/test_video.py", "--modey-only", "--quiet",
+    cmd = [sys.executable, "tests/test_video.py", arm, "--quiet",
            "--clean", "--target", target]
     return subprocess.run(cmd, env=env).returncode == 0
 
@@ -77,9 +94,9 @@ def main():
     args = p.parse_args()
 
     fail = 0
-    for name, flag, want_pass in ARMS:
+    for name, flag, want_pass, arm in ARMS:
         print(f"---- {name}: {flag}")
-        passed = run_arm(flag, args.target)
+        passed = run_arm(flag, args.target, arm)
         if want_pass and not passed:
             print(f"LEARN FAIL -- with {flag} the core never picked up the "
                   f"16,640 stride its guest programmed. The two flips are the "
@@ -97,7 +114,7 @@ def main():
     if fail:
         print("PLANAR CONTROLS FAIL")
         return 1
-    print("PLANAR CONTROLS PASS (4/4 negative controls caught, stride learning "
+    print("PLANAR CONTROLS PASS (5/5 negative controls caught, stride learning "
           "proven from a wrong default)")
     return 0
 
