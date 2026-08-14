@@ -348,15 +348,28 @@ OP_AGNOSTIC .op_nop
    ~a -- MVN inverts every bit including the one the macro reads, so AF came
    out exactly backwards on every INC and DEC of a register. The ModRM forms
    already use the right aux. */
+/* THE ARITHMETIC IS NORMALIZED, exactly as L(GRP5_INC)/L(GRP5_DEC) below are.
+   Without VNORM the operand sits in the LOW half of the register at 16-bit
+   operand size and SF, ZF and OF then come off bit 31 of a 32-bit add -- so
+   `dec ax` with AX=0xFFFF reported SF=0 (it is 0xFFFE, SF=1) and `inc ax` with
+   AX=0xFFFF reported ZF=0. These are opcodes 0x40-0x4F, the single most common
+   16-bit instructions there are; the defect is invisible to a test that only
+   ever decrements a small number, which is why 273 hand-written cases and the
+   `DEC r16 AF` case right next to it all passed over it. MEASURED: it is what
+   corrupted Wolfenstein 3-D's `finetangent[]` table -- built through Borland's
+   software 80x87 emulator, whose normalisation loops branch on exactly these
+   flags -- and with it the whole raycast scene. See tests/test_alu_fuzz.py. */
 OP .op_inc_r32
     AND.W R2, R0, #7
     MOV.W R2, R2, LSL #2
     ADD.W R2, R2, #8
     LDREG_V R3, R2
-    EOR.W R4, R3, #1               @ AF aux: a ^ b, with b == 1
-    ADDS R3, R3, #1
+    VNORM(R3)
+    EOR.W R4, R3, #(1 << NSH)      @ AF aux: a ^ b, with b == 1
+    ADDS R3, R3, #(1 << NSH)
     EOR.W R4, R4, R3
-    X86_FLAGS_INCDEC R3, R4, R0, R1    @ INC must not disturb CF
+    VDENORM(R3)
+    X86_FLAGS_INCDEC R3, R4, R0, R1, NSH   @ INC must not disturb CF
     B.N L(WRITE_REG)
 
 OP .op_dec_r32
@@ -364,10 +377,12 @@ OP .op_dec_r32
     MOV.W R2, R2, LSL #2
     ADD.W R2, R2, #8
     LDREG_V R3, R2
-    EOR.W R4, R3, #1
-    SUBS R3, R3, #1
+    VNORM(R3)
+    EOR.W R4, R3, #(1 << NSH)
+    SUBS R3, R3, #(1 << NSH)
     EOR.W R4, R4, R3
-    X86_FLAGS_INCDEC R3, R4, R0, R1    @ DEC must not disturb CF
+    VDENORM(R3)
+    X86_FLAGS_INCDEC R3, R4, R0, R1, NSH   @ DEC must not disturb CF
 L(WRITE_REG):
     STREG_V R3, R2
     B.W .fetch_decode_loop
@@ -1512,7 +1527,7 @@ L(SHIFT_ROL):
     BEQ.W L(SHIFT_NOFLAGS)
     AND.W R5, R5, #(VBITS - 1)
     CMP R5, #0
-    BEQ.W L(SHIFT_ROT_CF_ONLY)
+    BEQ.W L(SHIFT_ROL_CF_ONLY)
     RSB R12, R5, #VBITS
     LSL.W R4, R3, R5
     LSR.W R3, R3, R12
@@ -1526,17 +1541,36 @@ L(SHIFT_ROR):
     BEQ.W L(SHIFT_NOFLAGS)
     AND.W R5, R5, #(VBITS - 1)
     CMP R5, #0
-    BEQ.W L(SHIFT_ROT_CF_ONLY)
+    BEQ.W L(SHIFT_ROR_CF_ONLY)
     RSB R12, R5, #VBITS
     LSR.W R4, R3, R5
     LSL.W R3, R3, R12
     ORR.W R3, R3, R4
     VMASK(R3)
     UBFX R0, R3, #VMSB, #1
-    B.W L(SHIFT_ROT_FLAGS)
+    B.W L(SHIFT_ROTR_FLAGS)
 
-L(SHIFT_ROT_CF_ONLY):
+/* A count that is a multiple of the width leaves the value alone, but CF is
+   still DEFINED and it is not the same bit for the two directions: ROL takes
+   the bit that arrived in bit 0, ROR the one that arrived in the MSB. Sharing
+   one epilogue gave ROL the MSB. */
+L(SHIFT_ROL_CF_ONLY):
+    AND.W R0, R3, #1
+    B.W L(SHIFT_ROT_FLAGS)
+L(SHIFT_ROR_CF_ONLY):
     UBFX R0, R3, #VMSB, #1
+/* RIGHT rotates: OF is the XOR of the TWO most significant bits of the result,
+   not MSB ^ CF. For ROR, CF *is* the MSB of the result, so the shared left-hand
+   epilogue computed MSB ^ MSB == 0 and OF was never set at all. */
+L(SHIFT_ROTR_FLAGS):
+    BFI R11, R0, #0, #1             @ CF
+    UBFX R1, R3, #VMSB, #1
+    UBFX R12, R3, #(VMSB - 1), #1
+    EOR.W R1, R1, R12
+    BFI R11, R1, #11, #1            @ OF, defined for a count of 1
+    B.W L(SHIFT_DONE)
+
+/* LEFT rotates: OF = MSB(result) ^ CF-out. */
 L(SHIFT_ROT_FLAGS):
     BFI R11, R0, #0, #1             @ CF
     UBFX R1, R3, #VMSB, #1
@@ -1593,7 +1627,7 @@ L(SHIFT_RCR):
     ORR.W R3, R3, R0
     VMASK(R3)
     MOV R0, R1
-    B.W L(SHIFT_ROT_FLAGS)
+    B.W L(SHIFT_ROTR_FLAGS)
 
 L(SHIFT_SHL):
     ANDS R5, R5, #31
@@ -1737,7 +1771,7 @@ L(SHIFT8_ROL):
     ANDS R5, R5, #31
     BEQ.W L(SHIFT8_NOFLAGS)
     AND.W R5, R5, #7
-    CBZ R5, L(SHIFT8_ROT_CF_ONLY)   @ count%8==0: value unchanged, CF = bit 7
+    CBZ R5, L(SHIFT8_ROL_CF_ONLY)   @ count%8==0: value unchanged, CF = bit 0
     RSB R12, R5, #8
     LSL.W R4, R3, R5
     LSR.W R3, R3, R12
@@ -1750,17 +1784,31 @@ L(SHIFT8_ROR):
     ANDS R5, R5, #31
     BEQ.W L(SHIFT8_NOFLAGS)
     AND.W R5, R5, #7
-    CBZ R5, L(SHIFT8_ROT_CF_ONLY)
+    CBZ R5, L(SHIFT8_ROR_CF_ONLY)
     RSB R12, R5, #8
     LSR.W R4, R3, R5
     LSL.W R3, R3, R12
     ORR.W R3, R3, R4
     UXTB R3, R3
     UBFX R0, R3, #7, #1             @ CF = the bit rotated into bit 7
-    B.N L(SHIFT8_ROT_FLAGS)
+    B.N L(SHIFT8_ROTR_FLAGS)
 
-L(SHIFT8_ROT_CF_ONLY):
+L(SHIFT8_ROL_CF_ONLY):
+    AND.W R0, R3, #1
+    B.N L(SHIFT8_ROT_FLAGS)
+L(SHIFT8_ROR_CF_ONLY):
     UBFX R0, R3, #7, #1
+/* RIGHT rotates: OF is the XOR of the two most significant bits of the RESULT.
+   The left-hand form (MSB ^ CF) is identically zero for ROR, whose CF is that
+   same MSB -- so OF was never set. See L(SHIFT_ROTR_FLAGS). */
+L(SHIFT8_ROTR_FLAGS):
+    BFI R11, R0, #0, #1
+    UBFX R1, R3, #7, #1
+    UBFX R12, R3, #6, #1
+    EOR.W R1, R1, R12
+    BFI R11, R1, #11, #1
+    B.N L(SHIFT8_DONE)
+
 L(SHIFT8_ROT_FLAGS):
     /* Rotates touch only CF and OF; SF, ZF, AF and PF are left alone. OF is
        architecturally defined for a count of 1 only, as MSB(result) ^ CF. */
@@ -1806,7 +1854,7 @@ L(SHIFT8_RCR):
     ORR.W R3, R3, R4
     UBFX R0, R3, #8, #1
     UXTB R3, R3
-    B.N L(SHIFT8_ROT_FLAGS)
+    B.N L(SHIFT8_ROTR_FLAGS)
 
 L(SHIFT8_SHL):
     ANDS R5, R5, #31
@@ -2776,6 +2824,14 @@ OP_AGNOSTIC .op_aam_D4
     MLS R3, R4, R5, R3
     STRB.W R3, [R8, #8]
     STRB.W R4, [R8, #9]
+    /* SF, ZF and PF are DEFINED for AAM and AAD and come from AL. Setting no
+       flag at all left whatever the previous instruction wrote, so a guest's
+       `aam / jz` branched on a stale ZF. CF, OF and AF are undefined and are
+       left alone. */
+    LSLS.W R0, R3, #24
+    MRS  R0, APSR
+    X86_SF_ZF R0, R1
+    X86_PF R3, R1
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_aad_D5
@@ -2790,6 +2846,10 @@ OP_AGNOSTIC .op_aad_D5
     STRB.W R3, [R8, #8]
     MOV.W R4, #0
     STRB.W R4, [R8, #9]
+    LSLS.W R0, R3, #24             @ SF/ZF/PF from AL, as for AAM above
+    MRS  R0, APSR
+    X86_SF_ZF R0, R1
+    X86_PF R3, R1
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_salc_D6
@@ -3187,7 +3247,12 @@ L(GRP3_F7_TEST):
     CODE_PTR R5
     LD_V R5, R5
     EIP_ADV_V
-    ANDS.W R3, R3, R5              @ TEST sets flags and discards the result
+    /* VTEST, not a bare ANDS: at 16-bit operand size ARM's N flag is bit 31 of
+       a value that only occupies the low half, so `test ax,imm16` reported
+       SF=0 for every negative result. Every other TEST in this file already
+       goes through VTEST/LSLS -- this one was the outlier. */
+    AND.W R3, R3, R5               @ TEST sets flags and discards the result
+    VTEST(R0, R3)
     X86_FLAGS_LOGIC R3, R0, R1
     B.W .fetch_decode_loop
 L(GRP3_F7_NOT):

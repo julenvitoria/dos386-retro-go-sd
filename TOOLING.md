@@ -64,6 +64,13 @@ is exactly how the palette stream was cleared of a channel rotation.
 `--bytes-save SYM[:N]:FILE` writes the range out for a byte compare against a
 reference. **For GUEST memory use `--guest`, never `--bytes`.**
 
+`--artifacts [DIR]` (default `build/artifacts`) copies the `.png`/`.ppm` that a
+timeline's `screenshot` events produced out of the run directory **before**
+`stop()` deletes it. gwemu resolves those paths against its own cwd, which is
+the per-run temp directory, so without this the pictures a timeline exists to
+take are written and then thrown away -- which reads exactly like gwemu
+ignoring the events.
+
 ```bash
 # the 768 DAC bytes behind the pointer, as r,g,b triples
 python3 scripts/probe.py --retrogo --wait-magic \
@@ -1003,8 +1010,33 @@ standby. Called automatically by `make retrogo_media`.
 ## Harnesses (`tests/`)
 
 ```bash
-python3 tests/test_opcodes.py            # 162 cases: EFLAGS, segmentation,
+python3 tests/test_opcodes.py            # 273 cases: EFLAGS, segmentation,
                                          # 16-bit, 66/67, interrupts, speaker
+python3 tests/test_alu_fuzz.py           # DIFFERENTIAL fuzz vs Unicorn, 16-bit
+python3 tests/test_alu_fuzz.py --cases 20000 --seed 7
+python3 tests/test_alu_fuzz.py --group grp2
+
+### `tests/test_alu_fuzz.py` — the arithmetic, graded against Unicorn
+
+`test_opcodes.py` is hand-written and therefore only covers behaviours somebody
+thought of. This generates RANDOM operands for the instructions a 16-bit program
+actually lives on -- Grp2 shifts/rotates in all three count forms, Grp3
+MUL/IMUL/DIV/IDIV/NEG/NOT/TEST, the ADC/SBB carry chain, INC/DEC, CBW/CWD,
+AAM/AAD, SHLD/SHRD -- runs each one instruction under our core and under
+Unicorn, and diffs the eight registers and the DEFINED flags.
+
+Flags x86 leaves undefined are not compared (AF after shifts/rotates/logic and
+MUL/DIV, OF after a multi-bit shift), and an opcode with no handler is reported
+as a GAP (`exit_reason=UNIMPLEMENTED`, currently SHLD/SHRD) rather than graded
+as a wrong answer -- otherwise one real bug drowns in forty known holes. The
+seed is fixed and printed, so a failure is reproducible.
+
+**It found the Wolfenstein 3-D defect four hand-written INC/DEC cases had
+walked past**: `INC r16`/`DEC r16` (0x40-0x4F) took SF, ZF and OF off bit 31 of
+an un-normalized 32-bit add. It also caught `TEST Ev,Iv` at 16 bits, AAM/AAD
+setting no flags at all, and ROR/RCR computing OF as `MSB ^ MSB` (identically
+zero). Needs `pip install unicorn`; it SKIPs cleanly without it.
+
 python3 tests/test_benchmark.py
 python3 tests/test_game.py
 python3 tests/test_dos.py                # MCB arena, walked from the host, plus

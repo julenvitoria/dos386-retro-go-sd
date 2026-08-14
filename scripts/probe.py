@@ -141,6 +141,11 @@ def main():
                    help="decode the coalesced port-I/O ring (x86_io_log)")
     p.add_argument("--faults", action="store_true",
                    help="also dump ARMv7-M fault/exception state")
+    p.add_argument("--artifacts", nargs="?", const="build/artifacts",
+                   default=None, metavar="DIR",
+                   help="copy the .png/.ppm a timeline's `screenshot` events "
+                        "wrote out of the run directory before it is deleted "
+                        "(default build/artifacts)")
     p.add_argument("--samples", type=int, default=10)
     p.add_argument("--interval", type=float, default=1.0)
     p.add_argument("--wait-magic", action="store_true",
@@ -270,6 +275,16 @@ def main():
             read_faults(target.backend, symbol_maps=maps)
             target.backend.resume()
     finally:
+        # BEFORE stop(): the run directory is deleted there, and a timeline's
+        # `screenshot` events write into it (gwemu resolves those paths against
+        # its own cwd). Without this the pictures a timeline was written to
+        # take are produced and then thrown away -- which reads exactly like
+        # gwemu ignoring the events.
+        if args.artifacts and hasattr(target, "collect_artifacts"):
+            try:
+                target.collect_artifacts(args.artifacts)
+            except Exception as exc:                       # noqa: BLE001
+                print(f"collecting artifacts failed: {exc}")
         target.stop()
     return 0
 
