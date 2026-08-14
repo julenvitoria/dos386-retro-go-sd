@@ -43,6 +43,7 @@
 #include "x86_video_planar.h"
 #include "x86_pager.h"
 #include "x86_xms.h"
+#include "x86_ems.h"
 
 /* Chrom-ART offload for the chained 13h blit. DEFAULT OFF and UNVERIFIED --
    the whole rationale, the price and what tier 2 can and cannot prove are on
@@ -1528,6 +1529,18 @@ static void guest_reset(void)
      */
     x86_pager_reset();
     x86_pager_own(0, GUEST_RAM_SIZE / 4096u);
+    /*
+     * The SECOND window: EMS's logical pages, at linear 4 MB.
+     *
+     * They have to be pager pages rather than a byte range of the file the way
+     * XMS is, because an EMS page mapped into the page frame is read by
+     * ORDINARY GUEST INSTRUCTIONS and therefore has to be able to occupy a
+     * frame (x86_ems.h). No real-mode segment:offset can name linear 4 MB --
+     * FFFF:FFFF is 0x10FFEF -- so nothing but x86_ems.c ever reaches it, and
+     * its pagefile slots (4 MB..5 MB of x86page.swp) sit below the XMS store at
+     * 8 MB by the same arithmetic that keeps XMS off the pager's slots.
+     */
+    x86_pager_own_aux(X86_EMS_BACK_PAGE, X86_EMS_BACK_PAGES);
     if (guest_ram)
         /* POOL BYTES, not guest bytes. A frame is 4,104 bytes now -- 4,096 of
            guest space plus the eight the seam writes into (x86_pager.h). Handing
@@ -1604,6 +1617,22 @@ static void guest_reset(void)
         x86_map_fixed(0xFF000u, bios_id_page, 4096u);
     }
     x86_bios_rom_install();
+
+    /*
+     * EMS, and it is set up HERE rather than beside XMS above for one reason:
+     * it CHECKS that its page frame is free before it claims it, and the upper
+     * megabyte is not mapped until the block just above. Moving this call back
+     * up would make the check read sixteen FOLD_INVALID entries and refuse the
+     * interface on a machine where the frame is perfectly free.
+     *
+     * The size is honest the same way X86_XMS_DEFAULT_KB is: EMS pages are
+     * pager pages, and with no pagefile the pager cannot evict, so every page
+     * EMS handed out would have to stay resident forever out of a 160-frame
+     * pool. So no pagefile means ZERO pages, which means EMMXXXX0 does not
+     * open and the INT 67h vector is left on the bare IRET -- absent, rather
+     * than present and about to lose the guest's memory.
+     */
+    x86_ems_set_backing(pgf_ready ? X86_EMS_PAGES : 0u);
 
     /* Everything above 1 MB wraps to the bottom, as it does with A20 masked. */
     x86_mem_wrap_1mb();

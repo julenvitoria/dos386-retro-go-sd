@@ -20,6 +20,7 @@
 #include "x86_cpu.h"
 #include "x86_probe.h"
 #include "x86_xms.h"
+#include "x86_ems.h"
 #include "font8x8.h"
 
 /* Guest register accessors. The 8086 register file is 16-bit halves of the
@@ -115,6 +116,25 @@ _Static_assert(X86_XMS_ENTRY_SEG == STUB_SEG,
                "the XMS entry point must be in the HLE stub block");
 _Static_assert(X86_XMS_ENTRY_OFF + 4u <= IRET_OFF,
                "the XMS entry stub must sit below the bare IRET");
+
+/*
+ * EMS shares the same block, and it needs TWO things in it rather than one: a
+ * DOS device header whose name field a title reads at offset 0x0A of the INT
+ * 67h vector's SEGMENT, and the stub the vector points at. x86_ems.h lays the
+ * whole block out; what is asserted here is that neither runs into the vector
+ * stubs below it or the XMS entry above it, because both ends are compile-time
+ * constants and a test could only catch this after it shipped.
+ *
+ * x86_ems.c plants them, not x86_hle_install(), and only when EMS is real --
+ * the header IS the detection, so planting it unconditionally would advertise
+ * an expanded-memory manager with nothing behind it.
+ */
+_Static_assert(X86_EMS_HDR_LIN >= (STUB_SEG << 4) + 64u,
+               "the EMS device header must sit above the vector stubs");
+_Static_assert(X86_EMS_ENTRY_LIN + 4u <= (STUB_SEG << 4) + X86_XMS_ENTRY_OFF,
+               "the EMS entry stub must sit below the XMS control entry");
+_Static_assert(X86_EMS_HDR_LIN + 0x12u <= X86_EMS_ENTRY_LIN,
+               "the EMS device header must not overlap its own stub");
 
 /* Where a PC keeps its ROM identification. A system tool reads these directly
    rather than asking, so they have to exist as memory. */
@@ -270,6 +290,11 @@ int x86_hle_dispatch(uint8_t vector)
            exactly what the bare IRET this replaces did. Do not widen this arm
            without deciding what "absent" means for the subfunction you add. */
         return x86_xms_int2f();
+    case 0x67:
+        /* Expanded memory. Reached through the stub at 0064:0020, which the
+           IVT points at only while EMS has backing -- so this arm is not
+           reachable at all on a machine with no pagefile. */
+        return x86_ems_int67();
     case X86_HLE_SEL_XMS:
         /* Not a vector: the XMS control function, entered by CALL FAR through
            the stub at 0060:00C0. Its stub ends RETF, so nothing here may touch

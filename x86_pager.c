@@ -106,6 +106,7 @@ static x86_pg_read_fn  backing_read;
 static x86_pg_write_fn backing_write;
 
 static uint32_t own_first, own_count;
+static uint32_t aux_first, aux_count;   /* the second window; see x86_pager.h */
 
 /* The clock hand. One index, not a list: see the policy note in x86_pager.h. */
 static uint32_t victim_hand;
@@ -138,6 +139,7 @@ void x86_pager_reset(void)
     memset(extents, 0, sizeof(extents));
     extent_count = frame_count = free_count = 0;
     own_first = own_count = 0;
+    aux_first = aux_count = 0;
     victim_hand = 0;
     donated_base = NULL;
     donated_frames = donated_lo = 0;
@@ -194,6 +196,12 @@ void x86_pager_own(uint32_t first_page, uint32_t count)
     own_count = count;
 }
 
+void x86_pager_own_aux(uint32_t first_page, uint32_t count)
+{
+    aux_first = first_page;
+    aux_count = count;
+}
+
 void x86_pager_set_nor(const void *base, uint32_t bytes, uint32_t first_page)
 {
     nor_base  = (const uint8_t *)base;
@@ -213,8 +221,11 @@ void x86_pager_set_nor(const void *base, uint32_t bytes, uint32_t first_page)
 
 static int owns(uint32_t page)
 {
-    return pg_flags && own_count && page >= own_first
-           && page < own_first + own_count && page < X86_PG_PAGES;
+    if (!pg_flags || page >= X86_PG_PAGES)
+        return 0;
+    if (own_count && page >= own_first && page < own_first + own_count)
+        return 1;
+    return aux_count && page >= aux_first && page < aux_first + aux_count;
 }
 
 /*

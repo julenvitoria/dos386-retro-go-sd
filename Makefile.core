@@ -29,6 +29,7 @@ x86_osk.c \
 x86_hle.c \
 x86_bios.c \
 x86_dos.c \
+x86_ems.c \
 lib/FatFs/ff.c \
 lib/FatFs/ffunicode.c \
 x86_disk.c \

@@ -18,7 +18,8 @@
 
 #include "cutils.h"
 #include "x86_cpu.h"
-#include "x86_pager.h"          /* X86_PG_SIZE -- the granule XMS moves split on */
+#include "x86_pager.h"       /* X86_PG_SIZE -- the granule XMS moves split on */
+#include "x86_ems.h"          /* x86_ems_present() -- gates the EMMXXXX0 open */
 #include "lib/FatFs/ff.h"
 
 #define SEG(x)          ((uint32_t)(x) << 4)
@@ -392,7 +393,7 @@ static FIL *handle_get(uint16_t h)
  * program printing through the handle API got an "invalid handle" error for
  * every line it wrote.
  */
-enum { DOS_DEV_NONE = 0, DOS_DEV_CON, DOS_DEV_NUL };
+enum { DOS_DEV_NONE = 0, DOS_DEV_CON, DOS_DEV_NUL, DOS_DEV_EMS };
 #define DOS_DEV_HANDLE(d)  ((uint16_t)(0x00F0 + (d)))
 
 /* The name of the last file the guest asked us to create or open, for
@@ -417,6 +418,29 @@ static int dos_name_is_device(const char *p)
     }
     n[i] = 0;
 
+    /* EMMXXXX0 -- the expanded-memory manager, and the ONE device name here
+       that is eight characters rather than four, so it is compared against the
+       whole stem before the truncated form below.
+
+       It is a device only while EMS actually has backing. Answering the open
+       with no expanded memory behind it is the exact failure x86_ems.h refuses:
+       a title that gets a handle stops looking for another manager and then
+       dies at its first INT 67h. With no backing the name falls through to
+       FatFs, which cannot find it, and the guest gets CF=1/AX=2 -- "no such
+       file", which is what "no driver" has always looked like here. */
+    {
+        char full[9];
+        unsigned k = 0;
+        while (k < 8 && s[k] && s[k] != ':' && s[k] != '.') {
+            char c = s[k];
+            full[k] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+            k++;
+        }
+        full[k] = 0;
+        if (k == 8 && !strcmp(full, "EMMXXXX0"))
+            return x86_ems_present() ? DOS_DEV_EMS : DOS_DEV_NONE;
+    }
+
     if (!strcmp(n, "CON"))
         return DOS_DEV_CON;
     if (!strcmp(n, "NUL") || !strcmp(n, "PRN") || !strcmp(n, "AUX") ||
@@ -435,6 +459,8 @@ static int dos_handle_device(uint16_t h)
         return DOS_DEV_CON;
     if (h == DOS_DEV_HANDLE(DOS_DEV_NUL))
         return DOS_DEV_NUL;
+    if (h == DOS_DEV_HANDLE(DOS_DEV_EMS))
+        return DOS_DEV_EMS;        /* opened only to be closed; see above */
     return DOS_DEV_NONE;
 }
 
@@ -1140,6 +1166,8 @@ static int dos_int21_dispatch(uint8_t func)
         dos_log_path(path);
         int dev = dos_name_is_device(path);
         if (dev) {
+            if (dev == DOS_DEV_EMS)
+                x86_ems_device_opens++;
             x86_set_ax(DOS_DEV_HANDLE(dev));
             ok_clear_cf();
             return 1;
@@ -1167,7 +1195,14 @@ static int dos_int21_dispatch(uint8_t func)
            is one of our FatFs handles, i.e. a file on drive A. */
         switch ((uint8_t)(r[0] & 0xFF)) {
         case 0x00:
-            if (dos_handle_device(bx))
+            /* EMMXXXX0 is a character device but it is NOT the console: it is
+               neither stdin nor stdout, and a program that believed it was
+               would write its output into the memory manager. 0x80C0 is a
+               plain character device with the EOF and "not a disk file" bits,
+               which is what a real EMM's header attribute translates to. */
+            if (dos_handle_device(bx) == DOS_DEV_EMS)
+                x86_set_dx(0x80C0);
+            else if (dos_handle_device(bx))
                 x86_set_dx(0x80D3);
             else if (handle_get(bx))
                 x86_set_dx(0x0000);             /* file, drive A, not a device */
