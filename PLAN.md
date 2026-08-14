@@ -101,5 +101,7 @@ Evidence in `STATUS.md`; the verdicts, so they are not re-opened by guess:
 
 **Not scheduled, but live:** the planar store path roughly halves the
 interpreter for graphics titles (Wolf3D ~1.4 M ips in Mode Y against ~3.0 M in
-text). Mode Y still paints mid-draw frames in gameplay
-(`x86_modey_mid_draw`). Both are bigger than most of the above.
+text). Mode Y still paints mid-draw frames (`x86_modey_mid_draw`). VBE 320x240
+(`DOS_MODE_VBE240` in the prior port) is the only mode that fills the panel and
+reduces the blit to one memcpy — not ported. All three are bigger than most of
+the list above.
