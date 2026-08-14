@@ -183,6 +183,28 @@ static void cga_mode6_blit(uint8_t *dst, uint32_t stride);
 static void vga13_blit(uint8_t *dst, uint32_t stride);
 static void blit_ega16(uint8_t *dst, uint32_t stride);
 static void text_render_wide(uint8_t *dst, uint32_t stride);
+
+/*
+ * OPTIONAL 2-D ENGINE OFFLOAD FOR THE CHAINED 13h BLIT.
+ *
+ * This is a HOOK and not a call into the firmware, for two reasons. The core is
+ * a loadable plugin -- it may not link the HAL, so only src/main.c can reach
+ * dma2d_ctl() through the ABI -- and tests/test_video.py builds this file for
+ * the host, where there is no engine and the hook stays NULL. A NULL hook is
+ * the shipping default and costs the chained path one load and one compare
+ * against a 64,000-byte copy.
+ *
+ * The contract is narrow ON PURPOSE. The hook is offered ONE contiguous run of
+ * bytes, and only when the destination rows are contiguous too (stride ==
+ * width). That is exactly the precondition the firmware's M2M op imposes -- it
+ * hardcodes InputOffset = OutputOffset = 0 (references/game-and-watch-retro-go-
+ * sd/Core/Src/retro-go/gw_firmware_abi.c:95,104) -- so a non-320 stride falls
+ * back to the row loop instead of silently shearing the picture.
+ *
+ * Returns 0 if it took the copy (the caller must not touch dst until it has
+ * synchronised), nonzero to mean "not taken, do it yourself".
+ */
+int (*x86_video_blit_hook)(uint8_t *dst, const uint8_t *src, uint32_t bytes);
 #if X86_TEXT_AA
 static void text_alloc_palette(void);
 #endif
@@ -803,6 +825,12 @@ static void vga13_blit(uint8_t *dst, uint32_t stride)
         /* CHAINED 13h, BYTE FOR BYTE WHAT IT ALWAYS WAS. The unchained work
            below must not cost this path a single instruction: it is the mode
            most titles use and the reason 13h was buildable here at all. */
+        /* One contiguous 64,000-byte run, so a 2-D engine can take it whole --
+           but ONLY at the panel stride, where dst rows abut. See the hook. */
+        if (x86_video_blit_hook && stride == X86_VGA13_WIDTH
+            && x86_video_blit_hook(dst, src,
+                                   X86_VGA13_WIDTH * X86_VGA13_HEIGHT) == 0)
+            return;
         for (unsigned y = 0; y < X86_VGA13_HEIGHT; y++)
             memcpy(dst + y * stride, src + y * X86_VGA13_WIDTH, X86_VGA13_WIDTH);
         return;

@@ -710,6 +710,43 @@ the unpacker — disk-heavy, not a steady state), `topbench-menu` (CGA text, a
 database read, an INT 16h poll loop), `topbench-score` (`-l`, `--settle 0`
 because it halts on `INSB` a few seconds in).
 
+#### `X86_VIDEO_DMA2D=1` — Chrom-ART for the chained 13h blit (OFF, UNVERIFIED)
+
+```
+make -f Makefile.core pack X86_VIDEO_DMA2D=1
+```
+
+Not an instrument: an optimisation that **cannot be validated below tier 3**,
+kept behind a flag for exactly that reason. It hands the chained mode 13h
+identity copy (64,000 bytes) to DMA2D through the ABI's
+`GW_DMA2D_M2M_RGB565_START`, declaring two L8 pixels as one RGB565 pixel — the
+engine's M2M mode moves raw bytes and converts nothing. The case for it is that
+the LCD framebuffer is mapped **strongly-ordered** by the firmware's MPU
+(`references/game-and-watch-retro-go-sd/Core/Src/main.c:1358-1366`: TEX0,
+non-cacheable, **non-bufferable**), so the CPU's copy is 16,000 serialised bus
+round trips while the engine is a second AXI master that pays none of that. The
+reasoning, the price and the tearing hazard are on `dma2d_blit_hook()` in
+`src/main.c`.
+
+Host-visible counters: `x86_dma2d_selftest` (0 not run, 1 pass, 2 START
+refused, 3 bytes wrong), `x86_dma2d_blits`, `x86_dma2d_waits`,
+`x86_dma2d_fallback`.
+
+**What tier 2 can and cannot say.** gwemu models DMA2D
+(`references/gwemu/hw/display/gnw_h7b0_dma2d.c`) but runs the transfer
+*synchronously* (`:307`), so a missing or misplaced wait is invisible there and
+would tear on silicon. Worse, **no workload in this tree holds a chained 13h
+screen**: measured with the counters, WOLF3D is in Mode Y within one second and
+PRINCE_OF_PERSIA never leaves text, so `x86_dma2d_blits` stays 0 and an A/B of
+the picture exercises only the fallback. That is why `dma2d_selftest()` exists —
+one 64-byte transfer at init that proves the ABI call, the encoding, the poll
+and the cache maintenance on any target. It reads 1 under gwemu.
+
+```
+python3 scripts/probe.py --retrogo --timeline timelines/start-preselected-game.tl \
+    --watch x86_dma2d_selftest,x86_dma2d_blits,x86_dma2d_fallback
+```
+
 #### The zones, and what each one contains
 
 `X86_ZONES=1`, off by default like every other instrument. The design, the

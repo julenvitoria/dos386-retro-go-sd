@@ -78,7 +78,17 @@ X86_ZONES ?= 0
 # builds with it and prints the measured link delta in every report.
 X86_PROBE ?= 0
 
+# Chrom-ART (DMA2D) offload of the chained mode 13h blit, through the firmware
+# ABI's RGB565 M2M op. OFF by default and it is NOT an instrument -- it is an
+# UNVERIFIABLE optimisation: gwemu models the engine well enough to prove the
+# pixels but runs the transfer synchronously, so neither the timing nor the
+# placement of the wait can be checked below tier 3. The rationale, the price
+# and the strongly-ordered-framebuffer measurement it rests on are in src/main.c
+# on dma2d_blit_hook(). Build with X86_VIDEO_DMA2D=1 to A/B it on hardware.
+X86_VIDEO_DMA2D ?= 0
+
 CORE_C_DEFS := \
+-DX86_VIDEO_DMA2D=$(X86_VIDEO_DMA2D) \
 -DX86_PROFILE=$(X86_PROFILE) \
 -DX86_ZONES=$(X86_ZONES) \
 -DX86_PROBE=$(X86_PROBE) \

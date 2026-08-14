@@ -43,6 +43,17 @@
 #include "x86_video_planar.h"
 #include "x86_pager.h"
 
+/* Chrom-ART offload for the chained 13h blit. DEFAULT OFF and UNVERIFIED --
+   the whole rationale, the price and what tier 2 can and cannot prove are on
+   dma2d_blit_hook() further down. */
+#ifndef X86_VIDEO_DMA2D
+#define X86_VIDEO_DMA2D 0
+#endif
+#if X86_VIDEO_DMA2D
+static int dma2d_blit_hook(uint8_t *dst, const uint8_t *src, uint32_t bytes);
+static void dma2d_selftest(void);
+#endif
+
 #define APP_ID       100
 
 /* Output rate, and the half-buffer that goes with it.
@@ -752,6 +763,14 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
        page-aligned because bonus_layout() derived them from the pool's real
        base rather than from a compile-time offset -- which is what recovers
        the page a 2048-aligned base would otherwise cost. */
+#if X86_VIDEO_DMA2D
+    /* Offered, not imposed: the hook itself refuses anything it cannot encode
+       and vga13_blit falls back to the row loop, so an ABI or a peripheral that
+       will not start costs one branch a frame rather than a black screen. */
+    x86_video_blit_hook = dma2d_blit_hook;
+    dma2d_selftest();
+#endif
+
     bonus_layout(bonus, (uint32_t)bonus_sz);
     x86_arena_reset();
     if (bonus && bonus_arena_bytes)
@@ -1545,12 +1564,18 @@ static bool nor_snap_cb(odroid_dialog_choice_t *option,
  * game picture back underneath, so render into the active buffer and do not
  * swap -- the menu owns the swap.
  */
+static void dma2d_sync(void);       /* defined with the hook, below */
+
 static void core_repaint(void)
 {
     const gw_firmware_abi_t *abi = gw_firmware_abi();
     uint8_t *fb = (uint8_t *)abi->lcd_ctl(GW_LCD_BUFFER, GW_LCD_BUF_ACTIVE, 0, 0);
     if (fb) {
         x86_video_render(fb, FRAME_W);
+        /* We are inside the retro-go overlay here, which is also the ONLY other
+           user of DMA2D on this device (the JPEG cover-art path). Never leave a
+           transfer in flight across the return into it. */
+        dma2d_sync();
         /* The OSK coexists with retro-go's overlay rather than fighting it:
            the overlay draws ON TOP of whatever we leave in the active buffer
            and asks us for the picture back underneath, so the keyboard is part
@@ -1605,6 +1630,180 @@ volatile uint32_t x86_modey_presents;   /* host-visible: flips actually painted 
  * two buffers disagreeing and the swap showing each in turn. The flip path
  * always painted both; the frame loop's fallback painted one, which is the bug.
  */
+/* ---------------------------------------------------------------------------
+ * CHROM-ART (DMA2D) FOR THE CHAINED 13h BLIT.  DEFAULT OFF -- UNVERIFIED.
+ *
+ * WHY THIS IS WORTH ANYTHING AT ALL, AND IT IS NOT THE WORD "PARALLEL".
+ *
+ * The LCD framebuffer is mapped by the firmware's MPU regions 3-6 as TEX level
+ * 0, NOT cacheable, NOT bufferable (references/game-and-watch-retro-go-sd/
+ * Core/Src/main.c:1358-1366). On ARMv7-M that encoding -- TEX=000, C=0, B=0 --
+ * is STRONGLY-ORDERED memory: no line fills, no write merging, and no store
+ * buffer, so every store the blit issues stalls until AXI SRAM acknowledges it.
+ * The 64,000-byte identity copy is therefore not a memcpy at memcpy speed; it
+ * is 16,000 serialised round trips to the bus. That is why the `video` zone
+ * reads 0.32-0.51% under gwemu (STATUS.md:404) and cannot possibly read that on
+ * silicon: gwemu charges one cycle for a strongly-ordered store.
+ *
+ * DMA2D is a separate AXI master. It does not care that the destination is
+ * strongly-ordered -- that attribute is the CPU's view through the MPU, not a
+ * property of the memory -- so the same 64,000 bytes move at engine speed. The
+ * saving is the SUBSTITUTION, and it is roughly an order of magnitude. The
+ * overlap with the audio refill below is worth a few microseconds and is taken
+ * because it is free, but it is NOT the reason this exists. If the wait had to
+ * happen immediately the change would still pay; if the framebuffer were merely
+ * Normal-non-cacheable instead of strongly-ordered, it largely would not.
+ *
+ * WHAT IS AND IS NOT VERIFIED. gwemu models DMA2D (references/gwemu/hw/display/
+ * gnw_h7b0_dma2d.c) and its M2M path is a raw byte move with the foreground
+ * bpp, OPFCCR ignored, exactly as the reference manual says (:415-434) -- so
+ * tier 2 can prove the PIXELS. It runs the transfer SYNCHRONOUSLY (:307), so
+ * tier 2 can prove neither the timing nor that the wait below is correctly
+ * placed: a missing poll would tear on silicon and be invisible under gwemu.
+ * And CLAUDE.md's rule applies in full -- peripheral setup is not modelled.
+ * Hence default 0. Flip it to 1 to measure on hardware; nothing else changes.
+ *
+ * RGB565 IS A LIE WE ARE ALLOWED TO TELL. The firmware's op hardcodes RGB565
+ * in and out (gw_firmware_abi.c:95,104) and DMA2D has no L8 OUTPUT format at
+ * all (sdk/include/Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_dma2d.h:
+ * 222-226). But DMA2D_M2M does no conversion -- it moves bytes -- so two L8
+ * pixels are declared as one RGB565 pixel and 320x200 L8 becomes 160x200. This
+ * only works because both offsets are hardcoded 0, which is only correct when
+ * the rows abut; the hook contract in x86_video.c enforces that.
+ */
+#if X86_VIDEO_DMA2D
+/* Same raw-SCS idiom as DWT_CYCCNT above: the core does not link CMSIS. */
+#define SCB_DCCMVAC     (*(volatile uint32_t *)0xE000EF68)
+
+volatile uint32_t x86_dma2d_blits;     /* host-visible: transfers started */
+volatile uint32_t x86_dma2d_fallback;  /* host-visible: START refused     */
+volatile uint32_t x86_dma2d_waits;     /* host-visible: polls that waited */
+static int dma2d_pending;
+
+/*
+ * The aperture is CACHEABLE write-back -- the bonus pool above the framebuffer
+ * footprint is left Normal cacheable on purpose (main.c:734-740, and the
+ * firmware's own comment at Core/Src/main.c:1378-1380). The guest wrote those
+ * pixels through the D-cache, so an engine reading AXI directly sees STALE
+ * bytes unless they are cleaned out first. Clean, not clean-and-invalidate:
+ * invalidating would throw away the guest's own working set for nothing.
+ */
+static void dcache_clean_range(const void *p, uint32_t bytes)
+{
+    uint32_t a = (uint32_t)(uintptr_t)p & ~31u;
+    uint32_t end = (uint32_t)(uintptr_t)p + bytes;
+    __asm volatile ("dsb 0xF" ::: "memory");
+    for (; a < end; a += 32u)
+        SCB_DCCMVAC = a;
+    __asm volatile ("dsb 0xF" ::: "memory");
+}
+
+static int dma2d_blit_hook(uint8_t *dst, const uint8_t *src, uint32_t bytes)
+{
+    /* Two L8 pixels per declared RGB565 pixel, so an odd width has no honest
+       encoding. It cannot happen at 320, but the fallback is one branch. */
+    if (dma2d_pending || (bytes % (2u * X86_VGA13_HEIGHT)) != 0)
+        return -1;
+    /* DMA2D fetches halfwords here; both ends must be even. The aperture is
+       page-aligned and the framebuffer row offset is 20*320, but assert it
+       rather than inherit it. */
+    if ((((uint32_t)(uintptr_t)dst | (uint32_t)(uintptr_t)src) & 1u) != 0)
+        return -1;
+
+    dcache_clean_range(src, bytes);
+
+    uint32_t px = bytes / (2u * X86_VGA13_HEIGHT);   /* 160 */
+    if (gw_firmware_abi()->dma2d_ctl(GW_DMA2D_M2M_RGB565_START,
+                                     (uint32_t)(uintptr_t)src,
+                                     (uint32_t)(uintptr_t)dst,
+                                     (px << 16) | X86_VGA13_HEIGHT) != 0) {
+        x86_dma2d_fallback++;
+        return -1;                       /* caller does the row loop instead */
+    }
+    dma2d_pending = 1;
+    x86_dma2d_blits++;
+    return 0;
+}
+
+/*
+ * NOTHING may read or write the framebuffer between the start above and this.
+ * The engine owns those 64,000 bytes until it says otherwise, and the SWAP is
+ * the hard deadline: presenting a buffer with a transfer still in it is the
+ * mid-draw artefact docs/08 spent four rounds removing, arriving by a new road.
+ *
+ * The timeout is not belt and braces either. gwemu completes synchronously, so
+ * this returns immediately there and the bound is only ever load-bearing on
+ * silicon -- where a wedged engine must cost one frame, not the machine.
+ */
+static void dma2d_sync(void)
+{
+    if (!dma2d_pending)
+        return;
+    dma2d_pending = 0;
+    x86_dma2d_waits++;
+    (void)gw_firmware_abi()->dma2d_ctl(GW_DMA2D_POLL, 20u, 0, 0);
+}
+
+/*
+ * ONE 64-BYTE TRANSFER AT INIT, BECAUSE THE REAL ONE IS NOT REACHABLE TO TEST.
+ *
+ * Measured, not assumed: with this built and the counters watched under gwemu,
+ * WOLF3D reaches Mode Y within one second (x86_modey_presents=2 at t+1.0s) and
+ * PRINCE_OF_PERSIA never leaves text (x86_video_mode_byte=0x0F03), so
+ * x86_dma2d_blits stayed 0 for the whole window on both. There is no workload
+ * in this tree that puts a CHAINED 13h screen up long enough to sample, which
+ * means an A/B of the rendered picture proves only that the FALLBACK still
+ * works -- it never exercised the engine at all.
+ *
+ * So the wiring gets its own witness. This proves the ABI call is reachable,
+ * that START accepts the two-L8-pixels-as-one-RGB565 encoding, that POLL
+ * returns, and that the bytes actually move -- on gwemu AND on silicon, with no
+ * guest and no video mode involved. It does NOT prove the timing, and it does
+ * not prove the wait below is placed correctly against the swap; nothing short
+ * of hardware can. x86_dma2d_selftest: 0 = not run, 1 = pass, 2 = START
+ * refused, 3 = bytes wrong.
+ */
+volatile uint32_t x86_dma2d_selftest;
+static uint8_t dma2d_st_src[64];
+static uint8_t dma2d_st_dst[64];
+
+static void dma2d_selftest(void)
+{
+    for (unsigned i = 0; i < sizeof dma2d_st_src; i++) {
+        dma2d_st_src[i] = (uint8_t)(i * 7u + 1u);
+        dma2d_st_dst[i] = 0;
+    }
+    dcache_clean_range(dma2d_st_src, sizeof dma2d_st_src);
+    if (gw_firmware_abi()->dma2d_ctl(GW_DMA2D_M2M_RGB565_START,
+                                     (uint32_t)(uintptr_t)dma2d_st_src,
+                                     (uint32_t)(uintptr_t)dma2d_st_dst,
+                                     (32u << 16) | 1u) != 0) {
+        x86_dma2d_selftest = 2;
+        return;
+    }
+    (void)gw_firmware_abi()->dma2d_ctl(GW_DMA2D_POLL, 20u, 0, 0);
+    /* The engine wrote AXI behind the D-cache, so this core's view of the
+       destination is stale until it is invalidated. DCIMVAC, same raw-SCS
+       idiom; the buffer is ours and was never dirty, so nothing is lost. */
+    {
+        uint32_t a = (uint32_t)(uintptr_t)dma2d_st_dst & ~31u;
+        uint32_t end = (uint32_t)(uintptr_t)dma2d_st_dst + sizeof dma2d_st_dst;
+        __asm volatile ("dsb 0xF" ::: "memory");
+        for (; a < end; a += 32u)
+            *(volatile uint32_t *)0xE000EF5C = a;      /* SCB->DCIMVAC */
+        __asm volatile ("dsb 0xF" ::: "memory");
+    }
+    for (unsigned i = 0; i < sizeof dma2d_st_src; i++)
+        if (dma2d_st_dst[i] != dma2d_st_src[i]) {
+            x86_dma2d_selftest = 3;
+            return;
+        }
+    x86_dma2d_selftest = 1;
+}
+#else
+static void dma2d_sync(void) { }
+#endif
+
 static void modey_paint_both(const gw_firmware_abi_t *abi)
 {
     for (unsigned which = 0; which < 2; which++) {
@@ -1614,6 +1813,9 @@ static void modey_paint_both(const gw_firmware_abi_t *abi)
         if (!fb)
             continue;
         x86_video_render(fb, FRAME_W);
+        /* Unchained only, so the hook cannot have fired -- but a mode change
+           between the two paints is the guest's to make, not ours to assume. */
+        dma2d_sync();
         x86_osk_draw(fb, FRAME_W);
     }
 }
@@ -2094,6 +2296,13 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                     x86_video_modey_presented(0);
                 } else {
                     x86_video_render(fb, FRAME_W);
+                    /* x86_osk_draw() writes the framebuffer even with the
+                       keyboard closed -- the toast band -- so this cannot be
+                       conditioned on x86_osk_visible(). Correctness over the
+                       few microseconds of overlap that would buy: the win here
+                       is the SUBSTITUTION, not the parallelism (see the block
+                       on dma2d_blit_hook). */
+                    dma2d_sync();
                     x86_osk_draw(fb, FRAME_W);
                 }
             }
