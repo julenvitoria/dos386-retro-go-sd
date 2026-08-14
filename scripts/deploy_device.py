@@ -48,6 +48,19 @@ def main():
                    help="push only the core; leave internal flash alone")
     p.add_argument("--no-core", action="store_true",
                    help="flash only the firmware; leave the SD card alone")
+    p.add_argument("--preselect", metavar="ROM.dsk",
+                   help="TEMPORARILY point /CONFIG at this ROM so a timeline "
+                        "can be replayed from reset. The existing /CONFIG is "
+                        "saved to build/CONFIG.device-backup FIRST; put it "
+                        "back with --restore-config. Implies --no-firmware "
+                        "and --no-core unless those are given.")
+    p.add_argument("--restore-config", action="store_true",
+                   help="write build/CONFIG.device-backup back to /CONFIG")
+    p.add_argument("--oc-level", type=int, default=None, choices=[0, 1, 2, 3],
+                   help="overclock level for --preselect. Omit to reuse the "
+                        "level already in the device's /CONFIG, which is the "
+                        "point of the backup -- a compose otherwise RESETS a "
+                        "level set through the launcher UI")
     args = p.parse_args()
 
     intflash = os.path.join(args.firmware_dir, "gw_retro_go_intflash.bin")
@@ -59,6 +72,11 @@ def main():
     from gnwmanager.gnw import GnW
     from gnwmanager.ocdbackend.openocd_backend import OpenOCDBackend
     from scripts.common.sdcard import HardwareProbeSDCardManager
+
+    if args.preselect or args.restore_config:
+        # Config surgery only; do not also reflash unless explicitly asked.
+        if not any([args.no_firmware, args.no_core]):
+            args.no_firmware = args.no_core = True
 
     backend = OpenOCDBackend()
     backend.open()
@@ -84,7 +102,43 @@ def main():
         mgr = HardwareProbeSDCardManager(gnw)
         mgr.push_file(args.core, f"cores/{args.core_name}.bin")
 
-    print("done. /CONFIG, /roms and sd_content were NOT touched.")
+    BACKUP = "build/CONFIG.device-backup"
+
+    if args.preselect:
+        from scripts.common.retrogo_config import build as build_config, rom_path
+        # BACK UP FIRST, ALWAYS. /CONFIG carries the owner's preselected title
+        # and overclock level; regenerating it without a copy silently discards
+        # settings made through the launcher UI and there is no way back.
+        try:
+            existing = gnw.sd_read_file("/CONFIG")
+        except Exception as e:
+            sys.exit(f"could not read /CONFIG to back it up ({e}) -- refusing "
+                     f"to overwrite it blind")
+        os.makedirs("build", exist_ok=True)
+        with open(BACKUP, "wb") as fh:
+            fh.write(existing)
+        print(f"saved existing /CONFIG ({len(existing)} B) -> {BACKUP}")
+
+        oc = args.oc_level if args.oc_level is not None else 0
+        if args.oc_level is None:
+            print("NOTE: reusing overclock level 0; pass --oc-level to match "
+                  "what the launcher had, and --restore-config puts the "
+                  "original back verbatim either way")
+        startup = rom_path("dos", os.path.basename(args.preselect))
+        gnw.sd_write_file("/CONFIG", build_config(startup_file=startup,
+                                                  menu_timeout_s=0,
+                                                  cpu_oc_level=oc))
+        print(f"/CONFIG now preselects {startup}")
+
+    if args.restore_config:
+        if not os.path.exists(BACKUP):
+            sys.exit(f"no {BACKUP} to restore")
+        with open(BACKUP, "rb") as fh:
+            data = fh.read()
+        gnw.sd_write_file("/CONFIG", data)
+        print(f"restored /CONFIG from {BACKUP} ({len(data)} B)")
+
+    print("done. /roms and sd_content were NOT touched.")
     print("Power-cycle or reset the device to boot the new firmware.")
     return 0
 
