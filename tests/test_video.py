@@ -1325,6 +1325,40 @@ def present_checks(b, syms):
               "painted again in 12000 frames -- that is a frozen screen.")
         return False
 
+    # THE SAME GUEST DRAWING THE WAY A RAYCASTER ACTUALLY DOES. Arm 4 stores in
+    # every modelled frame, so `modey_quiet` never reaches 2 and the QUIET rule
+    # cannot fire at all -- its own assertion is "must be 0: never quiet". A
+    # real guest frame has store-free gaps in it (ray casting, the vislist sort,
+    # the page manager, the tic wait), and a gap that spans two loop slices is
+    # indistinguishable from a menu that has finished drawing. On hardware that
+    # was 62 quiet fallbacks against 94 flips, with `x86_modey_mid_draw` reading
+    # zero because it was only ever counted on the STALE path. This arm bursts:
+    # 22 frames of stores, 3 with none, through a 300-frame guest frame.
+    r = run(5)
+    if r is None:
+        return False
+    if r[0] > 3 or r[1] > 3:
+        print(f"FAIL: entering a level the loop painted {r[0]} frames "
+              f"({r[1]} of them mid-draw) and did not converge; the quiet "
+              f"back-off is not working.")
+        return False
+    if r[2] != 0 or r[3] != 0 or r[4] != 0:
+        print(f"FAIL: in a settled level the frame loop painted {r[2]} of 1500 "
+              f"frames of a guest that draws in BURSTS and flips every 300 "
+              f"({r[3]} mid-draw, {r[4]} quiet fallbacks). Every one of them is "
+              f"a store-free gap INSIDE the redraw mistaken for a finished "
+              f"page -- the one aliased page put on the panel with the "
+              f"raycaster partway across it. Caught at successive rotations "
+              f"that is the scene repeated across the viewport.")
+        return False
+    if r[5] != 300:
+        print(f"FAIL: flip gap measured {r[5]}, expected 300")
+        return False
+    if r[6] < 1:
+        print("FAIL: a bursty title that stopped flipping was never painted "
+              "again in 12000 frames -- refusing its quiet gaps froze it.")
+        return False
+
     r = run(2)
     if r is None:
         return False
@@ -1359,7 +1393,7 @@ def present_checks(b, syms):
         return False
 
     print("PASS: Mode Y presentation policy "
-          "(0 mid-draw paints at 20- and 300-frame flip gaps, "
+          "(0 mid-draw paints at 20- and 300-frame flip gaps, bursty or not, "
           "1 quiet paint, 3 stale paints, no freeze)")
     return True
 

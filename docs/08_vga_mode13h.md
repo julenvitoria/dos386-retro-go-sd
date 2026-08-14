@@ -309,6 +309,55 @@ settled run must be **0 loop paints, 0 mid-draw, 0 quiet fallbacks**. It then
 stops flipping while still drawing and must be rescued, which pins the
 anti-freeze property against the fix itself.
 
+**Bug 4 — "a quiet page is a finished page" was the LAST gameplay bug.** Bug 3
+silenced the staleness bound and hardware still showed the repeated scene, with
+`x86_modey_mid_draw` reading **zero** — because that witness was only ever
+incremented on the stale path. The counter that was moving is
+`x86_modey_fallbacks`: **62** of them in a hardware capture
+(`build/artifacts/hw_wolf3d.png`) whose flip count only reached **94**. Two
+thirds as many half-drawn pages on the panel as complete ones.
+
+Those are QUIET-page paints, authorised by a rule whose comment asserted that
+"a quiet page is a finished page whatever else is true of it". **That assertion
+is false for a raycaster.** A guest frame is not one unbroken run of stores:
+WOLF3D casts rays, sorts its vislist, pulls texture pages through its page
+manager and waits on the tic counter, all with the aperture untouched. Any of
+those gaps that spans two frame-loop slices is *indistinguishable* from a menu
+that has finished drawing, so the loop painted the one aliased page with the
+redraw partway across it. Caught on successive gaps at successive rotations,
+that is the scene repeated across the viewport — one door per fragment.
+
+Note what this is NOT: it is not a spatial addressing defect. The status bar,
+the HUD and the weapon in that capture are pixel-correct, and they travel the
+same Map Mask / plane-offset / page-fold path as the viewport. What separates
+them is not address, it is **time**: the furniture is drawn once and never
+redrawn, the viewport is redrawn every frame. A Map Mask, stride, interleave or
+fold error would mangle both.
+
+The fix has bug 3's shape, because it is bug 3's problem. For a title that has
+flipped and has stored since that flip — demonstrably partway through a redraw —
+the quiet run required before the loop may paint starts at the flat two frames
+and **doubles every time such a paint is taken**, clamped at 32 frames so a
+genuinely static screen is never more than ~0.5 s late. A title that has never
+flipped is untouched and keeps the flat two frames; it is the only kind the
+quiet rule now serves without argument. Every such paint is counted in
+`x86_modey_mid_draw`, so "the loop put a half-drawn page on the panel" has one
+number however the loop got there.
+
+**Why the 64000/64000 Mode Y arm never saw any of this** — it cannot. It grades
+one still frame of a program that draws once and halts; "which frames are
+painted" is not a pixel question. And the *presentation* arm missed it for a
+sharper reason: `which == 1` and `which == 4` both store in **every** modelled
+frame, so `modey_quiet` can never reach 2 and the quiet rule is structurally
+unable to fire. `which == 4`'s own assertion is written as `must be 0: never
+quiet`. The model assumed the conclusion. `which == 5` draws in **bursts** — 22
+frames of stores, 3 with none, through a 300-frame guest frame — which is how
+software actually drives the adapter, the same lesson as
+`references/8086tiny/docs/video/11-ega-planar.md` §"Why the first test passed
+while a real game rendered garbage". Measured: **60** mid-draw paints per 1500
+frames with `-DX86_MODEY_QUIET_NEGCTL=1` (the shipped rule compiled back in),
+**0** with the fix, and arms 1–4 stay green under that control.
+
 **What is left, and it is accepted.** Two things. First, the ≤ 2 frames the
 back-off costs at a menu-to-gameplay transition, which is unavoidable without a
 "the guest has finished" signal that does not exist. Second, the aliasing itself:

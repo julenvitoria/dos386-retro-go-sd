@@ -653,6 +653,52 @@ static void present_test_run(uint32_t which)
         for (i = 0; i < 12000; i++)
             paints += (unsigned)present_frame(1000u, 0);
         present_r[6] = paints;
+    } else if (which == 5) {
+        /*
+         * GAMEPLAY AS A RAYCASTER ACTUALLY DRIVES THE ADAPTER -- the case
+         * `which == 4` does NOT cover, and the reason hardware was still a
+         * house of mirrors with `x86_modey_mid_draw` reading zero.
+         *
+         * `which == 4` stores in EVERY modelled frame, so `modey_quiet` can
+         * never reach 2 and the quiet rule is structurally unable to fire; its
+         * own assertion is "must be 0: never quiet". A real guest frame is not
+         * one unbroken run of stores. WOLF3D casts rays, sorts its vislist,
+         * pulls texture pages through its page manager and waits on the tic
+         * counter, all with the aperture untouched, and any of those gaps that
+         * spans two loop slices is indistinguishable from a menu that has
+         * finished drawing. On hardware that is 62 quiet fallbacks against 94
+         * flips -- two thirds as many half-drawn pages as complete ones.
+         *
+         * So this arm draws in BURSTS: 22 frames of stores, then 3 frames of
+         * none, right through a 300-frame guest frame. Everything else is
+         * `which == 4`.
+         */
+#define BURSTY(i)  (((i) % 25u) < 22u ? 1000u : 0u)
+        for (i = 0; i < 100; i++)
+            paints += (unsigned)present_frame(200u, (i % 20u) == 19u);
+        paints = 0;
+        for (i = 0; i < 1500; i++)
+            paints += (unsigned)present_frame(BURSTY(i), (i % 300u) == 299u);
+        present_r[0] = paints;                  /* transition: <= 3 allowed  */
+        present_r[1] = x86_modey_mid_draw;
+        x86_modey_fallbacks = 0;
+        x86_modey_stale_paints = 0;
+        x86_modey_mid_draw = 0;
+        paints = 0;
+        for (i = 0; i < 1500; i++)
+            paints += (unsigned)present_frame(BURSTY(i), (i % 300u) == 299u);
+        present_r[2] = paints;                  /* steady state: must be 0   */
+        present_r[3] = x86_modey_mid_draw;      /* must be 0                 */
+        present_r[4] = x86_modey_fallbacks;     /* must be 0                 */
+        present_r[5] = x86_modey_flip_gap_max;  /* 300                       */
+        /* The same anti-freeze obligation as `which == 4`, and it is sharper
+           here: the guest now has quiet gaps AND has stopped flipping, so the
+           rule that refuses those gaps must not be the rule that freezes it. */
+        paints = 0;
+        for (i = 0; i < 12000; i++)
+            paints += (unsigned)present_frame(BURSTY(i), 0);
+        present_r[6] = paints;
+#undef BURSTY
     } else if (which == 2) {
         /* MENU. The guest redraws the highlight -- erase, then draw, over a
            few frames -- and then WAITS for a key, flipping nothing. Nothing may

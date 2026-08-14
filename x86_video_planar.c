@@ -97,6 +97,12 @@
 #define X86_MODEY_TIMER_NEGCTL 0    /* the frame loop paints on a TIMER, with */
 #endif                              /* no test for whether the guest had      */
                                     /* finished drawing -- the shipped bug    */
+#ifndef X86_MODEY_QUIET_NEGCTL
+#define X86_MODEY_QUIET_NEGCTL 0    /* "a quiet page is a finished page": the */
+#endif                              /* flat two-frame quiet rule, with no     */
+                                    /* account taken of a raycaster's         */
+                                    /* WITHIN-FRAME store-free gaps. The      */
+                                    /* state hardware was captured in         */
 
 /* Plane offsets alias into one 16 KB page: 4 * 0x4000 == 0x10000, the aperture
    exactly. A 320x200 page needs 16,000 of those 16,384, so the top 384 are
@@ -779,8 +785,49 @@ void x86_vga_planar_start_write(void)
  * stays there. The tier-1 model measures exactly that: the transition is
  * allowed one artefact, and the run after it must be clean.
  */
+/*
+ * ===========================================================================
+ * AND WHY "A QUIET PAGE IS A FINISHED PAGE" WAS STILL THE GAMEPLAY BUG
+ * ===========================================================================
+ *
+ * The staleness back-off above made the STALE bound silent during gameplay, and
+ * hardware still showed the house of mirrors. `x86_modey_mid_draw` agreed with
+ * the code and said zero -- because it was only ever incremented on the stale
+ * path. The counter that was actually moving was `x86_modey_fallbacks`: 62 of
+ * them in a hardware capture whose flip count only reached 94.
+ *
+ * Those are QUIET-page paints, and the rule that authorises them asserts, in a
+ * comment, that "a quiet page is a finished page whatever else is true of it".
+ * THAT ASSERTION IS FALSE FOR A RAYCASTER. A guest frame is not one unbroken
+ * run of stores: WOLF3D casts rays, sorts its vislist, pulls texture pages
+ * through its page manager and waits on the tic counter, all with the aperture
+ * untouched. Any of those gaps that spans two frame-loop slices reads exactly
+ * like a menu that has finished drawing, so the loop painted the one aliased
+ * page with the redraw partway across it -- the split viewport, and, caught on
+ * successive gaps at successive rotations, the scene repeated across the
+ * viewport.
+ *
+ * The fix has the same shape as the staleness bound's, because it is the same
+ * problem: there is NO signal that separates "quiet because finished" from
+ * "quiet in the middle of a frame". So the quiet rule is made SELF-CORRECTING
+ * instead. For a title that has flipped and has STORED SINCE that flip -- i.e.
+ * one that is demonstrably partway through a redraw -- the quiet run required
+ * before the loop may paint starts at the flat two frames and DOUBLES every
+ * time such a paint is taken, so a guest's within-frame gaps stop authorising
+ * paints after a couple of them and stay silent for the rest of the level.
+ *
+ * It is CLAMPED rather than unbounded, because the cost of a floor that is too
+ * high is latency on a genuinely static screen: a title that flips (WOLF3D's
+ * menus do) and then draws once and waits must still be shown promptly. Half a
+ * second is the accepted worst case there, against a defect that was on the
+ * panel continuously.
+ *
+ * A title that has NEVER flipped is untouched -- it keeps the flat two frames,
+ * and it is the only kind of title the quiet rule now serves without argument.
+ */
 #define X86_MODEY_IDLE_FRAMES   2u    /* frames since the last present         */
 #define X86_MODEY_QUIET_FRAMES  2u    /* consecutive frames with NO store      */
+#define X86_MODEY_QUIET_CLAMP   32u   /* ~0.5 s: the floor may not exceed this */
 #define X86_MODEY_STALE_FRAMES  60u   /* ~1 s: nothing may freeze indefinitely */
 #define X86_MODEY_FLIP_SLACK    8u    /* x the worst flip gap, once it flips   */
 #define X86_MODEY_GAP_CLAMP     0x100000u  /* keeps the product in range       */
@@ -806,6 +853,10 @@ static uint32_t modey_dirty;       /* stores since the last frame put on show */
 static uint32_t modey_flipper;     /* this title has flipped at least once    */
 static uint32_t modey_stores_flip; /* x86_vga_planar_stores at the last flip  */
 static uint32_t modey_stale_floor = X86_MODEY_STALE_FRAMES;
+/* How long the aperture must have been quiet before the loop may paint a title
+   that is partway through a redraw. Starts flat and backs off; see the block
+   comment above. */
+static uint32_t modey_quiet_floor = X86_MODEY_QUIET_FRAMES;
 
 /* How long the screen must have stood unpainted before the staleness bound may
    fire. Flat until this title flips; afterwards the larger of a multiple of its
@@ -833,6 +884,7 @@ void x86_video_modey_policy_reset(void)
     modey_flipper = 0;
     modey_stores_flip = x86_vga_planar_stores;
     modey_stale_floor = X86_MODEY_STALE_FRAMES;
+    modey_quiet_floor = X86_MODEY_QUIET_FRAMES;
     x86_video_modey_presented(0);
 }
 
@@ -894,15 +946,39 @@ int x86_video_modey_paint_due(void)
     if (!modey_dirty)
         return 0;
 
-    if (modey_quiet >= X86_MODEY_QUIET_FRAMES
-        && modey_idle >= X86_MODEY_IDLE_FRAMES) {
-        /* A quiet page is a finished page whatever else is true of it, so this
-           is never a mid-draw paint and never evidence about the flip rate. */
-        x86_modey_fallbacks++;
-        modey_idle = 0;
-        modey_stale = 0;
-        modey_dirty = 0;
-        return 1;
+    {
+        /* Is this guest demonstrably PARTWAY THROUGH A REDRAW? It has flipped,
+           so it presents its own frames, and it has stored since that flip, so
+           what is in the page is newer than the frame it last called complete.
+           A quiet run inside that is a gap in a redraw, not a finished picture
+           -- see the block comment above, and the 62 fallbacks on hardware. */
+        const int midredraw = (modey_flipper && stores != modey_stores_flip);
+#if X86_MODEY_QUIET_NEGCTL
+        const uint32_t need = X86_MODEY_QUIET_FRAMES;   /* the shipped rule */
+#else
+        const uint32_t need = midredraw ? modey_quiet_floor
+                                        : X86_MODEY_QUIET_FRAMES;
+#endif
+        if (modey_quiet >= need && modey_idle >= X86_MODEY_IDLE_FRAMES) {
+            x86_modey_fallbacks++;
+            if (midredraw) {
+                /* Counted as what it is. The same witness the stale path uses,
+                   so "the loop put a half-drawn page on the panel" has ONE
+                   number however the loop got there. */
+                uint32_t n = stores - modey_stores_flip;
+                x86_modey_mid_draw++;
+                if (n > x86_modey_mid_draw_max)
+                    x86_modey_mid_draw_max = n;
+                /* BACK OFF: this title's within-frame gaps are at least this
+                   long, so the next one must be longer to authorise a paint. */
+                if (modey_quiet_floor < X86_MODEY_QUIET_CLAMP)
+                    modey_quiet_floor *= 2u;
+            }
+            modey_idle = 0;
+            modey_stale = 0;
+            modey_dirty = 0;
+            return 1;
+        }
     }
     if (modey_stale < modey_stale_limit())
         return 0;
