@@ -441,7 +441,27 @@ static uint8_t *modey_page_base(uint32_t pg)
     return x86_vga_planar_aperture;
 }
 
-static uint8_t *vga_cell(uint32_t a)
+/* ---------------------------------------------------------------------------
+ * ITCM PLACEMENT FOR THE HOT PLANAR PATH.
+ *
+ * MEASURED on hardware, Wolf3D in Mode Y: six of twenty-four PC samples landed
+ * in x86_vga_planar_store / vga_cell / x86_vga_planar_active, all executing
+ * from 0x2405xxxx -- AXI. CLAUDE.md says hot loops MUST be pinned to ITCM; the
+ * interpreter is, and this path never was.
+ *
+ * The two move TOGETHER on purpose. ITCM is at 0x00000000 and AXI at
+ * 0x24000000, far outside BL range, so every call across the boundary costs a
+ * linker veneer. Moving the pair makes the interpreter's call INTO the store a
+ * near call (the interpreter is already in ITCM) and keeps store -> vga_cell
+ * near as well. Splitting them would trade one veneer for another.
+ *
+ * This is placement only: the PLANES stay in AXI, so it removes instruction
+ * fetch cost, not data cost. If a measurement ever shows the remaining cost is
+ * the plane accesses, this change is not the lever and should not be blamed.
+ */
+#define PLANAR_HOT __attribute__((section(".itcram_hot.planar")))
+
+PLANAR_HOT static uint8_t *vga_cell(uint32_t a)
 {
     uint32_t pg, off;
 
@@ -742,7 +762,7 @@ static void planar_byte(uint32_t a, uint8_t v)
         x86_vga_planar_aperture[a] = ega_read_byte(a);
 }
 
-void x86_vga_planar_store(uint32_t off, uint32_t val, uint32_t size)
+PLANAR_HOT void x86_vga_planar_store(uint32_t off, uint32_t val, uint32_t size)
 {
     uint8_t *ap = x86_vga_planar_aperture;
     uint32_t i;
