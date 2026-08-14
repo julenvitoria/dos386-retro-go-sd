@@ -1175,7 +1175,17 @@ static void guest_reset(void)
                                              guest_use_cmdtail ? cmdtail : "");
     }
     if (dsk_exec_rc != 0) {
-        memcpy(guest_ram + 0x100, demo_guest, sizeof(demo_guest));
+        /*
+         * guest_ram is a page POOL, not a flat image of the low megabyte, so
+         * `guest_ram + 0x100` was the pool's first frame and NOT guest linear
+         * 0x100. The demo was written somewhere the guest never executes, and
+         * the guest instead started at 0000:0100 -- inside the IVT -- and ran
+         * table bytes as code. Write it through the pager like everything
+         * else, and pin CS to 0 so 0000:0100 is where the bytes actually are.
+         */
+        x86_guest_copy_in(0x100, demo_guest, sizeof(demo_guest));
+        cpu_state_ptr->segs[1].sel = 0;
+        cpu_state_ptr->segs[1].base = 0;
         cpu_state_ptr->eip = 0x100;
         cpu_state_ptr->regs[4] = 0xFFFE;
     }
