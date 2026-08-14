@@ -208,11 +208,27 @@ def main():
         data = bytes(b.read_memory(fb, pitch * lines))
         core_syms = core
         fw_syms = get_symbols(image.elf)
-        sym = fw_syms.get("active_clut") or core["core_clut"]
-        clut = [b.read_uint32(sym + 4 * i) for i in range(args.clut_entries)]
+        # A 256-colour mode does NOT use active_clut. lcd_set_clut_ext() parks
+        # a CALLER-OWNED palette in ext_clut and clut_push() programs the LTDC
+        # from that, bypassing the darkened-twin cache entirely -- so reading
+        # active_clut here recovers the previous 32-entry CGA table and paints
+        # every mode-13h frame in the wrong colours. That is a defect of THIS
+        # TOOL that looks exactly like a palette defect in the core.
+        ext_p = fw_syms.get("ext_clut")
+        ext_n = fw_syms.get("ext_clut_count")
+        ext_addr = b.read_uint32(ext_p) if ext_p else 0
+        ext_count = (b.read_uint32(ext_n) & 0xFFFF) if ext_n else 0
+        if ext_addr and ext_count:
+            clut = [b.read_uint32(ext_addr + 4 * i) for i in range(ext_count)]
+            print(f"external palette: {ext_count} entries at 0x{ext_addr:08x} "
+                  f"(a 256-colour mode owns the whole table)")
+        else:
+            sym = fw_syms.get("active_clut") or core["core_clut"]
+            clut = [b.read_uint32(sym + 4 * i) for i in range(args.clut_entries)]
         b.resume()
 
-        print("CLUT: " + " ".join(f"{c:08x}" for c in clut))
+        print(f"CLUT ({len(clut)} entries, first 32): "
+              + " ".join(f"{c:08x}" for c in clut[:32]))
         w, h = min(pitch, SCREEN_W), min(lines, SCREEN_H)
         indices = bytearray(w * h)
         rgb = bytearray(w * h * 3)

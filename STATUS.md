@@ -749,6 +749,51 @@ adapter, which is unmodelled and returns the 0xFF no-device default —
 `INL_StartJoy` should conclude "no joystick" from that, and whether it does has
 not been measured.
 
+### "Blue where red should be" — the palette was never wrong; the CAPTURE was
+
+The report was that Wolf3D renders with correct geometry and rotated colours,
+and the leading hypothesis was a PHASE error in the 0x3C9 byte stream — one
+dropped or duplicated byte rotating r,g,b for every entry after it. **Measured,
+all three candidate stages are correct and the hypothesis is refuted.**
+
+`probe.py --bytes '*vga_dac:768' --bytes-group 3` (new; `vga_dac` is a
+`uint8_t *`, so `--dump` could only ever print the pointer) reads Wolf3D's
+`gamepal` back byte-exact and correctly phased: `00 00 00 / 00 00 2a /
+00 2a 00 / 00 2a 2a / 2a 00 00` — entry 4 is (42,0,0), RED — and every ramp in
+the table is still triple-aligned at offset 0x2df, which no shift survives.
+`x86_vga_dac_writes` is **1536 = exactly 2 x 768**, so `REP OUTSB` delivered
+one `x86_vga_dac_write()` per byte with no duplication and no drop across both
+palettes. `vga_clut256` behind it is right too: `00000000 000000aa 0000aa00
+0000aaaa 00aa0000` — entry 4 is `0x00AA0000`, red in the high byte. And the
+end-to-end panel through gwemu's modelled LTDC CLUT shows the signon screen's
+banners in red.
+
+**What was wrong is `scripts/screenshot.py`.** A 256-colour mode does not use
+`active_clut`: `lcd_set_clut_ext()` parks a caller-owned palette in `ext_clut`
+and `clut_push()` programs the LTDC from that, bypassing the darkened-twin
+cache. The tool read `active_clut`, and only 32 entries of it, so it repainted
+every mode-13h frame through the previous CGA table — unrelated colours over
+perfectly correct geometry, which is exactly what a channel rotation looks
+like. `wolf3d_after_1ah.png` is a capture of that tool defect, not of a video
+defect. It follows `ext_clut` now.
+
+**The same gap is live in the FIRMWARE and is not fixed here:**
+`lcd_get_clut_rgb565()` and `lcd_convert_lut8_to_rgb565()`'s `clut == NULL` arm
+both read `active_clut`, so retro-go's own on-device screenshots and save-state
+thumbnails of a 256-colour guest are miscoloured on silicon while the panel
+itself is right. That is `gw_lcd.c`, the user's tree.
+
+Tier 1 gained the arm that would have caught a real phase error and, more
+importantly, a **negative control**: `tests/main.c` arm 9 indexes 0x3C8 once and
+pushes N filler bytes before the 768. At N=768 the write cursor must wrap to
+phase 0 — Wolf3D's actual shape, two `rep outsb` palettes with one 0x3C8
+between them — and the CLUT must be unchanged. At N=1 the test asserts the CLUT
+rotates to exactly `(b[i-1], r[i], g[i])` and that the equality check REJECTS
+it. The pre-existing palette check already used per-channel-distinct values
+(`r=i>>2, g=i&0x3F, b=63-(i>>2)`), so it could see a rotation; what it could not
+do was prove it could see one. `test_video` all green, `test_opcodes` 273/273,
+core unchanged (`__CORE_BSS_END__` 0x2405a6c0 before and after).
+
 ## TOPBENCH — running, scoring, screenshotted
 
 The 4 px cell is an **Everex Micro Enhancer 5x8** face squeezed to 4, not a

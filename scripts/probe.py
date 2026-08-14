@@ -26,10 +26,11 @@ import sys
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from scripts.common.probe import (                       # noqa: E402
-    dump_arrays, dump_dos_log, dump_guest, dump_io_log, dump_symbol_name,
-    save_guest,
+    dump_arrays, dump_bytes, dump_dos_log, dump_guest, dump_io_log,
+    dump_symbol_name,
+    save_bytes, save_guest,
     load_symbol_maps,
-    parse_deref, parse_dump, parse_guest,
+    parse_bytes, parse_deref, parse_dump, parse_guest,
     parse_watch,
     sample, wait_for_value,
 )
@@ -79,6 +80,21 @@ def main():
                    metavar="SYM[:N][xG][=LABEL]",
                    help="hexdump N words of a symbol's own storage, grouped "
                         "G per line (arrays; --deref follows a pointer instead)")
+    p.add_argument("--bytes", action="append", default=[],
+                   metavar="SYM|*SYM+OFF|0xADDR[:N][=LABEL]",
+                   help="hexdump N BYTES at a host address, following a "
+                        "pointer with the *SYM+OFF form. --dump reads WORDS of "
+                        "a symbol's own storage and cannot reach the buffer "
+                        "behind a `uint8_t *`; --deref reads only one uint32. "
+                        "Repeatable. For guest RAM use --guest instead")
+    p.add_argument("--bytes-group", type=int, default=1, metavar="G",
+                   help="group --bytes output G bytes at a time (e.g. 3 for "
+                        "the VGA DAC's r,g,b triples, so a phase error in the "
+                        "stream is visible instead of counted by hand)")
+    p.add_argument("--bytes-save", action="append", default=[],
+                   metavar="SYM[:N]:FILE",
+                   help="write a host byte range to a file, for byte-comparing "
+                        "against a reference (e.g. the DOSBox-X DAC)")
     p.add_argument("--deref", action="append", default=[],
                    metavar="SYM[+OFF][=LABEL]",
                    help="read uint32 at (*SYM)+OFF; repeatable")
@@ -141,10 +157,19 @@ def main():
     derefs = [parse_deref(d) for d in args.deref]
     dumps = [parse_dump(d) for d in args.dump]
     guests = [parse_guest(g) for g in args.guest]
+    byte_dumps = [parse_bytes(b) for b in args.bytes]
+    byte_saves = []
+    for spec in args.bytes_save:
+        head, _, path = spec.rpartition(":")
+        sym, nbytes, _ = parse_bytes(head)
+        byte_saves.append((sym, nbytes, path))
 
     missing = [w for w in watches if w not in syms]
     missing += [s for s, _, _ in derefs if s not in syms]
     missing += [n for n in (dump_symbol_name(s) for s, _, _, _ in dumps)
+                if n is not None and n not in syms]
+    missing += [n for n in (dump_symbol_name(s)
+                            for s, _, _ in byte_dumps + byte_saves)
                 if n is not None and n not in syms]
     if missing:
         sys.exit(f"symbols not found in {elf}: {missing}")
@@ -194,6 +219,14 @@ def main():
         if dumps:
             target.backend.halt()
             dump_arrays(target, syms, dumps, symbol_maps=maps)
+            target.backend.resume()
+        if byte_dumps:
+            target.backend.halt()
+            dump_bytes(target, syms, byte_dumps, group=args.bytes_group)
+            target.backend.resume()
+        if byte_saves:
+            target.backend.halt()
+            save_bytes(target, syms, byte_saves)
             target.backend.resume()
         if args.guest_save:
             target.backend.halt()

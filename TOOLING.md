@@ -52,7 +52,24 @@ inside a known function are annotated with it, so a saved LR reads as
 sampling: read at t=0 and you see the state before the target has done
 anything, which is how a full log reads as empty.
 
+`--bytes SYM[:N]` is the third shape and the one for BYTE buffers:
+`--dump` reads words of a symbol's own storage and `--deref` reads exactly one
+uint32, so **neither can hexdump the memory behind a `uint8_t *`** — pointed at
+`vga_dac` (a `static uint8_t *`) `--dump` prints the four bytes of the pointer
+itself. `--bytes` takes the same three address forms as `--dump` (`name`,
+`0xADDR`, `*name+OFF`) and reads N bytes. `--bytes-group G` inserts a gap every
+G bytes: at `G=3` the VGA DAC's r,g,b triples line up in columns, so a PHASE
+error in a strided stream is visible instead of being counted by hand — which
+is exactly how the palette stream was cleared of a channel rotation.
+`--bytes-save SYM[:N]:FILE` writes the range out for a byte compare against a
+reference. **For GUEST memory use `--guest`, never `--bytes`.**
+
 ```bash
+# the 768 DAC bytes behind the pointer, as r,g,b triples
+python3 scripts/probe.py --retrogo --wait-magic \
+    --bytes '*vga_dac:768=DAC' --bytes-group 3
+python3 scripts/probe.py --retrogo --wait-magic \
+    --bytes-save '*vga_dac:768:build/artifacts/ours_dac.bin'
 python3 scripts/probe.py --retrogo --wait-magic \
     --watch core_ready,core_dtcm_ok,benchmark_insns --deref cpu_state_ptr+8=EAX
 python3 scripts/probe.py --dump x86_cs_log:16x4=CSLOG  # array contents
@@ -530,6 +547,21 @@ python3 scripts/screenshot.py --timeline timelines/run-to-completion.tl \
     --wait 48 --pan 16 --text --out build/artifacts/topbench.png
 python3 scripts/screenshot.py --target hardware --wait 20
 ```
+
+**It follows `ext_clut` when a 256-colour mode is up, and that is not
+cosmetic.** `lcd_set_clut_ext()` parks a CALLER-OWNED palette in `ext_clut` and
+`clut_push()` programs the LTDC from it, bypassing the darkened-twin
+`active_clut` cache entirely — so reading `active_clut` (which is what this tool
+did, and only 32 entries of it) recovers the PREVIOUS 32-entry CGA table and
+repaints every mode-13h frame in unrelated colours over perfectly correct
+geometry. That is indistinguishable from a palette defect in the core, and
+`build/artifacts/wolf3d_after_1ah.png` is a capture of it: the DAC, the
+256-entry CLUT and the LTDC were all correct in that run.
+**The firmware's own readback has the same gap and is NOT fixed here:**
+`lcd_get_clut_rgb565()` (`gw_lcd.c:433`) and `lcd_convert_lut8_to_rgb565()`'s
+`clut == NULL` arm both read `active_clut`, so retro-go's on-device screenshots
+and save-state thumbnails of a 256-colour guest are miscoloured on silicon even
+though the panel is right.
 
 `--text` dumps the 80x25 character buffer alongside the image, decoded as
 **CP437**; judging small glyphs by eye is how a `Runtime error 203` went unread

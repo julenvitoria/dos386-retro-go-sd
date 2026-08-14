@@ -404,6 +404,82 @@ def vga13_checks(b, syms):
         return False
     print("PASS: 256 CLUT entries exact (6->8 bit as (v<<2)|(v>>4))")
 
+    # ---- the write CURSOR: phase, wrap, and a negative control ------------
+    #
+    # 0x3C9 is a STREAM against an auto-incrementing byte cursor, and the whole
+    # palette's meaning rests on that cursor's PHASE. Shift it by one byte and
+    # every entry after it has r,g,b ROTATED -- red becomes blue -- while the
+    # bytes themselves stay perfectly valid 6-bit values and every pixel INDEX
+    # stays correct. That is the one palette failure a blit check, a read-back
+    # check and a byte-count check all pass through.
+    #
+    # Wolf3D is why the wrap arm exists: VL_SetPalette is `mov cx,768 /
+    # rep outsb`, and it runs TWICE with only one 0x3C8 between them, so the
+    # second palette is positioned by the cursor wrapping at 768. If the wrap
+    # landed anywhere but a multiple of 3, the SECOND palette would be rotated
+    # and the first would not -- which reads as a defect that comes and goes.
+    def stream_with_prewrite(n):
+        b.write_uint32(syms["vga_dac_prewrite"], n)
+        b.write_uint32(syms["run_video_flag"], 9)
+        if not wait_flag(b, syms["run_video_flag"], 0, "DAC prewrite stream hung"):
+            return None
+        b.write_uint32(syms["run_video_flag"], 7)
+        if not wait_flag(b, syms["run_video_flag"], 0, "CLUT snapshot hung"):
+            return None
+        raw2 = bytes(b.read_memory(syms["vga_clut_out"], 256 * 4))
+        return [int.from_bytes(raw2[i * 4:i * 4 + 4], "little") for i in range(256)]
+
+    if "vga_dac_prewrite" not in syms:
+        print("FAIL: harness has no vga_dac_prewrite; the cursor arm cannot run")
+        return False
+
+    # 768 filler bytes: the cursor must wrap to exactly 0, so the palette lands
+    # byte-for-byte where a fresh 0x3C8 would have put it.
+    wrapped = stream_with_prewrite(768)
+    if wrapped is None:
+        return False
+    if wrapped != want_clut:
+        i = next(i for i in range(256) if wrapped[i] != want_clut[i])
+        print(f"FAIL: after a 768-byte wrap the palette is mis-phased -- entry "
+              f"{i} is {wrapped[i]:#08x}, want {want_clut[i]:#08x}. Wolf3D "
+              f"streams two palettes back to back; the second would render in "
+              f"rotated channels (red as blue)")
+        return False
+    print("PASS: the 768-byte write cursor wraps to phase 0 (two back-to-back "
+          "palettes stay aligned)")
+
+    # NEGATIVE CONTROL. One filler byte is a deliberate one-byte phase error;
+    # the check above MUST reject it, or it is not checking anything.
+    shifted = stream_with_prewrite(1)
+    if shifted is None:
+        return False
+    if shifted == want_clut:
+        print("FAIL: a deliberate ONE-BYTE cursor shift produced an identical "
+              "CLUT -- the palette check cannot detect a channel rotation and "
+              "therefore proves nothing")
+        return False
+    # Name the rotation rather than just "differs": a one-byte shift puts
+    # (b[i-1], r[i], g[i]) in entry i, so red really does arrive as green and
+    # the previous entry's blue as red. Asserting the exact shape stops the
+    # control passing for some unrelated reason (a hung arm, a zeroed CLUT).
+    def ch(v, s):
+        return (v >> s) & 0xFF
+    rot = [(ch(want_clut[(i - 1) % 256], 0) << 16)
+           | (ch(want_clut[i], 16) << 8) | ch(want_clut[i], 8)
+           for i in range(1, 256)]
+    if shifted[1:] != rot:
+        print(f"FAIL: the one-byte shift did change the CLUT, but not into the "
+              f"expected channel rotation -- entry 1 is {shifted[1]:#08x}, a "
+              f"rotation would give {rot[0]:#08x}. The control is not "
+              f"exercising the cursor")
+        return False
+    print("PASS: negative control -- a one-byte cursor shift rotates every "
+          "entry to (b[i-1], r[i], g[i]) and the CLUT check rejects it")
+
+    # Put the correctly phased palette back for the arms below.
+    if stream_with_prewrite(768) is None:
+        return False
+
     # ---- the blit ---------------------------------------------------------
     # Vertical bars over the top half, diagonals over the bottom. A bar is
     # constant down a column, so a stride error slants it; a diagonal is

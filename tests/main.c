@@ -160,6 +160,13 @@ uint8_t  vga_test_pal[X86_VGA_PALETTE_BYTES] __attribute__((section(".ahb_bss"))
 uint8_t  vga_dac_arg[768] __attribute__((section(".ahb_bss")));
 uint32_t vga_clut_out[256] __attribute__((section(".ahb_bss")));
 volatile uint32_t vga_dac_readback[6];
+/* Filler bytes arm 9 pushes into 0x3C9 AFTER indexing and BEFORE the palette.
+   1 is a deliberate one-byte PHASE error -- the negative control, because a
+   palette check that cannot fail is not a check. 768 is Wolf3D's real shape:
+   it streams TWO full palettes, and the second is indexed only by the write
+   cursor having wrapped, so a wrap that does not land on a multiple of 3
+   rotates every channel of the second palette. */
+volatile uint32_t vga_dac_prewrite = 0;
 volatile uint32_t vga_regs_out[9];   /* CRTC/Seq/GC/Attr write-then-read-back */   /* first two entries, read back via 0x3C7/0x3C9 */
 
 volatile uint32_t text_mode_arg = 0x03;
@@ -1795,6 +1802,19 @@ void Reset_Handler(void) {
             x86_port_write(0x3C7, 0, 1);
             for (i = 0; i < 6; i++)
                 vga_dac_readback[i] = x86_port_read(0x3C9, 1);
+            run_video_flag = 0;
+        }
+        if (run_video_flag == 9) {
+            /* Index once, push vga_dac_prewrite filler bytes, then the 768.
+               No second 0x3C8: where the palette lands is decided entirely by
+               the auto-incrementing write cursor, which is the only thing that
+               can rotate r/g/b into each other. */
+            unsigned i;
+            x86_port_write(0x3C8, 0, 1);
+            for (i = 0; i < vga_dac_prewrite; i++)
+                x86_port_write(0x3C9, 0, 1);
+            for (i = 0; i < 768; i++)
+                x86_port_write(0x3C9, vga_dac_arg[i], 1);
             run_video_flag = 0;
         }
         if (run_video_flag == 8) {

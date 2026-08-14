@@ -161,6 +161,73 @@ def parse_dump(spec):
     return sym, int(cnt or 8, 0), group, (label or sym)
 
 
+def parse_bytes(spec):
+    """'*vga_dac+0:768=DAC' -> ('*vga_dac+0', 768, 'DAC')
+
+    A HOST-address byte range, in the same three shapes `_dump_base` accepts:
+    `name`, `0xADDR`, or `*name+OFF`. This is the companion to --dump, which
+    reads WORDS of a symbol's own storage: a `uint8_t *` palette, a ring of
+    bytes or a struct field is not words, and a symbol that is itself a POINTER
+    (`static uint8_t *vga_dac`) cannot be reached by --dump at all -- --dump
+    would hexdump the four bytes of the pointer. --deref follows a pointer but
+    reads exactly one uint32.
+
+    NOT for guest memory: use --guest, which walks the fold table.
+    """
+    label = None
+    if "=" in spec:
+        spec, label = spec.split("=", 1)
+    sym, _, cnt = spec.rpartition(":")
+    if not sym:                       # no ':' -> the whole thing is the symbol
+        sym, cnt = cnt, ""
+    sym = sym.strip()
+    reject_guest_ram(sym)
+    return sym, int(cnt or 64, 0), (label or sym)
+
+
+def read_bytes(target, syms, sym, nbytes):
+    """Bytes at a host address spec, or None if the symbol is not in the ELF."""
+    base = _dump_base(sym, syms, target.backend)
+    if base is None:
+        return None, None
+    return base, target.backend.read_memory(base, nbytes)
+
+
+def dump_bytes(target, syms, specs, out=print, group=1):
+    """Hexdump host byte ranges. `group` inserts a gap every G bytes, which is
+    what makes a phase error in a strided stream (the DAC's r,g,b triples)
+    readable rather than something you count on screen."""
+    for sym, nbytes, label in specs:
+        base, data = read_bytes(target, syms, sym, nbytes)
+        if data is None:
+            out(f"  {label}: symbol not found")
+            continue
+        out(f"  {label} @0x{base:08x} ({nbytes} bytes):")
+        per = 16 if group <= 1 else group * max(1, 16 // group)
+        for i in range(0, len(data), per):
+            row = data[i:i + per]
+            if group > 1:
+                cells = [" ".join(f"{b:02x}" for b in row[j:j + group])
+                         for j in range(0, len(row), group)]
+                hexs = "  ".join(cells)
+            else:
+                hexs = " ".join(f"{b:02x}" for b in row)
+            txt = "".join(chr(b) if 32 <= b < 127 else "." for b in row)
+            out(f"    +{i:04x}  {hexs:<50}  |{txt}|")
+
+
+def save_bytes(target, syms, specs, out=print):
+    """Write host byte ranges to files, for byte-comparing against a reference."""
+    for sym, nbytes, path in specs:
+        base, data = read_bytes(target, syms, sym, nbytes)
+        if data is None:
+            out(f"  {sym}: symbol not found")
+            continue
+        with open(path, "wb") as f:
+            f.write(data)
+        out(f"  wrote {len(data)} bytes at 0x{base:08x} ({sym}) to {path}")
+
+
 def dump_symbol_name(sym):
     """The ELF symbol a dump spec depends on, or None for a literal address."""
     sym = sym.lstrip("*")
