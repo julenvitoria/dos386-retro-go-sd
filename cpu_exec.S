@@ -27,6 +27,14 @@
 
     .equ EIP_OFFSET, CPU_EIP
     .equ EFLAGS_OFFSET, CPU_EFLAGS
+    /* The granule seam. 0 is the NEGATIVE CONTROL and reproduces the defect:
+       no prologue is emitted, no flush runs, and a straddling access reads and
+       writes the slack instead of the neighbour. See x86_seam.c and
+       tests/test_seam.py. */
+#ifndef X86_SEAM_FIX
+#define X86_SEAM_FIX 1
+#endif
+
     .equ REGS_OFFSET, CPU_REGS
     .equ REG_ESP_OFFSET, CPU_ESP
     .equ TABLE_BASE_OFFSET, CPU_TABLE_BASE
@@ -107,7 +115,59 @@
      * entry: a zero entry produced `0 | offset`, and address 0 is ITCM -- so a
      * guest write to an unmapped page silently overwrote the interpreter's own
      * instructions. */
+    /* ---------------------------------------------------------------- *
+     * THE SEAM PROLOGUE.
+     *
+     * host = lin + k with one k per granule, so a 16- or 32-bit access whose
+     * bytes span a 4 KB boundary resolves ONE pointer from the LOW granule and
+     * then runs off the top of that host page -- into an unrelated guest page's
+     * frame. Silently. See x86_seam.c for the whole story; this is the trigger.
+     *
+     * THE PREDICATE IS TWO INSTRUCTIONS AND A NOT-TAKEN BRANCH, and that is
+     * where this port differs from the one it comes from. The prior port tested
+     * `(a & 0xFFF) == 0xFFF` and paid four instructions per site because 0xFFF
+     * is not a Thumb-2 modified immediate, so each site materialised it with a
+     * `movw` (references/8086tiny/8086tiny.c:11945-11955). Two things change
+     * here. We are a 386, so an operand is up to FOUR bytes and offset 0xFFD
+     * and 0xFFE straddle as surely as 0xFFF -- their predicate would MISS those.
+     * And the wider test happens to encode better:
+     *
+     *     LSLS  t, lin, #20          ; the granule offset, at the top of t
+     *     CMN   t, #0x400000         ; carry out iff offset >= 0xFFC
+     *     BCS   <sync>
+     *
+     * 0x400000 IS a modified immediate, so there is no literal and no second
+     * register. Offset 0xFFC with a 4-byte operand does not actually straddle
+     * and is synced anyway -- a false positive costs one call that finds
+     * nothing to do, and narrowing it costs an instruction on every access.
+     *
+     * \dest_ptr IS THE SCRATCH. It is dead here -- the fold is about to
+     * overwrite it -- so the predicate needs no register the site does not
+     * already own. It therefore must not be the same register as \vaddr; no
+     * site passes the same one and .ifc catches it at assembly time if one ever
+     * does, rather than silently folding a shifted address.
+     * ---------------------------------------------------------------- */
+    .macro SEAM_CHECK dest_ptr, vaddr
+#if X86_SEAM_FIX
+    .ifc \dest_ptr, \vaddr
+        .error "SEAM_CHECK needs dest_ptr != vaddr"
+    .endif
+        LSLS \dest_ptr, \vaddr, #20
+        CMN \dest_ptr, #0x400000
+        BCS 97f
+96:
+        .pushsection .itcram_hot.norslow, "ax", %progbits
+97:     PUSH {R0-R3, R12, LR}
+        MOV R0, \vaddr
+        BL x86_seam_sync
+        POP {R0-R3, R12, LR}
+        B 96b
+        .popsection
+#endif
+    .endm
+
     .macro MEM_GET_PTR_R dest_ptr, vaddr
+        SEAM_CHECK \dest_ptr, \vaddr
         UBFX \dest_ptr, \vaddr, #12, #12
         LDR \dest_ptr, [R9, \dest_ptr, LSL #2]
         ADDS \dest_ptr, \dest_ptr, \vaddr
@@ -115,6 +175,7 @@
     .endm
 
     .macro MEM_GET_PTR_W dest_ptr, vaddr
+        SEAM_CHECK \dest_ptr, \vaddr
         UBFX \dest_ptr, \vaddr, #12, #12
         LDR \dest_ptr, [R9, \dest_ptr, LSL #2]
         ADDS \dest_ptr, \dest_ptr, \vaddr
@@ -349,6 +410,25 @@ x86_cpu_interp_asm:
     STR R12, [R8, #TABLE_BASE_OFFSET]
 
 .fetch_decode_loop:
+    /* THE SEAM FLUSH. The instruction that just retired may have stored through
+     * a granule boundary, and those bytes are sitting in the low granule's
+     * slack. Push them into the neighbour now, because this is the instruction
+     * boundary and no operand pointer the decoder produced outlives it -- the
+     * same lifetime argument the prior port's flush point rests on
+     * (references/8086tiny/8086tiny.c:21255-21259).
+     *
+     * COST WHEN NOTHING STRADDLED: one DTCM load and a not-taken CBZ. seam_n
+     * lives in the CPU context for exactly that -- a global would need a
+     * literal pool inside .itcram_hot. It is placed above the PIT load so the
+     * load-use shadow is not lengthened. */
+#if X86_SEAM_FIX
+    LDR R1, [R8, #CPU_SEAM_N]
+    CBZ R1, 95f
+    PUSH {R0-R3, R12, LR}
+    BL x86_seam_flush
+    POP {R0-R3, R12, LR}
+95:
+#endif
     // Decrement PIT cycle counter and check for hardware interrupts
     LDR R1, [R8, #CPU_PIT_COUNTER] // pit_counter
     // R6 carries a POINTER to the active segment's descriptor, not a base
@@ -832,6 +912,21 @@ x86_cpu_interp_asm:
     STR R0, [R8, #CPU_EXIT_REASON]
 
 .save_state_and_exit:
+    /* THE SECOND FLUSH POINT. Every exit hands control to host code that reads
+     * and writes guest memory -- an HLE service filling a DTA, the renderer,
+     * a savestate -- and a straddling store made by the LAST instruction is
+     * still sitting in the low granule's slack until it is pushed. The prior
+     * port flushes at both frame-exit paths for the same reason
+     * (references/8086tiny/8086tiny.c:25156, :25163). Cost: one DTCM load per
+     * interpreter exit, which is per SLICE, not per instruction. */
+#if X86_SEAM_FIX
+    LDR R0, [R8, #CPU_SEAM_N]
+    CBZ R0, 94f
+    PUSH {R0-R3, R12, LR}
+    BL x86_seam_flush
+    POP {R0-R3, R12, LR}
+94:
+#endif
     LDR R12, [R8, #SEG_CS_BASE] // CS.base
     SUB R10, R10, R12
     STR R10, [R8, #EIP_OFFSET]

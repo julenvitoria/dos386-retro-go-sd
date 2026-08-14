@@ -21,6 +21,7 @@ x86_io.c \
 x86_mem.c \
 x86_arena.c \
 x86_pager.c \
+x86_seam.c \
 x86_nor.c \
 x86_video.c \
 x86_video_planar.c \
@@ -62,6 +63,20 @@ X86_TEXT_BILEVEL_FONT ?= 1
 endif
 
 # Per-opcode DWT cycle profiling; see Makefile for why it is off by default.
+# THE GRANULE SEAM (x86_seam.c). 0 is the NEGATIVE CONTROL: no seam prologue is
+# emitted at the fold sites and no flush runs at the instruction boundary, so a
+# straddling 16/32-bit access reads and writes the slack past the low granule
+# instead of its neighbour -- the defect itself. tests/test_seam.py --negative
+# builds this and asserts the wrong answers, because a test that cannot be made
+# to fail is not a test. Never ship 0.
+# PSP SHIFT, in paragraphs, for the granule-seam acceptance test only. 0 is the
+# shipping path. 15 puts the PSP 256 bytes off a 4 KB boundary, which is the
+# placement that silently corrupted Wolfenstein 3-D before the seam was fixed.
+# See x86_dos.c and tests/test_seam.py.
+X86_DOS_PSP_SHIFT ?= 0
+
+X86_SEAM_FIX ?= 1
+
 X86_PROFILE ?= 0
 
 # Frame-loop phase/zone wall-time accounting (x86_zones.h). Off by default like
@@ -79,6 +94,8 @@ X86_ZONES ?= 0
 X86_PROBE ?= 0
 
 CORE_C_DEFS := \
+-DX86_SEAM_FIX=$(X86_SEAM_FIX) \
+-DX86_DOS_PSP_SHIFT=$(X86_DOS_PSP_SHIFT) \
 -DX86_PROFILE=$(X86_PROFILE) \
 -DX86_ZONES=$(X86_ZONES) \
 -DX86_PROBE=$(X86_PROBE) \

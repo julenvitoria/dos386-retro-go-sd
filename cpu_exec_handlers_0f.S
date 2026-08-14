@@ -53,6 +53,7 @@ L(OP_LIDT):
     CMP R2, #0
     BNE.W .raise_gp_fault
 L(OP_LIDT_OK):
+    SEAM_CHECK R2, R7
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
@@ -204,6 +205,7 @@ OP .op_iret_CF
    jumped by a number assembled out of the following instruction. */
 OP .op_0f_jcc_rel32
     UBFX R2, R1, #0, #4
+    SEAM_CHECK R4, R10
     UBFX R4, R10, #12, #12
     LDR.W R4, [R9, R4, LSL #2]
     ADDS R4, R4, R10
@@ -349,6 +351,7 @@ OP .op_0f_movzx_gv_ew
 
 L(OP_0F_MOVZX_GV_EW_MEM):
     BL L(DECODE_MODRM_32)
+    SEAM_CHECK R4, R7
     UBFX R4, R7, #12, #12
     LDR.W R4, [R9, R4, LSL #2]
     ADDS R4, R4, R7
@@ -416,6 +419,7 @@ OP .op_0f_movsx_gv_ew
 
 L(OP_0F_MOVSX_GV_EW_MEM):
     BL L(DECODE_MODRM_32)
+    SEAM_CHECK R4, R7
     UBFX R4, R7, #12, #12
     LDR.W R4, [R9, R4, LSL #2]
     ADDS R4, R4, R7

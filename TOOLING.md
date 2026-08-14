@@ -397,6 +397,7 @@ x86_arena_refusals,x86_arena_deficit,x86_pinned_pages,x86_a20_state
 | `x86_pg_faults_r` / `_faults_w` / `_faults_host` | fold misses serviced, split by cause. `_faults_host` are from `x86_guest_ptr()` and carry **every DOS program load** -- loading is a copy into memory the guest has never touched, so under demand paging all of it faults from the host side. A title whose `_faults_r` is 0 is not broken: any page the host wrote is already resident |
 | `x86_pg_fill_zero` / `_fill_nor` / `_fill_file` | where each faulted page's contents came from. The ratio is the answer to "how much of this guest's memory has ever been anywhere but ZERO" |
 | `x86_pg_exhausted` | **the loud one.** No frame was free and no victim could be taken, so the guest got a clean `X86_EXIT_MEM_FAULT`. A pool that silently ate the store would be indistinguishable from one that works |
+| `x86_seam_syncs` / `_writes` / `_overflow` / `_flushes` | THE GRANULE SEAM (`x86_seam.c`). `_syncs` is how many straddling accesses were SERVED -- the neighbour's leading bytes pulled into the low frame's eight slack bytes; `_writes` is how many bytes a straddling STORE pushed back at the instruction boundary; `_flushes` how many instruction boundaries actually ran a push. **`_overflow` is the loud one**: a straddle that could NOT be served -- a boundary whose low granule has no frame (a fixed mapping, or a NOR-backed page: neither has slack and neither's neighbour is ours to write), or five live boundaries in one instruction against four slots. A non-zero `_overflow` means some access fell back to the old, wrong behaviour, and it is a number to read rather than a silence to infer from. WOLF3D measured 52,216 / 1 / 2 / 52,188 over 25 s: the seam is RARE, and one wrong byte per 52,000 is exactly the shape of a defect that survives for months |
 | `x86_pg_unmapped` | faults for addresses OUTSIDE the pager's window. Not a page fault -- a genuinely unmapped address, i.e. the guest's own wild pointer. Kept separate on purpose: conflating the two turns a guest bug into a silent allocation |
 | `core_dtcm_next` / `core_dtcm_headroom_max` | where the firmware's DTCM bump pool got to after the core's allocations, and an UPPER BOUND on what is left. `GW_MEM_OP_FREE_SIZE` is "RAM only today", so the ABI cannot be asked; this is the only witness. Measured 96,068 B free above a bump at `0x200088BC` |
 
@@ -1092,6 +1093,37 @@ python3 tests/test_paging.py             # the guest memory ARCHITECTURE, as
                                          # deficit. Two arms (0x110000 and
                                          # 0x200000 not aliased) fail on the
                                          # pre-fix whole-space wrap
+python3 tests/test_seam.py               # THE GRANULE SEAM. host = lin + k with
+                                         # one k per 4 KB page, so two adjacent
+                                         # GUEST granules are adjacent in HOST
+                                         # memory only by luck -- the pager hands
+                                         # frames out in FAULT order. A 16- or
+                                         # 32-bit access spanning the boundary
+                                         # resolves one pointer from the LOW
+                                         # granule and runs off the top of that
+                                         # frame, silently.
+                                         # This is the ONE tier-1 harness whose
+                                         # fold is deliberately NOT contiguous:
+                                         # every other arm runs identity over
+                                         # test_ram or a pager whose frames come
+                                         # out of one extent in order, and the
+                                         # defect cannot occur in either, which
+                                         # is why it went unseen. The arm gives
+                                         # the two granules one frame each from
+                                         # extents 48 KB apart and paints the low
+                                         # frame's slack 0xEE, so a broken access
+                                         # returns something recognisable rather
+                                         # than a plausible zero.
+python3 tests/test_seam.py --negative    # the negative control, and it MUST
+                                         # fail without --negative: builds
+                                         # X86_SEAM_FIX=0 (no prologue, no
+                                         # flush) and asserts the WRONG answers
+                                         # -- reads returning 0xEE slack and a
+                                         # straddling store landing in it. The
+                                         # contiguous arm is asserted positively
+                                         # in BOTH builds, because a fixed
+                                         # mapping's fold entries compare equal
+                                         # and x86_seam_sync() early-outs.
 python3 tests/test_core_retrogo.py       # tier 2
 python3 tests/test_timeline.py           # tier 2: replays a timeline through
                                          # the HARDWARE player (shadow word at

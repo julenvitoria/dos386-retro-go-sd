@@ -150,6 +150,15 @@ volatile uint32_t arena_r[32];
 volatile uint32_t run_pager_flag = 0;
 volatile uint32_t pager_r[24];
 
+volatile uint32_t run_seam_flag = 0;
+volatile uint32_t seam_r[24];
+/* Which fold the seam arm installs: 0 = NON-CONTIGUOUS (the defect), 1 = the
+   two granules laid out back to back. The second is the NEGATIVE CONTROL --
+   the same guest program, the same expectations, a fold in which no seam can
+   exist. If it ever fails, the arm is wrong about something other than the
+   seam. Driven from the host so one build answers both. */
+volatile uint32_t seam_contiguous = 0;
+
 volatile uint32_t run_video_flag = 0;
 volatile uint32_t video_blit_cycles = 0;
 uint8_t cga_test_vram[X86_VRAM_BYTES] __attribute__((section(".test_bss")));
@@ -1821,7 +1830,7 @@ static void pager_test_run(void)
     x86_pager_reset();
     x86_pager_own(PGT_FIRST, PGT_PAGES);
     pager_r[0] = (x86_pager_add_frames(test_ram + PGT_MEM_OFF,
-                                       PGT_FRAMES * 4096u) == 0);
+                                       X86_PG_POOL_BYTES(PGT_FRAMES)) == 0);
     pager_r[1] = x86_pg_frames_total;
     pager_r[2] = x86_pg_frames_free;
     for (uint32_t i = 0; i < PGT_PAGES; i++)
@@ -1865,8 +1874,9 @@ static void pager_test_run(void)
         uint32_t host = (PGT_FIRST << 12) + k;
         pager_r[10] = (k != FOLD_INVALID)
                       && (host >= (uint32_t)(uintptr_t)(test_ram + PGT_MEM_OFF))
-                      && (host <  (uint32_t)(uintptr_t)(test_ram + PGT_MEM_OFF
-                                                        + PGT_FRAMES * 4096u));
+                      && (host <  (uint32_t)(uintptr_t)(
+                                        test_ram + PGT_MEM_OFF
+                                        + X86_PG_POOL_BYTES(PGT_FRAMES)));
     }
 
     /*
@@ -1920,6 +1930,167 @@ static void pager_test_run(void)
         guest_page_table[PGT_FIRST + i] = FOLD_INVALID;
     x86_pager_reset();
     pager_r[19] = x86_pg_frames_total;
+}
+
+/* ---- the granule seam ----------------------------------------------------
+ *
+ * host = lin + k, and k is per 4 KB granule. Two adjacent guest granules are
+ * therefore only adjacent in HOST memory by luck -- the pager hands out frames
+ * in fault order, copy-on-write moves a granule into the pool, and a fixed
+ * mapping (VRAM, the 13h aperture, the open-bus filler) has neighbours that are
+ * not memory at all. An access whose bytes span the boundary resolves ONE
+ * pointer, from the LOW granule's k, and then reads or writes straight past the
+ * top of that host page -- into whatever happens to follow it.
+ *
+ * The prior DOS port called this "the seam" and it is the same bug: a
+ * straddling 16-bit DATA read is what made KEEN4 and TOPBENCH diverge there
+ * (references/8086tiny/8086tiny.c:7176-7183).
+ *
+ * WHY THE EXISTING TIER-1 ARMS CANNOT SEE IT. Everything else here runs on a
+ * fold that is either identity over test_ram or a pager whose four frames come
+ * out of one extent in order -- in both, granule N+1 IS the memory after
+ * granule N, so the defect is invisible by construction. This arm installs the
+ * fold BY HAND, with the two granules deliberately 48 KB apart, and paints the
+ * eight bytes after the low granule with 0xEE so a broken access returns
+ * something recognisable rather than a plausible zero.
+ */
+#define SEAM_LOW_OFF   (672u * 1024u)   /* page-aligned, past the arena's 160K */
+#define SEAM_HIGH_OFF  (720u * 1024u)   /* deliberately NOT low + 4096         */
+#define SEAM_SEG       0xC000u
+#define SEAM_FIRST     (0xC0000u >> 12)
+
+/* Put one byte into guest memory through the host accessor, which faults the
+   page in exactly as a program load does. */
+static void seam_poke(uint32_t lin, uint8_t v)
+{
+    uint8_t *p = (uint8_t *)x86_guest_ptr(lin, 1);
+    if (p)
+        *p = v;
+}
+
+static uint32_t seam_peek(uint32_t lin)
+{
+    uint8_t *p = (uint8_t *)x86_guest_ptr(lin, 1);
+    return p ? *p : 0xFFFFFFFFu;
+}
+
+static void seam_test_run(void)
+{
+    for (uint32_t i = 0; i < 24; i++)
+        seam_r[i] = 0;
+
+    uint32_t s0 = x86_seam_syncs, w0 = x86_seam_writes, o0 = x86_seam_overflow;
+
+    x86_pager_reset();
+    guest_page_table[SEAM_FIRST]     = FOLD_INVALID;
+    guest_page_table[SEAM_FIRST + 1] = FOLD_INVALID;
+
+    if (seam_contiguous) {
+        /* THE CONTIGUITY CONTROL, and it CANNOT use the pager. A frame is
+           4,104 bytes now -- 4,096 of guest space and eight of slack -- so no
+           two pager frames are ever contiguous, by construction. What is
+           contiguous is a FIXED mapping: identity over test_ram, which is what
+           every other arm in this harness runs on and what x86_map_fixed()
+           installs for VRAM and the aperture. The fold entries then compare
+           EQUAL, x86_seam_sync() takes its early-out, and the straddling
+           accesses are correct with no seam machinery involved at all.
+           This arm must therefore pass in BOTH builds -- including
+           -DX86_SEAM_FIX=0 -- and a failure here is the guest program or the
+           harness, never the seam. */
+        guest_page_table[SEAM_FIRST] =
+            FOLD_K((uint32_t)(uintptr_t)(test_ram + SEAM_LOW_OFF), SEAM_FIRST);
+        guest_page_table[SEAM_FIRST + 1] =
+            FOLD_K((uint32_t)(uintptr_t)(test_ram + SEAM_LOW_OFF + 4096u),
+                   SEAM_FIRST + 1);
+        memset(test_ram + SEAM_LOW_OFF, 0, 2u * 4096u);
+    } else {
+        /* THE DEFECT. Two extents 48 KB apart and one frame each, so granule
+           N+1 is emphatically not the memory after granule N -- which is what
+           the shipping pager produces anyway, because it hands frames out in
+           FAULT order over a single pool. This is that shape, made explicit
+           and made deterministic. */
+        x86_pager_own(SEAM_FIRST, 2);
+        x86_pager_add_frames(test_ram + SEAM_LOW_OFF,  X86_PG_POOL_BYTES(1));
+        x86_pager_add_frames(test_ram + SEAM_HIGH_OFF, X86_PG_POOL_BYTES(1));
+        seam_poke(SEAM_FIRST << 12, 0);
+        seam_poke((SEAM_FIRST + 1u) << 12, 0);
+    }
+
+    uint32_t lo = SEAM_FIRST << 12;
+    uint32_t hi = (SEAM_FIRST + 1u) << 12;
+    seam_poke(lo + 0xFFE, 0x99);
+    seam_poke(lo + 0xFFF, 0xAA);
+    seam_poke(hi + 0,     0xBB);
+    seam_poke(hi + 1,     0xCC);
+    seam_poke(hi + 2,     0xDD);
+
+    /* Paint the low granule's slack with something recognisable. A broken
+       access reads or writes THESE eight bytes instead of the neighbour, and
+       0xEE is visible on sight where a zero would read as plausible data. */
+    uint8_t *slack = x86_pager_slack(SEAM_FIRST);
+    seam_r[11] = (slack != NULL);
+    if (slack)
+        memset(slack, 0xEE, X86_PG_SLACK);
+    seam_r[12] = (guest_page_table[SEAM_FIRST]
+                  != guest_page_table[SEAM_FIRST + 1]);   /* NOT contiguous */
+
+    /*
+     *   mov ax,0C000h        B8 00 C0
+     *   mov ds,ax            8E D8
+     *   mov bx,0FFFh         BB FF 0F
+     *   mov ax,[bx]          8B 07        <- 16-bit read across the seam
+     *   mov [0010h],ax       A3 10 00
+     *   mov eax,[bx-1]       66 8B 47 FF  <- 32-bit read at 0FFEh, 2 bytes over
+     *   mov [0012h],eax      66 A3 12 00
+     *   mov ax,1234h         B8 34 12
+     *   mov [bx],ax          89 07        <- 16-bit WRITE across the seam
+     *   hlt                  F4
+     *
+     * The results land at offsets 10h/12h, well inside the low granule, so
+     * reading them back cannot itself straddle anything.
+     */
+    static const uint8_t prog[] = {
+        0xB8, 0x00, 0xC0,  0x8E, 0xD8,
+        0xBB, 0xFF, 0x0F,
+        0x8B, 0x07,
+        0xA3, 0x10, 0x00,
+        0x66, 0x8B, 0x47, 0xFF,
+        0x66, 0xA3, 0x12, 0x00,
+        0xB8, 0x34, 0x12,
+        0x89, 0x07,
+        0xF4,
+    };
+    memcpy(test_ram, prog, sizeof(prog));
+    memset(&cpu_state_dtcm, 0, sizeof(cpu_state_dtcm));
+    for (int i = 0; i < 6; i++)
+        cpu_state_dtcm.segs[i].limit = 0xFFFFFFFF;
+    cpu_state_dtcm.pit_reload = 0xFFFFFFFF;
+    cpu_state_dtcm.pit_counter = 0xFFFFFFFF;
+    x86_cpu_interp_asm();
+
+    seam_r[0] = cpu_state_dtcm.exit_reason;                 /* 6 = HLT       */
+    seam_r[1] = seam_peek(lo + 0x10) | (seam_peek(lo + 0x11) << 8);
+                                                            /* 0xBBAA        */
+    seam_r[2] = seam_peek(lo + 0x12) | (seam_peek(lo + 0x13) << 8)
+                | (seam_peek(lo + 0x14) << 16) | (seam_peek(lo + 0x15) << 24);
+                                                            /* 0xCCBBAA99    */
+    seam_r[3] = seam_peek(lo + 0xFFF);                      /* 0x34          */
+    seam_r[4] = seam_peek(hi + 0);                          /* 0x12          */
+    seam_r[5] = seam_peek(hi + 1);                          /* 0xCC          */
+    slack = x86_pager_slack(SEAM_FIRST);
+    seam_r[6] = slack ? slack[0] : 0xFFFFFFFFu;
+    seam_r[7] = seam_contiguous;
+    seam_r[8] = x86_seam_syncs - s0;
+    seam_r[9] = x86_seam_writes - w0;
+    seam_r[10] = x86_seam_overflow - o0;
+
+    /* Put the two granules back the way the rest of the harness leaves them --
+       0xC0000 is past the end of test_ram, so UNMAPPED, exactly as the pager
+       arm restores them. Leaving our scratch mapped there would hand the next
+       arm this one's buffers as guest memory. */
+    x86_pager_reset();
+    guest_page_table[SEAM_FIRST]     = FOLD_INVALID;
+    guest_page_table[SEAM_FIRST + 1] = FOLD_INVALID;
 }
 
 static void dosfile_test_run(void)
@@ -2195,6 +2366,11 @@ void Reset_Handler(void) {
         if (run_pager_flag == 1) {
             pager_test_run();
             run_pager_flag = 0;
+        }
+
+        if (run_seam_flag == 1) {
+            seam_test_run();
+            run_seam_flag = 0;
         }
 
         if (run_dos_flag == 1) {

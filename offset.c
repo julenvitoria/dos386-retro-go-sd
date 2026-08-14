@@ -75,6 +75,7 @@ int main(void)
     EMIT("CPU_NOR_PTR",      offsetof(X86CPUState, nor_ptr));
     EMIT("CPU_VGA_BASE",     offsetof(X86CPUState, vga_base));
     EMIT("CPU_VGA_LATCH",    offsetof(X86CPUState, vga_latch));
+    EMIT("CPU_SEAM_N",       offsetof(X86CPUState, seam_n));
     EMIT("CPU_TABLE_BASE",       offsetof(X86CPUState, opcode_table_base));
     printf("\n    .equ %-24s, %zu\n", "CPU_STATE_SIZE", sizeof(X86CPUState));
 
