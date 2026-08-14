@@ -59,6 +59,159 @@ def walk(backend, ram_addr):
     return out
 
 
+def raw_chain(backend, ram_addr):
+    """The chain as raw 16-byte headers, keyed by segment.
+
+    walk() decodes; this photographs. Proving that a failed AH=4Ah left the
+    chain alone needs the BYTES, not an interpretation of them -- the whole
+    defect was a write that produced a chain still perfectly well-formed.
+    """
+    out = []
+    seg = ARENA_FIRST_MCB
+    for _ in range(64):
+        hdr = bytes(backend.read_memory(ram_addr + seg * 16, 16))
+        out.append((seg, hdr))
+        if hdr[0] != MCB_MEMBER:
+            break
+        seg = seg + (hdr[3] | (hdr[4] << 8)) + 1
+    return out
+
+
+def stage(b, syms, n):
+    """Run one arena stage on the target and wait for it."""
+    b.write_uint32(syms["run_dos_flag"], n)
+    for _ in range(100):
+        if b.read_uint32(syms["run_dos_flag"]) == 0:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def arena_hardening(b, syms, ram):
+    """The four MCB defects, each with its own observable."""
+    ok = True
+
+    def fail(msg):
+        nonlocal ok
+        print(f"FAIL: {msg}")
+        ok = False
+
+    for n in (2, 3):
+        if n == 3:
+            before = raw_chain(b, ram)
+        if not stage(b, syms, n):
+            fail(f"arena stage {n} never completed")
+            return False
+    after = raw_chain(b, ram)
+    r = [b.read_uint32(syms["dos_r"] + 4 * i) for i in range(25)]
+    A, B, C = r[10], r[11], r[12]
+    grew, grow_largest = r[13], r[14]
+    print(f"\narena hardening: A=0x{A:04x} B=0x{B:04x} (freed) C=0x{C:04x}")
+    print(f"  failed grow of A to 0xFFFF: returned {grew}, "
+          f"largest 0x{grow_largest:04x}")
+
+    if A == 0 or B == 0 or C == 0:
+        fail("the three-block setup did not allocate")
+    if grew:
+        fail("resizing A to 0xFFFF paragraphs succeeded; there is not that "
+             "much memory and C is in the way")
+    # DEFECT 1: the chain must be untouched, byte for byte.
+    if [s for s, _ in before] != [s for s, _ in after]:
+        fail(f"a failed grow changed the SHAPE of the chain: "
+             f"{[hex(s) for s, _ in before]} -> {[hex(s) for s, _ in after]}")
+    else:
+        diff = [(s, h1, h2) for (s, h1), (_, h2) in zip(before, after)
+                if h1 != h2]
+        if diff:
+            s, h1, h2 = diff[0]
+            fail(f"a failed grow mutated the chain: MCB 0x{s:04x} was "
+                 f"{h1[:5].hex()} and is now {h2[:5].hex()}. A 4Ah that "
+                 f"reports failure and eats the free block anyway is a loop "
+                 f"the guest can never win")
+        else:
+            print(f"  chain byte-identical across the failed grow "
+                  f"({len(before)} blocks)")
+    # DOS reports what the block COULD grow to: A + header + B.
+    if grow_largest != 0x201:
+        fail(f"a failed 4Ah reported largest 0x{grow_largest:04x}, expected "
+             f"0x0201 (A 0x100 + 1 header + free B 0x100)")
+
+    # DEFECT: a failed 48h must name the true largest free block.
+    if not stage(b, syms, 4):
+        fail("arena stage 4 never completed")
+        return False
+    r = [b.read_uint32(syms["dos_r"] + 4 * i) for i in range(25)]
+    chain = walk(b, ram)
+    true_largest = max([sz for _, _, own, sz in chain if own == 0] or [0])
+    print(f"  failed 48h: returned 0x{r[15]:04x}, largest 0x{r[16]:04x} "
+          f"(host walk says 0x{true_largest:04x})")
+    if r[15] != 0:
+        fail("allocating 0xFFFF paragraphs succeeded")
+    if r[16] != true_largest:
+        fail(f"a failed AH=48h reported BX=0x{r[16]:04x} but the largest free "
+             f"block in the chain is 0x{true_largest:04x}. A client that "
+             f"retries with BX retries with a lie")
+
+    # DEFECT: adjacent free blocks must merge.
+    if not stage(b, syms, 5):
+        fail("arena stage 5 never completed")
+        return False
+    r = [b.read_uint32(syms["dos_r"] + 4 * i) for i in range(25)]
+    print(f"  after freeing C, alloc(0x201) -> 0x{r[18]:04x} "
+          f"(B was 0x{B:04x})")
+    if not r[17]:
+        fail("freeing C failed")
+    if not r[19]:
+        fail(f"a 0x201-paragraph request landed at 0x{r[18]:04x}, not at B "
+             f"(0x{B:04x}); B and C are adjacent and free, so it only misses "
+             f"them if they were never coalesced")
+
+    # DEFECT 2: owner 0 must never survive into the chain.
+    if not stage(b, syms, 6):
+        fail("arena stage 6 never completed")
+        return False
+    r = [b.read_uint32(syms["dos_r"] + 4 * i) for i in range(25)]
+    print(f"  alloc with owner=0 -> 0x{r[20]:04x}, recorded owner "
+          f"0x{r[21]:04x}; next alloc -> 0x{r[22]:04x}")
+    if r[20] == 0:
+        fail("the owner-0 allocation failed outright")
+    if r[21] == 0:
+        fail("a block allocated with owner 0 was recorded with owner 0, which "
+             "IS the free-list encoding -- it is live memory sitting on the "
+             "free list")
+    if not r[23]:
+        fail(f"the next allocation returned 0x{r[22]:04x}, the SAME memory as "
+             f"the live block at 0x{r[20]:04x}")
+    if r[24] == 0:
+        fail("the chain is malformed after the owner-0 allocation")
+
+    # The DOS/4GW loop, and what it costs. Not a timing measurement: MCB header
+    # reads, each one an x86_guest_ptr() call, which is where the emulator was
+    # measured to be spending its time.
+    if not stage(b, syms, 7):
+        fail("arena stage 7 never completed")
+        return False
+    r = [b.read_uint32(syms["dos_r"] + 4 * i) for i in range(30)]
+    reads, blocks0, blocks1, steady, answer = r[25], r[26], r[27], r[28], r[29]
+    print(f"\n  256 x (4Ah 0xFFFF probe + 48h 0xFFFF): {reads} MCB header "
+          f"reads, {reads / 512.0:.1f} per call")
+    print(f"  chain {blocks0} blocks before, {blocks1} after; answer "
+          f"0x{answer:04x}, steady across all 256: {steady}")
+    if blocks1 != blocks0:
+        fail(f"256 FAILED probes moved the chain from {blocks0} blocks to "
+             f"{blocks1}. A loop that fails must be a fixed point, or the "
+             f"arena is eaten by the probing itself -- this is the Dark "
+             f"Forces pathology")
+    if not steady:
+        fail("the probe loop returned a different largest size on a later "
+             "iteration despite every call failing; nothing changed, so "
+             "nothing about the answer may change either")
+    if reads > 512 * 16:
+        fail(f"{reads / 512.0:.1f} header reads per INT 21h memory call on a "
+             f"{blocks0}-block chain is not a bounded walk")
+    return ok
+
+
 CF = 1
 
 TEST_INI = bytes(((i * 7 + 11) & 0xFF) for i in range(700))
@@ -310,6 +463,9 @@ def main(args):
             print(f"FAIL: chain runs past conventional memory to 0x{end:04x}")
             ok = False
 
+        if not arena_hardening(b, syms, ram):
+            ok = False
+
         # The HLE stubs and their bare-IRET default live in guest memory. DOS
         # hands out everything from ARENA_FIRST_MCB up, so any IVT entry that
         # points at or above it is aimed at memory a program will overwrite --
@@ -354,8 +510,93 @@ def main(args):
         runner.stop()
 
 
+# --------------------------------------------------------------------------
+# Negative controls. Each rebuilds x86_dos.c with ONE fix mutated back to the
+# defective form it had before this pass, and requires the test to FAIL. A
+# check that cannot fail proves nothing, and every one of these defects
+# produced a chain that was still perfectly well-formed afterwards -- exactly
+# the shape a green-by-construction test hides.
+MUTATIONS = {
+    # Commit the merge BEFORE deciding, which is what the old mcb_resize did by
+    # merging and recursing: a failed grow eats the free block it was just told
+    # was not enough.
+    "rollback": ("failed grow commits the merge anyway", [
+        ("    if (avail < paras) {",
+         "    m.size = (uint16_t)avail; m.type = last_type;\n"
+         "    mcb_write(seg, &m);\n"
+         "    if (avail < paras) {"),
+    ]),
+    # Report the FIRST free block instead of the largest -- the shape of every
+    # "close enough" answer to BX, and fatal to a client that retries with it.
+    "largest": ("failed 48h reports a free block, not the LARGEST one", [
+        ("            if (m.size > best)\n                best = m.size;",
+         "            if (best == 0)\n                best = m.size;"),
+    ]),
+    # mcb_free() coalesces the whole chain, which would hide the loss of the
+    # merge in mcb_alloc, so both go.
+    "coalesce": ("adjacent free blocks are never merged", [
+        ("        while (m.owner == MCB_FREE && m.type != MCB_LAST &&\n"
+         "               mcb_read((uint16_t)(seg + m.size + 1u), &n) &&\n"
+         "               n.owner == MCB_FREE) {\n"
+         "            m.size = (uint16_t)(m.size + n.size + 1u);\n"
+         "            m.type = n.type;\n"
+         "            mcb_write(seg, &m);\n"
+         "        }\n", ""),
+        ("    mcb_write(seg, &m);\n    mcb_coalesce();\n    return 1;\n}",
+         "    mcb_write(seg, &m);\n    return 1;\n}"),
+    ]),
+    "owner": ("owner 0 is recorded as-is: live memory on the free list", [
+        ("    if (owner == MCB_FREE)\n"
+         "        owner = MCB_OWNER_DOS;      "
+         "/* an allocation is never free; see above */\n", ""),
+    ]),
+}
+
+
+def negative_control(args):
+    """Rebuild with one fix mutated out and require this test to FAIL."""
+    import pathlib
+    src = pathlib.Path("x86_dos.c")
+    original = src.read_text()
+    names = list(MUTATIONS) if args.negative == "all" else [args.negative]
+    for n in names:
+        for find, _ in MUTATIONS[n][1]:
+            if find not in original:
+                print(f"FAIL: the mutation target for '{n}' is not in "
+                      f"x86_dos.c -- this control would pass without testing "
+                      f"anything")
+                return False
+    all_ok = True
+    try:
+        for n in names:
+            why, edits = MUTATIONS[n]
+            text = original
+            for find, repl in edits:
+                text = text.replace(find, repl, 1)
+            src.write_text(text)
+            print(f"\n-- negative control '{n}': {why} --")
+            args.negative = None
+            failed = not main(args)
+            if failed:
+                print(f"PASS (negative control '{n}'): the test rejects the "
+                      f"defective core")
+            else:
+                print(f"FAIL (negative control '{n}'): the test PASSED with "
+                      f"the defect present, so it measures nothing")
+                all_ok = False
+    finally:
+        src.write_text(original)
+        print("-- x86_dos.c restored --")
+    return all_ok
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
     add_runner_args(p)
+    p.add_argument("--negative", nargs="?", const="all",
+                   choices=["all", *MUTATIONS],
+                   help="rebuild with a fix mutated out and require a FAIL")
     args = p.parse_args()
+    if args.negative:
+        sys.exit(0 if negative_control(args) else 1)
     sys.exit(0 if main(args) else 1)

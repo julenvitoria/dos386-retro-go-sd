@@ -80,7 +80,7 @@ volatile uint32_t load_guest_flag = 0;
 /* DOS arena self-test. The host arms it and reads the results back; the MCB
    chain lives in guest memory so the host can also walk it independently. */
 volatile uint32_t run_dos_flag = 0;
-volatile uint32_t dos_r[16];
+volatile uint32_t dos_r[32];
 
 /* HLE stub planting. The stubs and the bare-IRET default sit in guest memory;
    the host checks they land BELOW the DOS arena, because anything at or above
@@ -2326,6 +2326,104 @@ void Reset_Handler(void) {
             dos_r[7] = dos_test_alloc(0xFFFF, &largest);
             dos_r[8] = largest;                    /* must report a real size */
             dos_r[9] = dos_test_walk();            /* chain still consistent */
+            run_dos_flag = 0;
+        }
+
+        /*
+         * Arena hardening, driven in STAGES so the host can photograph the
+         * whole chain between them. A failed grow has to leave the chain
+         * byte-identical, and the only way to prove that is to compare the
+         * bytes on either side of the one call -- which means the call has to
+         * be a stage of its own.
+         *
+         * Layout after stage 2:  A(0x100 owned) B(0x100 FREE) C(0x100 owned)
+         *                        then the rest of conventional memory, free.
+         */
+        if (run_dos_flag >= 2 && run_dos_flag <= 7) {
+            static uint16_t A, B, C;
+            uint16_t l = 0;
+            switch (run_dos_flag) {
+            case 2:
+                x86_dos_arena_init();
+                A = dos_test_alloc(0x100, &l);
+                B = dos_test_alloc(0x100, &l);
+                C = dos_test_alloc(0x100, &l);
+                dos_test_free(B);
+                dos_r[10] = A;
+                dos_r[11] = B;
+                dos_r[12] = C;
+                break;
+            case 3:
+                /* THE failed grow. A is followed by free B (0x100) and then by
+                   OWNED C, so 0xFFFF cannot be satisfied. It must fail without
+                   swallowing B, and report what A could actually grow to:
+                   0x100 + 1 + 0x100 = 0x201. */
+                dos_r[13] = dos_test_resize(A, 0xFFFF, &l);
+                dos_r[14] = l;
+                break;
+            case 4:
+                /* A failed AH=48h must name the TRUE largest free block. The
+                   host cross-checks this against its own walk of the chain. */
+                dos_r[15] = dos_test_alloc(0xFFFF, &l);
+                dos_r[16] = l;
+                break;
+            case 5:
+                /* Coalescing: free C, so B and C and the tail are three
+                   adjacent free blocks. A request for exactly B+header+C must
+                   land at B -- it only fits if they were merged. */
+                dos_r[17] = dos_test_free(C);
+                dos_r[18] = dos_test_alloc(0x201, &l);
+                dos_r[19] = (dos_r[18] == B) ? 1 : 0;
+                break;
+            case 6: {
+                /* owner 0 is FREE. A block allocated by a caller that passes 0
+                   must NOT be recorded as free, and must not be handed out
+                   again by the next allocation. */
+                x86_dos_arena_init();
+                uint16_t z = dos_test_alloc_owner(0x40, 0, &l);
+                dos_r[20] = z;
+                dos_r[21] = dos_test_owner_of(z);      /* must not be 0 */
+                uint16_t y = dos_test_alloc(0x40, &l);
+                dos_r[22] = y;
+                dos_r[23] = (y != z) ? 1 : 0;
+                dos_r[24] = dos_test_walk();
+                break;
+            }
+            case 7: {
+                /* The DOS/4GW shape, in miniature: probe for the largest block
+                   with 4Ah BX=0xFFFF, then try 48h for it, over and over,
+                   never freeing. This is the loop Dark Forces was measured in
+                   -- 17,114 allocations and 34,234 resizes, zero frees, the
+                   arena marched to segment 0x896A. What must be true is that
+                   the loop is a fixed point: the same answer every time, the
+                   chain no size bigger, and a bounded number of header reads
+                   per call. */
+                x86_dos_arena_init();
+                uint16_t P = dos_test_alloc(0x100, &l);
+                uint16_t Q = dos_test_alloc(0x100, &l);
+                (void)dos_test_alloc(0x100, &l);        /* the wall */
+                dos_test_free(Q);
+                uint16_t blocks0 = dos_test_walk();
+                x86_mcb_reads = 0;
+                uint16_t big = 0, first = 0;
+                int stable = 1;
+                for (int i = 0; i < 256; i++) {
+                    big = 0;
+                    (void)dos_test_resize(P, 0xFFFF, &big);
+                    if (i == 0)
+                        first = big;
+                    else if (big != first)
+                        stable = 0;
+                    (void)dos_test_alloc(0xFFFF, &big);
+                }
+                dos_r[25] = x86_mcb_reads;              /* for 512 calls */
+                dos_r[26] = blocks0;
+                dos_r[27] = dos_test_walk();            /* must equal blocks0 */
+                dos_r[28] = stable;
+                dos_r[29] = first;
+                break;
+            }
+            }
             run_dos_flag = 0;
         }
 

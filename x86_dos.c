@@ -37,6 +37,26 @@
 #define MCB_MEMBER      0x4Du       /* 'M': another block follows */
 #define MCB_LAST        0x5Au       /* 'Z': end of the chain      */
 
+/*
+ * owner == 0 is FREE, and that is not ambiguous -- it is provably unusable as
+ * a real owner. An owner field holds a PSP SEGMENT, and a PSP is the first
+ * paragraph of the DATA area of an allocated block, so it is always
+ * `mcb_seg + 1` for some block in the chain. The chain starts at
+ * ARENA_FIRST_MCB (0x0070) and every block sits at or above it, so the
+ * smallest owner value any block can ever carry is 0x0071. Segment 0 is the
+ * interrupt vector table; nothing is ever allocated there, and DOS itself uses
+ * the same encoding for the same reason.
+ *
+ * What IS a real hazard is a CALLER passing 0 as the owner and meaning "I will
+ * fill this in later" -- the program loader did exactly that, and the block
+ * holding the running program stayed on the free list until the next AH=48h
+ * handed it back out. mcb_alloc() now refuses to record 0: an allocation is by
+ * definition not free, so owner 0 is normalised to MCB_OWNER_DOS at the single
+ * point where it would otherwise enter the chain.
+ */
+#define MCB_FREE        0x0000u     /* owner value meaning "on the free list" */
+#define MCB_OWNER_DOS   0x0008u     /* blocks DOS itself owns (env, loader)   */
+
 uint32_t x86_dos_last_error;        /* host-visible: last failing function */
 
 /* --------------------------------------------------------------------------
@@ -52,8 +72,16 @@ typedef struct {
     uint16_t size;                  /* paragraphs, excluding the header */
 } mcb_t;
 
+/* Chain-walk cost, in header reads. Every one of these is an x86_guest_ptr()
+   call, and this counter is the whole reason the arena's cost is a number
+   rather than an opinion: the recon pass found the host PC sitting in
+   mcb_read/x86_guest_ptr and the guest down to ~40 KIPS, and "it feels faster"
+   is not a measurement. Host-visible; four bytes. */
+uint32_t x86_mcb_reads;
+
 static int mcb_read(uint16_t seg, mcb_t *m)
 {
+    x86_mcb_reads++;
     uint8_t *p = x86_guest_ptr(SEG(seg), 16);
     if (!p)
         return 0;
@@ -80,7 +108,7 @@ void x86_dos_arena_init(void)
 {
     mcb_t m;
     m.type = MCB_LAST;
-    m.owner = 0;                    /* free */
+    m.owner = MCB_FREE;
     m.size = (uint16_t)(ARENA_END_SEG - ARENA_FIRST_MCB - 1u);
     mcb_write(ARENA_FIRST_MCB, &m);
 }
@@ -96,7 +124,7 @@ static void mcb_coalesce(void)
         if (m.type == MCB_LAST)
             break;
         uint16_t next = (uint16_t)(seg + m.size + 1u);
-        if (m.owner == 0 && mcb_read(next, &n) && n.owner == 0) {
+        if (m.owner == MCB_FREE && mcb_read(next, &n) && n.owner == MCB_FREE) {
             m.size = (uint16_t)(m.size + n.size + 1u);
             m.type = n.type;
             mcb_write(seg, &m);
@@ -106,52 +134,81 @@ static void mcb_coalesce(void)
     }
 }
 
-static uint16_t mcb_largest_free(void)
+/* Split `m` (already read, sitting at `seg`) down to `paras` paragraphs,
+   handing the remainder back as a free block. Writes `m`. The tail absorbs the
+   block after it if that one is free too, so a shrink never leaves two
+   adjacent free blocks behind -- which is what made a later grow fail for no
+   reason. Local, so it costs two reads instead of a whole-chain coalesce. */
+static void mcb_shrink_to(uint16_t seg, mcb_t *m, uint16_t paras)
 {
-    uint16_t seg = ARENA_FIRST_MCB, best = 0;
-    mcb_t m;
-    while (mcb_read(seg, &m)) {
-        if (m.owner == 0 && m.size > best)
-            best = m.size;
-        if (m.type == MCB_LAST)
-            break;
-        seg = (uint16_t)(seg + m.size + 1u);
+    if (m->size <= paras + 1u)
+        return;                     /* not worth a header; keep the slack */
+
+    uint16_t tail = (uint16_t)(seg + paras + 1u);
+    mcb_t t;
+    t.type = m->type;
+    t.owner = MCB_FREE;
+    t.size = (uint16_t)(m->size - paras - 1u);
+
+    if (t.type != MCB_LAST) {
+        mcb_t n;
+        uint16_t after = (uint16_t)(tail + t.size + 1u);
+        if (mcb_read(after, &n) && n.owner == MCB_FREE) {
+            t.size = (uint16_t)(t.size + n.size + 1u);
+            t.type = n.type;
+        }
     }
-    return best;
+    mcb_write(tail, &t);
+
+    m->type = MCB_MEMBER;
+    m->size = paras;
+    mcb_write(seg, m);
 }
 
 /* Allocate `paras` paragraphs. Returns the DATA segment, or 0 with *largest
    set to the biggest block available -- which is what INT 21h 48h must report
-   so a program can retry with a size that fits. */
+   so a program can retry with a size that fits.
+ *
+ * One pass. It used to be three -- mcb_coalesce(), then the fitting walk, then
+ * mcb_largest_free() -- each an O(n) chain walk through x86_guest_ptr() per
+ * node. With a fragmented arena that is where the emulator was spending
+ * essentially all of its time (measured: host PC in mcb_alloc/mcb_read/
+ * x86_guest_ptr, guest down to ~40 KIPS). Merging free neighbours as the walk
+ * passes them, and tracking the largest while it goes, gets the same answers
+ * for a third of the reads and no extra state.
+ */
 static uint16_t mcb_alloc(uint16_t paras, uint16_t owner, uint16_t *largest)
 {
-    mcb_coalesce();
+    if (owner == MCB_FREE)
+        owner = MCB_OWNER_DOS;      /* an allocation is never free; see above */
 
-    uint16_t seg = ARENA_FIRST_MCB;
-    mcb_t m;
+    uint16_t seg = ARENA_FIRST_MCB, best = 0;
+    mcb_t m, n;
     while (mcb_read(seg, &m)) {
-        if (m.owner == 0 && m.size >= paras) {
-            if (m.size > paras + 1u) {
-                /* Split: the tail becomes a new free block. */
-                uint16_t tail = (uint16_t)(seg + paras + 1u);
-                mcb_t t;
-                t.type = m.type;
-                t.owner = 0;
-                t.size = (uint16_t)(m.size - paras - 1u);
-                mcb_write(tail, &t);
-                m.type = MCB_MEMBER;
-                m.size = paras;
-            }
-            m.owner = owner;
+        /* Absorb the whole run of free blocks that follows this free one. */
+        while (m.owner == MCB_FREE && m.type != MCB_LAST &&
+               mcb_read((uint16_t)(seg + m.size + 1u), &n) &&
+               n.owner == MCB_FREE) {
+            m.size = (uint16_t)(m.size + n.size + 1u);
+            m.type = n.type;
             mcb_write(seg, &m);
-            return (uint16_t)(seg + 1u);
+        }
+        if (m.owner == MCB_FREE) {
+            if (m.size > best)
+                best = m.size;
+            if (m.size >= paras) {
+                mcb_shrink_to(seg, &m, paras);
+                m.owner = owner;
+                mcb_write(seg, &m);
+                return (uint16_t)(seg + 1u);
+            }
         }
         if (m.type == MCB_LAST)
             break;
         seg = (uint16_t)(seg + m.size + 1u);
     }
     if (largest)
-        *largest = mcb_largest_free();
+        *largest = best;
     return 0;
 }
 
@@ -161,7 +218,7 @@ static int mcb_free(uint16_t data_seg)
     mcb_t m;
     if (!mcb_read(seg, &m))
         return 0;
-    m.owner = 0;
+    m.owner = MCB_FREE;
     mcb_write(seg, &m);
     mcb_coalesce();
     return 1;
@@ -178,41 +235,66 @@ static int mcb_resize(uint16_t data_seg, uint16_t paras, uint16_t *largest)
         return 0;
 
     if (paras <= m.size) {
-        if (m.size > paras + 1u) {
-            uint16_t tail = (uint16_t)(seg + paras + 1u);
-            mcb_t t;
-            t.type = m.type;
-            t.owner = 0;
-            t.size = (uint16_t)(m.size - paras - 1u);
-            mcb_write(tail, &t);
-            m.type = MCB_MEMBER;
-            m.size = paras;
-            mcb_write(seg, &m);
-            mcb_coalesce();
-        }
+        mcb_shrink_to(seg, &m, paras);
         return 1;
     }
 
-    if (m.type != MCB_LAST) {
-        uint16_t next = (uint16_t)(seg + m.size + 1u);
-        mcb_t n;
-        if (mcb_read(next, &n) && n.owner == 0 &&
-            (uint32_t)m.size + 1u + n.size >= paras) {
-            m.size = (uint16_t)(m.size + n.size + 1u);
-            m.type = n.type;
-            mcb_write(seg, &m);
-            return mcb_resize(data_seg, paras, largest);
-        }
+    /*
+     * Grow. PROBE FIRST, COMMIT ONLY ON SUCCESS.
+     *
+     * This used to merge the next free block in and then recurse, and if the
+     * result was still too small it returned 0 with the merge already written.
+     * A failed AH=4Ah therefore ATE the free block it had just been told was
+     * not enough -- while reporting failure. DOS/4GW probes for the largest
+     * available block with BX=0xFFFF, gets "no", and asks again; each "no"
+     * consumed more of the arena, so the loop never converged (measured on
+     * STAR_WARS_DARKFORCES: 34,234 resizes, zero frees, arena marched to
+     * segment 0x896A and the chain walk swamped the emulator).
+     *
+     * The walk below only READS. It also spans the entire run of adjacent free
+     * blocks rather than just the first one, so a grow no longer fails merely
+     * because the free space either side of a boundary had not been coalesced.
+     */
+    uint32_t avail = m.size;
+    uint16_t last_type = m.type, next = (uint16_t)(seg + m.size + 1u);
+    mcb_t n;
+    while (last_type != MCB_LAST && mcb_read(next, &n) && n.owner == MCB_FREE) {
+        avail += 1u + n.size;
+        last_type = n.type;
+        next = (uint16_t)(next + n.size + 1u);
     }
-    if (largest)
-        *largest = m.size;
-    return 0;
+
+    if (avail < paras) {
+        /* DOS reports the largest size this block CAN grow to. Nothing has
+           been written: the chain is byte-identical to what we found. */
+        if (largest)
+            *largest = (uint16_t)(avail > 0xFFFFu ? 0xFFFFu : avail);
+        return 0;
+    }
+
+    m.size = (uint16_t)avail;
+    m.type = last_type;
+    mcb_shrink_to(seg, &m, paras);
+    mcb_write(seg, &m);
+    return 1;
 }
 
 /* Test shims. The arena functions are static on purpose -- nothing outside
    INT 21h should allocate -- but the tier-1 harness has to drive them. */
 uint16_t dos_test_alloc(uint16_t paras, uint16_t *largest)
 { return mcb_alloc(paras, 0x1234, largest); }
+/* Deliberately reachable with owner 0: the point is to prove that a caller who
+   asks for a block "to fill the owner in later" cannot leave it on the free
+   list. Nothing but the test uses this. */
+uint16_t dos_test_alloc_owner(uint16_t paras, uint16_t owner, uint16_t *largest)
+{ return mcb_alloc(paras, owner, largest); }
+uint16_t dos_test_owner_of(uint16_t data_seg)
+{
+    mcb_t m;
+    if (!mcb_read((uint16_t)(data_seg - 1u), &m))
+        return 0xFFFFu;
+    return m.owner;
+}
 uint16_t dos_test_free(uint16_t seg)   { return (uint16_t)mcb_free(seg); }
 uint16_t dos_test_resize(uint16_t seg, uint16_t paras, uint16_t *largest)
 { return (uint16_t)mcb_resize(seg, paras, largest); }
@@ -607,12 +689,12 @@ int x86_dos_exec(const char *path, const char *cmdline)
         want = need;
 
     uint16_t largest = 0;
-    uint16_t block = mcb_alloc(want, 0, &largest);
+    uint16_t block = mcb_alloc(want, MCB_OWNER_DOS, &largest);
     uint16_t granted = want;
     if (!block) {
         uint16_t avail = largest;
         if (avail >= need) {
-            block = mcb_alloc(avail, 0, &largest);
+            block = mcb_alloc(avail, MCB_OWNER_DOS, &largest);
             granted = avail;
         }
     }

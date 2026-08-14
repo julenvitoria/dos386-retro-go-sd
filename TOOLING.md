@@ -883,6 +883,20 @@ python3 tests/test_opcodes.py            # 162 cases: EFLAGS, segmentation,
 python3 tests/test_benchmark.py
 python3 tests/test_game.py
 python3 tests/test_dos.py                # MCB arena, walked from the host, plus
+python3 tests/test_dos.py --negative     # 4 controls: rollback, largest,
+                                         # coalesce, owner -- each rebuilds
+                                         # x86_dos.c with ONE fix mutated back
+                                         # to its defective form and requires a
+                                         # FAIL; source restored in a finally.
+                                         # --negative rollback runs just one.
+                                         # The arena half now drives STAGES
+                                         # (run_dos_flag 2..7) so the host can
+                                         # photograph the whole chain either
+                                         # side of a single failed AH=4Ah and
+                                         # compare it BYTE for byte, and stage
+                                         # 7 runs the DOS/4GW probe loop and
+                                         # reports MCB header reads per call
+                                         # (x86_mcb_reads).
                                          # FILE I/O from guest code against a
                                          # FAT12 volume the test builds itself:
                                          # 3Dh/3Fh/42h/3Eh/43h/4Eh/4Fh, the

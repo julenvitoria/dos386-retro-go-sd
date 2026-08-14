@@ -494,6 +494,9 @@ uint16_t dos_test_alloc(uint16_t paras, uint16_t *largest);
 uint16_t dos_test_free(uint16_t seg);
 uint16_t dos_test_resize(uint16_t seg, uint16_t paras, uint16_t *largest);
 uint16_t dos_test_walk(void);
+extern uint32_t x86_mcb_reads;      /* MCB header reads: the arena's cost */
+uint16_t dos_test_alloc_owner(uint16_t paras, uint16_t owner, uint16_t *largest);
+uint16_t dos_test_owner_of(uint16_t data_seg);
 extern uint32_t x86_hle_unhandled_vector, x86_hle_unhandled_func;
 
 uint32_t x86_port_read(uint32_t port, uint32_t size);
