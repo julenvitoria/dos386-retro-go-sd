@@ -412,6 +412,12 @@ static uint32_t   last_slice_halted = 0;
 volatile uint32_t guest_max_slice    = 20000u;
 volatile uint32_t guest_panel_ms_used = 0;  /* the period the budget is 90% OF */
 volatile uint32_t guest_slice_halted = 0;
+/* Where the guest was when it executed HLT: (CS << 16) | IP, 16 deep, plus the
+   last linear EIP. See the capture site for why the LOCATION is the question
+   and the count is not. */
+volatile uint32_t x86_hlt_log[16];
+volatile uint32_t x86_hlt_log_idx = 0;
+volatile uint32_t x86_hlt_last_eip = 0;
 volatile uint32_t guest_grow_blocked = 0;
 static uint32_t   max_slice = 20000u;    /* unthrottled mode's working slice  */
 static uint32_t   rate_window_ms;        /* start of the achieved-rate window */
@@ -453,7 +459,24 @@ static uint32_t   rate_window_frames;
  * shows up as dropped frames, which is a number we already publish rather than
  * a silent stutter.
  */
-#define GUEST_EXEC_PCT       90u
+/*
+ * 85, not 90. Measured on silicon at 90: 59.0 fps but 4.2 dropped and busy
+ * 56.5% -- the drops are the cliff, not saturation. A slice that overruns the
+ * panel period does not cost the overrun, it costs a WHOLE frame, because the
+ * swap then waits for the next vsync and the MCU sits idle for the remainder.
+ * So the optimum is just INSIDE the deadline and the penalty for being just
+ * outside it is enormous; 85% of 16 ms is ~13.6 ms with ~2.4 ms of margin for
+ * the blit, the audio refill and the input poll.
+ *
+ * THE REMAINING IDLE IS NOT OURS TO RECLAIM. Measured in the same run:
+ * guest_exec_ms reads 0 on most frames and guest_slice_halted climbs by ~253
+ * over 660 frames -- ~38% of frames end on a guest HLT -- while guest_ticks
+ * runs at 18.6/s, the stock 18.2 Hz BIOS tick. The guest halts waiting for a
+ * timer interrupt ~55 ms away, i.e. 3.3 frames. A real 386 idles there too.
+ * No value of this constant recovers it; the lever is the guest's tick rate,
+ * which is the guest's business.
+ */
+#define GUEST_EXEC_PCT       85u
 /* Bounds on the display period the budget is a percentage OF. 16 ms is 60 Hz;
    the window is deliberately narrow because anything outside it means the
    measurement is wrong rather than the panel is unusual, and a budget derived
@@ -2369,6 +2392,17 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
              * HLT, which is where the handler's IRET belongs.
              */
             if (reason == X86_EXIT_HALT) {
+                /* WHERE the guest halts decides whether the idle is real.
+                   A benchmark's timing loop and a DOS keyboard wait produce
+                   the same counter and mean completely different things: the
+                   first is work we cannot have, the second is the guest
+                   sitting at a prompt and nothing to do with throughput.
+                   One ring of (CS<<16 | IP), plus a linear EIP, answers it. */
+                x86_hlt_log[x86_hlt_log_idx & 15u] =
+                    ((uint32_t)cpu_state_ptr->segs[1].sel << 16)
+                    | (cpu_state_ptr->eip & 0xFFFFu);
+                x86_hlt_log_idx++;
+                x86_hlt_last_eip = cpu_state_ptr->eip;
                 cpu_state_ptr->exit_reason = 0;
                 if (!(cpu_state_ptr->eflags & 0x200u))
                     break;            /* interrupts masked: nothing can wake it */
