@@ -98,6 +98,36 @@ Verdicts only; evidence in [`docs/12`](docs/12_memory_tiers.md) and
 5. A/B the DMA2D blit on hardware — merged, off, unverified.
 6. Retro-go overlay legibility over 256-colour modes.
 
+### Queued — `x86_vga_planar_store`: exhaust C, then consider assembly
+
+**Gated on measurement, in this order. Do not start at step 3.**
+
+1. **Re-profile it.** The case for converting rested on pre-optimisation data:
+   PC samples used to land in `x86_vga_planar_store`, and after the write-class
+   work they moved back into ITCM and `cls_general` went to 0. Establish what
+   share of frame time the planar path costs *now*, on hardware
+   (`profile_opcodes.py --retrogo --target hardware --settle 20 --window 25`),
+   with Wolf3D in Mode Y.
+2. **Exhaust the C.** More classes, cheaper `vga_cell()` (cache the page base
+   and recompute only when the offset leaves it), avoid re-deriving what the
+   class already implies. Measure each.
+3. **Only then assembly, and only for the ABI.** The win is not out-guessing
+   the compiler — GCC's Thumb-2 is good — it is escaping AAPCS. `R8`-`R11` are
+   reserved for CPU state and are callee-saved, so every call from the
+   interpreter forces a prologue/epilogue: ~8 instructions of stub plus the
+   callee's own, ~20-25 cycles of pure overhead against a fast-path body of
+   ~10-15. Hand assembly reads `R8` directly and returns without touching the
+   stack.
+
+**Cost to weigh against it:** once converted, the C is dead and every future
+change is hand-written. This function was modified ~6 times in one session,
+including the change that bought +55-73%. Freezing it early would have made
+that harder. **If step 1 says the path is a single-digit share of frame time,
+stop — the answer is no.**
+
+Keep the C as the oracle if it is converted: diff assembly against C on the
+same inputs, the way fast paths are already graded against the general path.
+
 ### Not scheduled, but live
 
 - Mode Y still paints mid-draw frames (`x86_modey_mid_draw`).
