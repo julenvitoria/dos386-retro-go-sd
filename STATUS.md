@@ -1376,6 +1376,52 @@ planar clear before the loop is reached. `x86_hle_log`'s 32 newest entries are
 
 Not measured: whether Keen would render correctly given 0Dh — nothing here tests
 the planar path, only that the guest is alive, blind and waiting for input.
+## Keen 4's black screen after the AH=1Ah change — KEEN cleared it, not us
+
+The banner vanished the moment `INT 10h AH=1Ah` started answering VGA
+(`5de7e70`), and the obvious suspect was the mode-0Dh REFUSAL clearing the
+screen on its way out. **It does not.** `x86_video_set_mode()` returns before
+its `memset` when `mode_select()` refuses, and the ring proves the order.
+
+The ring could not show it, though: a set to the mode ALREADY UP adopts nothing
+(`mode_select()` short-circuits) and so logs no tag 1, yet it still CLEARS the
+display. That is a cause with no entry. **Tag 6** now records every INT 10h
+AH=00 set-mode REQUEST, before the decision. With it, Keen 4's whole video
+history reads in six words:
+
+```
+06 0304   AH=00 asks mode 3 (old 4)   -- x86_bios_init()
+01 5003   adopted, 80 columns
+03 0103   renderer follows
+06 0303   AH=00 asks mode 3, ALREADY 3  -- Keen, before the banner: clears
+06 0303   AH=00 asks mode 3, ALREADY 3  -- Keen, AFTER the banner: ERASES IT
+06 0d03   AH=00 asks mode 0Dh
+05 0d03   REFUSED, mode 3 stays up
+```
+
+Confirmed independently, because "who wrote 2000 blank cells" is exactly the
+question two suspects answer identically: the BIOS clear was temporarily made to
+fill `0x0721` (`!`) instead of `0x0720`, and the screen came back **`21 07` in
+every cell**. The blank IS our clear — run from a mode set the GUEST asked for,
+with AL=0x03 (bit 7 clear, i.e. "do clear"), one call before it asks for 0Dh.
+
+So there is nothing to fix in the refusal path, and the refusal is now pinned by
+a tier-1 test (`tests/test_video.py`, `refusal_is_side_effect_free`): draw a
+known screen in mode 3, request 0Dh, require tag 5 AND a byte-identical VRAM and
+frame — with a negative control that a `0x0720` wipe is detected, and verified
+to FAIL against a deliberately clearing `x86_video_set_mode()`.
+
+**Restoring the banner would take a per-title behaviour switch and nothing
+less.** Before `5de7e70` the banner survived only because Keen stopped at the
+AH=12h gate before its second mode set; now it gets further and tidies up after
+itself, exactly as it would on real hardware. The picture comes back when mode
+0Dh renders, not before. Painting a "mode 0Dh unsupported" notice into the
+surviving text buffer was considered and rejected: it is a VRAM write, and a
+refusal that writes VRAM is the very side effect this section rules out.
+
+Cost: `__CORE_BSS_END__` 0x2405a6c0 -> 0x2405a6d0, **+16 B**. Wolf3D unaffected
+(AH=1Ah still AX=0x1a1a/BX=0x0008, `x86_vga13_ok=1`, 1,536 DAC writes). Tier 1
+green, `test_opcodes` 273/273.
 
 ## Open defects
 

@@ -760,6 +760,9 @@ static void vga13_blit(uint8_t *dst, uint32_t stride)
  *   tag 2  port 0x3D8 write                     value = the byte written
  *   tag 3  renderer follow                      value = mode, aux = is_text
  *   tag 5  mode REFUSED, previous one stays     value = old mode, aux = asked
+ *   tag 6  INT 10h AH=00 set-mode REQUESTED     value = old mode, aux = asked
+ *          (logged before the decision -- a set to the mode already up clears
+ *           the display and adopts nothing, so it has no tag 1 of its own)
  *
  * A run with tag 1 and tag 3 disagreeing is a renderer that did not follow the
  * guest; a run of tag 5 names a mode a title wants and we do not have, which is
@@ -816,6 +819,14 @@ static int mode_select(uint8_t mode)
  */
 void x86_video_set_mode(uint8_t mode)
 {
+    /* Tag 6 BEFORE anything else: a set to the mode already up adopts nothing
+       (mode_select() short-circuits) and so logs no tag 1, yet it still CLEARS
+       the display -- which is the loudest thing this call does. Without this
+       entry a screen that went blank between two samples has no cause in the
+       ring at all, and the blank reads as a renderer fault. Measured: Keen 4's
+       banner is erased by its SECOND INT 10h AH=00 AL=03h, and only this tag
+       shows that it happened. */
+    x86_video_log_event(6, mode, video_mode);
     if (!mode_select(mode))
         return;
     cur_row = cur_col = 0;

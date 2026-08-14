@@ -261,11 +261,102 @@ def mode_switch_checks(b, syms):
         return False
     print("PASS: mode 11h refused, mode 0 stays up (nothing renders it)")
 
+    if not refusal_is_side_effect_free(b, syms):
+        return False
+
     if not vga_reg_file_checks(b, syms):
         return False
     if not vga13_checks(b, syms):
         return False
     return ok
+
+
+def read_mode_log(b, syms):
+    """The mode ring, oldest-to-newest, as (tag, aux, value) triples."""
+    idx = b.read_uint32(syms["x86_video_mode_log_idx"])
+    raw = b.read_memory(syms["x86_video_mode_log"], 16 * 4)
+    words = [int.from_bytes(raw[i * 4:i * 4 + 4], "little") for i in range(16)]
+    n = min(idx, 16)
+    order = [(idx - n + i) & 15 for i in range(n)]
+    return [((words[o] >> 24) & 0xFF, (words[o] >> 8) & 0xFFFF, words[o] & 0xFF)
+            for o in order]
+
+
+def refusal_is_side_effect_free(b, syms):
+    """A REFUSED mode set must leave the previous screen BYTE-IDENTICAL.
+
+    The whole point of refusing a mode we cannot render is that the previous
+    one stays up -- docs/08 states it and x86_bios.c's AH=1Ah comment leans on
+    it. That promise is only worth what it is tested for: a refusal that
+    cleared VRAM on the way out would leave the same picture a renderer bug
+    does (2000 cells of 0x0720), and nothing else in this file would notice.
+
+    Mode 0Dh is the case that matters -- it is what Commander Keen 4 asks for
+    -- and it must come back as tag 5 in the mode ring AND leave both the
+    guest's VRAM and the rendered frame exactly as they were.
+    """
+    for n in ("x86_video_mode_log", "x86_video_mode_log_idx", "cga_test_vram"):
+        if n not in syms:
+            print(f"missing symbol {n} -- rebuild tests/main.c")
+            return False
+
+    r = guest_set_mode(b, syms, 3)
+    if r is None or r[0] != 3:
+        print("FAIL: could not get back to text mode 3 for the refusal check")
+        return False
+
+    cells = bytearray()
+    for i in range(80 * 25):
+        cells += bytes([0x21 + (i % 90), 0x5D if (i % 7) else 0x5F])
+    b.write_memory(syms["cga_test_vram"], bytes(cells))
+    before_vram = bytes(b.read_memory(syms["cga_test_vram"], 80 * 25 * 2))
+    before_frame = render(b, syms)
+    if before_frame is None:
+        return False
+
+    r = guest_set_mode(b, syms, 0x0D)
+    if r is None:
+        return False
+    if r[0] != 3 or r[1] != 1 or r[3] != 3:
+        print(f"FAIL: mode 0Dh was not refused cleanly (mode {r[0]:#x} "
+              f"is_text={r[1]} bda_mode={r[3]:#x})")
+        return False
+    log = read_mode_log(b, syms)
+    if not any(tag == 5 and aux == 0x0D and value == 0x03 for tag, aux, value
+               in log):
+        print(f"FAIL: no tag-5 refusal of 0Dh in the mode ring: {log}")
+        return False
+
+    after_vram = bytes(b.read_memory(syms["cga_test_vram"], 80 * 25 * 2))
+    after_frame = render(b, syms)
+    if after_frame is None:
+        return False
+    if after_vram != before_vram:
+        diff = sum(1 for g, w in zip(after_vram, before_vram) if g != w)
+        blanked = after_vram[:4] == bytes([0x20, 0x07, 0x20, 0x07])
+        extra = ("  -- VRAM holds 0x0720 spaces, i.e. the refusal ran the "
+                 "mode-set CLEAR" if blanked else "")
+        print(f"FAIL: a REFUSED mode set changed VRAM: {diff} of "
+              f"{len(before_vram)} bytes{extra}")
+        return False
+    if after_frame != before_frame:
+        print("FAIL: a REFUSED mode set changed the rendered frame")
+        return False
+
+    # Negative control. The check above can only be trusted if it FAILS on the
+    # damage it claims to detect, so do that damage deliberately -- the exact
+    # 0x0720 fill x86_video_set_mode() writes -- and require the comparison to
+    # see it. A test that passes on a wiped screen is not a test.
+    b.write_memory(syms["cga_test_vram"], bytes([0x20, 0x07]) * (80 * 25))
+    poisoned = bytes(b.read_memory(syms["cga_test_vram"], 80 * 25 * 2))
+    if poisoned == before_vram:
+        print("FAIL: negative control -- a fully blanked VRAM compares EQUAL "
+              "to the drawn screen, so the refusal check cannot fail")
+        return False
+    b.write_memory(syms["cga_test_vram"], before_vram)
+    print("PASS: mode 0Dh refused (tag 5), previous text screen byte-identical "
+          "(negative control: a 0x0720 wipe is detected)")
+    return True
 
 
 def expected_vga13(aperture):
