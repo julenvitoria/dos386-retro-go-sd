@@ -8,13 +8,14 @@ this sets a real data watchpoint and reports the ARM PC at the stop, resolved
 against the ELF. Inside our interpreter that PC is the handler, which names the
 guest instruction class immediately.
 
-Addresses may be a raw 0x..., a symbol, or a POINTER dereference with an offset
--- which is what guest RAM needs, since `guest_ram` is a pointer allocated at
-run time:
+Addresses may be a raw 0x..., a symbol, a POINTER dereference with an offset,
+or `guest:0xLIN` for a guest LINEAR address. Guest memory needs the last form:
+`guest_ram` is a frame POOL since demand paging landed, so `*guest_ram+OFF`
+reads an unrelated resident page. That spelling is REFUSED rather than served.
 
     # who is scribbling on the relocated stub at guest linear 0x2E920?
     python3 scripts/watch_memory.py --retrogo --wait-magic \\
-        --addr '*guest_ram+0x2E920' --length 4
+        --addr guest:0x2E920 --length 4
 
     # a plain global, and keep going for the first three writes
     python3 scripts/watch_memory.py --retrogo --wait-magic \\
@@ -30,7 +31,7 @@ import sys
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from scripts.common.probe import (                       # noqa: E402
-    describe_pc, load_symbol_maps, wait_for_value,
+    describe_pc, load_symbol_maps, reject_guest_ram, wait_for_value,
 )
 from scripts.common.target import Image, add_target_args, open_target  # noqa: E402
 from scripts.common.watchpoint import (                  # noqa: E402
@@ -66,6 +67,7 @@ def resolve(backend, syms, spec):
         if k & FOLD_INVALID:
             sys.exit(f"--addr: guest linear {lin:#x} is not mapped right now")
         return (lin + k) & 0xFFFFFFFF
+    reject_guest_ram(spec)
     deref = spec.startswith("*")
     body = spec[1:] if deref else spec
     name, _, off = body.partition("+")

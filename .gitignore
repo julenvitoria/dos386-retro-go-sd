@@ -36,3 +36,6 @@ test_pic_opt.c
 test_tbh.S
 __pycache__/
 *.pyc
+
+# Other agents run in git worktrees under here; they are never our content.
+.claude/worktrees/

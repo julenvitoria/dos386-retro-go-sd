@@ -292,6 +292,83 @@ x86_cpu_interp_asm:
     BEQ .handle_pit_or_irq
 
 .resume_fetch:
+#ifdef X86_TRACE_ODDSP
+    /* Catch the FIRST instruction boundary at which guest SP is ODD, and hold
+       it. A 16-bit DOS guest moves SP by two for its whole life, so an odd SP
+       is a defect in whatever ran last -- and slot [1] is that instruction's
+       EIP, which is the answer this trap exists to produce. It records rather
+       than samples on purpose: the interpreter's instruction count varies by
+       ~1500 between identical builds (the wall-clock tick steers the slice), so
+       every count-based bisection of a rare event is unsound. This one is not.
+       cpu_state.regs are written back as the interpreter goes, so REG_ESP is
+       live here; cpu_state.eip is NOT, which is why R10 is used for the EIP. */
+#ifndef X86_TRACE_ODDREG
+#define X86_TRACE_ODDREG REG_ESP
+#endif
+    PUSH {R0, R1, R2, R3}
+    MOVW R0, #:lower16:x86_oddsp_log
+    MOVT R0, #:upper16:x86_oddsp_log
+    LDR R3, [R0, #288]               @ [72] free-running instruction count
+    ADD.W R3, R3, #1
+    STR R3, [R0, #288]
+    LDR R2, [R0, #0]                 @ caught already? the ring is frozen
+    CBNZ R2, 3f
+    /* X86_TRACE_SKIP arms the trap late. A register that is legitimately odd
+       during startup -- BP is a general register until a frame is set up, and
+       the unpacker loads it with a segment value at instruction 28 -- makes an
+       ungated "first odd" trap fire on a non-defect and hide the real one. The
+       ring keeps filling while disarmed, so the history is still there. */
+#if X86_TRACE_SKIP
+    MOVW R2, #(X86_TRACE_SKIP & 0xFFFF)
+    MOVT R2, #(X86_TRACE_SKIP >> 16)
+    CMP R3, R2
+    BLO.N 2f
+#endif
+#ifdef X86_TRACE_LOWSP
+    /* "The stack has leaked past a level it should never reach." Aimed at a
+       push/pop imbalance repeated thousands of times, where the individual
+       leak is invisible and only the drift is not. */
+    LDR.W R1, [R8, #REG_ESP]
+    MOVW R2, #(X86_TRACE_LOWSP & 0xFFFF)
+    MOVT R2, #(X86_TRACE_LOWSP >> 16)
+    CMP R1, R2
+    BHS.N 2f
+#elif defined(X86_TRACE_LOWEIP)
+    /* "The guest is executing somewhere it can never legitimately be." A linear
+       EIP below the DOS load area is not a subtle invariant like an odd SP --
+       it is the IVT and the BDA being run as code -- and it fires EARLIER in a
+       derailment than any register predicate, which is what makes it the one to
+       reach for first. */
+    MOV.W R1, R10
+    MOVW R2, #(X86_TRACE_LOWEIP & 0xFFFF)
+    MOVT R2, #(X86_TRACE_LOWEIP >> 16)
+    CMP R1, R2
+    BHS.N 2f
+#else
+    LDR.W R1, [R8, #X86_TRACE_ODDREG]
+    LSLS R2, R1, #31                 @ bit 0 into C/Z: Z set == even
+    BEQ.N 2f
+#endif
+    MOV.W R2, #1
+    STR R2, [R0, #0]
+    STR R3, [R0, #4]
+    STR.W R10, [R0, #8]
+    STR R1, [R0, #12]
+    LDR.W R2, [R8, #SEG_SS_BASE]
+    STR R2, [R0, #16]
+    LDR.W R2, [R8, #REG_ESP]
+    STR R2, [R0, #20]
+    LDR.W R2, [R8, #REG_EBP]
+    STR R2, [R0, #24]
+    B.N 3f                           @ freeze the ring where it stands
+2:  LDR R1, [R0, #28]                @ [7] ring write index
+    AND.W R1, R1, #63
+    ADD.W R2, R0, #32                @ [8..71] the ring itself
+    STR.W R10, [R2, R1, LSL #2]
+    ADD.W R1, R1, #1
+    STR R1, [R0, #28]
+3:  POP {R0, R1, R2, R3}
+#endif
 #ifdef X86_TRACE_EIP
     /* Diagnostic sampler, off unless x86_trace.inc turns it on. See
        scripts/trace_diff.py and the alignment traps in TOOLING.md.

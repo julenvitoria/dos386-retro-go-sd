@@ -120,7 +120,25 @@ def parse_deref(spec):
         spec, off_s = spec.split("+", 1)
         off = int(off_s, 0)
     sym = spec.strip()
+    reject_guest_ram(sym)
     return sym, off, (label or f"*{sym}+{off:#x}")
+
+
+GUEST_RAM_IS_NOT_LINEAR = (
+    "*guest_ram+OFF no longer names guest linear memory: since demand paging "
+    "landed, guest_ram is a FRAME POOL, so this reads an arbitrary resident "
+    "page and returns plausible-looking wrong bytes rather than failing. "
+    "Use the fold-table path instead -- probe.py --guest / --guest-save, or "
+    "watch_memory.py --addr guest:0xLIN."
+)
+
+
+def reject_guest_ram(sym):
+    """Refuse the old spelling LOUDLY. Silently returning unrelated pages is
+    the exact failure class this project keeps losing hours to, and the old
+    form appears in TOOLING.md and in several harnesses."""
+    if sym.lstrip("*").split("+", 1)[0].strip() == "guest_ram":
+        raise SystemExit("probe: " + GUEST_RAM_IS_NOT_LINEAR)
 
 
 def parse_dump(spec):
@@ -139,6 +157,7 @@ def parse_dump(spec):
         spec, group = head, int(g, 0)
     sym, _, cnt = spec.partition(":")
     sym = sym.strip()
+    reject_guest_ram(sym)
     return sym, int(cnt or 8, 0), group, (label or sym)
 
 
@@ -161,6 +180,7 @@ def _dump_base(sym, syms, backend=None):
                       reach guest RAM: `guest_ram` is a pointer the core is
                       handed at startup, so its value is not in the ELF.
     """
+    reject_guest_ram(sym)
     deref = sym.startswith("*")
     sym = sym.lstrip("*")
     off = 0

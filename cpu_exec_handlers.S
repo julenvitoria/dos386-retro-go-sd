@@ -3960,7 +3960,15 @@ L(FAR_SET):
 #ifndef USE_16_BIT
 .str_exit:
     LDR.W R3, [R8, #CPU_REP_ACTIVE]
+#ifdef X86_TRACE_EIP
+    /* CBZ reaches +126 bytes and the sampler's counter bump below does not fit
+       inside that. Widened ONLY in a tracing build, so a shipping core keeps
+       the two-byte encoding on this hot path. */
+    CMP R3, #0
+    BEQ.W 1f
+#else
     CBZ R3, 1f
+#endif
     LDR.W R5, [R8, #REG_ECX]
     TST.W R2, #ADDRSIZE_XOR
     IT EQ
@@ -3988,6 +3996,21 @@ L(FAR_SET):
     IT EQ
     UXTHEQ R5, R5
     STR.W R5, [R8, #REG_ECX]
+#ifdef X86_TRACE_EIP
+    /* A batched element bypasses .resume_fetch, so without this the sampler's
+       index counts DISPATCHES, not guest instructions -- and where a batch gets
+       cut moves with the wall-clock-driven slice, so the index differed by
+       ~1500 between identical builds while guest_insns_total was bit-identical.
+       That is what made every count-based bisection unsound; it is the sampler
+       that was non-deterministic, not the guest. */
+    PUSH {R0, R3}
+    MOVW R0, #:lower16:x86_eip_log_idx
+    MOVT R0, #:upper16:x86_eip_log_idx
+    LDR R3, [R0]
+    ADD.W R3, R3, #1
+    STR R3, [R0]
+    POP {R0, R3}
+#endif
     LDR.W R3, [R8, #CPU_REP_HANDLER]
     BX R3                              @ straight back into the string handler
     /* rep_active must NOT survive into another instruction: an interrupt can be

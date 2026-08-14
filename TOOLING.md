@@ -90,6 +90,37 @@ never silently invents zeros for memory that is not mapped.
 `scripts/watch_memory.py --addr guest:0xLIN` resolves the same way, for catching
 the write that corrupted a guest address rather than reading it after the fact.
 
+#### Catching a derailment: the invariant traps in `x86_trace.inc`
+
+`X86_TRACE_EIP` SAMPLES. These CATCH: they arm a predicate, fire on the first
+instruction that violates it, record the state, and **freeze a 64-deep ring of
+the linear EIPs that led there**. Read the whole block with
+`probe.py --dump x86_oddsp_log:73x1`; the ring is `[8..71]`, oldest at `[7]&63`.
+
+| define | fires on |
+|---|---|
+| `X86_TRACE_ODDSP` | turns the trap on at all (required by the others) |
+| `X86_TRACE_ODDREG R` | first boundary where guest register `R` is ODD; default `REG_ESP`. A 16-bit DOS guest moves SP by two for its whole life, so an odd SP is a defect at the instant it happens |
+| `X86_TRACE_LOWEIP N` | first instruction with linear EIP below `N`. "The guest is running the IVT as code" — fires EARLIER in a derailment than any register predicate, so reach for it first |
+| `X86_TRACE_LOWSP N` | first boundary with SP below `N`, for a push/pop imbalance whose single leak is invisible and whose drift is not |
+| `X86_TRACE_SKIP N` | arms the trap only after `N` instructions. Not optional for a register predicate: BP is a general register during startup (the unpacker loads it with a segment value at instruction 28), so an ungated "first odd BP" fires on a non-defect and hides the real one. The ring keeps filling while disarmed |
+
+**Catch, do not bisect, when the event is rare.** A bisection needs the run to be
+reproducible at the granularity you are bisecting; a trap needs nothing. That
+mattered here: `X86_TRACE_EIP`'s index used to count DISPATCHES, and a batched
+`REP` element re-enters the string handler without passing the sampler, so where
+a batch got cut moved with the wall-clock-driven slice and the index differed by
+~1,500 between identical builds. `.str_exit` bumps the counter now, and the index
+is bit-reproducible (measured: 2,647,648 on three consecutive WOLF3D runs, from
+2,453,372/2,454,873 before). **The guest itself was never the problem** —
+`guest_insns_total` was 2,723,483 on every run throughout.
+
+**The old `*guest_ram+OFF` spelling now FAILS with a message** in `--dump`,
+`--deref` and `watch_memory.py --addr`, rather than serving a wrong page. It is
+still in older harnesses and in this file's history, and a reader that returns
+plausible bytes for the wrong address is the exact failure class this project
+keeps losing hours to.
+
 #### The three clocks, and how to watch them
 
 The emulator loop has three independent clocks (see the block comment at the
@@ -286,17 +317,18 @@ port row raises, and not more than that.
 ```bash
 # who is scribbling on the relocated stub at guest linear 0x2E920?
 python3 scripts/watch_memory.py --retrogo --wait-magic \
-    --addr '*guest_ram+0x2E920' --length 4
+    --addr guest:0x2E920 --length 4
 python3 scripts/watch_memory.py --retrogo --wait-magic --addr core_ready --hits 3 \
-    --peek '*guest_ram+0x810:224'
+    --peek 0x24058cd0:224
 ```
 
 `probe.py` samples; this catches. A corrupting write is one instruction among
 millions and polling never sees it, so this sets a real data watchpoint and
 reports the ARM PC at the stop resolved against the ELF — inside the
 interpreter that PC is the handler, which names the guest instruction class.
-`--addr` takes a raw `0x…`, a symbol, or `*SYM+OFF` to dereference a pointer
-(guest RAM needs the last form). `--peek` hexdumps on every hit, which turns a
+`--addr` takes a raw `0x…`, a symbol, `*SYM+OFF` to dereference a pointer, or
+`guest:0xLIN` for a guest LINEAR address — which is what guest RAM needs.
+`*guest_ram+OFF` is **refused**, not served: see below. `--peek` hexdumps on every hit, which turns a
 watchpoint on a completion flag into a clean snapshot of what a load produced.
 
 Caveat: a stop can repeat on the same access without advancing. Treat repeated

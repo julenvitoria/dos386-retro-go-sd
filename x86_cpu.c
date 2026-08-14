@@ -286,3 +286,21 @@ uint32_t x86_iret_log[4];
    symbol exists for probe.py whether or not the sampler is compiled in. */
 uint32_t x86_eip_log[64];
 uint32_t x86_eip_log_idx;
+
+/* First-odd-SP trap (X86_TRACE_ODDSP). A 16-bit DOS guest's SP is even for its
+   whole life -- every PUSH/POP/CALL/RET/INT moves it by two -- so SP going ODD
+   is a handler bug caught at the instant it happens, and catching an EVENT is
+   the only way to name it: sampling cannot, because the run is not
+   bit-reproducible and the culprit is one instruction in millions.
+   X86_TRACE_ODDREG picks which register is watched (REG_ESP by default; point
+   it at REG_EBP and the same trap names whatever made BP odd, which is the next
+   question every time the answer is a `MOV SP,BP` epilogue).
+   The EIP ring FREEZES on the catch rather than snapshotting into a second
+   buffer: the sixteen instructions that led up to the event are the whole
+   answer, and a ring that keeps running past the event overwrites them with
+   whatever the guest did while dying.
+     [0] caught flag  [1] instruction count at the catch  [2] EIP now
+     [3] watched reg  [4] SS base  [5] ESP  [6] EBP
+     [7] ring write index at the catch    [72] instruction count now
+     [8..71] the frozen ring, oldest at (idx & 63)  */
+uint32_t x86_oddsp_log[73];

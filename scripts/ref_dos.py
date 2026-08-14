@@ -206,14 +206,26 @@ def main():
         for line in regs.splitlines():
             if line.startswith(("EIP", "CS ", "DS ", "SS ", "ESP")):
                 print("  " + line.strip())
-        if args.save:
-            os.makedirs(os.path.dirname(args.save) or ".", exist_ok=True)
-            mon.cmd(f"pmemsave 0 0x100000 {os.path.abspath(args.save)}")
-            print(f"wrote {args.save}")
-        if args.screen:
-            os.makedirs(os.path.dirname(args.screen) or ".", exist_ok=True)
-            mon.cmd(f"screendump {os.path.abspath(args.screen)}")
-            print(f"wrote {args.screen}")
+        # VERIFY the file appeared. The monitor acknowledges a command it has
+        # not finished, so a terminate() straight after silently produces no
+        # file at all and the caller diffs against a stale image -- which is
+        # worse than an error, because the diff still "works".
+        for flag, cmd, want in ((args.save, "pmemsave 0 0x100000", 0x100000),
+                                (args.screen, "screendump", 0)):
+            if not flag:
+                continue
+            path = os.path.abspath(flag)
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            if os.path.exists(path):
+                os.unlink(path)
+            mon.cmd(f"{cmd} {path}")
+            for _ in range(20):
+                if os.path.exists(path) and os.path.getsize(path) >= want:
+                    break
+                time.sleep(0.5)
+            else:
+                raise SystemExit(f"ref_dos: {cmd} produced no usable {path}")
+            print(f"wrote {flag} ({os.path.getsize(path)} bytes)")
     finally:
         proc.terminate()
         try:
