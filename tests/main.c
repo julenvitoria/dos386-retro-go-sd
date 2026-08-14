@@ -112,6 +112,21 @@ uint8_t dosfile_img[DOSFILE_IMG_BYTES] __attribute__((aligned(4)));
 volatile uint32_t run_dosfile_flag = 0;
 volatile uint32_t dosfile_r[40];
 
+/* MZ LOAD self-test: x86_dos_exec() end to end, against an .EXE the host built
+   on dosfile_img.
+
+   This is the gap that let a corrupted program load ship. Nothing else in the
+   suite runs a real MZ image through the PSP/environment path, so every DOS
+   test passed both before and after a change that loaded WOLF3D.EXE as
+   garbage. What matters is not that exec RETURNS 0 -- it did, throughout -- it
+   is that the IMAGE IS INTACT AT THE ENTRY POINT and that the PSP the program
+   is about to read describes the block it was actually given. The host does
+   the comparison: it wrote the file, so it knows every byte that must appear
+   at load_seg, and it can walk the PSP fields itself rather than trusting a
+   checksum computed by the code under test. */
+volatile uint32_t run_dosexec_flag = 0;
+volatile uint32_t dosexec_r[16];
+
 volatile uint32_t run_nor_flag = 0;
 volatile uint32_t nor_r[24];
 
@@ -2108,6 +2123,45 @@ static void dosfile_test_run(void)
                                   (test_ram[DOSF_RES + i * 2 + 1] << 8));
 }
 
+/*
+ * Load a real MZ .EXE through x86_dos_exec() and report where everything went.
+ *
+ * Deliberately reports rather than asserts: the host built the file, so the
+ * host is the only side that can say what the loaded image MUST contain, and a
+ * check computed by the same code that did the load proves nothing about it.
+ */
+static void dosexec_test_run(void)
+{
+    static const uint8_t hle_vectors[] = {
+        0x08, 0x09, 0x10, 0x16, 0x1A, 0x20, 0x21,
+    };
+    for (int i = 0; i < 16; i++)
+        dosexec_r[i] = 0;
+
+    x86_video_init(cga_test_vram, cga_test_palette);
+    x86_video_set_aperture(vga_test_aperture, vga_test_pal);
+    x86_bios_init();
+    x86_hle_install(hle_vectors, sizeof(hle_vectors));
+
+    x86_disk_set_memory(dosfile_img, DOSFILE_IMG_BYTES);
+    dosexec_r[0] = (uint32_t)f_mount(&dosfile_fs, "", 1);
+
+    kbd_test_reset_cpu(0);
+    x86_dos_arena_init();
+    dosexec_r[1] = (uint32_t)x86_dos_exec("LOAD.EXE", "-x");
+
+    dosexec_r[2]  = cpu_state_dtcm.segs[1].sel;      /* CS  */
+    dosexec_r[3]  = cpu_state_dtcm.eip;              /* IP  */
+    dosexec_r[4]  = cpu_state_dtcm.segs[2].sel;      /* SS  */
+    dosexec_r[5]  = cpu_state_dtcm.regs[4] & 0xFFFF; /* SP  */
+    dosexec_r[6]  = cpu_state_dtcm.segs[3].sel;      /* DS, which DOS sets to
+                                                        the PSP on entry */
+    dosexec_r[7]  = cpu_state_dtcm.segs[0].sel;      /* ES, likewise */
+    dosexec_r[8]  = x86_dos_psp();
+    dosexec_r[9]  = dos_test_walk();                 /* chain still consistent */
+    dosexec_r[10] = cpu_state_dtcm.segs[1].base;
+}
+
 // External arrays from x86_cpu.c
 extern uint32_t (*io_port_read_table[1024])(void *opaque, uint32_t offset, int size_log2);
 extern void *io_port_opaque_table[1024];
@@ -2460,6 +2514,11 @@ void Reset_Handler(void) {
         if (run_dosfile_flag == 1) {
             dosfile_test_run();
             run_dosfile_flag = 0;
+        }
+
+        if (run_dosexec_flag == 1) {
+            dosexec_test_run();
+            run_dosexec_flag = 0;
         }
 
         if (run_video_flag == 1) {

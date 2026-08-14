@@ -901,7 +901,24 @@ python3 tests/test_dos.py --negative     # 4 controls: rollback, largest,
                                          # FAT12 volume the test builds itself:
                                          # 3Dh/3Fh/42h/3Eh/43h/4Eh/4Fh, the
                                          # not-found path, a drive-letter
-                                         # prefix and a lower-case name
+                                         # prefix and a lower-case name.
+                                         # ALSO the MZ LOAD arm: a real .EXE
+                                         # the test builds is run through
+                                         # x86_dos_exec() and the IMAGE IS
+                                         # COMPARED BYTE FOR BYTE at load_seg,
+                                         # with the PSP (mem_top, env segment,
+                                         # command tail) and the entry state
+                                         # read out of guest memory. A one-byte
+                                         # poke is the negative control. This
+                                         # is the check whose absence let a
+                                         # change that loaded WOLF3D.EXE as
+                                         # garbage pass every tier-1 test --
+                                         # "still running" is not "working".
+                                         # NOTE tier 1 maps guest memory FLAT
+                                         # (tests/main.c identity fold), so it
+                                         # cannot see corruption that depends
+                                         # on 4 KB granule alignment; that
+                                         # class still needs a picture.
 python3 tests/test_pit.py                # PIT channel 0 -- the SYSTEM TIMER's
                                          # divisor -- programmed by GUEST OUTs:
                                          # the real Wolf3D sequence (0x214B =

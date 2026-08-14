@@ -383,6 +383,176 @@ def file_test(b, syms):
     return ok
 
 
+# ---------------------------------------------------------------------------
+# The MZ LOAD test.
+#
+# WHY IT EXISTS. A DOS-layer change was merged, and reverted, that loaded
+# WOLF3D.EXE as garbage -- the game booted to a screen of one repeating byte
+# pattern tiled across all 25 rows. Every tier-1 test passed before AND after
+# it, because nothing here ran a real MZ image through the PSP/environment
+# path. The non-regression argument offered at the time was that the guest
+# executed 64 million instructions "and is still running", which a guest
+# printing rubbish does very happily.
+#
+# So this asserts the only thing that actually matters about a program load:
+# THE IMAGE IS INTACT WHERE THE PROGRAM IS ABOUT TO EXECUTE. The host built
+# the .EXE, so the host knows every byte that must appear at load_seg, and it
+# compares them itself rather than trusting a checksum from the code under
+# test. It also checks the PSP the program is about to read describes the block
+# it was actually given, and that the entry state matches the header.
+#
+# The body is a pseudo-random pattern rather than a constant: a load that
+# duplicates, drops or shifts a chunk still matches a constant fill.
+# ---------------------------------------------------------------------------
+EXE_BODY = bytes(((i * 37 + i // 251 + 5) & 0xFF) for i in range(9000))
+EXE_HDR_PARAS = 2
+EXE_CS, EXE_IP = 0x0010, 0x0023
+EXE_SS, EXE_SP = 0x0180, 0x0100
+EXE_MINALLOC, EXE_MAXALLOC = 0x0200, 0xFFFF
+EXEC_CMDTAIL = b"-x"
+
+
+def build_exe():
+    """A real MZ .EXE: header, no relocations, a known body."""
+    import struct
+    hdr_bytes = EXE_HDR_PARAS * 16
+    total = hdr_bytes + len(EXE_BODY)
+    pages = (total + 511) // 512
+    last = total % 512
+    h = struct.pack("<14H", 0x5A4D, last, pages, 0, EXE_HDR_PARAS,
+                    EXE_MINALLOC, EXE_MAXALLOC, EXE_SS, EXE_SP, 0,
+                    EXE_IP, EXE_CS, 0x001C, 0)
+    return h + bytes(hdr_bytes - len(h)) + EXE_BODY
+
+
+def check_image(b, ram, load_seg, expect, label):
+    """Compare the loaded image against the file. Returns (ok, message)."""
+    got = bytes(b.read_memory(ram + load_seg * 16, len(expect)))
+    if got == expect:
+        return True, f"{label}: image intact, {len(expect)} bytes"
+    first = next(i for i in range(len(expect)) if got[i] != expect[i])
+    nbad = sum(1 for i in range(len(expect)) if got[i] != expect[i])
+    return False, (f"{label}: image DIFFERS -- {nbad} of {len(expect)} bytes, "
+                   f"first at offset 0x{first:04x} "
+                   f"(expected 0x{expect[first]:02x}, got 0x{got[first]:02x})")
+
+
+def exec_test(b, syms):
+    from scripts.common.fat12 import build_image
+
+    for n in ("run_dosexec_flag", "dosexec_r", "dosfile_img", "test_ram"):
+        if n not in syms:
+            print(f"missing symbol {n}")
+            return False
+    ram = syms["test_ram"]
+    exe = build_exe()
+    b.write_memory(syms["dosfile_img"],
+                   build_image([("LOAD.EXE", exe)]))
+
+    b.write_uint32(syms["run_dosexec_flag"], 1)
+    for _ in range(200):
+        if b.read_uint32(syms["run_dosexec_flag"]) == 0:
+            break
+        time.sleep(0.05)
+    else:
+        print("FAIL: the MZ load test never completed")
+        return False
+
+    r = [b.read_uint32(syms["dosexec_r"] + 4 * i) for i in range(16)]
+    (mount, rc, cs, ip, ss, sp, ds, es, psp, nblocks, csbase) = r[:11]
+    load_seg = (psp + 16) & 0xFFFF
+
+    print("\nMZ load:")
+    print(f"  mount           {mount} (0 = FR_OK)")
+    print(f"  x86_dos_exec    {rc if rc < 0x80000000 else rc - (1 << 32)}")
+    print(f"  PSP             0x{psp:04x}   load_seg 0x{load_seg:04x}")
+    print(f"  CS:IP           {cs:04x}:{ip:04x}  (base 0x{csbase:05x})")
+    print(f"  SS:SP           {ss:04x}:{sp:04x}")
+    print(f"  DS / ES         {ds:04x} / {es:04x}")
+    print(f"  blocks in chain {nblocks}")
+
+    ok = True
+    if mount != 0 or rc != 0:
+        print("FAIL: the .EXE did not load at all")
+        return False
+    if psp == 0:
+        print("FAIL: no PSP segment")
+        return False
+
+    # THE CHECK THIS TEST EXISTS FOR.
+    good, msg = check_image(b, ram, load_seg, EXE_BODY, "positive")
+    print(f"  {'PASS' if good else 'FAIL'}: {msg}")
+    if not good:
+        ok = False
+
+    # The entry state has to name the header's entry point, or an intact image
+    # is being entered in the wrong place -- which looks identical from a
+    # counter and produces exactly the same "runs, draws rubbish" screen.
+    if cs != ((load_seg + EXE_CS) & 0xFFFF) or ip != EXE_IP:
+        print(f"FAIL: entry is {cs:04x}:{ip:04x}, expected "
+              f"{(load_seg + EXE_CS) & 0xFFFF:04x}:{EXE_IP:04x}")
+        ok = False
+    if ss != ((load_seg + EXE_SS) & 0xFFFF) or sp != EXE_SP:
+        print(f"FAIL: stack is {ss:04x}:{sp:04x}, expected "
+              f"{(load_seg + EXE_SS) & 0xFFFF:04x}:{EXE_SP:04x}")
+        ok = False
+    if ds != psp or es != psp:
+        print(f"FAIL: DS/ES are {ds:04x}/{es:04x}, expected the PSP {psp:04x}")
+        ok = False
+    if csbase != cs * 16:
+        print(f"FAIL: CS base 0x{csbase:05x} does not match selector {cs:04x}")
+        ok = False
+
+    # The PSP itself, read out of guest memory.
+    p = bytes(b.read_memory(ram + psp * 16, 256))
+    mem_top = p[2] | (p[3] << 8)
+    env = p[0x2C] | (p[0x2D] << 8)
+    tail_len = p[0x80]
+    tail = p[0x81:0x81 + tail_len]
+    print(f"  PSP: INT 20h {p[0]:02x}{p[1]:02x}  mem_top 0x{mem_top:04x}  "
+          f"env 0x{env:04x}  tail {tail_len} {tail!r}")
+    if p[0] != 0xCD or p[1] != 0x20:
+        print("FAIL: PSP does not start with INT 20h")
+        ok = False
+    if mem_top <= load_seg:
+        print(f"FAIL: PSP mem_top 0x{mem_top:04x} is not above the image")
+        ok = False
+    if tail != EXEC_CMDTAIL:
+        print(f"FAIL: command tail is {tail!r}, expected {EXEC_CMDTAIL!r}")
+        ok = False
+    # An environment segment, if one is handed out, must not overlap the
+    # program. This is the exact shape of the reverted change's failure.
+    if env:
+        if load_seg <= env < mem_top or env == psp:
+            print(f"FAIL: environment 0x{env:04x} overlaps the program "
+                  f"(PSP 0x{psp:04x}, load 0x{load_seg:04x}, "
+                  f"top 0x{mem_top:04x})")
+            ok = False
+
+    # The whole program, PSP included, must lie inside conventional memory and
+    # above the HLE stubs.
+    if psp * 16 < ARENA_FIRST_MCB * 16 or mem_top > ARENA_END_SEG:
+        print(f"FAIL: the program does not lie inside the arena")
+        ok = False
+
+    # NEGATIVE CONTROL. Poke ONE byte of the loaded image and re-run the same
+    # comparison: if it still passes, the check above is decorative and the
+    # next corrupted load ships too. One byte is the hardest case on purpose.
+    poke = len(EXE_BODY) // 3
+    orig = bytes(b.read_memory(ram + load_seg * 16 + poke, 1))
+    b.write_memory(ram + load_seg * 16 + poke, bytes([orig[0] ^ 0xFF]))
+    bad, msg = check_image(b, ram, load_seg, EXE_BODY, "negative control")
+    b.write_memory(ram + load_seg * 16 + poke, orig)
+    if bad:
+        print("FAIL: negative control -- a corrupted image still compared "
+              "equal, so the image check proves nothing")
+        ok = False
+    else:
+        print(f"  PASS: {msg}")
+
+    return ok
+
+
 def main(args):
     runner = build_and_create_runner(args)
     try:
@@ -502,6 +672,9 @@ def main(args):
                       f"(0x{arena_lin:05x})")
 
         if not file_test(b, syms):
+            ok = False
+
+        if not exec_test(b, syms):
             ok = False
 
         print("\nPASS" if ok else "\nFAIL")
