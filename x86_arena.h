@@ -100,6 +100,12 @@ int x86_arena_claim(uint32_t id, uint32_t count, uint32_t block_bytes,
                     void **out);
 void x86_arena_release(uint32_t id);
 
+/* Is `id` currently holding arena pages? The mode path has to know: CGA VRAM
+   falls back to a plain RAM_EMU allocation when the arena could not place it
+   (src/main.c), and lending storage the arena never owned would hand the guest
+   a pointer into memory the arena is about to give to someone else. */
+int x86_arena_held(uint32_t id);
+
 /* Would this claim succeed, without making it? For the mode table, which has
    to decide whether to adopt a mode before it commits to it. */
 int x86_arena_would_fit(uint32_t id, uint32_t count, uint32_t block_bytes);

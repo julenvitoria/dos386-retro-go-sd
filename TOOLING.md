@@ -387,6 +387,7 @@ x86_arena_refusals,x86_arena_deficit,x86_pinned_pages,x86_a20_state
 | Symbol | Meaning |
 |---|---|
 | `x86_arena_bytes` / `_used` / `_free` / `_largest` | the display's AXI, as one pool instead of three permanent blocks. **`_largest` is the number that decides whether a mode fits**, not `_free`: a claim's block must be contiguous, so a fragmented arena can have room for an EGA plane and no run to put it in |
+| `x86_vga_ega_card_offsets` | the EGA 0Dh card actually fitted, in PLANE OFFSETS (one offset is four interleaved bytes, so the card is 4x this). Sized from the arena at the mode set, not fixed: 0Dh lends the CGA claim out and pulls the 13h aperture down to the bottom, which is 19,456 offsets on the shipping layout against the 8,192 that cut Keen 4's intro off at row 128. Read it with `x86_vga_planar_lost` and `x86_vga_latch_miss` -- a small card shows up there first |
 | `x86_arena_deficit` | bytes the LAST refused claim could not place. This is what a refusal message quotes -- "EGA needs 118,784 bytes more than exist" is actionable and "EGA failed" is not |
 | `x86_arena_refusals` / `_claims_ok` | claims refused outright and claims satisfied. A claim is **all or nothing**: the previous port measured a partial EGA card as producing worse output than no EGA (8 KB/plane truncates cleanly; 16 KB and 32 KB alias the floating pages onto each other and fill the screen with noise that reads as a rendering defect). A rising `_refusals` with a black screen is the system working |
 | `x86_pinned_pages` | guest pages the pager may never evict. 24 with CGA VRAM and the 13h aperture mapped (8 + 16); a 0 here while a mode is up means the display's storage is evictable, which is a defect the picture would show a frame later |
@@ -943,6 +944,17 @@ python3 tests/test_video.py              # CGA mode 4 blitter, pixel-exact, plus
                                          # store hook and the word `out dx,ax`
                                          # register writes are on the path.
                                          # --modey-only runs just the Mode Y arm.
+                                         # An EGA-FIT arm runs after those, on
+                                         # the layout the REAL core claims (35
+                                         # pages, CGA then the 13h aperture):
+                                         # mode 0Dh must lend the CGA claim out,
+                                         # pull the aperture down and come back
+                                         # with 19,456 plane offsets instead of
+                                         # 8,192; returning to text must give the
+                                         # CGA claim back BLANK; and against an
+                                         # arena with no spare page 0Dh must be
+                                         # refused and counted, never quietly
+                                         # given a card of zero.
                                          # A THIRD Mode Y arm asks a question no
                                          # pixel test can: WHICH FRAMES ARE
                                          # PAINTED. Mode Y aliases every page

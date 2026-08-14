@@ -262,6 +262,11 @@ extern uint8_t *x86_vga_planar_aperture;
 extern volatile uint32_t x86_vga_planar_stores;
 void x86_vga_planar_store(uint32_t off, uint32_t val, uint32_t size);
 extern volatile uint32_t x86_vga13_ok;
+/* The EGA 0Dh card actually fitted, in PLANE OFFSETS (one offset is four
+   interleaved bytes). Sized from the arena at the mode set rather than fixed,
+   so "how big is the card" -- the first question a clipped picture raises -- is
+   a number a probe can read. 0 while no planar mode is armed. */
+extern volatile uint32_t x86_vga_ega_card_offsets;
 extern volatile uint32_t x86_vga_dac_writes;
 /* 256 ARGB8888 entries built from the guest's DAC. Non-NULL only while a
    256-colour mode is up; the frame loop pushes it through

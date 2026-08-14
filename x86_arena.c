@@ -184,6 +184,13 @@ void x86_arena_release(uint32_t id)
     arena_recount();
 }
 
+int x86_arena_held(uint32_t id)
+{
+    if (id >= X86_ARENA_CLAIMS)
+        return 0;
+    return claims[id].held ? 1 : 0;
+}
+
 /*
  * The whole claim, or none of it.
  *

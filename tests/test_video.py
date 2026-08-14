@@ -1241,6 +1241,75 @@ def ega_checks(b, syms):
     return True
 
 
+def egafit_checks(b, syms):
+    """The ENLARGED EGA card: the CGA loan, the compaction, and the refusal.
+
+    Keen 4 programs a CRTC Offset of 0x20 -- 64 bytes per row -- so an 8,192
+    offset plane is 128 rows and the bottom three quarters of the intro was
+    black. The card is sized from the arena now, and this arm asserts the
+    arithmetic on the layout the real core claims rather than on whatever the
+    bonus pool happened to release.
+    """
+    for n in ("run_egafit_flag", "egafit_r"):
+        if n not in syms:
+            print(f"missing symbol {n}")
+            return False
+    b.write_uint32(syms["run_egafit_flag"], 1)
+    if not wait_flag(b, syms["run_egafit_flag"], 0, "EGA fit arm hung"):
+        return False
+    r = [b.read_uint32(syms["egafit_r"] + 4 * i) for i in range(16)]
+    print(f"  claims={r[0]}{r[1]} largest_before={r[2]} mode={r[3]:#04x} "
+          f"card={r[4]} cga_held={r[5]} armed={r[6]} | back: mode={r[8]:#04x} "
+          f"cga_held={r[9]} cell={r[10]:#06x} | control: mode={r[12]:#04x} "
+          f"refused={r[13]} deficit={r[15]}")
+
+    if not (r[0] and r[1]):
+        print("FAIL: the harness could not make the core's own two claims")
+        return False
+    if r[2] != 45056:
+        print(f"FAIL: expected 45,056 bytes free before the loan, got {r[2]}")
+        return False
+    if r[3] != 0x0D or not r[6] or r[7]:
+        print(f"FAIL: mode 0Dh was not adopted (mode {r[3]:#x}, armed {r[6]}, "
+              f"refusals {r[7]})")
+        return False
+    if r[4] != 19456:
+        print(f"FAIL: the card is {r[4]} plane offsets, expected 19,456. "
+              f"77,824 contiguous bytes / 4 planes is the whole point of "
+              f"lending the CGA claim and compacting the aperture; "
+              f"{r[4] * 4} bytes means one of the two did not happen.")
+        return False
+    if r[5]:
+        print("FAIL: the CGA claim is still held while 0Dh is up, so the card "
+              "got only the tail of the arena")
+        return False
+    if r[8] != 0x03 or not r[9] or r[11]:
+        print(f"FAIL: returning to text did not give the CGA claim back "
+              f"(mode {r[8]:#x}, held {r[9]}, ega_armed {r[11]})")
+        return False
+    if r[10] != 0x0720:
+        print(f"FAIL: the text buffer came back as {r[10]:#06x}, not blank "
+              f"(0x0720). Its pages held EGA planes and the contents were not "
+              f"cleared, so the guest's screen is plane bytes read as glyphs.")
+        return False
+    # ---- the negative control
+    if r[12] == 0x0D:
+        print("FAIL: 0Dh was ADOPTED against an arena with no spare page. A "
+              "mode whose stores have nowhere to land must be refused.")
+        return False
+    if r[13] < 1 or r[14] or r[15] == 0:
+        print(f"FAIL: the refusal was silent -- refusals {r[13]}, armed "
+              f"{r[14]}, deficit {r[15]}. A refusal must be counted and must "
+              f"quote what it could not place.")
+        return False
+    print(f"PASS: EGA card 8,192 -> {r[4]} plane offsets ({r[4] * 4} B, "
+          f"{r[4] // 64} rows at Keen's 64-byte pitch); CGA lent and returned "
+          f"blank; a card that does not fit is refused and counted")
+    b.write_uint32(syms["run_planar_flag"], 3)
+    wait_flag(b, syms["run_planar_flag"], 0, "planar unmap hung")
+    return True
+
+
 def present_checks(b, syms):
     """The Mode Y PRESENTATION POLICY -- which frames the loop paints.
 
@@ -1476,7 +1545,12 @@ def main(args):
             return False
         if not present_checks(b, syms):
             return False
-        return ega_checks(b, syms)
+        if not ega_checks(b, syms):
+            return False
+        # LAST: it re-points the video layer at arena blocks of its own and
+        # rebuilds the arena around them, so nothing may run after it that
+        # expects the harness's standard buffers still to be claimed.
+        return egafit_checks(b, syms)
     finally:
         runner.stop()
 

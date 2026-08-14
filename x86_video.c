@@ -865,14 +865,22 @@ static void vga13_blit(uint8_t *dst, uint32_t stride)
  * planes of one 8-pixel group are a single aligned 32-bit load. That layout is
  * tiny386's / QEMU's; the idea is theirs.
  *
- * KEEN 4'S LEVEL BACKGROUNDS ARE NOT REACHABLE HERE AND THAT IS ARITHMETIC, NOT
- * A MISSING FEATURE. The Galaxy engine caches its tile art in off-screen video
- * memory and blits it out with latch copies; measured on the reference, 97.2%
- * of those copies source from beyond an 8 KB plane, its write high-water is
- * plane offset 65,536, and nothing between 8 KB and 64 KB per plane buys a
- * partial picture -- at 16 KB the frame is WORSE than at 8 KB, not better. That
- * is a 256 KB card against a device with ~25 KB spare. 0Dh gets Keen's banner
- * and its menus; it does not get its levels.
+ * KEEN 4'S LEVEL BACKGROUNDS ARE STILL NOT FULLY REACHABLE HERE, AND THAT IS
+ * ARITHMETIC. The Galaxy engine caches its tile art in off-screen video memory
+ * and blits it out with latch copies; measured on the reference, 97.2% of those
+ * copies source from beyond an 8 KB plane and its write high-water is plane
+ * offset 65,536 -- a 256 KB card. The card is sized from the arena now (see
+ * planar_storage_follow), which reaches 19,456 offsets on the shipping layout
+ * instead of 8,192: the whole 200-row frame is addressable at Keen's 64-byte
+ * pitch where it used to cut off at row 128, and the off-screen tiles that do
+ * not fit still draw as nothing. A complete frame with wrong tiles, not a
+ * pixel-correct one.
+ *
+ * KNOWN LIMIT OF THE LOAN: while 0Dh is up the guest's 0xB8000 mapping still
+ * points at the pages the planes now hold. Our own writers stand down
+ * (cga_storage_ok()); a guest that writes text memory it cannot see while in a
+ * graphics mode corrupts plane bytes instead. Nothing needs 32 KB to park it
+ * on, and no title has been seen to do it.
  */
 #define EGA_WIDTH     320u
 #define EGA_ROWS      200u
@@ -991,6 +999,8 @@ static void blit_ega16(uint8_t *dst, uint32_t stride)
  *   tag 3  renderer follow                      value = mode, aux = is_text
  *   tag 5  mode REFUSED, previous one stays     value = old mode, aux = asked
  *   tag 6  INT 10h AH=00 set-mode REQUESTED     value = old mode, aux = asked
+ *   tag 7  a display CLAIM was refused          value = 0 CGA loan, 1 EGA card
+ *   tag 8  EGA card fitted                      aux = plane offsets >> 8
  *          (logged before the decision -- a set to the mode already up clears
  *           the display and adopts nothing, so it has no tag 1 of its own)
  *
@@ -1044,6 +1054,132 @@ volatile int32_t x86_video_pan = -1;
  *   0Dh      the aperture is the CPU read shadow and the block is the planes.
  *            Losing it IS a refusal -- there is nowhere for a pixel to go.
  */
+/*
+ * ---- THE CGA LOAN, AND THE COMPACTION IT PAYS FOR -------------------------
+ *
+ * While a planar mode is armed the 32 KB CGA claim is DEAD WEIGHT: text and
+ * CGA graphics cannot be on screen at the same time as 0Dh, which is the whole
+ * premise of the arena ("the peak demand is the LARGEST mode rather than the
+ * sum", x86_arena.h). So 0Dh borrows it and gives it back on the way out.
+ *
+ * Releasing it is not enough by itself, and the arithmetic says why. The arena
+ * is 35 pages, claimed in init order: CGA at pages 0-7, the 13h aperture at
+ * 8-23, 11 pages free at 24-34. Dropping CGA leaves TWO holes (8 pages and 11
+ * pages) and the planes are ONE interleaved block -- plane p at offset a lives
+ * at planes[4a+p] -- so a split card is not addressable and the best a release
+ * alone buys is 11,264 offsets. The aperture is therefore RE-CLAIMED first,
+ * which first-fits it into the vacated bottom and leaves one 19-page run:
+ *
+ *      143,360 arena - 65,536 aperture = 77,824 = 19,456 plane offsets
+ *      19,456 / 64 B per row (Keen's CRTC Offset 0x20) = 304 rows > 200
+ *
+ * against the 8,192 offsets (128 rows) that cut Keen's intro off three
+ * quarters of the way up. It is still not the 65,536 offsets/plane the Galaxy
+ * engine's off-screen tile cache actually wants (11-ega-planar.md, "Keen 4
+ * needs a 256 KB card"), so expect a whole frame with wrong tiles in it, not a
+ * pixel-correct one.
+ *
+ * CONTENTS ARE NOT PRESERVED, and that is safe by exactly one mechanism: every
+ * return to text goes through INT 10h AH=00, and x86_video_set_mode() clears
+ * the cell buffer to 0x0720 after mode_select(). Nothing else may assume it,
+ * so a re-claim that lands on different pages is blanked HERE too -- a guest
+ * that drives the BDA directly (mode_sync_from_bda -> mode_select, which does
+ * NOT clear) would otherwise read plane bytes as characters.
+ */
+static uint8_t cga_lent;            /* the CGA claim is on loan to 0Dh */
+
+/*
+ * May the CGA cell/pixel buffer be touched at all?
+ *
+ * WHILE THE LOAN IS OUT, cga_vram POINTS AT THE PLANES. Every writer below --
+ * the mode-set clear, the graphics scroll, gfx_putchar(), putpixel -- runs in
+ * ANY non-text mode, 0Dh included, so without this they would scribble CGA
+ * bytes over the EGA card and the corruption would read as a planar bug. None
+ * of them loses anything by standing down: their output is a CGA-format screen
+ * that no 0Dh renderer reads.
+ */
+static int cga_storage_ok(void)
+{
+    return cga_vram && !cga_lent;
+}
+
+static void cga_storage_lend(void)
+{
+    if (cga_lent || !x86_arena_held(X86_ARENA_ID_CGA))
+        return;                     /* not arena-backed: nothing to lend */
+    x86_arena_release(X86_ARENA_ID_CGA);
+    cga_lent = 1;
+}
+
+static void cga_storage_reclaim(void)
+{
+    void *blk = NULL;
+
+    if (!cga_lent)
+        return;
+    if (x86_arena_claim(X86_ARENA_ID_CGA, 1, X86_VRAM_BYTES, &blk) != 0) {
+        /* Loud, and it must also STOP: cga_vram still points into pages the
+           arena now considers free, and claiming anything else would alias
+           them onto the text buffer. */
+        x86_video_log_event(7, 0, 0);
+        return;
+    }
+    cga_lent = 0;
+    cga_vram = (uint8_t *)blk;
+    x86_map_fixed(0xB8000u, cga_vram, X86_VRAM_BYTES);
+    memset(cga_vram, 0, X86_VRAM_BYTES);
+    for (unsigned i = 0; i < TEXT_COLS * TEXT_ROWS; i++)
+        ((uint16_t *)cga_vram)[i] = 0x0720;
+}
+
+/* Pull the 13h aperture down to the bottom of the arena so the planes get one
+   run rather than two. A re-claim releases the old claim first, so this is a
+   no-op the second time. Its contents are the CPU read shadow, which
+   x86_vga_planar_arm() rebuilds. */
+static void aperture_compact(void)
+{
+    void *blk = NULL;
+
+    if (!x86_arena_held(X86_ARENA_ID_VGA13))
+        return;                     /* not arena-backed: leave it alone */
+    if (x86_arena_claim(X86_ARENA_ID_VGA13, 1, X86_VGA_APERTURE_BYTES,
+                        &blk) != 0)
+        return;                     /* the old placement survives intact */
+    if ((uint8_t *)blk == vga_aperture)
+        return;
+    vga_aperture = (uint8_t *)blk;
+    x86_vga_planar_aperture = vga_aperture;
+    x86_map_fixed(0xA0000u, vga_aperture, X86_VGA_APERTURE_BYTES);
+    memset(vga_aperture, 0, X86_VGA_APERTURE_BYTES);
+}
+
+/* The largest card the arena will give, in plane offsets, bounded by what the
+   mode can ADDRESS (the A segment decodes 64 KB per plane) and by page
+   granularity. Deliberately a maximum and not a minimum: 11-ega-planar.md
+   warns that sizing 0Dh to the visible page is a partial fix at best, because
+   Keen's tile cache lives off-screen. 0 means not even the old size fits. */
+#define X86_EGA_PLANE_MAX   0x10000u        /* 64 KB/plane, a 256 KB card */
+#define EGA_OFFS_PER_PAGE   (X86_ARENA_PAGE / 4u)
+
+static uint32_t ega_fit_offsets(void)
+{
+    uint32_t off = x86_arena_largest / 4u;
+
+    if (off > X86_EGA_PLANE_MAX)
+        off = X86_EGA_PLANE_MAX;
+    off &= ~(EGA_OFFS_PER_PAGE - 1u);
+    while (off >= X86_EGA_PLANE_OFFSETS) {
+        if (x86_arena_would_fit(X86_ARENA_ID_EGA, 1, 4u * off))
+            return off;
+        off -= EGA_OFFS_PER_PAGE;
+    }
+    return 0;
+}
+
+/* The card actually fitted, in plane offsets. Host-visible because "how big is
+   the card" is the first question a clipped picture raises. */
+volatile uint32_t x86_vga_ega_card_offsets;
+
 static void planar_storage_follow(uint8_t kind)
 {
     void *blk = NULL;
@@ -1051,16 +1187,34 @@ static void planar_storage_follow(uint8_t kind)
     if (kind == VM_EGA4) {
         x86_arena_release(X86_ARENA_ID_SPARE);
         x86_vga_modey_set_cache(NULL, 0);
-        if (x86_arena_claim(X86_ARENA_ID_EGA, 1, 4u * X86_EGA_PLANE_OFFSETS,
-                            &blk) == 0)
-            x86_vga_ega_set_planes(blk, X86_EGA_PLANE_OFFSETS);
-        else
+        /* Release BEFORE measuring: x86_arena_largest cannot know that a
+           re-claim would free the card we are replacing. */
+        x86_arena_release(X86_ARENA_ID_EGA);
+        x86_vga_ega_set_planes(NULL, 0);
+        cga_storage_lend();
+        aperture_compact();
+        uint32_t offs = ega_fit_offsets();
+        if (offs && x86_arena_claim(X86_ARENA_ID_EGA, 1, 4u * offs, &blk) == 0) {
+            x86_vga_ega_set_planes(blk, offs);
+            x86_vga_ega_card_offsets = offs;
+            x86_video_log_event(8, offs >> 8, 0);
+        } else {
+            /* Loud: the mode is about to be refused, and the counter plus the
+               arena deficit are what say why. */
             x86_vga_ega_set_planes(NULL, 0);
+            x86_vga_ega_card_offsets = 0;
+            x86_vga_ega_refused++;
+            x86_video_log_event(7, 0, 1);
+        }
         return;
     }
 
     x86_arena_release(X86_ARENA_ID_EGA);
     x86_vga_ega_set_planes(NULL, 0);
+    x86_vga_ega_card_offsets = 0;
+    cga_storage_reclaim();
+    if (cga_lent)
+        return;                 /* the loan is outstanding: claim nothing */
     if (kind != VM_VGA8) {
         x86_arena_release(X86_ARENA_ID_SPARE);
         x86_vga_modey_set_cache(NULL, 0);
@@ -1131,6 +1285,14 @@ void x86_video_set_mode(uint8_t mode)
         return;
     cur_row = cur_col = 0;
     text_scroll_col = 0;
+    if (!cga_storage_ok()) {
+        /* 0Dh has the CGA pages. The 13h aperture is still separate storage
+           and still has to be cleared below. */
+        if (cur_desc->kind == VM_VGA8 && vga_aperture)
+            memset(vga_aperture, 0, X86_VGA_APERTURE_BYTES);
+        x86_video_refresh_palette();
+        return;
+    }
     memset(cga_vram, 0, X86_VRAM_BYTES);
     /* The 13h aperture is separate storage, so clearing CGA VRAM does not
        touch it. A guest that sets 13h expects a blank screen, and leaving the
@@ -1246,7 +1408,7 @@ static void gfx_putchar(uint8_t ch, uint8_t colour, unsigned col, unsigned row)
     const unsigned char *g = x86_font8x8()[ch];
     unsigned wide = (cur_desc->kind == VM_CGA2);
 
-    if (row >= TEXT_ROWS || col >= cur_desc->cols)
+    if (row >= TEXT_ROWS || col >= cur_desc->cols || !cga_storage_ok())
         return;
 
     if (wide) {
@@ -1309,6 +1471,8 @@ void x86_video_scroll(uint8_t lines, uint8_t attr)
 {
     unsigned cols = cur_desc->cols;
 
+    if (!cga_storage_ok())
+        return;                 /* the planes hold those pages: see the loan */
     if (!x86_video_is_text()) {
         if (lines == 0 || lines >= TEXT_ROWS)
             memset(cga_vram, 0, X86_VRAM_BYTES);
@@ -1367,7 +1531,7 @@ void x86_video_teletype(uint8_t ch)
 
 void x86_video_putpixel(uint16_t x, uint16_t y, uint8_t colour)
 {
-    if (x >= CGA_WIDTH || y >= CGA_HEIGHT)
+    if (x >= CGA_WIDTH || y >= CGA_HEIGHT || !cga_storage_ok())
         return;
     uint32_t off = ((y & 1) ? CGA_PLANE_ODD : 0) + (y >> 1) * CGA_ROW_BYTES
                  + (x >> 2);
