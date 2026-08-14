@@ -42,6 +42,64 @@ THE TWO TRAPS, BOTH OF WHICH COST REAL TIME HERE
    title.
 
 ------------------------------------------------------------------------------
+TWO ENGINES, AND WHY -- QEMU CANNOT RUN WOLFENSTEIN 3D AT ALL
+------------------------------------------------------------------------------
+`--engine qemu` (default) is the machine described above. `--engine dosbox`
+runs the SAME image under DOSBox-X. That is not redundancy: it was forced by a
+measurement.
+
+**QEMU's VGA cannot satisfy Wolf3D's `VL_SetScreen`, and no option changes it.**
+That routine waits for "active display, not in vertical retrace" and then for
+the end of active display, with a TimeCount timeout as its only escape:
+
+    mov cx,[TimeCount] / add cx,2
+  L1: in al,3DA / test al,1 / jnz L1     ; wait for DISPLAY ENABLE
+  L2: sti / cli / cmp [TimeCount],cx / jae done
+      in al,3DA / test al,8 / jnz L1     ; back to L1 on VERTICAL RETRACE
+                 test al,1 / jz  L2
+
+QEMU's `vga_dumb_retrace()` returns `st01 ^ (ST01_V_RETRACE|ST01_DISP_ENABLE)`,
+i.e. it flips BOTH bits on every read, so port 0x3DA alternates 0x00 <-> 0x09
+and NEVER shows 0x01 or 0x08. **Measured** by single-stepping the guest over
+QEMU's gdbstub: `eip=56 al=0 ... eip=65 al=9 -> back to 56`, forever. The
+TimeCount escape cannot fire either, because TimeCount is only advanced by the
+game's own INT 08h handler, which `SD_Startup()` installs LATER. `retrace=on`
+(`vga_precise_retrace`) is dead code in modern QEMU -- the property is not
+exposed on `VGA`, `isa-vga`, `cirrus-vga` or any other model in 10.1. So this
+is not a tuning problem; the reference simply cannot get past the signon
+screen, and **that stall is QEMU's, not the guest's and not ours**.
+
+DOSBox-X models display-enable and vertical-retrace independently and runs the
+title correctly. Measured with the shipped `WOLF3D.dsk`, unmodified apart from
+`--no-hooks`: signon screen with MOUSE / JOYSTICK / ADLIB / SOUND BLASTER /
+SOUND SOURCE detected, then the main menu, then episode select. INT 08h is
+hooked by the game (`2aee:0095`) and INT 09h too (`26b7:0009`), which is the
+direct proof that `SDL_SetTimer0()` and `IN_Startup()` ran.
+
+The DOSBox-X engine boots the image's OWN MS-DOS (`imgmount 2 ... -fs none` +
+`boot -l c`), not DOSBox-X's built-in DOS, so the software stack matches the
+QEMU engine and our emulator. State comes out through DOSBox-X's `autosave=`
+save states, which are ZIPs carrying the whole `Memory` and `Vga` components --
+so `--save` still writes a byte-comparable low megabyte and `--screen` writes a
+real PNG of the mode 13h/Mode-Y framebuffer.
+
+Four DOSBox-X traps, each of which produced silence rather than an error:
+
+1. **`[sdl] priority`'s second field is the INACTIVE priority and defaults to
+   pausing.** Under `SDL_VIDEODRIVER=dummy` the window is never focused, so the
+   emulator starts, prints its banner and then STOPS. `priority=normal,normal`.
+2. **DOSBox-X's working directory is not yours.** Under the flatpak it is
+   `~/.var/app/com.dosbox_x.DOSBox-X/config/dosbox-x`, so every relative path in
+   `[autoexec]` silently resolves somewhere else and `imgmount` fails with no
+   host-visible trace. All paths written into the config are ABSOLUTE.
+3. **A host directory mounted with `mount d <path>` is not writable from the
+   guest here**, so the shell cannot be used as an output channel. Everything
+   observable comes from the save state and the `[log]` file instead.
+4. **The signon screen waits for a key**, and a reference sitting there looks
+   exactly like one that hung. `--keys` is delivered with `autotype -w`, which
+   is asynchronous and survives the `boot`.
+
+------------------------------------------------------------------------------
 WHAT IT IS NOT
 ------------------------------------------------------------------------------
 It is not a timing reference and not a claim about our silicon. And a reference
@@ -122,6 +180,133 @@ def rewrite_boot_files(path, launch):
         d[off:off + SECTOR] = body + b"\x1a" * (SECTOR - len(body))
         struct.pack_into("<I", d, ent + 28, len(body))
     open(path, "wb").write(bytes(d))
+
+
+def state_memory(path):
+    """The low megabyte out of a DOSBox-X save state.
+
+    The `Memory` component is a short header followed by raw RAM, and the
+    header's length is not documented anywhere we can rely on. Rather than
+    hardcode the 136 bytes this build happens to use, the base is FOUND and
+    then VALIDATED against the BDA: 0x413 is the conventional-memory size in KB
+    and must be 640 (or at least plausible), which no other offset in the
+    search window satisfies. A wrong base would hand back plausible-looking
+    bytes for the wrong address, which is the failure class this tree keeps
+    losing hours to, so it raises instead.
+    """
+    import zipfile
+    z = zipfile.ZipFile(path)
+    m = z.read("Memory")
+    for k in range(0, 8192):
+        if struct.unpack_from("<H", m, k + 0x413)[0] in range(512, 641) \
+                and m[k + 0x449] <= 0x13:
+            return m[k:k + 0x100000]
+    raise SystemExit(f"ref_dos: no BDA signature in {path} -- save state "
+                     f"layout changed, do not guess a base")
+
+
+VGA_VRAM = 2 * 1024 * 1024
+
+
+def state_screen(path, png):
+    """Render mode 13h / Mode Y out of a save state's `Vga` component.
+
+    Wolf3D runs UNCHAINED (Mode Y), so a pixel is not a byte at a linear
+    offset: plane = x & 3 and the offset is y*80 + (x >> 2), and DOSBox-X
+    stores planar VRAM interleaved four bytes per address. Reading it linearly
+    gives a picture that is a quarter as wide, repeated -- which looks like a
+    rendering bug rather than a decoding one.
+
+    The DAC is found by scanning for a 768-byte run of 6-bit values; a
+    greyscale index image is written if that fails, because the INDEXES are the
+    part that carries the answer and a missing palette must not cost the shot.
+    """
+    import zipfile
+    from PIL import Image
+    v = zipfile.ZipFile(path).read("Vga")
+    if len(v) < VGA_VRAM:
+        raise SystemExit(f"ref_dos: {path} Vga component is too small")
+    vb = len(v) - VGA_VRAM
+    px = bytearray(320 * 200)
+    for y in range(200):
+        row = y * 80
+        for x in range(320):
+            px[y * 320 + x] = v[vb + (row + (x >> 2)) * 4 + (x & 3)]
+    im = Image.frombytes("P", (320, 200), bytes(px))
+    # FORWARD, first match, and that is not arbitrary: any SHIFT of the real
+    # table is also all-6-bit, so scanning backwards lands on the last valid
+    # shift and renders a correct Wolf3D frame in rotated colours -- which
+    # reads as a palette defect in the thing being measured rather than in the
+    # reader. The first match is the table's true start.
+    pal = None
+    for i in range(0, vb - 768):
+        w = v[i:i + 768]
+        if max(w) < 64 and len(set(w)) > 20:
+            pal = [c * 255 // 63 for c in w]
+            break
+    im.putpalette(pal if pal else
+                  [c for i in range(256) for c in (i, i, i)])
+    os.makedirs(os.path.dirname(os.path.abspath(png)) or ".", exist_ok=True)
+    im.convert("RGB").save(png)
+    return len(set(px))
+
+
+def run_dosbox(args, img):
+    """Boot `img`'s own MS-DOS under DOSBox-X and sample it via save states."""
+    work = os.path.abspath(args.work)
+    saves = os.path.join(work, "saves")
+    shutil.rmtree(saves, ignore_errors=True)
+    os.makedirs(saves, exist_ok=True)
+    log = os.path.join(work, "dosbox.log")
+    conf = os.path.join(work, "dosbox.conf")
+    cyls, heads, secs = geometry(img)
+    n = max(1, min(args.samples, 100))
+    keys = " ".join(k.strip() for k in args.keys.split(",") if k.strip())
+    auto = (f"autotype -w {args.settle:.0f} -p {args.key_pace} {keys}\n"
+            if keys else "")
+    # Every path absolute (trap 2); priority's second field not 'pause'
+    # (trap 1); autosave gives us `n` states `--interval` apart.
+    open(conf, "w").write(
+        "[sdl]\npriority=normal,normal\n"
+        f"[dosbox]\nmachine={args.machine}\nmemsize={args.mem}\n"
+        f"startbanner=false\nautosave={args.interval:.0f} 1-{n}\n"
+        f"[log]\nlogfile={log}\nint10=true\nsblaster=true\n"
+        "[autoexec]\n"
+        f"imgmount 2 {img} -t hdd -fs none -size 512,{secs},{heads},{cyls}\n"
+        f"{auto}boot -l c\n")
+    limit = args.settle + args.interval * (n + 1)
+    subprocess.run([args.dosbox, "-conf", conf, "-nogui", "-nomenu",
+                    "-savedir", saves, "-time-limit", str(int(limit))],
+                   env=dict(os.environ, SDL_VIDEODRIVER="dummy"),
+                   stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
+                   timeout=limit + 90)
+    slots = sorted((f for f in os.listdir(saves) if f.endswith(".sav")),
+                   key=lambda f: int(f.split(".")[0]))
+    if not slots:
+        raise SystemExit("ref_dos: DOSBox-X produced no save state -- check "
+                         f"{log}; an [autoexec] that never ran leaves it "
+                         "ending right after COMMAND.COM starts")
+    last = None
+    for i, s in enumerate(slots):
+        p = os.path.join(saves, s)
+        d = state_memory(p)
+        last = d
+        i8 = struct.unpack_from("<HH", d, 8 * 4)
+        i9 = struct.unpack_from("<HH", d, 9 * 4)
+        print(f"  slot {s:>7} mode=0x{d[0x449]:02x} "
+              f"INT08={i8[1]:04x}:{i8[0]:04x} INT09={i9[1]:04x}:{i9[0]:04x} "
+              f"tick={struct.unpack_from('<I', d, 0x46C)[0]}")
+        if args.screen:
+            out = (args.screen if len(slots) == 1 else
+                   f"{os.path.splitext(args.screen)[0]}_{i + 1}.png")
+            print(f"      screen -> {out} "
+                  f"({state_screen(p, out)} distinct indexes)")
+    if args.save:
+        path = os.path.abspath(args.save)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        open(path, "wb").write(last)
+        print(f"wrote {args.save} ({len(last)} bytes)")
+    return 0
 
 
 class Monitor:
@@ -209,7 +394,24 @@ def main():
                    help="comma-separated monitor sendkey names pressed before "
                         "sampling, e.g. ret,spc -- a title waiting on a signon "
                         "keypress is indistinguishable from one that has hung")
+    p.add_argument("--cmd", action="append", default=[],
+                   help="extra QEMU monitor command, run and printed at every "
+                        "sample. Repeatable. e.g. --cmd 'x/16i $cs*16+$eip'")
+    p.add_argument("--qemu-arg", action="append", default=[],
+                   help="extra argument passed straight to qemu-system-i386. "
+                        "Repeatable; use --qemu-arg=-M --qemu-arg=isapc")
     p.add_argument("--mem", type=int, default=16)
+    p.add_argument("--engine", choices=("qemu", "dosbox"), default="qemu",
+                   help="qemu is the default; QEMU CANNOT run Wolfenstein 3D "
+                        "(its port 0x3DA flips display-enable and vertical "
+                        "retrace together -- see the module docstring), so use "
+                        "dosbox for any title that polls for retrace")
+    p.add_argument("--dosbox", default="dosbox",
+                   help="the DOSBox-X binary for --engine dosbox")
+    p.add_argument("--machine", default="svga_s3",
+                   help="DOSBox-X [dosbox] machine type")
+    p.add_argument("--key-pace", type=float, default=3.0,
+                   help="seconds between --keys presses under --engine dosbox")
     p.add_argument("--work", default="build/run/refdos")
     args = p.parse_args()
 
@@ -227,6 +429,9 @@ def main():
     cyls, heads, secs = geo
     print(f"geometry from the BPB: cyls={cyls} heads={heads} secs={secs}")
 
+    if args.engine == "dosbox":
+        return run_dosbox(args, os.path.abspath(img))
+
     sock = os.path.join(args.work, "mon.sock")
     if os.path.exists(sock):
         os.unlink(sock)
@@ -238,7 +443,7 @@ def main():
         + (["-vnc", args.display[4:]] if args.display.startswith("vnc=")
            else ["-display", args.display])
         + [
-         "-monitor", f"unix:{sock},server,nowait"],
+         "-monitor", f"unix:{sock},server,nowait"] + list(args.qemu_arg),
         stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     try:
         print(f"letting the reference run {args.settle:.0f}s...")
@@ -281,6 +486,12 @@ def main():
                             for c in range(80)).rstrip()
                         if line:
                             print(f"      |{line}")
+            for c in args.cmd:
+                out = mon.cmd(c)
+                for line in out.splitlines():
+                    line = line.rstrip()
+                    if line and not line.startswith("(qemu)") and line != c:
+                        print(f"      {line}")
             print(f"  t+{n * args.interval:5.0f}s CS:IP={bits.get('CS')}:"
                   f"{bits.get('EIP')} DS={bits.get('DS')} SS:SP="
                   f"{bits.get('SS')}:{bits.get('ESP')} "

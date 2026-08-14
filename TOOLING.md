@@ -123,6 +123,91 @@ place.** Check `--samples`, the mode byte and the screendump before trusting any
 comparison, or the two images are snapshots of different moments and every
 difference between them is noise.
 
+##### `--engine dosbox` — because QEMU **cannot run Wolfenstein 3D at all**
+
+`--cmd 'CMD'` runs any extra monitor command at every sample and `--qemu-arg=X`
+passes X straight to QEMU, so a hypothesis about the machine model can be tested
+without editing the script. Both were added to find the following, and the
+finding is the reason the second engine exists.
+
+**QEMU's port 0x3DA flips display-enable and vertical-retrace TOGETHER**, so the
+state Wolf3D's `VL_SetScreen` waits for never occurs:
+
+```
+   mov cx,[TimeCount] / add cx,2         ; the only escape from the loop
+L1: in al,3DA / test al,1 / jnz L1       ; wait for DISPLAY ENABLE
+L2: cmp [TimeCount],cx / jae done
+    in al,3DA / test al,8 / jnz L1       ; a VERTICAL RETRACE restarts at L1
+               test al,1 / jz  L2
+```
+
+`vga_dumb_retrace()` returns `st01 ^ (ST01_V_RETRACE|ST01_DISP_ENABLE)`, so
+0x3DA alternates **0x00 ↔ 0x09** and is never 0x01 or 0x08. Measured by
+single-stepping the guest over QEMU's gdbstub (`--qemu-arg=-s`, then
+`gdb -ex 'set architecture i8086' -ex 'target remote :1234'` and `stepi`):
+`eip=56 al=0 … eip=65 al=9 → back to 56`, forever. The TimeCount escape cannot
+fire either — TimeCount is advanced only by the game's own INT 08h handler,
+which `SD_Startup()` installs *later*. `vga_precise_retrace` is dead code in
+QEMU 10.1: the `retrace` property is exposed on **no** VGA model (`VGA`,
+`isa-vga`, `cirrus-vga`, …), so `-global VGA.retrace=on` does nothing. **This
+stall is QEMU's. It is not the guest's and it is not ours** — and every reading
+of "the reference is stuck in the same place we are" that was taken from it is
+a coincidence of two different causes.
+
+DOSBox-X models the two bits independently and runs the title:
+
+```bash
+python3 scripts/ref_dos.py --engine dosbox --no-hooks --launch WOLF3D.EXE \
+    --dsk references/.../WOLF3D.dsk --settle 38 --samples 10 --interval 3 \
+    --keys space,space,space,space --key-pace 5 \
+    --screen build/artifacts/w.png --save build/artifacts/w.bin
+```
+
+That exact line reaches the **main menu** (slot 5) and the episode select
+(slots 1-4, 6-10), reproducibly across runs. It boots the image's OWN MS-DOS
+(`imgmount 2 … -fs none` + `boot -l c`), not DOSBox-X's built-in DOS, so the
+software stack matches the QEMU engine and matches ours.
+
+State comes out of DOSBox-X's `autosave=` **save states**, which are ZIPs
+holding the whole `Memory` and `Vga` components: `--save` writes the low
+megabyte byte-comparably against `probe.py --guest-save`, `--screen` writes one
+PNG per sample of the mode 13h / **Mode Y** framebuffer, and each line prints
+the BIOS video mode, the INT 08h/09h vectors and the BIOS tick. **INT 08h ≠ the
+DOS default is the single number that says `SD_Startup()` completed** — on
+DOSBox-X it reads `2aee:0095` and INT 09h `26b7:0009`, i.e. `SDL_SetTimer0()`
+and `IN_Startup()` both ran. Under QEMU both stay at DOS's `0de7:…` forever.
+
+Four DOSBox-X traps, each of which produced silence rather than an error:
+
+1. **`[sdl] priority`'s second field is the INACTIVE priority and can be
+   `pause`.** Under `SDL_VIDEODRIVER=dummy` the window is never focused, so the
+   emulator boots, prints its banner and then STOPS — an `[autoexec]` that
+   simply never runs. `priority=normal,normal`.
+2. **DOSBox-X's working directory is not yours.** Under the flatpak it is
+   `~/.var/app/com.dosbox_x.DOSBox-X/config/dosbox-x`, so every relative path in
+   `[autoexec]` resolves somewhere else and `imgmount` fails with nothing
+   host-visible. Every path the script writes is ABSOLUTE.
+3. **`mount d <hostdir>` is not writable from the guest here**, so the DOS shell
+   cannot be used as an output channel. Everything observable comes from the
+   save state and the `[log]` file.
+4. **The signon screen waits for a key**, and a reference sitting on it looks
+   exactly like one that hung. `--keys` is delivered with `autotype -w`, which
+   is asynchronous and survives the `boot`.
+
+Two decoding rules in `state_screen()` that a naive reader gets wrong, both
+noted in the code: Wolf3D is **unchained**, so a pixel is
+`plane = x & 3, offset = y*80 + (x >> 2)` over DOSBox-X's four-byte-interleaved
+VRAM — read linearly it comes out quarter-width and repeated, which looks like a
+rendering defect rather than a decoding one. And the DAC is located by scanning
+**forwards** for the first all-6-bit 768-byte run: any *shift* of the real table
+is also all-6-bit, so scanning backwards lands on the last valid shift and
+renders a correct frame in rotated colours.
+
+**The image itself is healthy and that was checked host-side, not assumed.** All
+eight `.WL1` files plus `WOLF3D.EXE` are present on the MBR-partitioned FAT16
+volume with an allocated cluster chain at least as long as the directory size —
+nothing truncated, `VSWAP.WL1` exactly 742,912 B.
+
 `scripts/watch_memory.py --addr guest:0xLIN` resolves the same way, for catching
 the write that corrupted a guest address rather than reading it after the fact.
 

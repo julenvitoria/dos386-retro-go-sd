@@ -558,10 +558,43 @@ cost a round, and all four are the same mistake, trusting an instrument:
    `cmp si,[0x9265] / jz`, so a call with `sdm_Off` while it is already 0 skips
    the store. A zero hit count there proves nothing.
 
-**The reference (`scripts/ref_dos.py`, QEMU booting the shipped .dsk) also does
-not reach the menu** — it sits in a TimeCount wait at our-linear 0x1E066 with
-INT 08h still owned by DOS. Until it does, there is no oracle for this point,
-and getting it there is the highest-value next step.
+### The reference reaches the main menu — on DOSBox-X, because QEMU CANNOT
+
+The previous reading was that the QEMU reference "also does not reach the menu",
+sitting in a TimeCount wait with INT 08h still owned by DOS, which invited the
+conclusion that Wolf3D needs something neither machine provides. **Measured, the
+two stalls are unrelated and the reference's is QEMU's own defect.**
+
+Wolf3D's `VL_SetScreen` waits for display-enable and then for the end of active
+display *without* a vertical retrace, with a TimeCount timeout as its only
+escape. **QEMU's `vga_dumb_retrace()` flips ST01's display-enable and
+vertical-retrace bits TOGETHER**, so port 0x3DA alternates 0x00 ↔ 0x09 and is
+never 0x01 or 0x08 — measured by single-stepping the guest over QEMU's gdbstub:
+`eip=56 al=0 … eip=65 al=9 → back to 56`, forever. The TimeCount escape cannot
+fire, because TimeCount is advanced only by the game's own INT 08h handler,
+which `SD_Startup()` installs later. `vga_precise_retrace` is unreachable in
+QEMU 10.1 — the `retrace` property is exposed on no VGA model — so it is not
+tunable, and every reading of "the reference is stuck where we are" taken from
+that machine was two different causes landing on one symptom.
+
+**On DOSBox-X the same shipped `.dsk`, unmodified apart from `--no-hooks`, runs
+the title correctly**: the signon screen with MOUSE / JOYSTICK / ADLIB / SOUND
+BLASTER / SOUND SOURCE detected, the **main menu**
+(`build/artifacts/ref_wolf3d_mainmenu.png`), episode select
+(`ref_wolf3d_episodes.png`), the high-score table and the gameplay demo. INT 08h
+reads `2aee:0095` and INT 09h `26b7:0009` — the game's own handlers — so
+`SDL_SetTimer0()` and `IN_Startup()` both ran, i.e. it is fully past the
+`SD_Startup()` our guest is stuck inside. `ref_dos.py --engine dosbox` drives it
+and pulls the whole low megabyte plus a rendered Mode-Y frame out of DOSBox-X
+`autosave=` save states, so there is an oracle at an arbitrary point now. The
+command and the four DOSBox-X traps are in [`TOOLING.md`](TOOLING.md).
+
+Checked host-side rather than assumed: the image is complete — all eight `.WL1`
+files and `WOLF3D.EXE` present on the MBR-partitioned FAT16 volume, every
+cluster chain at least as long as its directory size, `VSWAP.WL1` exactly
+742,912 B. **The disk exonerates itself, DOSBox-X exonerates the game, and the
+defect that keeps Wolf3D inside `SD_Startup()` is ours.**
+
 ## TOPBENCH — running, scoring, screenshotted
 
 The 4 px cell is an **Everex Micro Enhancer 5x8** face squeezed to 4, not a
