@@ -1289,6 +1289,42 @@ def present_checks(b, syms):
         print(f"FAIL: flip gap measured {r[3]}, expected 20")
         return False
 
+    # THE SAME GUEST AT THE SPEED THE DEVICE RUNS IT. The arm above flips every
+    # 20 frames, which is faster than the 60-frame staleness bound, so the bound
+    # could never fire and the arm never asked what happens when it does. On
+    # silicon a WOLF3D gameplay frame is much longer than 60 loop frames: the
+    # bound fired mid-redraw, every guest frame, which is the split viewport and
+    # the house of mirrors. 300-frame flips, stores in every frame, 1500 frames.
+    r = run(4)
+    if r is None:
+        return False
+    # Menus (fast flips), then a level entered: 1500 frames of continuous
+    # drawing with a flip every 300. The estimate of the guest's frame time is
+    # necessarily stale across that transition and nothing can distinguish a
+    # slow frame from a stopped one, so the bound may fire a couple of times --
+    # but it must BACK OFF, and it is graded on the run after.
+    if r[0] > 2 or r[1] > 2:
+        print(f"FAIL: entering a level the loop painted {r[0]} frames "
+              f"({r[1]} of them mid-draw) and did not converge; the staleness "
+              f"back-off is not working.")
+        return False
+    if r[2] != 0 or r[3] != 0 or r[4] != 0:
+        print(f"FAIL: in a settled level the frame loop painted {r[2]} of 1500 "
+              f"frames of a guest that draws continuously and flips every 300 "
+              f"({r[3]} mid-draw, {r[4]} quiet). Every mid-draw paint is the "
+              f"one aliased page caught with the raycaster still writing it -- "
+              f"the split viewport, and the house of mirrors while turning.")
+        return False
+    if r[5] != 300:
+        print(f"FAIL: flip gap measured {r[5]}, expected 300")
+        return False
+    # ...and it must not have bought that by freezing: the same guest then stops
+    # flipping and keeps drawing, and has to be rescued eventually.
+    if r[6] < 1:
+        print("FAIL: a title that stopped flipping and kept drawing was never "
+              "painted again in 12000 frames -- that is a frozen screen.")
+        return False
+
     r = run(2)
     if r is None:
         return False
@@ -1323,7 +1359,8 @@ def present_checks(b, syms):
         return False
 
     print("PASS: Mode Y presentation policy "
-          "(0/200 mid-draw paints, 1 quiet paint, 3 stale paints)")
+          "(0 mid-draw paints at 20- and 300-frame flip gaps, "
+          "1 quiet paint, 3 stale paints, no freeze)")
     return True
 
 

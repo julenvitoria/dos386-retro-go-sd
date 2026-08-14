@@ -587,7 +587,7 @@ void x86_vga_modey_arm(int on)
     /* The presentation policy is per-arming state too: a stale quiet run from
        whatever ran before must not authorise a paint of a page this mode has
        not drawn yet. */
-    x86_video_modey_presented(0);
+    x86_video_modey_policy_reset();
 
     x86_vga_modey_armed = 1;
     hook_set(1);
@@ -740,21 +740,101 @@ void x86_vga_planar_start_write(void)
  * flips would otherwise never be shown at all, so a long stale bound remains;
  * at one second it cannot fire inside a title that is flipping, because every
  * flip resets it.
+ *
+ * ===========================================================================
+ * AND WHY A FLAT ONE-SECOND BOUND WAS STILL THE GAMEPLAY BUG
+ * ===========================================================================
+ *
+ * The quiet rule fixed the MENUS, which do go quiet, and left GAMEPLAY exactly
+ * as broken as it was. A raycaster never goes quiet: it stores in every frame
+ * of its redraw, so `modey_quiet` never reaches 2 and the ONLY rule that could
+ * ever fire was the 60-frame staleness bound -- which by construction fires 60
+ * frames after the last flip, i.e. at an arbitrary instant in the middle of the
+ * next redraw. A WOLF3D gameplay frame on the device takes far longer than 60
+ * frame-loop iterations, so the bound fired inside essentially every guest
+ * frame. That is the SAME artefact as the 8-frame hatch, at 60 frames instead
+ * of 8: a split viewport, and a house of mirrors while turning.
+ *
+ * So the bound is no longer a constant. Its only job is the ANTI-FREEZE
+ * property -- a title that stops flipping must not leave a dead panel -- and a
+ * title that IS flipping is not frozen, however slowly it flips. It is
+ * therefore scaled to what this guest has been OBSERVED to do: for a title that
+ * has flipped, it may not fire until the screen has stood unpainted for several
+ * times the longest gap between flips that title has ever shown, so a flip
+ * always gets there first. A title that has never flipped has no gap, keeps the
+ * flat one-second bound, and is the only kind of title the bound now serves. A
+ * flipping title that later stops is still rescued -- after a delay measured in
+ * ITS OWN frame times rather than in ours, which is the only unit that means
+ * anything here.
+ *
+ * AND THE BOUND BACKS OFF WHEN IT IS WRONG, because the worst gap seen SO FAR
+ * is a lower bound on the gap, never the gap. WOLF3D's menus flip fast and its
+ * gameplay flips slowly, so entering a level the estimate is stale by an order
+ * of magnitude and the bound fires once inside the first slow frame. There is
+ * no signal that separates "drawing a slow frame" from "stopped flipping and
+ * still drawing" -- they are the same observation -- so the bound cannot be
+ * made right first time. It is made SELF-CORRECTING instead: every stale paint
+ * inside a flipping title doubles the floor, so a wrong estimate costs at most
+ * a couple of frames and then converges above the guest's real frame time and
+ * stays there. The tier-1 model measures exactly that: the transition is
+ * allowed one artefact, and the run after it must be clean.
  */
 #define X86_MODEY_IDLE_FRAMES   2u    /* frames since the last present         */
 #define X86_MODEY_QUIET_FRAMES  2u    /* consecutive frames with NO store      */
 #define X86_MODEY_STALE_FRAMES  60u   /* ~1 s: nothing may freeze indefinitely */
+#define X86_MODEY_FLIP_SLACK    8u    /* x the worst flip gap, once it flips   */
+#define X86_MODEY_GAP_CLAMP     0x100000u  /* keeps the product in range       */
 
 volatile uint32_t x86_modey_fallbacks;    /* quiet-page paints by the loop    */
 volatile uint32_t x86_modey_stale_paints; /* the last-resort bound firing     */
 volatile uint32_t x86_modey_flip_gap;     /* frames between the last 2 flips  */
 volatile uint32_t x86_modey_flip_gap_max;
+/*
+ * THE DEFECT COUNTER, and it is the whole point of the instrumentation. A paint
+ * the LOOP took inside a title that flips, with stores banked since that flip,
+ * IS a mid-draw paint -- the split viewport, counted, with the store count
+ * saying how half-drawn the page was. It must stay at zero during gameplay.
+ */
+volatile uint32_t x86_modey_mid_draw;     /* loop paints with stores pending  */
+volatile uint32_t x86_modey_mid_draw_max; /* worst store count at such a paint*/
 
 static uint32_t modey_idle;        /* frames since the last present           */
 static uint32_t modey_stale;       /* frames since the last paint of any kind */
 static uint32_t modey_quiet;       /* consecutive frames with no planar store */
 static uint32_t modey_stores_seen; /* x86_vga_planar_stores a frame ago       */
 static uint32_t modey_dirty;       /* stores since the last frame put on show */
+static uint32_t modey_flipper;     /* this title has flipped at least once    */
+static uint32_t modey_stores_flip; /* x86_vga_planar_stores at the last flip  */
+static uint32_t modey_stale_floor = X86_MODEY_STALE_FRAMES;
+
+/* How long the screen must have stood unpainted before the staleness bound may
+   fire. Flat until this title flips; afterwards the larger of a multiple of its
+   own worst flip gap and the floor the back-off has reached, so that a flip
+   always beats it to the paint. */
+static uint32_t modey_stale_limit(void)
+{
+    uint32_t gap;
+
+    if (!modey_flipper)
+        return X86_MODEY_STALE_FRAMES;
+    gap = x86_modey_flip_gap_max;
+    if (gap > X86_MODEY_GAP_CLAMP)
+        gap = X86_MODEY_GAP_CLAMP;
+    gap *= X86_MODEY_FLIP_SLACK;
+    return (gap > modey_stale_floor) ? gap : modey_stale_floor;
+}
+
+/* Per-ARMING policy state. The witnesses above are cumulative and host-visible;
+   this is not. A stale quiet run -- or a stale "this title flips" -- left by
+   whatever ran before must not authorise a paint of a page this mode has not
+   drawn yet. */
+void x86_video_modey_policy_reset(void)
+{
+    modey_flipper = 0;
+    modey_stores_flip = x86_vga_planar_stores;
+    modey_stale_floor = X86_MODEY_STALE_FRAMES;
+    x86_video_modey_presented(0);
+}
 
 void x86_video_modey_presented(int from_flip)
 {
@@ -762,6 +842,8 @@ void x86_video_modey_presented(int from_flip)
         x86_modey_flip_gap = modey_idle;
         if (modey_idle > x86_modey_flip_gap_max)
             x86_modey_flip_gap_max = modey_idle;
+        modey_flipper = 1;
+        modey_stores_flip = x86_vga_planar_stores;
     }
     modey_idle = 0;
     modey_stale = 0;
@@ -814,11 +896,32 @@ int x86_video_modey_paint_due(void)
 
     if (modey_quiet >= X86_MODEY_QUIET_FRAMES
         && modey_idle >= X86_MODEY_IDLE_FRAMES) {
+        /* A quiet page is a finished page whatever else is true of it, so this
+           is never a mid-draw paint and never evidence about the flip rate. */
         x86_modey_fallbacks++;
-    } else if (modey_stale >= X86_MODEY_STALE_FRAMES) {
-        x86_modey_stale_paints++;
-    } else {
+        modey_idle = 0;
+        modey_stale = 0;
+        modey_dirty = 0;
+        return 1;
+    }
+    if (modey_stale < modey_stale_limit())
         return 0;
+    x86_modey_stale_paints++;
+    /* The bound fired. If this title flips and has stored since its last flip,
+       what we are about to put on the panel is a HALF-DRAWN page -- the split
+       viewport. Count it, and how far into the redraw it was. */
+    if (modey_flipper && stores != modey_stores_flip) {
+        uint32_t n = stores - modey_stores_flip;
+        x86_modey_mid_draw++;
+        if (n > x86_modey_mid_draw_max)
+            x86_modey_mid_draw_max = n;
+        /* BACK OFF. This title flips, and we painted it mid-draw anyway, so the
+           estimate of its frame time was too short -- double it. Two or three
+           of these and the bound is above the guest's real frame and silent for
+           the rest of the level; without it, a menu-to-gameplay transition
+           re-arms the artefact for good. */
+        if (modey_stale_floor < X86_MODEY_GAP_CLAMP)
+            modey_stale_floor *= 2u;
     }
     modey_idle = 0;
     modey_stale = 0;

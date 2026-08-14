@@ -941,8 +941,12 @@ python3 tests/test_video.py              # CGA mode 4 blitter, pixel-exact, plus
                                          # highlight showing the old item and
                                          # the new one. It drives
                                          # x86_video_modey_paint_due() directly
-                                         # against three modelled guests, with
-                                         # no LCD and no CPU.
+                                         # against four modelled guests, with
+                                         # no LCD and no CPU -- including a
+                                         # SLOW gameplay guest that draws in
+                                         # every frame and flips every 300,
+                                         # which is the case the device hits
+                                         # and the 20-frame model missed.
                                          # --present-only runs just that arm
 python3 scripts/run_planar_controls.py   # grades those arms: FIVE negative
                                          # controls that must FAIL (chain-4

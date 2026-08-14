@@ -237,9 +237,9 @@ and `x86_vga_planar_stores` is already maintained on the hot path. The frame
 loop may paint only when the aperture has been **quiet for two whole slices**
 and something has been drawn since the last present — quiet is a completed
 picture by construction, and it is exactly the case the hatch exists for (a menu
-that draws once and waits for a key). A 60-frame staleness bound remains so that
-a guest which stores forever and never flips cannot freeze the screen; every
-flip resets it, so it cannot fire inside a title that is flipping.
+that draws once and waits for a key). A staleness bound remains so that a guest
+which stores forever and never flips cannot freeze the screen — it was 60 frames
+flat, which is **bug 3 below**.
 
 **Bug 2 — the fallback painted ONE buffer.** The frame loop calls
 `GW_LCD_SWAP` **unconditionally every iteration**, because the swap is also its
@@ -255,7 +255,7 @@ The decision lives in the **core** (`x86_video_modey_paint_due()` in
 `x86_video_planar.c`), not in the frame loop, because "which frames are
 painted" is not a pixel question: `tests/test_video.py` was at 64000/64000 with
 this defect shipping. The core function is drivable with no LCD and no CPU, and
-`tests/test_video.py --present-only` grades it against three modelled guests —
+`tests/test_video.py --present-only` grades it against four modelled guests —
 gameplay (flips, stores every frame: **0 of 200** loop paints), a menu (draws,
 then waits: exactly **1** paint, and not one while it is drawing), and a
 pathological non-flipping guest (only the staleness bound may fire, and must).
@@ -267,13 +267,58 @@ Counters, on WOLF3D under gwemu through the signon and title screens, 30 s:
 **stop growing** once the guest goes quiet — a static screen is painted once and
 then not repainted at all, where the timer repainted it 8 times a second.
 
-**What is left, and it is accepted.** The 60-frame staleness bound is the one
-remaining path that can put a half-drawn page on the panel: a title that draws
-for over a second without flipping gets one stale frame per second, corrected on
-the next paint. It is the price of "nothing may freeze", it fired twice in the
-30 s run above, and removing it needs a signal for "the guest has finished" that
-does not exist. Nothing here is fixed by more memory; a second real page is
-66,560 bytes that do not exist.
+**Bug 3 — the staleness bound WAS the gameplay bug.** Bugs 1 and 2 fixed the
+menus, which go quiet, and hardware still reported the split viewport and the
+house of mirrors. The reason is in the paragraph above, written as if it were a
+detail: *"every flip resets it, so it cannot fire inside a title that is
+flipping"* — true only while the guest flips faster than 60 frame-loop
+iterations. **A raycaster never goes quiet**, so the quiet rule can never fire
+during gameplay and the 60-frame bound was the *only* rule left; and a WOLF3D
+gameplay frame on the device is far longer than 60 loop iterations, so the bound
+fired **inside every guest frame, at an arbitrary column of the redraw**. It was
+the 8-frame timer again, at 60 frames.
+
+Note what this was NOT: the flip path was never suppressed. `x86_video_page_flip()`
+is called unconditionally from `x86_vga_planar_start_write()`
+(`x86_video_planar.c:718`) and paints both buffers immediately. Flips were always
+the primary trigger; the fallback was firing *as well*.
+
+The bound is no longer a constant. Its only job is anti-freeze, and **a title
+that is flipping is not frozen however slowly it flips**, so it is scaled to what
+this guest has been observed to do: flat 60 frames until the title flips at all,
+and afterwards `max(floor, 8 × the worst flip gap seen)`. Because the worst gap
+seen so far is a lower bound and never the gap — WOLF3D's menus flip fast and its
+gameplay flips slowly — the estimate is necessarily wrong across a menu-to-level
+transition, and **nothing distinguishes "drawing a slow frame" from "stopped
+flipping and still drawing"**; they are the same observation. So the bound
+**backs off**: every stale paint taken with stores banked since the last flip
+doubles the floor. A wrong estimate costs a couple of frames at the transition
+and then converges above the guest's real frame time and stays silent.
+
+`x86_modey_mid_draw` / `x86_modey_mid_draw_max` count exactly that failure — a
+loop paint with a non-zero store count since the last flip — and the store count
+says how far into the redraw the page was caught. It is the defect, counted.
+
+The tier-1 model gained the case that was missing, and the reason the old one
+missed it is one number: it flipped every **20** frames against a **60**-frame
+bound, so the bound could not fire and the arm only ever proved that the quiet
+rule stays out of the way. The new arm (`tests/main.c`, `which == 4`) plays
+100 menu frames flipping every 20, then 1500 gameplay frames drawing in every
+frame and flipping every 300, twice: the transition may cost ≤ 2 paints, and the
+settled run must be **0 loop paints, 0 mid-draw, 0 quiet fallbacks**. It then
+stops flipping while still drawing and must be rescued, which pins the
+anti-freeze property against the fix itself.
+
+**What is left, and it is accepted.** Two things. First, the ≤ 2 frames the
+back-off costs at a menu-to-gameplay transition, which is unavoidable without a
+"the guest has finished" signal that does not exist. Second, the aliasing itself:
+one page of storage means the panel shows page N while the guest draws N+1 over
+it, and `references/8086tiny/docs/video/15-mode-y.md` measured a real 256 KB card
+holding pages 0 and 2 finished with page 1 a few columns into the next frame.
+Presenting on the flip is what keeps that to the measured **0.58 %** of the
+reference card on the same frame, and it is not fixed by getting the fold right.
+Nothing here is fixed by more memory either — a second real page is 66,560 bytes
+that do not exist.
 
 ### The arena arithmetic that actually held
 

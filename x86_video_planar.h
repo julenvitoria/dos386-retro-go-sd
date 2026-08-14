@@ -111,11 +111,19 @@ int  x86_video_modey_paint_due(void);
 /* "A frame has just been put on the panel." from_flip distinguishes the
    guest's own page flip from the loop's fallback, for the gap counters. */
 void x86_video_modey_presented(int from_flip);
+/* Forget everything the policy learned about the PREVIOUS title -- its quiet
+   run and, crucially, whether it flipped. Called from x86_vga_modey_arm(). */
+void x86_video_modey_policy_reset(void);
 
 extern volatile uint32_t x86_modey_fallbacks;
 extern volatile uint32_t x86_modey_stale_paints;
 extern volatile uint32_t x86_modey_flip_gap;
 extern volatile uint32_t x86_modey_flip_gap_max;
+/* Loop paints taken with stores banked since the last flip: mid-draw paints,
+   which is the split-viewport defect counted. Zero during gameplay or the
+   policy is showing half-drawn pages again. */
+extern volatile uint32_t x86_modey_mid_draw;
+extern volatile uint32_t x86_modey_mid_draw_max;
 
 /* ---- host-visible witnesses; all of this is the deliverable -------------- */
 extern volatile uint32_t x86_vga_planar_stores;   /* stores that took the hook */

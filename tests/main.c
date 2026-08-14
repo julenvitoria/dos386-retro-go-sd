@@ -586,6 +586,8 @@ static void present_test_run(uint32_t which)
     x86_modey_stale_paints = 0;
     x86_modey_flip_gap = 0;
     x86_modey_flip_gap_max = 0;
+    x86_modey_mid_draw = 0;
+    x86_modey_mid_draw_max = 0;
     x86_vga_modey_arm(0);
     x86_vga_modey_arm(1);
     present_r[7] = x86_vga_modey_armed;
@@ -603,6 +605,54 @@ static void present_test_run(uint32_t which)
         present_r[1] = x86_modey_fallbacks;
         present_r[2] = x86_modey_stale_paints;
         present_r[3] = x86_modey_flip_gap_max;
+        present_r[4] = x86_modey_mid_draw;
+    } else if (which == 4) {
+        /*
+         * GAMEPLAY AT THE SPEED THE DEVICE ACTUALLY RUNS IT -- the case the
+         * `which == 1` model does NOT cover, and the reason hardware was still
+         * a house of mirrors while this file was green.
+         *
+         * That model flips every 20 frames against a 60-frame staleness bound
+         * that every flip resets, so the bound could never fire and the arm
+         * proved only that the QUIET rule stays out of the way. On silicon a
+         * WOLF3D gameplay frame is far LONGER than the loop's 60 frames, the
+         * bound fired inside the redraw, and no test asked.
+         *
+         * Three phases, in the order a player meets them:
+         *   MENU      100 frames flipping every 20, which is what leaves the
+         *             policy's idea of this guest's frame time far too short.
+         *   ENTERING  1500 frames of continuous drawing flipping every 300. The
+         *             estimate is wrong here and cannot be right -- nothing
+         *             distinguishes a slow frame from a stopped one -- so the
+         *             bound may fire, but the back-off must make it converge.
+         *   THE LEVEL the same 1500 frames again, with the counters zeroed.
+         *             This one must be PERFECTLY clean: no loop paint at all.
+         */
+        for (i = 0; i < 100; i++)
+            paints += (unsigned)present_frame(200u, (i % 20u) == 19u);
+        paints = 0;
+        for (i = 0; i < 1500; i++)
+            paints += (unsigned)present_frame(1000u, (i % 300u) == 299u);
+        present_r[0] = paints;                  /* transition: <= 2 allowed  */
+        present_r[1] = x86_modey_mid_draw;
+        x86_modey_fallbacks = 0;
+        x86_modey_stale_paints = 0;
+        x86_modey_mid_draw = 0;
+        paints = 0;
+        for (i = 0; i < 1500; i++)
+            paints += (unsigned)present_frame(1000u, (i % 300u) == 299u);
+        present_r[2] = paints;                  /* steady state: must be 0   */
+        present_r[3] = x86_modey_mid_draw;      /* must be 0                 */
+        present_r[4] = x86_modey_fallbacks;     /* must be 0: never quiet    */
+        present_r[5] = x86_modey_flip_gap_max;  /* 300                       */
+        /* ANTI-FREEZE, in the same arm, because the fix that makes those zero
+           is exactly the fix that could freeze this: the guest now STOPS
+           flipping and keeps drawing forever. It must still be rescued --
+           late, in units of its OWN frame time, but rescued. */
+        paints = 0;
+        for (i = 0; i < 12000; i++)
+            paints += (unsigned)present_frame(1000u, 0);
+        present_r[6] = paints;
     } else if (which == 2) {
         /* MENU. The guest redraws the highlight -- erase, then draw, over a
            few frames -- and then WAITS for a key, flipping nothing. Nothing may
