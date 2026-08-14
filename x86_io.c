@@ -14,6 +14,7 @@
 #include "cutils.h"   /* x86_cpu.h leans on BOOL/TRUE from here */
 #include "x86_cpu.h"
 #include "x86_probe.h"
+#include "x86_video_planar.h"
 #include "x86_audio_wave.h"   /* the generator; <stdint.h> only, host-testable */
 
 /* ---------------------------------------------------------------------------
@@ -133,6 +134,92 @@ static int vga_mono_decoded(void) { return (vga_regs.misc & 1u) == 0u; }
  * permanently and every subsequent write lands in the wrong register.
  */
 void x86_vga_attr_reset_flipflop(void) { vga_regs.attr_flipflop = 0; }
+
+/* ---------------------------------------------------------------------------
+ * WHAT THE RENDERER AND THE PLANAR ADAPTER READ OUT OF THESE FILES.
+ *
+ * Accessors, not copies. The whole reason the register file is a faithful store
+ * is that ONE place holds each value; a blit that kept its own idea of the row
+ * pitch is how a write path and a renderer come to disagree about the same
+ * screen (references/8086tiny/docs/video/11-ega-planar.md).
+ */
+
+/* Display start, CRTC 0x0C (high) / 0x0D (low), in PLANE OFFSETS. */
+unsigned x86_vga_crtc_start(void)
+{
+    return ((unsigned)vga_regs.crtc[0x0C] << 8) | vga_regs.crtc[0x0D];
+}
+
+/*
+ * ROW PITCH = 2 x CRTC OFFSET, because the Offset register counts WORDS.
+ *
+ * A real EGA BIOS writes 0x14 (20) for mode 0Dh and 0Dh is 40 bytes per plane
+ * per row; it writes 0x28 (40) for a Mode Y page whose row is 80 plane offsets.
+ * This has been got wrong before, in a way that was self-consistent (Offset as
+ * BYTES in the C with a compensating value in the BIOS) and was settled only by
+ * rendering a frame and looking at it -- an autocorrelation "measurement" had
+ * confidently agreed with the mistake. See 11-ega-planar.md, "The Offset unit".
+ *
+ * A zero Offset would collapse the picture to one row, so a guest that never
+ * programs it gets the mode's default rather than nothing; x86_vga_crtc_preset()
+ * plants that at the mode set and this is the belt-and-braces half.
+ */
+unsigned x86_vga_row_pitch(void)
+{
+    unsigned off = vga_regs.crtc[0x13];
+    return off ? off * 2u : 80u;
+}
+
+/* Attribute Controller index 0x13, low 3 bits: the horizontal pel pan, in
+   pixels. A scrolling EGA title reprograms it every frame. */
+unsigned x86_vga_pel_panning(void) { return vga_regs.attr[0x13] & 7u; }
+
+/* ATC palette registers 0x00-0x0F: pixel value -> DAC entry. */
+const uint8_t *x86_vga_attr_palette(void) { return vga_regs.attr; }
+
+/*
+ * Plant the CRTC geometry a real VGA BIOS writes for `mode`.
+ *
+ * Chained 13h does not need it -- its blit is a straight copy. A title that
+ * unchains without programming the Offset itself does, or it inherits mode
+ * 0Dh's 20 and renders at half the stride. Values are the ones a VGA BIOS
+ * leaves behind: 0x28 (40 words = 80 bytes) for 13h, 0x14 (20 words = 40
+ * bytes) for 0Dh, and a display start of zero for both.
+ */
+void x86_vga_crtc_preset(uint8_t mode)
+{
+    vga_regs.crtc[0x0C] = 0;
+    vga_regs.crtc[0x0D] = 0;
+    vga_regs.crtc[0x13] = (mode == 0x13) ? 0x28 : 0x14;
+    /* Identity attribute palette. Pixel value n -> DAC entry n, which in a VGA
+       DAC IS the sixteen EGA colours -- IBM's 00 01 02 03 04 05 14 07 38.. are
+       indices into a 64-entry EGA DAC layout and would recolour every EGA-16
+       title against our 256-colour table. A deviation from IBM's NUMBERS, not
+       from the hardware; it is also verbatim what a real VGA reads back in
+       mode 13h. */
+    for (unsigned i = 0; i < 16; i++)
+        vga_regs.attr[i] = (uint8_t)i;
+    vga_regs.attr[0x13] = 0;            /* no pel panning until asked */
+}
+
+/*
+ * The Sequencer's Chain-4 bit may only be believed in mode 13h.
+ *
+ * Unchaining is something software does to itself long after the BIOS mode set,
+ * so it has to be driven off the real register -- but a blind I/O probe walking
+ * the Sequencer (FreeDOS does exactly this at boot, writing 0xFF everywhere)
+ * would otherwise reinterpret whatever mode is running as planar. The BDA is
+ * the authority because it is what the mode set publishes; the renderer's own
+ * mode byte is the fallback for a link with no BDA page backed.
+ */
+static int vga_in_mode13(void)
+{
+    uint8_t bmode; uint16_t bcols;
+
+    if (x86_bios_bda_video(&bmode, &bcols))
+        return bmode == 0x13;
+    return x86_video_mode() == 0x13;
+}
 
 static void pit_write_control(uint8_t v)
 {
@@ -590,8 +677,32 @@ static uint32_t port_read_inner(uint32_t port)
     return 0xFFFFFFFFu;
 }
 
+/*
+ * A WORD `OUT dx, ax` TO AN INDEX/DATA PAIR IS TWO WRITES, AND DROPPING AH IS
+ * THE SINGLE MOST EXPENSIVE BUG THIS FILE CAN HAVE.
+ *
+ * Real software almost never writes these registers as two byte OUTs. It writes
+ * `mov ax,0x0604 / out dx,ax` -- index in AL, data in AH, one instruction. The
+ * reference port shipped a byte-only path and measured the cost when it finally
+ * built a test that drove the adapter the way software does: dropping AH failed
+ * 56,767 of 64,000 pixels. Wolfenstein 3-D unchains with exactly this form.
+ *
+ * Only the four index/data pairs are split. The DAC stream at 0x3C9 must NOT
+ * be, and neither must 0x3C0, which is one port sequenced by a flip-flop rather
+ * than two ports.
+ */
+static int vga_index_port(uint32_t port)
+{
+    return port == 0x3C4u || port == 0x3CEu || port == 0x3D4u || port == 0x3B4u;
+}
+
 void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
 {
+    if (size >= 2u && vga_index_port(port)) {
+        x86_port_write(port, value & 0xFFu, 1);
+        x86_port_write(port + 1u, (value >> 8) & 0xFFu, 1);
+        return;
+    }
     (void)size;
     io_log(2, port, value);
 #if X86_PROBE
@@ -680,21 +791,36 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
     case 0x3B5:
         if (!vga_mono_decoded()) break;
         /* fall through */
-    case 0x3D5:
-        vga_regs.crtc[vga_regs.crtc_idx & (VGA_CRTC_REGS - 1)] = (uint8_t)value;
+    case 0x3D5: {
+        unsigned idx = vga_regs.crtc_idx & (VGA_CRTC_REGS - 1);
+        vga_regs.crtc[idx] = (uint8_t)value;
+        /* The display start pair is the only CRTC write with a side effect: it
+           feeds the Mode Y page-stride learning and it is the present edge. */
+        if ((idx & 0x1Eu) == 0x0Cu)
+            x86_vga_planar_start_write();
         break;
+    }
     case 0x3C4:
         vga_regs.seq_idx = (uint8_t)value;
         break;
-    case 0x3C5:
-        vga_regs.seq[vga_regs.seq_idx & (VGA_SEQ_REGS - 1)] = (uint8_t)value;
+    case 0x3C5: {
+        unsigned idx = vga_regs.seq_idx & (VGA_SEQ_REGS - 1);
+        vga_regs.seq[idx] = (uint8_t)value;
+        /* Index 2 is the Map Mask and index 4 bit 3 is Chain-4. The adapter
+           keeps no second copy of either -- it is fed from here. */
+        if (idx == 2u || (idx == 4u && vga_in_mode13()))
+            x86_vga_planar_seq_write(idx, (uint8_t)value);
         break;
+    }
     case 0x3CE:
         vga_regs.gc_idx = (uint8_t)value;
         break;
-    case 0x3CF:
-        vga_regs.gc[vga_regs.gc_idx & (VGA_GC_REGS - 1)] = (uint8_t)value;
+    case 0x3CF: {
+        unsigned idx = vga_regs.gc_idx & (VGA_GC_REGS - 1);
+        vga_regs.gc[idx] = (uint8_t)value;
+        x86_vga_planar_gc_write(idx, (uint8_t)value);
         break;
+    }
     case 0x3C0:
         if (!vga_regs.attr_flipflop)
             vga_regs.attr_idx = (uint8_t)value;

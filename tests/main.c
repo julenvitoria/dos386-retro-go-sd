@@ -5,6 +5,7 @@
 #include "../cutils.h"
 #include "../x86_cpu.h"
 #include "../x86_arena.h"
+#include "../x86_video_planar.h"
 #include "../x86_pager.h"
 #include "../x86_profile.h"
 #include "../x86_osk.h"
@@ -171,6 +172,25 @@ volatile uint32_t vga_regs_out[9];   /* CRTC/Seq/GC/Attr write-then-read-back */
 
 volatile uint32_t text_mode_arg = 0x03;
 volatile uint32_t text_scroll_arg = 0;      /* (attr << 8) | lines */
+
+/* ---------------------------------------------------------------------------
+ * PLANAR VGA -- unchained 13h ("Mode Y") and EGA 0Dh.
+ *
+ * These arms run GUEST CODE, and that is the whole point. The planar pipeline
+ * hangs off the store hook in cpu_exec.S and off word `OUT dx,ax` writes to the
+ * Sequencer and the Graphics Controller; a host-side test that called
+ * x86_vga_planar_store() directly would exercise neither, and the reference
+ * port's record is exactly that -- a 64,000-pixel test that drove the adapter
+ * the way a TEST does passed unchanged through all five bugs that made a real
+ * game render garbage (11-ega-planar.md, "Why the first test passed").
+ *
+ * So the host writes a program into guest memory and this runs it. The program
+ * itself lives in tests/test_video.py, where it can carry its own commentary
+ * next to the expectation it is supposed to satisfy.
+ */
+#define PLANAR_CODE_BASE 0x3000u
+volatile uint32_t run_planar_flag = 0;
+volatile uint32_t planar_r[12];
 
 // Latched fault state, for the host to read over the debug backend.
 volatile uint32_t fault_active = 0;   // 0 = none, else VECTACTIVE
@@ -468,6 +488,65 @@ static void modeswitch_test_set(void)
     kbd_test_reset_cpu(MSW_CODE_BASE);
     msw_r[5] = kbd_test_run_to_halt();
     msw_snapshot();
+}
+
+/*
+ * Bring the machine up the way the real core does for a planar mode.
+ *
+ * THE FOLD HAS TO BE REMAPPED, and forgetting it is the failure this comment
+ * exists to prevent. test_ram is identity-mapped from guest 0, so guest
+ * 0xA0000 lands in test_ram by default -- NOT in vga_test_aperture, which is
+ * what x86_video_set_aperture() gave the store hook. The hook compares the
+ * resolved host pointer against cpu->vga_base, so with the default mapping it
+ * never fires and every planar store lands raw in plain RAM: a screen of
+ * nothing, from a test that ran to completion. x86_video_map() is the same call
+ * the core makes and it is what makes the two agree.
+ *
+ * THE ARENA HAS TO EXIST, for the same class of reason. Mode Y's off-screen
+ * cache at 0xC300 is an arena claim; with no arena the claim is refused, the
+ * cache-staged rows are discarded, and 25 rows come out wrong for a reason that
+ * has nothing to do with the code under test.
+ */
+static void planar_test_init(void)
+{
+    static const uint8_t hle_vectors[] = { 0x08, 0x09, 0x10, 0x16, 0x1A, 0x20, 0x21 };
+
+    x86_video_init(cga_test_vram, cga_test_palette);
+    x86_video_set_aperture(vga_test_aperture, vga_test_pal);
+    x86_video_map();
+    x86_arena_reset();
+    x86_arena_add_region(arena_test_mem, ARENA_TEST_PAGES * 4096u);
+    x86_bios_init();
+    x86_hle_install(hle_vectors, sizeof(hle_vectors));
+    for (unsigned i = 0; i < 12; i++)
+        planar_r[i] = 0;
+}
+
+static void planar_test_run(void)
+{
+    kbd_test_reset_cpu(PLANAR_CODE_BASE);
+    planar_r[7] = kbd_test_run_to_halt();
+    planar_r[0] = x86_video_mode();
+    planar_r[1] = test_ram[0x449];
+    planar_r[2] = (uint32_t)x86_vga_is_unchained();
+    planar_r[3] = x86_vga_modey_page;
+    planar_r[4] = x86_vga_planar_stores;
+    planar_r[5] = x86_vga_planar_lost;
+    planar_r[6] = x86_vga_modey_flips;
+    planar_r[8] = x86_vga_latch_loads;
+    planar_r[9] = x86_vga_latch_miss;
+    planar_r[10] = x86_vga_ega_armed;
+    planar_r[11] = x86_arena_free;
+}
+
+/* Put guest 0xA0000/0xB8000 back on test_ram, so an arm that runs after this
+   one sees the identity map the harness set up at reset. */
+static void planar_test_unmap(void)
+{
+    for (uint32_t g = 0xA0000u; g < 0xC0000u; g += 4096u) {
+        uint32_t i = g >> FOLD_SHIFT;
+        guest_page_table[i] = FOLD_K((uint32_t)test_ram + g, i);
+    }
 }
 
 static void modeswitch_test_tty(void)
@@ -1780,6 +1859,18 @@ void Reset_Handler(void) {
         if (run_modeswitch_flag == 3) {
             modeswitch_test_tty();
             run_modeswitch_flag = 0;
+        }
+        if (run_planar_flag == 1) {
+            planar_test_init();
+            run_planar_flag = 0;
+        }
+        if (run_planar_flag == 2) {
+            planar_test_run();
+            run_planar_flag = 0;
+        }
+        if (run_planar_flag == 3) {
+            planar_test_unmap();
+            run_planar_flag = 0;
         }
         if (run_video_flag == 4) {
             x86_video_set_mode((uint8_t)text_mode_arg);

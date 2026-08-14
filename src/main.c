@@ -40,6 +40,7 @@
 #include "x86_zones.h"   /* ZONES: frame-loop phase accounting, X86_ZONES=1 */
 #include "x86_osk.h"
 #include "x86_arena.h"
+#include "x86_video_planar.h"
 #include "x86_pager.h"
 
 #define APP_ID       100
@@ -1558,6 +1559,77 @@ static void core_repaint(void)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * PRESENT ON THE GUEST'S PAGE FLIP.
+ *
+ * Mode Y aliases every page into one page's worth of storage (there is no room
+ * for a second: x86_video_planar.c), so at any instant that storage holds
+ * whatever the guest is drawing RIGHT NOW. Painting at the emulator's own frame
+ * boundary composites a finished frame with a half-drawn one -- measured on the
+ * reference port against a 256 KB card, and reported as "vertical slabs from
+ * different frames". A display-start change is the guest stating that the page
+ * it just left is COMPLETE, which is the only instant an aliased page is known
+ * good, so that is when the screen is painted.
+ *
+ * It costs NO MEMORY -- the alternative, a second real page, is 66,560 bytes
+ * that do not exist -- and FEWER blits than before whenever the guest runs
+ * below the panel rate, which on this device it does.
+ *
+ * BOTH BUFFERS ARE PAINTED, and that is not belt and braces. The firmware
+ * double-buffers and the swap alternates between them, so painting only the
+ * active one makes the panel flip between this frame and the one before it --
+ * the failure the previous port documented for its letterbox bars.
+ *
+ * We are called from inside an OUT instruction, i.e. from inside the guest
+ * slice, so we do NOT swap: the frame loop's own swap presents what we leave.
+ */
+#ifndef X86_MODEY_PRESENT_ON_FLIP
+#define X86_MODEY_PRESENT_ON_FLIP 1     /* 0 takes it back to the tearing model */
+#endif
+/* How many frames without a flip before the frame loop paints anyway. A title
+   that stops flipping -- a menu, a pause, a title screen -- must not be a
+   FROZEN screen. */
+#define MODEY_IDLE_FRAMES 8
+
+volatile uint32_t x86_modey_presents;   /* host-visible: flips actually painted */
+static uint32_t modey_idle;             /* frames since the last flip present  */
+
+void x86_video_page_flip(void)
+{
+#if X86_MODEY_PRESENT_ON_FLIP
+    const gw_firmware_abi_t *abi = gw_firmware_abi();
+    for (unsigned which = 0; which < 2; which++) {
+        uint8_t *fb = (uint8_t *)abi->lcd_ctl(GW_LCD_BUFFER,
+                                              which ? GW_LCD_BUF_INACTIVE
+                                                    : GW_LCD_BUF_ACTIVE, 0, 0);
+        if (!fb)
+            continue;
+        x86_video_render(fb, FRAME_W);
+        x86_osk_draw(fb, FRAME_W);
+    }
+    x86_modey_presents++;
+    modey_idle = 0;
+#endif
+}
+
+/* Does the frame loop still owe this frame a paint? Yes for every mode except
+   a Mode Y title that is flipping for itself, and yes again after
+   MODEY_IDLE_FRAMES without a flip. */
+static int frame_owes_paint(void)
+{
+#if X86_MODEY_PRESENT_ON_FLIP
+    if (!x86_vga_is_unchained())
+        return 1;
+    if (modey_idle++ >= MODEY_IDLE_FRAMES) {
+        modey_idle = 0;
+        return 1;
+    }
+    return 0;
+#else
+    return 1;
+#endif
+}
+
 static void poll_input(const gw_firmware_abi_t *abi)
 {
     odroid_gamepad_state_t pad;
@@ -1998,8 +2070,14 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                                               GW_LCD_BUF_ACTIVE, 0, 0);
         fb_addr = (uint32_t)fb;
         if (fb) {
-            x86_video_render(fb, FRAME_W);
-            x86_osk_draw(fb, FRAME_W);
+            /* A Mode Y title paints itself on its own page flips, so the frame
+               boundary owes it nothing -- until MODEY_IDLE_FRAMES pass without
+               one, which is what keeps a title that STOPS flipping from being a
+               frozen screen. Every other mode owes a paint every frame. */
+            if (frame_owes_paint()) {
+                x86_video_render(fb, FRAME_W);
+                x86_osk_draw(fb, FRAME_W);
+            }
             fb_sample = *(volatile uint32_t *)(fb + 20 * FRAME_W);
         }
         clut_sample = core_clut[1];
