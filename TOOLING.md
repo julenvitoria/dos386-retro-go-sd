@@ -979,10 +979,50 @@ python3 scripts/make_retrogo_config.py --out build/CONFIG --rom dos ALLEYCAT.dsk
 Preselects a ROM (so no launcher navigation is needed) and disables idle
 standby. Called automatically by `make retrogo_media`.
 
+### `gwemu_run.py` — an INTERACTIVE session the harness cannot close
+
+```bash
+# boot to the retro-go menu and drive it yourself (no ROM preselected)
+python3 scripts/sdcard.py --image build/sd-menu.img \
+    --rom references/game-and-watch-retro-go-sd/roms/dos/KEEN4.dsk \
+    --core dos.bin --no-config
+python3 scripts/gwemu_run.py --sd build/sd-menu.img
+
+# same, sampling counters every 3 s while you play
+python3 scripts/gwemu_run.py --sd build/sd-menu.img \
+    --watch guest_insns_total,core_ready,x86_pg_exhausted --interval 3
+```
+
+**Use this, not `probe.py --gui`, whenever a HUMAN is going to touch the
+emulator.** `GwemuTarget` starts gwemu with `-S` (halted) and only the GDB
+backend's `resume()` runs it, then `atexit` tears the process down when the
+harness exits. That is right for a measurement — boot, sample to a
+deterministic point, stop — and exactly wrong for someone sitting in front of
+the window: every sampling harness kills the emulator the moment it finishes
+booting, which on a slow boot is the moment it becomes useful. This script owns
+the process for as long as the WINDOW is open and exits when you close it.
+
+`--watch` is optional and off by default, because sampling halts the CPU;
+leave it off if you are judging responsiveness.
+
+**Confirm CONFIG is really absent rather than trusting `--no-config`:**
+
+```bash
+mdir -i build/sd-menu.img@@1M -/ :: | grep -i config
+```
+
 ### Vendored
 
 `make_sdcard_image.py` (partitioned SD image), `sync_from_firmware.sh`
 (re-vendor `sdk/` from a firmware checkout, then update `SDK_VERSION`).
+
+**Re-vendoring is not done until it is COMMITTED.** Agent worktrees share
+`.git` but have their own working trees, so an uncommitted `sdk/include/`
+leaves every agent compiling against the OLD ABI while the main checkout uses
+the new one — invisible from both sides. That skew cost two agents a wrong
+diagnosis of tier 2, one of them concluding the harness was broken. It also
+does not announce itself: the core still BUILDS and then refuses to start,
+with retro-go spinning in `show_corrupted_installation_screen()`.
 
 ## Source layout (emulator side)
 
