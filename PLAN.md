@@ -88,7 +88,35 @@ Evidence in `STATUS.md`; the verdicts, so they are not re-opened by guess:
    RAM AXI pool". Being implemented alongside eviction, because donating frames
    without eviction turns a shortfall into a hard `X86_EXIT_MEM_FAULT`.
 
-**Queue B — rendering, then the interpreter**
+**Queue B — the planar store path first, then rendering**
+
+B0. **The planar store path halves the interpreter for graphics titles** —
+Wolf3D ~1.4 M ips in Mode Y against ~3.0 M in text, PC samples landing in
+`x86_vga_planar_store`. Every guest store to `A000:*` pays: range check →
+out-of-line stub → **C call** → `x86_vga_cell()` page fold → write-mode switch
+→ map-mask loop, ~45 cycles for what is usually one byte. Four changes, in
+order, each measured:
+   1. **Precompute a mode index** at `OUT` time. Sequencer/GC state only changes
+      on a port write, so collapse (write mode, map mask, bit mask, set/reset,
+      ALU) into one index there and make the store path a table dispatch
+      instead of re-testing five registers per store.
+   2. **Fast-path the dominant case.** Wolf3D's compiled scalers write ONE
+      plane at a time: write mode 0, no set/reset, bit mask 0xFF, single-plane
+      map mask. That is `aperture[4*a + p] = v` and nothing else. A write-mode-1
+      + map-mask-0x0F fast path already exists; this is the other half.
+   3. **Keep the hot cases out of C.** The push/pop and ABI around the call is a
+      real fraction of the cost; the top one or two cases belong inline in the
+      assembly stub, falling back to the C pipeline for the rest.
+   4. **Batch `REP STOS`/`MOVS`.** They pay the whole chain per element today.
+      The prior port kept a separate planar REP loop for exactly this — a lift,
+      not an invention.
+
+   **Measurement is part of the task, not a follow-up.** Baselines to beat:
+   Wolf3D ~1.4 M ips in Mode Y and ~3.0 M in text (TOPBENCH), `asm_metrics`
+   static counts against the committed `tests/asm_baseline.json`, and
+   `x86_vga_planar_stores`. Hardware profiling (`profile_opcodes.py --target
+   hardware`) is the owner's to run — leave a recipe.
+
 1. A **golden-screenshot gate** with programmatic comparison. Two "runs fine,
    renders garbage" regressions shipped in one session because nothing in the
    suite can see a picture.
