@@ -842,7 +842,7 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
         /* The display start pair is the only CRTC write with a side effect: it
            feeds the Mode Y page-stride learning and it is the present edge. */
         if ((idx & 0x1Eu) == 0x0Cu)
-            x86_vga_planar_start_write();
+            x86_vga_planar_start_write(idx);
         break;
     }
     case 0x3C4:

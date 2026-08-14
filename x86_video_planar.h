@@ -50,9 +50,16 @@ void x86_vga_planar_seq_write(unsigned idx, uint8_t val);
 /* Graphics Controller: Set/Reset, Enable Set/Reset, Colour Compare, Data
    Rotate, Read Map Select, Mode, Miscellaneous, Colour Don't Care, Bit Mask. */
 void x86_vga_planar_gc_write(unsigned idx, uint8_t val);
-/* CRTC display start (index 0x0C/0x0D) has been reprogrammed. Feeds the Mode Y
-   stride learning and, on a real change, the present-on-page-flip edge. */
-void x86_vga_planar_start_write(void);
+/* CRTC display start: ONE HALF of it has been written, and `idx` says which
+   (0x0C high, 0x0D low). The start is a 16-bit value programmed as two separate
+   byte OUTs, so after the first of the pair the register file holds a HYBRID --
+   the new half of one page and the old half of another, an address the guest
+   never asked for. Acting on that hybrid is what counted two flips per real
+   flip and painted a frame from an address that was never programmed, so this
+   only commits when the pair is complete (or at the next frame boundary, for a
+   guest that writes just one half). Feeds the Mode Y stride learning and the
+   present-on-page-flip edge. */
+void x86_vga_planar_start_write(unsigned idx);
 
 /* ---- arming -------------------------------------------------------------- */
 
@@ -119,6 +126,15 @@ extern volatile uint32_t x86_modey_fallbacks;
 extern volatile uint32_t x86_modey_stale_paints;
 extern volatile uint32_t x86_modey_flip_gap;
 extern volatile uint32_t x86_modey_flip_gap_max;
+/* The CURRENT flip cadence, not the high-water mark. `_max` can only grow, so
+   one slow phase penalises every quiet screen after it for ever -- which is the
+   escape-to-menu hold. This one decays towards what the guest is doing NOW and
+   is what the recency and anti-freeze windows are scaled by. */
+extern volatile uint32_t x86_modey_flip_gap_est;
+/* Half-written display starts deferred rather than acted on. Host-visible
+   because "we painted from an address the guest never programmed" needs a
+   number, not an argument. */
+extern volatile uint32_t x86_modey_start_partial;
 /* Loop paints taken with stores banked since the last flip: mid-draw paints,
    which is the split-viewport defect counted. Zero during gameplay or the
    policy is showing half-drawn pages again. */

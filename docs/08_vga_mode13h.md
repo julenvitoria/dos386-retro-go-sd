@@ -210,6 +210,54 @@ per-row source offset; the chained path is byte-identical and
 | present-on-page-flip | `src/main.c`, `x86_video_page_flip()` |
 | the tier-1 evidence | `tests/test_video.py`, `scripts/run_planar_controls.py` |
 
+### The display start is 16 bits written as TWO byte OUTs — latch the pair
+
+`x86_vga_planar_start_write()` is called from `x86_io.c:845` on a write to CRTC
+index `0x0C` (high) or `0x0D` (low). It used to recompute
+`(crtc[0x0C] << 8) | crtc[0x0D]` and act on the result **per byte**. Between the
+two OUTs of a page flip the register file holds the new page's high byte over
+the **previous** page's low byte — an address the guest never programmed — and
+acting on it:
+
+* counted **two flips per real flip** whenever both halves change, i.e. two
+  present edges and two 2 × 64,000-pixel blits per page flip, taken from inside
+  the guest slice;
+* painted a whole frame sourced from that hybrid address. The correct paint
+  followed one instruction later, so the hybrid is not what settles on the
+  panel — but the blit is spent;
+* and fed the **stride learner** a distance measured between a real start and a
+  hybrid one. The learner latches the smallest accepted distance for the arming,
+  so one hybrid landing inside `[16000, 20480]` mislays every page for the rest
+  of the title.
+
+Real hardware latches the start pair as a unit at vertical retrace and never
+mid-pair. So does the core now: a half is recorded as it arrives and the value
+is committed when the pair is complete, **in either order**; a guest that writes
+only one half is committed at the next frame boundary, one loop frame late.
+
+> **Why the 64000/64000 arm could not see this, and what changed.** Every start
+> the Mode Y guest programmed had a low byte of zero, and so did the one before
+> it, so the `0x0D` write never changed the value and the hybrid was
+> bit-identical to the real address. The mutation was a **no-op at the geometry
+> under test** — the same trap `15-mode-y.md` records for "read the unchained
+> aperture linearly". The guest's first flip now goes `0x0000 -> 0x8260`, which
+> moves both halves, and `tests/main.c` takes over the weak
+> `x86_video_page_flip()` to log the display start at **every** present edge.
+> The arm asserts the log is exactly `[0x8260, 0x8200, 0x4100, 0x8200]`, which
+> `-DX86_MODEY_START_NEGCTL=1` fails with five edges beginning `0x8200`.
+>
+> **This is NOT the cause of the WOLF3D house of mirrors, and the arithmetic
+> says so.** WOLF3D's pages are the Galaxy engine's `PAGE1START = 0`,
+> `PAGE2START = 0x4100`, `PAGE3START = 0x8200`, spaced by `SCREENSIZE = 80*208 =
+> 16,640` — a stride whose **low byte is zero**. Every start it programs
+> therefore shares one low byte (whatever constant `screenofs` contributes), the
+> `0x0D` write never changes the value, and no hybrid is ever formed. The
+> reading of "94 flips for ~47 real page flips" as two counted per real one does
+> not survive that: at a zero-low-byte stride the count is exact, and 94 flips
+> means 94 guest frames. The fix is still right — it is wrong to act on an
+> address no guest programmed, and any title whose page stride is not a multiple
+> of 256 *does* form hybrids — but the split viewport is somewhere else.
+
 ### Presentation: WHEN the screen is painted, and the two bugs that were in it
 
 Because pages alias, the one page of storage holds **whatever the guest is
@@ -503,6 +551,80 @@ Two further limits are ours rather than the reference's:
 * **The off-screen base assumes THREE pages.** A title that double-buffers and
   caches two pages up has its cache aliased onto page 3's storage. Nothing
   observable states the page count.
+
+### Symptom A, measured off the hardware capture — what it is NOT
+
+`build/artifacts/hw_wolf3d.png` is 320x240; the guest's 320x200 sits at panel
+row 20. Measurements on it, so the next pass starts from data:
+
+* **The viewport is 240 wide, at guest x 40..279, with a symmetric one-pixel
+  black frame at 39 and 280 on every row.** A global display-start error shifts
+  the whole picture and would break that symmetry. There is no global shift.
+* **No periodic horizontal replication.** Mean absolute column difference over
+  the viewport rises monotonically with shift, 11.5 at 1 px to 29.8 at 20 px,
+  with no minimum anywhere out to 120. "Three doors" is not the scene repeated
+  three times, and the earlier autocorrelation result stands.
+* **The door is ONE door, centred, with a foreign slab dropped into it.**
+  At guest row 90 the turquoise runs x 114..147 and 176..197 with 28 px of blue
+  wall (x 148..175) between them; the union 114..197 is centred on 155 against a
+  viewport centre of 160.
+* **Guest row 140 is half content, half border** — border to x 155, content
+  from 156 — and rows 141+ are all border. A viewport boundary cannot fall
+  mid-row; a *partial write* can.
+
+So the artefact is **narrow vertical slabs of foreign content scattered through
+an otherwise correct frame**, which is the "vertical slabs from different
+frames" signature, not a spatial-addressing one. The status bar, the border and
+the gun are exact and travel the same Map Mask -> plane offset -> page fold ->
+blit path, so the fold and the plane mapping are not implicated. **The remaining
+suspect is a store that reaches the aperture at a different plane offset than
+the one the blit reads it back from, for gameplay's write pattern
+specifically** — menus never leave page 0, gameplay cycles all three, so the
+fold is the only mechanism that behaves differently between the two. Whether
+`x86_vga_modey_page` is actually 16,640 **on silicon** is the one number that
+would settle it and it has never been read off the device; `probe.py` can.
+
+### Recency is not the anti-freeze window, and a maximum never decays
+
+Two questions were scaled by the same number and they are not the same question:
+
+| question | who asks | being wrong late | being wrong early |
+|---|---|---|---|
+| has this guest **stopped flipping**, so a dead panel needs rescuing? | `modey_stale_limit()` | costs nothing | a half-drawn page on the panel |
+| is this guest flipping **now**, so a quiet gap is a gap in a redraw? | `modey_is_flipping()` | **every quiet screen is held back for the whole window** | a half-drawn page on the panel |
+
+Both used `X86_MODEY_FLIP_SLACK` (8) times `x86_modey_flip_gap_max`. Leaving
+gameplay, hardware's `flip_gap_max` is **34**, so "this guest flips" stayed true
+for 272 loop frames — **~4.5 s at 60 Hz** — during which the menu was judged by
+the raycaster's rule and its whole draw was hidden. That is the report exactly:
+
+> "pressing escape to get back to the main menu causes the weird holding onto a
+> frame to occur again… it does fix itself given some time though, it like
+> caught up."
+
+And a **maximum can only grow**. One slow phase penalised every quiet screen
+after it for the rest of the arming, with nothing to take the penalty off.
+
+Two changes. The windows are now scaled by `x86_modey_flip_gap_est`, a cadence
+that jumps up to a longer gap at once (being late is the safe direction) and
+**eases down** towards a shorter one, halving the error each flip;
+`x86_modey_flip_gap_max` survives as a witness because probes quote it. And
+recency gets its own, much tighter multiplier — `X86_MODEY_FLIP_RECENT`, 2. A
+guest that has not flipped in two of its own frame times has stopped flipping;
+there is no evidence in a third. It cannot go to 1: at a 30-frame cadence
+`modey_flip_age` reaches 30 immediately before every flip, so the raycaster
+would lose its protection at the end of each of its own frames.
+
+Graded by the **escape arm** (`which == 7`): a level at hardware's cadence, then
+a menu that **keeps drawing** — two frames of blitting in four, for 400 frames.
+A guest that is still drawing never offers a quiet run long enough to be painted
+on, so the only thing that can free the screen is recency expiring. Measured
+hold **60 frames** with the fix; `-DX86_MODEY_RECENCY_NEGCTL=1` puts it back
+over the 90-frame limit and the arm fails. The first version of that arm let the
+menu **fall silent** after 30 frames and was worthless — its quiet run reached
+the raycaster's threshold within a few frames either way, and it passed with the
+bug compiled in. That is the fourth time this project has written a control that
+could not fail; the record is here so it is the last.
 
 ## 5. What WOLF3D actually does today — measured
 

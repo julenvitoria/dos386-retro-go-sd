@@ -190,7 +190,30 @@ volatile uint32_t text_scroll_arg = 0;      /* (attr << 8) | lines */
  */
 #define PLANAR_CODE_BASE 0x3000u
 volatile uint32_t run_planar_flag = 0;
-volatile uint32_t planar_r[12];
+volatile uint32_t planar_r[20];
+
+/*
+ * THE FLIP LOG -- the witness for the half-written display start.
+ *
+ * x86_video_page_flip() is the device's present-on-page-flip edge and it is
+ * weak, so a harness may take it over. Recording the CRTC display start at
+ * every edge is the only way to see the defect at tier 1: the start is a 16-bit
+ * value written as two byte OUTs, and a core that recomputes and acts on each
+ * one paints a frame from the new high byte joined to the PREVIOUS page's low
+ * byte -- an address the guest never programmed. A pixel comparison cannot see
+ * it, because the correct value arrives one instruction later and the LAST
+ * frame is the one the picture is compared against.
+ */
+#define FLIP_LOG_MAX 6u
+static uint32_t flip_log[FLIP_LOG_MAX];
+static uint32_t flip_log_n;
+
+void x86_video_page_flip(void)
+{
+    if (flip_log_n < FLIP_LOG_MAX)
+        flip_log[flip_log_n] = x86_vga_crtc_start();
+    flip_log_n++;
+}
 
 /*
  * MODE Y PRESENTATION POLICY -- which frames the loop paints.
@@ -544,12 +567,16 @@ static void planar_test_init(void)
     x86_arena_add_region(arena_test_mem, 8u * 4096u);
     x86_bios_init();
     x86_hle_install(hle_vectors, sizeof(hle_vectors));
-    for (unsigned i = 0; i < 12; i++)
+    for (unsigned i = 0; i < 20; i++)
         planar_r[i] = 0;
 }
 
 static void planar_test_run(void)
 {
+    flip_log_n = 0;
+    for (unsigned i = 0; i < FLIP_LOG_MAX; i++)
+        flip_log[i] = 0;
+    x86_modey_start_partial = 0;
     kbd_test_reset_cpu(PLANAR_CODE_BASE);
     planar_r[7] = kbd_test_run_to_halt();
     planar_r[0] = x86_video_mode();
@@ -563,6 +590,10 @@ static void planar_test_run(void)
     planar_r[9] = x86_vga_latch_miss;
     planar_r[10] = x86_vga_ega_armed;
     planar_r[11] = x86_arena_free;
+    planar_r[12] = flip_log_n;
+    planar_r[13] = x86_modey_start_partial;
+    for (unsigned i = 0; i < FLIP_LOG_MAX; i++)
+        planar_r[14 + i] = flip_log[i];
 }
 
 /*
@@ -633,6 +664,7 @@ static void present_test_run(uint32_t which)
     x86_modey_stale_paints = 0;
     x86_modey_flip_gap = 0;
     x86_modey_flip_gap_max = 0;
+    x86_modey_flip_gap_est = 0;
     x86_modey_mid_draw = 0;
     x86_modey_mid_draw_max = 0;
     x86_vga_modey_arm(0);
@@ -839,6 +871,76 @@ static void present_test_run(uint32_t which)
             paints += (unsigned)present_frame(bursty_next(), (i % 30u) == 29u);
         present_r[4] = paints;              /* must be 0                     */
         present_r[6] = x86_modey_mid_draw;  /* must be 0                     */
+    } else if (which == 7) {
+        /*
+         * ESCAPE FROM GAMEPLAY BACK TO THE MENU -- symptom B, modelled at the
+         * cadence HARDWARE measured rather than at a convenient one.
+         *
+         * Reported as "pressing escape to get back to the main menu causes the
+         * weird holding onto a frame to occur again... it does fix itself given
+         * some time though, it like caught up". That is the RECENCY window: for
+         * as long as the policy believes this guest flips, a quiet screen is
+         * judged by the raycaster's rule and its whole draw is held back. The
+         * window was 8 x the WORST flip gap ever seen -- 8 x 34 on hardware,
+         * 272 loop frames, ~4.5 s at 60 Hz -- and a maximum never decays, so
+         * every menu after the first level paid gameplay's bill for ever.
+         *
+         * The menu is drawn IN PIECES (two frames of blitting, two idle, for 30
+         * frames) because that is what a menu does and because a single
+         * unbroken draw is rescued by the quiet rule at once and measures
+         * nothing. The measurement is frames from the FIRST store of the menu
+         * to the first paint of it -- the length of time the panel holds the
+         * last gameplay frame.
+         *
+         * The previous agent's pessimistic finding -- that tightening recency
+         * costs the menu->gameplay transition -- was measured against a 300
+         * frame modelled flip gap. Hardware's is 34. The level phases here run
+         * at 30 and the transition is still graded, below.
+         */
+        bursty_reset();
+        for (i = 0; i < 100; i++)
+            (void)present_frame(200u, (i % 20u) == 19u);
+        for (i = 0; i < 1500; i++)
+            (void)present_frame(bursty_next(), (i % 30u) == 29u);
+        present_r[5] = x86_modey_flip_gap_max;      /* what a maximum reads   */
+        present_r[6] = x86_modey_flip_gap_est;      /* what a cadence reads   */
+
+        /* ---- ESCAPE. No more flips, ever, and the menu KEEPS DRAWING: the
+           player is holding a direction through the entries, the highlight is
+           erased and redrawn, pics are paged in. Two frames of blitting, two
+           idle, for 400 frames.
+           
+           A menu that draws briefly and then falls silent measures nothing,
+           and that is the trap the first version of this arm walked into: its
+           quiet run reaches the raycaster's threshold within a few frames of
+           the draw ending, so the hold came out the same with the bug in and
+           the bug out. What the report is about is the panel showing NOTHING
+           while the guest draws -- and a guest that is still drawing never
+           offers a quiet run longer than its own gaps. So the ONLY thing that
+           can free this screen is the policy deciding this guest has stopped
+           flipping, which is the recency window and nothing else. The
+           measurement is the frame of the first paint. */
+        first = 0xFFFFFFFFu;
+        for (i = 0; i < 400u; i++)
+            if (present_frame((i % 4u) < 2u ? 500u : 0u, 0)
+                && first == 0xFFFFFFFFu)
+                first = i + 1u;
+        present_r[0] = first;               /* the hold, in frames */
+        present_r[3] = x86_modey_inframe_gap;
+
+        /* ...and it must not have bought that by painting the level mid-draw.
+           Back into gameplay, the same way the player came out of it. */
+        x86_modey_fallbacks = 0;
+        x86_modey_mid_draw = 0;
+        for (i = 0; i < 120; i++)
+            (void)present_frame(bursty_next(), (i % 30u) == 29u);
+        x86_modey_fallbacks = 0;
+        x86_modey_mid_draw = 0;
+        paints = 0;
+        for (i = 0; i < 1500; i++)
+            paints += (unsigned)present_frame(bursty_next(), (i % 30u) == 29u);
+        present_r[1] = paints;              /* must be 0 */
+        present_r[2] = x86_modey_mid_draw;  /* must be 0 */
     } else if (which == 2) {
         /* MENU. The guest redraws the highlight -- erase, then draw, over a
            few frames -- and then WAITS for a key, flipping nothing. Nothing may

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-The controls for the Mode Y arm of tests/test_video.py -- four negative, one
+The controls for the Mode Y arm of tests/test_video.py -- six negative, one
 positive. Each is a separate build of the bare-metal harness with one flag set,
 run through `tests/test_video.py --modey-only`.
 
@@ -53,6 +53,29 @@ anything.
                                         here, by tests/test_video.py
                                         --present-only.
 
+  START    -DX86_MODEY_START_NEGCTL=1   the display start is recomputed and
+                                        ACTED ON per byte OUT again. The start
+                                        is 16 bits written as 0x0C (high) then
+                                        0x0D (low), so between them the register
+                                        file holds the new page's high byte over
+                                        the previous page's low byte -- an
+                                        address no guest ever programmed. The
+                                        Mode Y arm's guest now changes both
+                                        halves on its first flip precisely so
+                                        this control CAN fail; with every low
+                                        byte zero, as it was, the hybrid is
+                                        identical to the real value and the
+                                        mutation is a no-op.
+  RECENCY  -DX86_MODEY_RECENCY_NEGCTL=1 "this guest flips" decays against the
+                                        HIGH-WATER flip gap and the anti-freeze
+                                        slack -- 8 x 34 = 272 loop frames on
+                                        hardware's numbers. That is the ~4.5 s
+                                        the menu spends governed by the
+                                        raycaster's rule after escaping a level,
+                                        with its whole draw hidden, before it
+                                        "catches up". Graded by the escape arm
+                                        of --present-only.
+
   LEARN    -DX86_MODEY_PAGE0=16384      the POSITIVE control. The same 64,000
                                         pixels must still come out from a WRONG
                                         default, because the core is supposed to
@@ -76,6 +99,8 @@ ARMS = [
     ("BLIT",   "-DX86_MODEY_BLIT_NEGCTL=1",   False, "--modey-only"),
     ("PAGE",   "-DX86_MODEY_PAGE_NEGCTL=1",   False, "--modey-only"),
     ("TIMER",  "-DX86_MODEY_TIMER_NEGCTL=1",  False, "--present-only"),
+    ("START",  "-DX86_MODEY_START_NEGCTL=1",  False, "--modey-only"),
+    ("RECENCY", "-DX86_MODEY_RECENCY_NEGCTL=1", False, "--present-only"),
     ("LEARN",  "-DX86_MODEY_PAGE0=16384",     True,  "--modey-only"),
 ]
 
@@ -114,8 +139,9 @@ def main():
     if fail:
         print("PLANAR CONTROLS FAIL")
         return 1
-    print("PLANAR CONTROLS PASS (5/5 negative controls caught, stride learning "
-          "proven from a wrong default)")
+    n = sum(1 for a in ARMS if not a[2])
+    print(f"PLANAR CONTROLS PASS ({n}/{n} negative controls caught, stride "
+          f"learning proven from a wrong default)")
     return 0
 
 

@@ -698,10 +698,51 @@ void x86_vga_planar_gc_write(unsigned idx, uint8_t val)
  * The display start has been reprogrammed. Two consequences, and they are
  * separate: the stride learning, and the present edge.
  */
-void x86_vga_planar_start_write(void)
+/*
+ * THE DISPLAY START IS 16 BITS PROGRAMMED AS TWO BYTES, AND HALF OF IT IS NOT
+ * AN ADDRESS.
+ *
+ * Every VGA program writes CRTC 0x0C (high) and 0x0D (low) as two separate
+ * OUTs. Between them the register file holds the new half of the page being
+ * flipped to and the OLD half of the page being flipped from -- an address the
+ * guest never asked for. Recomputing `(crtc[0x0C] << 8) | crtc[0x0D]` on each
+ * write and acting on it therefore:
+ *
+ *   - counts TWO flips per real flip whenever both halves change, which is
+ *     twice the blits and twice the present edges;
+ *   - paints a whole frame sourced from the hybrid address, i.e. rows fetched
+ *     from an offset the guest never programmed. The correct paint follows one
+ *     instruction later, so the hybrid is not what settles on the panel -- but
+ *     it is a full 2 x 64,000-pixel blit thrown away, from inside the guest
+ *     slice, on every single page flip;
+ *   - and, worst, feeds the STRIDE LEARNING a distance measured between a real
+ *     start and a hybrid one. The learner takes the SMALLEST accepted distance
+ *     and latches it for the arming, so one hybrid inside [16000, 20480] mislays
+ *     every page for the rest of the title.
+ *
+ * Real hardware does not have this problem: the start register pair is latched
+ * as a unit at vertical retrace, never mid-pair. So we latch too. A half is
+ * recorded as it arrives and the value is committed when the PAIR is complete,
+ * in either order. A guest that writes only one half (a coarse vertical scroll)
+ * still gets its start -- committed at the next frame boundary, one loop frame
+ * late, which is invisible and is the only case that costs anything at all.
+ */
+#ifndef X86_MODEY_START_NEGCTL
+#define X86_MODEY_START_NEGCTL 0    /* 1: act on each byte, hybrids and all */
+#endif
+
+#define MODEY_START_HI  1u
+#define MODEY_START_LO  2u
+#define MODEY_START_BOTH (MODEY_START_HI | MODEY_START_LO)
+
+volatile uint32_t x86_modey_start_partial;
+static uint8_t modey_start_seen;
+
+static void modey_start_commit(void)
 {
     uint32_t s, d;
 
+    modey_start_seen = 0;
     if (!x86_vga_modey_armed)
         return;
     s = x86_vga_crtc_start();
@@ -730,6 +771,37 @@ void x86_vga_planar_start_write(void)
     x86_vga_modey_flips++;
     x86_video_page_flip();
     x86_video_modey_presented(1);
+}
+
+void x86_vga_planar_start_write(unsigned idx)
+{
+    if (!x86_vga_modey_armed)
+        return;
+#if X86_MODEY_START_NEGCTL
+    /* THE NEGATIVE CONTROL: recompute and act on every byte, hybrid or not.
+       This is the code the hardware capture was taken against, and the Mode Y
+       arm's flip log must fail here or it is grading nothing. */
+    (void)idx;
+    modey_start_commit();
+#else
+    modey_start_seen |= (idx == 0x0Du) ? MODEY_START_LO : MODEY_START_HI;
+    if (modey_start_seen == MODEY_START_BOTH) {
+        modey_start_commit();
+        return;
+    }
+    /* One half so far. Hold it: the other one is almost always the very next
+       instruction, and if it never comes the frame boundary commits it. */
+    x86_modey_start_partial++;
+#endif
+}
+
+/* A half-written start that no second half ever completed. Committed at the
+   frame boundary so a guest that programs only one half is at most one loop
+   frame late, and never so that a hybrid is acted on. */
+static void modey_start_settle(void)
+{
+    if (modey_start_seen)
+        modey_start_commit();
 }
 
 /* ---------------------------------------------------------------------------
@@ -891,13 +963,46 @@ void x86_vga_planar_start_write(void)
 #define X86_MODEY_QUIET_FRAMES  2u    /* consecutive frames with NO store      */
 #define X86_MODEY_QUIET_CLAMP   32u   /* ~0.5 s: the measurement's upper bound */
 #define X86_MODEY_STALE_FRAMES  60u   /* ~1 s: nothing may freeze indefinitely */
-#define X86_MODEY_FLIP_SLACK    8u    /* x the worst flip gap, once it flips   */
+#define X86_MODEY_FLIP_SLACK    8u    /* x the flip cadence, for ANTI-FREEZE   */
+/*
+ * AND A MUCH TIGHTER ONE FOR "IS THIS GUEST FLIPPING NOW?".
+ *
+ * The two windows were the same number and they are not the same question. The
+ * anti-freeze bound must be generous -- being late to rescue a dead panel costs
+ * nothing, being early puts a half-drawn page on it -- so eight times the
+ * cadence is right there. RECENCY is the opposite trade: while it says "this
+ * guest flips", every quiet screen is judged by the raycaster's rule and its
+ * whole draw is hidden. At 8 x a hardware-measured 34-frame gap that is 272
+ * loop frames, ~4.5 s, which is exactly the reported "pressing escape back to
+ * the menu holds a frame... it does fix itself given some time though, it like
+ * caught up". A guest that has not flipped in TWO of its own frame times has
+ * stopped flipping; there is no evidence in a third.
+ */
+#define X86_MODEY_FLIP_RECENT   2u    /* x the flip cadence, for RECENCY       */
+#define X86_MODEY_RECENT_MIN    8u    /* ...never shorter than the quiet rule  */
 #define X86_MODEY_GAP_CLAMP     0x100000u  /* keeps the product in range       */
 
 volatile uint32_t x86_modey_fallbacks;    /* quiet-page paints by the loop    */
 volatile uint32_t x86_modey_stale_paints; /* the last-resort bound firing     */
 volatile uint32_t x86_modey_flip_gap;     /* frames between the last 2 flips  */
-volatile uint32_t x86_modey_flip_gap_max;
+volatile uint32_t x86_modey_flip_gap_max; /* WITNESS ONLY -- see _est below   */
+/*
+ * THE CADENCE THE WINDOWS ARE SCALED BY, AND WHY IT IS NOT `_max`.
+ *
+ * `x86_modey_flip_gap_max` is a HIGH-WATER MARK: it can only grow, for the whole
+ * arming. Once WOLF3D's gameplay pushes it to 34 every quiet screen after it --
+ * every menu, every intro, every pause -- is judged against 34 for the rest of
+ * the title, however fast the guest is flipping by then. A title that flipped
+ * slowly ONCE permanently penalises everything that follows it, and nothing ever
+ * takes the penalty off.
+ *
+ * So the windows are scaled by an estimate that can come DOWN: it jumps
+ * immediately to a longer gap (being late is the safe direction, and a
+ * raycaster's first slow frame must widen the window at once) and eases towards
+ * a shorter one, halving the error each flip. `_max` stays as a witness because
+ * probes and hardware captures quote it.
+ */
+volatile uint32_t x86_modey_flip_gap_est;
 /*
  * THE DEFECT COUNTER, and it is the whole point of the instrumentation. A paint
  * the LOOP took inside a title that flips, with stores banked since that flip,
@@ -955,7 +1060,12 @@ static uint32_t modey_gap;
  * seconds and gets the flat two-frame rule back -- exactly the behaviour it had
  * before any of this, which is the behaviour that was not complained about.
  */
+#ifndef X86_MODEY_RECENCY_NEGCTL
+#define X86_MODEY_RECENCY_NEGCTL 0
+#endif
+
 static uint32_t modey_stale_limit(void);
+static uint32_t modey_flip_recent(void);
 
 static int modey_is_flipping(void)
 {
@@ -971,7 +1081,22 @@ static int modey_is_flipping(void)
        definition of "long enough without a flip that something must be
        wrong". Reusing it means there is ONE number for "this guest has
        stopped flipping" rather than two that can disagree. */
-    return modey_flipper && modey_flip_age < modey_stale_limit();
+#if X86_MODEY_RECENCY_NEGCTL
+    /* THE NEGATIVE CONTROL for symptom B: recency off the HIGH-WATER MARK and
+       the anti-freeze slack, byte for byte the rule the escape-to-menu hold was
+       reported against. The escape arm must fail here. */
+    {
+        uint32_t gap = x86_modey_flip_gap_max;
+        if (gap > X86_MODEY_GAP_CLAMP)
+            gap = X86_MODEY_GAP_CLAMP;
+        gap *= X86_MODEY_FLIP_SLACK;
+        if (gap < modey_stale_floor)
+            gap = modey_stale_floor;
+        return modey_flipper && modey_flip_age < gap;
+    }
+#else
+    return modey_flipper && modey_flip_age < modey_flip_recent();
+#endif
 #endif
 }
 
@@ -981,11 +1106,24 @@ static uint32_t modey_stale_limit(void)
 
     if (!modey_flipper)
         return X86_MODEY_STALE_FRAMES;
-    gap = x86_modey_flip_gap_max;
+    gap = x86_modey_flip_gap_est;
     if (gap > X86_MODEY_GAP_CLAMP)
         gap = X86_MODEY_GAP_CLAMP;
     gap *= X86_MODEY_FLIP_SLACK;
     return (gap > modey_stale_floor) ? gap : modey_stale_floor;
+}
+
+/* How recently this guest must have flipped for its quiet gaps to be read as
+   gaps in a REDRAW rather than as a finished screen. See X86_MODEY_FLIP_RECENT:
+   short, because everything this window covers is a screen held back. */
+static uint32_t modey_flip_recent(void)
+{
+    uint32_t gap = x86_modey_flip_gap_est;
+
+    if (gap > X86_MODEY_GAP_CLAMP)
+        gap = X86_MODEY_GAP_CLAMP;
+    gap *= X86_MODEY_FLIP_RECENT;
+    return (gap > X86_MODEY_RECENT_MIN) ? gap : X86_MODEY_RECENT_MIN;
 }
 
 /* Per-ARMING policy state. The witnesses above are cumulative and host-visible;
@@ -994,6 +1132,8 @@ static uint32_t modey_stale_limit(void)
    drawn yet. */
 void x86_video_modey_policy_reset(void)
 {
+    modey_start_seen = 0;
+    x86_modey_flip_gap_est = 0;
     modey_flipper = 0;
     modey_flip_age = 0;
     modey_stores_flip = x86_vga_planar_stores;
@@ -1006,12 +1146,15 @@ void x86_video_modey_policy_reset(void)
     x86_video_modey_presented(0);
 }
 
+static void modey_gap_observe(uint32_t gap);
+
 void x86_video_modey_presented(int from_flip)
 {
     if (from_flip) {
         x86_modey_flip_gap = modey_idle;
         if (modey_idle > x86_modey_flip_gap_max)
             x86_modey_flip_gap_max = modey_idle;
+        modey_gap_observe(modey_idle);
         modey_flipper = 1;
         modey_flip_age = 0;
         modey_stores_flip = x86_vga_planar_stores;
@@ -1023,6 +1166,20 @@ void x86_video_modey_presented(int from_flip)
     modey_stores_seen = x86_vga_planar_stores;
 }
 
+/* The flip cadence the windows are scaled by. Jumps UP, eases DOWN. */
+static void modey_gap_observe(uint32_t gap)
+{
+    uint32_t est = x86_modey_flip_gap_est;
+
+    if (gap > X86_MODEY_GAP_CLAMP)
+        gap = X86_MODEY_GAP_CLAMP;
+    if (est == 0u || gap >= est)
+        est = gap;
+    else
+        est -= (est - gap) >> 1;
+    x86_modey_flip_gap_est = est;
+}
+
 int x86_video_modey_paint_due(void)
 {
     uint32_t stores;
@@ -1031,6 +1188,10 @@ int x86_video_modey_paint_due(void)
        so there is no half-drawn page to catch. */
     if (!x86_vga_modey_armed)
         return 1;
+
+    /* A half-written start held from the guest slice: commit it here, where the
+       pair is demonstrably not coming. */
+    modey_start_settle();
 
     stores = x86_vga_planar_stores;
     if (stores == modey_stores_seen) {
