@@ -441,6 +441,7 @@ L(ALU_EB_GB_MEM):
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     MEM_TRAP_R R2
+    VGA_LATCH R2, R12
     LDRB R3, [R2, #0]
 L(ALU_DISPATCH_8_SUBOP):
     UBFX R12, R0, #3, #3
@@ -480,6 +481,7 @@ L(ALU_EV_GV_MEM):
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     MEM_TRAP_R R2
+    VGA_LATCH R2, R12
     LD_V R3, R2
 L(ALU_DISPATCH_32_SUBOP):
     UBFX R12, R0, #3, #3
@@ -521,6 +523,7 @@ L(ALU_GB_EB_MEM):
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     MEM_TRAP_R R2
+    VGA_LATCH R2, R12
     LDRB R5, [R2, #0]
     UBFX R4, R1, #3, #3
     AND.W R3, R4, #3
@@ -564,6 +567,7 @@ L(ALU_GV_EV_MEM):
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     MEM_TRAP_R R2
+    VGA_LATCH R2, R12
     LD_V R5, R2
     UBFX R4, R1, #3, #3
     MOV.W R4, R4, LSL #2
@@ -648,6 +652,7 @@ L(ALU_EB_IMM8_80_MEM):
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     MEM_TRAP_R R2
+    VGA_LATCH R2, R12
     LDRB R3, [R2, #0]
 L(ALU_DISPATCH_EB_IMM8_80_SUBOP):
     UBFX R12, R1, #3, #3
@@ -692,6 +697,7 @@ L(ALU_EV_IMM32_81_MEM):
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     MEM_TRAP_R R2
+    VGA_LATCH R2, R12
     LD_V R3, R2
 L(ALU_DISPATCH_EV_IMM32_81_SUBOP):
     UBFX R12, R1, #3, #3
@@ -736,6 +742,7 @@ L(ALU_EV_IMM8_83_MEM):
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     MEM_TRAP_R R2
+    VGA_LATCH R2, R12
     LD_V R3, R2
 L(ALU_DISPATCH_EV_IMM8_83_SUBOP):
     UBFX R12, R1, #3, #3
@@ -782,6 +789,7 @@ L(TEST_EB_GB_84_MEM):
     LDR.W R12, [R2, #REC_MODRM_FN]
     BLX R12
     MEM_GET_PTR_R R12, R7
+    VGA_LATCH R12, R7
     LDRB R3, [R12]
     UBFX R4, R1, #3, #3
     AND.W R5, R4, #3
@@ -821,6 +829,7 @@ L(TEST_EV_GV_85_MEM):
     LDR.W R12, [R2, #REC_MODRM_FN]
     BLX R12
     MEM_GET_PTR_R R12, R7
+    VGA_LATCH R12, R7
     LD_V R3, R12
     UBFX R4, R1, #3, #3
     MOV.W R4, R4, LSL #2
@@ -866,8 +875,9 @@ L(XCHG_EB_GB_86_MEM):
     ADD.W R4, R4, #8
     LDRB.W R5, [R8, R4]
     MEM_GET_PTR R12, R7
+    VGA_LATCH R12, R7
     LDRB R3, [R12]
-    STRB R5, [R12]
+    VGA_ST_B R5, R12, R7
     STRB.W R3, [R8, R4]
     B.W .fetch_decode_loop
 
@@ -900,8 +910,9 @@ L(XCHG_EV_GV_87_MEM):
     ADD.W R4, R4, #8
     LDREG_V R5, R4
     MEM_GET_PTR R12, R7
+    VGA_LATCH R12, R7
     LD_V R3, R12
-    ST_V R5, R12
+    VGA_ST_V R5, R12, R7
     STREG_V R3, R4
     B.W .fetch_decode_loop
 
@@ -948,7 +959,7 @@ L(MOV_EB_GB_MEM):
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     MEM_TRAP_W R2
-    STRB R5, [R2, #0]
+    VGA_ST_B R5, R2, R12
     B.W .fetch_decode_loop
 
 OP .op_mov_ev_gv_89
@@ -986,7 +997,7 @@ L(MOV_EV_GV_MEM):
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     MEM_TRAP_W R2
-    ST_V R5, R2
+    VGA_ST_V R5, R2, R12
     B.W .fetch_decode_loop
 
 OP .op_lea_8D
@@ -1057,6 +1068,7 @@ L(MOV_GB_EB_MEM):
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     MEM_TRAP_R R2
+    VGA_LATCH R2, R12
     LDRB R5, [R2, #0]
     UBFX R2, R1, #3, #3
     AND.W R3, R2, #3
@@ -1095,6 +1107,7 @@ L(MOV_GV_EV_MEM):
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     MEM_TRAP_R R2
+    VGA_LATCH R2, R12
     LD_V R5, R2
     UBFX R2, R1, #3, #3
     MOV.W R2, R2, LSL #2
@@ -1127,7 +1140,7 @@ L(POP_EV_8F_MEM):
     POP_V R3, R4, R12
     POP {R7}
     MEM_GET_PTR R12, R7
-    ST_V R3, R12
+    VGA_ST_V R3, R12, R4
     B.W .fetch_decode_loop
 
 /* XCHG at the operand size. Both this and 0x87 swapped the full 32 bits in
@@ -1188,6 +1201,7 @@ OP .op_popfd_9D
 OP_AGNOSTIC .op_mov_al_moffs8_A0
     MOFFS_ADDR R4, R3
     MEM_GET_PTR_R R3, R4
+    VGA_LATCH R3, R4
     LDRB R3, [R3, #0]
     STRB.W R3, [R8, #REG_EAX]
     B.W .fetch_decode_loop
@@ -1195,6 +1209,7 @@ OP_AGNOSTIC .op_mov_al_moffs8_A0
 OP .op_mov_eax_moffs32_A1
     MOFFS_ADDR R4, R3
     MEM_GET_PTR_R R3, R4
+    VGA_LATCH R3, R4
     LD_V R3, R3
     STREG_V R3, #REG_EAX           @ 16-bit MOV must not clear the high half
     B.W .fetch_decode_loop
@@ -1203,14 +1218,14 @@ OP_AGNOSTIC .op_mov_moffs8_al_A2
     MOFFS_ADDR R4, R3
     LDRB.W R3, [R8, #REG_EAX]
     MEM_GET_PTR R12, R4
-    STRB.W R3, [R12]
+    VGA_ST_B R3, R12, R4
     B.W .fetch_decode_loop
 
 OP .op_mov_moffs32_eax_A3
     MOFFS_ADDR R4, R3
     LDREG_V R3, #REG_EAX
     MEM_GET_PTR R12, R4
-    ST_V R3, R12
+    VGA_ST_V R3, R12, R4
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_test_al_imm8_A8
@@ -1242,10 +1257,11 @@ OP .op_test_eax_imm32_A9
 OP_AGNOSTIC .op_movsb_A4
     STR_SRC R4, R3
     MEM_GET_PTR_R R3, R4
+    VGA_LATCH R3, R12
     LDRB R3, [R3]
     STR_DST R5, R12
     MEM_GET_PTR R12, R5
-    STRB R3, [R12]
+    VGA_ST_B R3, R12, R5
     STR_DELTA R7, 1
     STR_ADV REG_ESI, R7, R4
     STR_ADV REG_EDI, R7, R5
@@ -1254,10 +1270,11 @@ OP_AGNOSTIC .op_movsb_A4
 OP .op_movsd_A5
     STR_SRC R4, R3
     MEM_GET_PTR_R R3, R4
+    VGA_LATCH R3, R12
     LD_V R3, R3
     STR_DST R5, R12
     MEM_GET_PTR R12, R5
-    ST_V R3, R12
+    VGA_ST_V R3, R12, R5
     STR_DELTA R7, OPSZ
     STR_ADV REG_ESI, R7, R4
     STR_ADV REG_EDI, R7, R5
@@ -1266,9 +1283,11 @@ OP .op_movsd_A5
 OP_AGNOSTIC .op_cmpsb_A6
     STR_SRC R4, R3
     MEM_GET_PTR_R R3, R4
+    VGA_LATCH R3, R12
     LDRB R3, [R3]
     STR_DST R5, R12
     MEM_GET_PTR_R R12, R5
+    VGA_LATCH R12, R4
     LDRB R5, [R12]
     LSL.W R3, R3, #24
     LSL.W R5, R5, #24
@@ -1285,9 +1304,11 @@ OP_AGNOSTIC .op_cmpsb_A6
 OP .op_cmpsd_A7
     STR_SRC R4, R3
     MEM_GET_PTR_R R3, R4
+    VGA_LATCH R3, R12
     LD_V R3, R3
     STR_DST R5, R12
     MEM_GET_PTR_R R12, R5
+    VGA_LATCH R12, R4
     LD_V R5, R12
     VNORM(R3)
     VNORM(R5)
@@ -1305,7 +1326,7 @@ OP_AGNOSTIC .op_stosb_AA
     STR_DST R5, R12
     MEM_GET_PTR R12, R5
     LDRB.W R3, [R8, #REG_EAX]
-    STRB R3, [R12]
+    VGA_ST_B R3, R12, R5
     STR_DELTA R7, 1
     STR_ADV REG_EDI, R7, R5
     B.W .str_exit
@@ -1314,7 +1335,7 @@ OP .op_stosd_AB
     STR_DST R5, R12
     MEM_GET_PTR R12, R5
     LDREG_V R3, #REG_EAX
-    ST_V R3, R12
+    VGA_ST_V R3, R12, R5
     STR_DELTA R7, OPSZ
     STR_ADV REG_EDI, R7, R5
     B.W .str_exit
@@ -1322,6 +1343,7 @@ OP .op_stosd_AB
 OP_AGNOSTIC .op_lodsb_AC
     STR_SRC R4, R3
     MEM_GET_PTR_R R3, R4
+    VGA_LATCH R3, R12
     LDRB R3, [R3]
     STRB.W R3, [R8, #REG_EAX]
     STR_DELTA R7, 1
@@ -1331,6 +1353,7 @@ OP_AGNOSTIC .op_lodsb_AC
 OP .op_lodsd_AD
     STR_SRC R4, R3
     MEM_GET_PTR_R R3, R4
+    VGA_LATCH R3, R12
     LD_V R3, R3
     STREG_V R3, #REG_EAX
     STR_DELTA R7, OPSZ
@@ -1340,6 +1363,7 @@ OP .op_lodsd_AD
 OP_AGNOSTIC .op_scasb_AE
     STR_DST R5, R12
     MEM_GET_PTR_R R12, R5
+    VGA_LATCH R12, R4
     LDRB R5, [R12]
     LDRB.W R3, [R8, #REG_EAX]
     LSL.W R3, R3, #24
@@ -1356,6 +1380,7 @@ OP_AGNOSTIC .op_scasb_AE
 OP .op_scasd_AF
     STR_DST R5, R12
     MEM_GET_PTR_R R12, R5
+    VGA_LATCH R12, R4
     LD_V R5, R12
     LDREG_V R3, #REG_EAX
     VNORM(R3)
@@ -1400,7 +1425,7 @@ OP_AGNOSTIC .op_insb_6C
     MOV R1, R0
     STR_DST R5, R12
     MEM_GET_PTR R12, R5
-    STRB R1, [R12]
+    VGA_ST_B R1, R12, R4
     STR_DELTA R7, 1
     STR_ADV REG_EDI, R7, R5
     B.W .str_exit
@@ -1415,7 +1440,7 @@ OP .op_insv_6D
     MOV R1, R0
     STR_DST R5, R12
     MEM_GET_PTR R12, R5
-    ST_V R1, R12
+    VGA_ST_V R1, R12, R4
     STR_DELTA R7, OPSZ
     STR_ADV REG_EDI, R7, R5
     B.W .str_exit
@@ -1423,6 +1448,7 @@ OP .op_insv_6D
 OP_AGNOSTIC .op_outsb_6E
     STR_SRC R4, R3
     MEM_GET_PTR_R R3, R4
+    VGA_LATCH R3, R12
     LDRB R1, [R3]
     STR_DELTA R7, 1
     STR_ADV REG_ESI, R7, R4        @ the index advance, while R2 is still live
@@ -1437,6 +1463,7 @@ OP_AGNOSTIC .op_outsb_6E
 OP .op_outsv_6F
     STR_SRC R4, R3
     MEM_GET_PTR_R R3, R4
+    VGA_LATCH R3, R12
     LD_V R1, R3
     STR_DELTA R7, OPSZ
     STR_ADV REG_ESI, R7, R4
@@ -1530,7 +1557,7 @@ L(MOV_EB_IMM8_C6_MEM):
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     MEM_GET_PTR R12, R7
-    STRB R5, [R12]
+    VGA_ST_B R5, R12, R4
     B.W .fetch_decode_loop
 
 OP .op_mov_ev_imm32_C7
@@ -1564,7 +1591,7 @@ L(MOV_EV_IMM_C7_MEM):
     LD_V R5, R5
     EIP_ADV_V
     MEM_GET_PTR R12, R7
-    ST_V R5, R12
+    VGA_ST_V R5, R12, R4
     B.W .fetch_decode_loop
 
 /* C1 / D1 / D3 shift a v-width operand, so they are NOT pass-agnostic: they
@@ -1603,6 +1630,7 @@ L(SHIFT_EV_IMM8_C1_MEM):
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     MEM_TRAP_R R2
+    VGA_LATCH R2, R12
     LD_V R3, R2
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
@@ -1651,6 +1679,7 @@ L(SHIFT_EV_MEM):
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     MEM_TRAP_R R2
+    VGA_LATCH R2, R12
     LD_V R3, R2
 L(SHIFT_DISPATCH_32):
     UBFX R12, R1, #3, #3
@@ -1810,7 +1839,7 @@ L(SHIFT_SAR):
 L(SHIFT_NOFLAGS):
     /* Masked count of zero: value unchanged, no flag moves. */
 L(SHIFT_DONE):
-    ST_V R3, R2
+    VGA_ST_V R3, R2, R12
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_shift_eb_imm8_C0
@@ -1846,6 +1875,7 @@ L(SHIFT_EB_IMM8_C0_MEM):
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     MEM_TRAP_R R2
+    VGA_LATCH R2, R12
     LDRB R3, [R2, #0]
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
@@ -1897,6 +1927,7 @@ L(SHIFT_EB_MEM):
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     MEM_TRAP_R R2
+    VGA_LATCH R2, R12
     LDRB R3, [R2, #0]
 L(SHIFT_DISPATCH_8):
     UBFX R12, R1, #3, #3
@@ -2044,7 +2075,7 @@ L(SHIFT8_SAR):
 L(SHIFT8_NOFLAGS):
     /* A masked count of zero: the value is unchanged and NO flag moves. */
 L(SHIFT8_DONE):
-    STRB R3, [R2, #0]
+    VGA_ST_B R3, R2, R12
     B.W .fetch_decode_loop
 
 /* BCD adjust: DAA (27), DAS (2F), AAA (37), AAS (3F).
@@ -2235,7 +2266,7 @@ L(ALU_CMP):
     X86_FLAGS_ARITH R3, R4, R0, R1, 1, NSH
     B.W .fetch_decode_loop         @ CMP discards the result
 L(WRITEBACK_REG):
-    ST_V R3, R2
+    VGA_ST_V R3, R2, R12
     B.W .fetch_decode_loop
     /* 8-bit cores. Same normalization with sh=24. */
 L(ALU8_ADD):
@@ -2287,7 +2318,7 @@ L(ALU8_CMP):
     X86_FLAGS_ARITH R3, R4, R0, R1, 1, 24
     B.W .fetch_decode_loop         @ CMP discards the result
 L(WRITEBACK_REG8):
-    STRB R3, [R2, #0]
+    VGA_ST_B R3, R2, R12
     B.W .fetch_decode_loop
 #ifndef USE_16_BIT
     .global decode_modrm_addr32
@@ -2580,6 +2611,7 @@ L(GRP4_MEM):
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     MEM_TRAP_R R2
+    VGA_LATCH R2, R12
     LDRB R3, [R2, #0]
 L(GRP4_DISPATCH):
     UBFX R12, R1, #3, #3
@@ -2609,7 +2641,7 @@ L(GRP4_DEC):
     LSR.W R3, R3, #24
     X86_FLAGS_INCDEC R3, R4, R0, R1, 24
 L(GRP4_STORE):
-    STRB R3, [R2, #0]
+    VGA_ST_B R3, R2, R12
     B.W .fetch_decode_loop
 
 OP .op_grp5_FF
@@ -2648,6 +2680,7 @@ L(GRP5_MEM):
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     MEM_TRAP_R R2
+    VGA_LATCH R2, R12
     LD_V R3, R2
 L(GRP5_DISPATCH):
     UBFX R12, R1, #3, #3
@@ -2678,7 +2711,7 @@ L(GRP5_INC):
     EOR.W R4, R4, R3
     VDENORM(R3)
     X86_FLAGS_INCDEC R3, R4, R0, R1, NSH
-    ST_V R3, R2
+    VGA_ST_V R3, R2, R12
     B.W .fetch_decode_loop
 L(GRP5_DEC):
     VNORM(R3)
@@ -2687,7 +2720,7 @@ L(GRP5_DEC):
     EOR.W R4, R4, R3
     VDENORM(R3)
     X86_FLAGS_INCDEC R3, R4, R0, R1, NSH
-    ST_V R3, R2
+    VGA_ST_V R3, R2, R12
     B.W .fetch_decode_loop
 L(GRP5_CALL):
     LDR.W R4, [R8, #SEG_CS_BASE]
@@ -2901,6 +2934,7 @@ L(IMUL69_MEM):
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     MEM_TRAP_R R2
+    VGA_LATCH R2, R12
     LD_V R3, R2
 L(IMUL69_DO):
     UBFX R5, R10, #12, #12
@@ -2949,6 +2983,7 @@ L(IMUL6B_MEM):
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     MEM_TRAP_R R2
+    VGA_LATCH R2, R12
     LD_V R3, R2
 L(IMUL6B_DO):
     UBFX R5, R10, #12, #12
@@ -3081,6 +3116,7 @@ OP_AGNOSTIC .op_xlat_D7
     LDR.W R4, [R9, R4, LSL #2]
     ADDS R4, R4, R3
     MEM_TRAP_R R4
+    VGA_LATCH R4, R12
     LDRB R4, [R4, #0]
     STRB.W R4, [R8, #8]
     B.W .fetch_decode_loop
@@ -3335,6 +3371,7 @@ L(GRP3_F6_MEM):
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     MEM_TRAP_R R2
+    VGA_LATCH R2, R12
     LDRB R3, [R2, #0]
 L(GRP3_F6_DISPATCH):
     UBFX R12, R1, #3, #3
@@ -3372,7 +3409,7 @@ L(GRP3_F6_TEST):
     B.W .fetch_decode_loop
 L(GRP3_F6_NOT):
     MVN.W R3, R3
-    STRB R3, [R2, #0]
+    VGA_ST_B R3, R2, R12
     B.W .fetch_decode_loop
 L(GRP3_F6_NEG):
     /* CF is "the operand was non-zero", which ARM gives as NOT-borrow, hence
@@ -3384,7 +3421,7 @@ L(GRP3_F6_NEG):
     EOR.W R4, R4, R3
     LSR.W R3, R3, #24
     X86_FLAGS_ARITH R3, R4, R0, R1, 1, 24
-    STRB R3, [R2, #0]
+    VGA_ST_B R3, R2, R12
     B.W .fetch_decode_loop
 
 L(GRP3_F6_MUL):
@@ -3474,6 +3511,7 @@ L(GRP3_F7_MEM):
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     MEM_TRAP_R R2
+    VGA_LATCH R2, R12
     LD_V R3, R2
 L(GRP3_F7_DISPATCH):
     UBFX R12, R1, #3, #3
@@ -3504,7 +3542,7 @@ L(GRP3_F7_TEST):
     B.W .fetch_decode_loop
 L(GRP3_F7_NOT):
     MVN.W R3, R3
-    ST_V R3, R2
+    VGA_ST_V R3, R2, R12
     B.W .fetch_decode_loop
 L(GRP3_F7_NEG):
     VNORM(R3)
@@ -3513,7 +3551,7 @@ L(GRP3_F7_NEG):
     EOR.W R4, R4, R3
     VDENORM(R3)
     X86_FLAGS_ARITH R3, R4, R0, R1, 1, NSH   @ CF = (operand != 0)
-    ST_V R3, R2
+    VGA_ST_V R3, R2, R12
     B.W .fetch_decode_loop
 
 L(GRP3_F7_MUL):
@@ -3746,6 +3784,7 @@ L(MOV_SREG_MEM):
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R7
     MEM_TRAP_R R3
+    VGA_LATCH R3, R12
     LDRH R5, [R3, #0]
 L(MOV_SREG_SET):
     UBFX R4, R1, #3, #3
@@ -3785,7 +3824,7 @@ L(MOV_EW_SREG_MEM):
     MLA R3, R4, R3, R8
     LDRH.W R5, [R3, #SEG_ES_SEL]
     MEM_GET_PTR R3, R7
-    STRH R5, [R3, #0]
+    VGA_ST_H R5, R3, R12
     B.W .fetch_decode_loop
 
 /* LES (C4) / LDS (C5): Gv <- [mem], then Sreg <- [mem + operand size].
@@ -3812,12 +3851,14 @@ L(LOAD_FAR_PTR):
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R7
     MEM_TRAP_R R3
+    VGA_LATCH R3, R12
     LD_V R4, R3                    @ offset, operand-size wide
     ADD.W R7, R7, #OPSZ
     UBFX R3, R7, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R7
     MEM_TRAP_R R3
+    VGA_LATCH R3, R12
     LDRH R5, [R3, #0]              @ selector, always 16 bits
     POP {R0, R1}
     UBFX R3, R1, #3, #3
@@ -4159,12 +4200,14 @@ L(GRP5_FAR_ENTRY):
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R7
     MEM_TRAP_R R3
+    VGA_LATCH R3, R12
     LD_V R4, R3                    @ new IP/EIP, operand-size wide
     ADD.W R7, R7, #OPSZ
     UBFX R3, R7, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R7
     MEM_TRAP_R R3
+    VGA_LATCH R3, R12
     LDRH R5, [R3, #0]              @ new CS selector
     CMP R0, #0
     BEQ.N L(GRP5_FAR_SET)

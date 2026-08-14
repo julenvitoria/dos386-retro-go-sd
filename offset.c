@@ -73,6 +73,8 @@ int main(void)
     EMIT("CPU_REP_HANDLER",  offsetof(X86CPUState, rep_handler));
     EMIT("CPU_REP_BATCH",    offsetof(X86CPUState, rep_batch));
     EMIT("CPU_NOR_PTR",      offsetof(X86CPUState, nor_ptr));
+    EMIT("CPU_VGA_BASE",     offsetof(X86CPUState, vga_base));
+    EMIT("CPU_VGA_LATCH",    offsetof(X86CPUState, vga_latch));
     EMIT("CPU_TABLE_BASE",       offsetof(X86CPUState, opcode_table_base));
     printf("\n    .equ %-24s, %zu\n", "CPU_STATE_SIZE", sizeof(X86CPUState));
 

@@ -251,7 +251,7 @@ L(OP_0F_SETCC_MEM):
     LDR.W R12, [R9, R12, LSL #2]
     ADDS R12, R12, R7
     MEM_TRAP_W R12
-    STRB.W R3, [R12]
+    VGA_ST_B R3, R12, R4
     B.W .fetch_decode_loop
 
 /* 0F 20 /r  MOV r32, CRn      0F 22 /r  MOV CRn, r32
@@ -321,6 +321,7 @@ L(OP_0F_MOVZX_GV_EB_MEM):
     LDR.W R4, [R9, R4, LSL #2]
     ADDS R4, R4, R7
     MEM_TRAP_R R4
+    VGA_LATCH R4, R3
     LDRB R4, [R4, #0]
 
 L(OP_0F_MOVZX_GV_EB_WRITE):
@@ -352,6 +353,7 @@ L(OP_0F_MOVZX_GV_EW_MEM):
     LDR.W R4, [R9, R4, LSL #2]
     ADDS R4, R4, R7
     MEM_TRAP_R R4
+    VGA_LATCH R4, R3
     LDRH R4, [R4, #0]
 
 L(OP_0F_MOVZX_GV_EW_WRITE):
@@ -386,6 +388,7 @@ L(OP_0F_MOVSX_GV_EB_MEM):
     LDR.W R4, [R9, R4, LSL #2]
     ADDS R4, R4, R7
     MEM_TRAP_R R4
+    VGA_LATCH R4, R3
     LDRSB.W R4, [R4]
 
 L(OP_0F_MOVSX_GV_EB_WRITE):
@@ -417,6 +420,7 @@ L(OP_0F_MOVSX_GV_EW_MEM):
     LDR.W R4, [R9, R4, LSL #2]
     ADDS R4, R4, R7
     MEM_TRAP_R R4
+    VGA_LATCH R4, R3
     LDRSH.W R4, [R4]
 
 L(OP_0F_MOVSX_GV_EW_WRITE):

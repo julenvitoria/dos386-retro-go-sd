@@ -106,6 +106,18 @@ struct X86CPUState {
      * would need a literal pool inside the ITCM hot section. Zero means the
      * page is genuinely absent and the stub takes the .mem_fault exit. */
     uint32_t nor_ptr;
+    /* VGA aperture hook. `vga_base` is the HOST base of the 64 KB guest
+       aperture at 0xA0000 while a planar mode is armed, and 0 otherwise.
+       Every converted guest-memory site tests `ptr - vga_base` unsigned
+       against 0x10000: host pointers live at 0x24xxxxxx, so with a zero base
+       the difference is never below 64 KB and the check can never fire. That
+       is why 0 is the disarmed sentinel and why reset needs no special case.
+       `vga_latch` is the window offset (0..0xFFFF) of the last guest READ that
+       landed inside the aperture -- the adapter's four read latches are
+       indexed by it and the planar write modes consume them. Both sit next to
+       nor_ptr so each is one LDR off R8 in DTCM. */
+    uint32_t vga_base;
+    uint32_t vga_latch;
 };
 typedef struct X86CPUState X86CPUState;
 
@@ -223,6 +235,16 @@ extern X86CPUState *cpu_state_ptr;
    like any other unrenderable mode rather than drawing into memory nothing
    reads. x86_vga13_ok is the witness. */
 void x86_video_set_aperture(void *aperture, void *palette_block);
+
+/* --- VGA aperture store hook (x86_video_planar.c) -------------------------
+   The interpreter's converted store sites call this INSTEAD OF storing when
+   cpu->vga_base is armed and the pointer lands in the 64 KB window. `off` is
+   the window offset, `val` the value the guest wrote and `size` 1, 2 or 4.
+   `x86_vga_planar_aperture` is the host base the offset is relative to; it is
+   kept in step with the video layer's aperture by x86_video_set_aperture(). */
+extern uint8_t *x86_vga_planar_aperture;
+extern volatile uint32_t x86_vga_planar_stores;
+void x86_vga_planar_store(uint32_t off, uint32_t val, uint32_t size);
 extern volatile uint32_t x86_vga13_ok;
 extern volatile uint32_t x86_vga_dac_writes;
 /* 256 ARGB8888 entries built from the guest's DAC. Non-NULL only while a
