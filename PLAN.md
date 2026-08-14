@@ -11,7 +11,6 @@ State: [`STATUS.md`](STATUS.md). Running: [`TOOLING.md`](TOOLING.md). Design:
 Emulate a DOS machine's RAM inside the AXI available: RAM_EMU 724 KB plus
 ~150 KB released as a bonus pool when the LCD runs LUT8, as **two disjoint
 regions**.
-
 - **Done**: checked translation. `host = lin + k` from a flat DTCM table;
   unmapped pages hold `FOLD_INVALID` so one `ADDS`+`BMI` validates every access
   at zero cost. Entries are offsets, not bases.
@@ -19,10 +18,9 @@ regions**.
 - **In progress**: pager eviction, and donating spare guest frames to the arena
   — [`docs/12`](docs/12_memory_tiers.md).
 - **Measurement-gated**: NOR backing. Re-measure the code-vs-data split first;
-  it is currently 100% write, which kills the premise
-  ([`docs/12`](docs/12_memory_tiers.md) §3).
-- Eviction *policy* is not the lever: LRU was measured capped at 2.1x over FIFO
-  while the pool-size cliff is 350x. Spend effort on bytes, not policy.
+  it is 100% write, which kills the premise ([`docs/12`](docs/12_memory_tiers.md) §3).
+- Eviction *policy* is not the lever: LRU measured 2.1x over FIFO against a
+  350x pool-size cliff. Spend effort on bytes, not policy.
 
 Blueprint: [`docs/01`](docs/01_memory_architecture.md).
 
@@ -82,21 +80,22 @@ Verdicts only; evidence in [`docs/12`](docs/12_memory_tiers.md) and
    [`docs/09`](docs/09_frame_pacing_and_clocks.md) §7.
 1. A **golden-screenshot gate** with programmatic comparison. Two "runs fine,
    renders garbage" regressions shipped in one session because nothing in the
-   suite can see a picture. A golden captured from a broken build blesses the
-   bug, so each must be eye-verified once and that verification recorded.
+   suite could see a picture. A golden from a broken build blesses the bug, so
+   each is eye-verified once and that verification recorded.
 2. Wolf3D's off-screen VRAM cache is too small — discards above `0xE300`.
-3. **DONE** -- the VGA aperture is a fold trap; non-planar titles pay nothing
-   for it. `docs/08` says what it cost and what freeing the read shadow would
-   buy B4.
-4. Keen's watchdog reset and half-height intro.
-5. A/B the DMA2D blit on hardware — merged, off, unverified.
-6. Retro-go overlay legibility over 256-colour modes.
+3. **DONE** — the aperture is a fold trap, so non-planar titles pay nothing.
+   `docs/08` prices it and sizes what freeing the read shadow would buy B4.
+4. Keen's watchdog reset and half-height intro. Blocked on the read shadow.
+5. DMA2D A/B: `scripts/dma2d_ab.py` builds both arms and a synthetic chained-13h
+   guest. That guest does not reach 13h yet; timing is tier 3 either way.
+6. Overlay legibility over 256 colours: mechanism settled, fix designed, needs
+   no firmware change — `docs/04` §7. Not implemented.
 
 ### Not scheduled, but live
 
 - Mode Y still paints mid-draw frames (`x86_modey_mid_draw`).
-- **VBE 320x240** (`DOS_MODE_VBE240` in the prior port) is the only mode that
-  fills the panel and reduces the blit to one `memcpy` — not ported. Note it is
-  a *custom* mode number: little period software will ask for it.
+- **VBE 320x240** (`DOS_MODE_VBE240` in the prior port) fills the panel and
+  reduces the blit to one `memcpy` — not ported, and a *custom* mode number
+  little period software will ask for.
 - An adapter-advertisement Options entry (CGA / EGA+VGA / VGA-only), so a title
-  that cannot render what we claim becomes a switch, not a black screen.
+  we cannot render becomes a switch, not a black screen.
