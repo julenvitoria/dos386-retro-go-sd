@@ -979,6 +979,33 @@ python3 scripts/make_retrogo_config.py --out build/CONFIG --rom dos ALLEYCAT.dsk
 Preselects a ROM (so no launcher navigation is needed) and disables idle
 standby. Called automatically by `make retrogo_media`.
 
+### `deploy_device.py` — update the real device
+
+```bash
+python3 scripts/deploy_device.py                  # firmware + core
+python3 scripts/deploy_device.py --no-firmware    # core only (the inner loop)
+```
+
+Flashes `gw_retro_go_intflash.bin` to internal flash and pushes
+`/cores/dos.bin` over the probe. **It never touches `/CONFIG`, `/roms` or
+`sd_content`** — which is why this exists instead of `sdcard.py --probe`:
+compose rewrites `/CONFIG`, silently resetting the overclock level and
+preselected title the owner set through the launcher, and it would push the
+whole ROM library over SWD.
+
+**Do not call `gnw.erase()` before `gnw.flash()`.** `flash()` ->
+`program(erase=True)` already erases each sector as it writes. A separate
+whole-bank erase is redundant and the on-target helper answers `BAD_SEGFAULT`.
+
+Verify without disturbing what is running:
+
+```bash
+python3 scripts/probe.py --retrogo --target hardware --no-flash \
+    --watch core_ready,guest_insns_total,x86_vga13_ok
+```
+
+Add `--hard-reset` to reboot into freshly flashed firmware.
+
 ### `sdcard.py` — one ROM or the whole library
 
 ```bash
