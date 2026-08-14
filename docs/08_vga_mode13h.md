@@ -358,6 +358,71 @@ while a real game rendered garbage". Measured: **60** mid-draw paints per 1500
 frames with `-DX86_MODEY_QUIET_NEGCTL=1` (the shipped rule compiled back in),
 **0** with the fix, and arms 1–4 stay green under that control.
 
+**Bug 5 — the fix for bug 4 froze the intro and the menus.** Reported from
+hardware immediately after it landed:
+
+> "there's an issue in the intro/menu. If you press a button to skip, it just
+> freezes the image for a moment and then jumps to where you tried to get to."
+
+The rule bug 4 shipped was a DOUBLING back-off in the staleness bound's shape:
+every quiet paint taken mid-redraw doubled the quiet run required for the next,
+clamped at 32 frames. Two properties made it wrong for the menus, and the second
+is the one that matters:
+
+1. **It was MONOTONIC.** It converged on the worst thing the guest had ever done
+   and stayed there, so the menus paid gameplay's bill. That is now a
+   MEASUREMENT instead: the longest store-free pause this guest has been *seen*
+   to take in the middle of a redraw — a quiet run with unpainted stores banked
+   that ended because the guest STORED AGAIN rather than because we painted it.
+   The measurement is taken only while `modey_dirty` (the long quiet after a
+   flip is game logic, not a redraw) and only for runs shorter than the clamp (a
+   longer one is a menu waiting for a key, and learning it is the latency this
+   replaced). `x86_modey_inframe_gap` is host-visible: it *is* this title's menu
+   latency, so "are the menus slow" is a number to read, not a guess.
+2. **`modey_flipper` was sticky for the whole arming.** *WOLF3D's intro and
+   menus do not flip* — `flips=2` across the entire signon/title/menu phase,
+   measured twice: under gwemu (the counters earlier in this section) and on
+   hardware (2 at the menu→gameplay transition, 94 by the end of a level). They
+   draw straight into the page they are already displaying and call VW_SetScreen
+   with an unchanged value, which `x86_vga_planar_start_write()` correctly
+   ignores. So two flips during the signon put every later menu under the
+   raycaster's rule for ever, and the panel held the OLD screen for the whole
+   time the new one was being drawn into memory — which is the report almost
+   word for word. It is not a latency *after* the guest goes quiet; the whole
+   DRAW is hidden. On real hardware you watch those screens being painted.
+
+So being a title that flips now DECAYS (`modey_is_flipping()`), against the same
+threshold the anti-freeze bound already uses — one number for "this guest has
+stopped flipping" rather than two that can disagree. Gameplay flips every 20–34
+frames and is never near it; the intro crosses it in a couple of seconds and
+gets the flat two-frame rule back, which is exactly the behaviour it had before
+any of this work and the behaviour nobody complained about.
+
+**The test suite had the same blind spot as the code, and that is why it
+shipped: every presentation arm asserted a paint did NOT happen, and not one
+asserted that a paint happened SOON.** `which == 6` is the promptness arm. It
+plays a level (bursty, flipping every 30 — hardware's measured `flip_gap_max` is
+34, not the 300 `which == 4` models), then a menu that goes quiet while the last
+flip is recent (painted within 12 frames), then SIX intro screens drawn in
+pieces long after the last flip (the last must be revealed within 6 frames of
+its first store), then the level again (0 paints, 0 mid-draw).
+
+Two things about that arm are the residue of controls that survived, and both
+are worth keeping:
+
+* **The modelled gaps VARY** (2, 3, 5, 7 — `bursty_next()`). With every gap the
+  same length a doubling back-off takes one paint, doubles once and is silent
+  for ever, so the model pronounced the doubling fine while hardware froze.
+  Varied gaps ratchet it, which is what actually happened.
+* **SIX intro screens, not one.** The failure is a ratchet, and the staleness
+  bound rescues a single screen anyway — so a one-screen model passes while the
+  panel is frozen.
+
+Measured: with `-DX86_MODEY_BACKOFF_NEGCTL=1` (the doubling *and* the sticky
+flipper — the policy exactly as it regressed) the last intro screen is **never**
+revealed while it is being drawn; with the fix it is revealed after **4** frames,
+and the level on either side of it still takes **0** loop paints.
+
 **What is left, and it is accepted.** Two things. First, the ≤ 2 frames the
 back-off costs at a menu-to-gameplay transition, which is unavoidable without a
 "the guest has finished" signal that does not exist. Second, the aliasing itself:
