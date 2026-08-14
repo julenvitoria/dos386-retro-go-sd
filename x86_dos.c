@@ -240,7 +240,8 @@ uint16_t dos_test_walk(void)
 static uint16_t psp_seg;
 static uint32_t dta_lin;            /* disk transfer area, default PSP:0080 */
 
-static void psp_build(uint16_t seg, uint16_t mem_top, const char *tail)
+static void psp_build(uint16_t seg, uint16_t mem_top, const char *tail,
+                      uint16_t env_seg)
 {
     /* Built in a local and copied granule-aware: a PSP is placed at an
        arbitrary PARAGRAPH, so 256 bytes from it straddles a 4 KB granule
@@ -255,7 +256,8 @@ static void psp_build(uint16_t seg, uint16_t mem_top, const char *tail)
     p[3] = (uint8_t)(mem_top >> 8);
     p[5] = 0x9A;                                /* far call to the dispatcher */
     p[0x0A] = 0x00; p[0x0B] = 0x00;             /* INT 22h terminate vector */
-    p[0x2C] = 0x00; p[0x2D] = 0x00;             /* no environment block */
+    p[0x2C] = (uint8_t)env_seg;                 /* environment block */
+    p[0x2D] = (uint8_t)(env_seg >> 8);
     p[0x50] = 0xCD; p[0x51] = 0x21; p[0x52] = 0xCB;  /* INT 21h / RETF */
 
     unsigned n = tail ? (unsigned)strlen(tail) : 0;
@@ -377,27 +379,68 @@ static void guest_str(uint32_t lin, char *out, unsigned max)
  * f_open rejects outright with FR_INVALID_DRIVE. We have exactly one volume
  * (the mounted .dsk), so every drive letter means the same disk: strip it.
  *
- * FF_FS_RPATH is 0 too, so there is no current directory to be relative to and
- * a leading separator is meaningless -- but harmless -- to strip as well; what
- * matters is that "A:FOO.INI" and "\FOO.INI" and "FOO.INI" all reach the same
- * root-directory entry, which is where a single-floppy DOS title keeps its
- * files.
+ * FF_FS_RPATH is 0 too, so FatFs has no current directory of its own. That is
+ * fine for a single-floppy title whose files all sit in the root, and WRONG for
+ * a title AUTOEXEC.BAT reaches with `CD \DF` -- every relative name it then
+ * opens ("DARK.GOB") has to be resolved against that directory, and with no
+ * CWD anywhere in the stack it resolved against the root and missed. So the
+ * current directory is kept HERE, as a plain prefix string, and applied to
+ * exactly the paths DOS would apply it to: the relative ones. An absolute path
+ * ("\DF\TEXT.MSG", "C:\FOO") still means the root, as it does under DOS.
  */
+static char dos_cwd[48];                        /* "" = root; no trailing '/' */
+
+void x86_dos_set_cwd(const char *dir)
+{
+    unsigned i = 0;
+    if (dir) {
+        while (*dir == '\\' || *dir == '/')
+            dir++;
+        while (dir[i] && i < sizeof(dos_cwd) - 1) {
+            dos_cwd[i] = (dir[i] == '\\') ? '/' : dir[i];
+            i++;
+        }
+        while (i && (dos_cwd[i - 1] == '/'))
+            i--;
+    }
+    dos_cwd[i] = 0;
+}
+
+const char *x86_dos_get_cwd(void) { return dos_cwd; }
+
 static void dos_path_from_guest(uint32_t lin, char *out, unsigned max)
 {
     char raw[64];
     guest_str(lin, raw, sizeof(raw));
 
     const char *s = raw;
-    if (s[0] && s[1] == ':')                    /* drop any "X:" */
+    int absolute = 0;
+    if (s[0] && s[1] == ':') {                  /* drop any "X:" */
         s += 2;
+        absolute = 1;                           /* "C:FOO" is drive-relative,
+                                                   but we have one volume and
+                                                   no per-drive CWD; root is
+                                                   the safe reading */
+    }
+    if (*s == '\\' || *s == '/')
+        absolute = 1;
     while (*s == '\\' || *s == '/')             /* and any leading separator */
         s++;
 
     unsigned i = 0;
-    while (s[i] && i < max - 1) {
-        out[i] = s[i];
+    if (!absolute && dos_cwd[0]) {
+        while (dos_cwd[i] && i < max - 2) {
+            out[i] = dos_cwd[i];
+            i++;
+        }
+        if (i < max - 1)
+            out[i++] = '/';
+    }
+    unsigned j = 0;
+    while (s[j] && i < max - 1) {
+        out[i] = (s[j] == '\\') ? '/' : s[j];
         i++;
+        j++;
     }
     out[i] = 0;
 }
@@ -606,6 +649,47 @@ int x86_dos_exec(const char *path, const char *cmdline)
     if (want < need)
         want = need;
 
+    /*
+     * The ENVIRONMENT BLOCK, and it is not optional for a DOS extender.
+     *
+     * PSP+2Ch was hardcoded to 0 -- "no environment" -- which real DOS never
+     * produces. A DOS 3.0+ environment ends with a second NUL, a word 0x0001,
+     * and then the ASCIIZ FULL PATH OF THE PROGRAM ITSELF, and that path is
+     * the ONLY way a program can find the file it was loaded from. Every
+     * Watcom-built binary uses it for argv[0]; DOS/4GW's stub uses it to
+     * reopen its own .EXE and read the linear-executable image that follows
+     * the stub. With env=0 the stub could not find itself: measured on
+     * STAR_WARS_DARKFORCES.dsk, it did its handle probes and then called
+     * INT 21h AH=4Ch with AL=01 without printing anything.
+     *
+     * Allocated BEFORE the program's own block, exactly as DOS does it -- a
+     * program whose maxalloc is 0xFFFF (and DF.EXE's is) takes every free
+     * paragraph, so an environment asked for afterwards can only fail.
+     */
+    /* Owner 0x0008 ("DOS"), NOT 0: owner==0 is how mcb_alloc spells FREE, so a
+       block claimed with owner 0 is handed straight back out by the next
+       allocation. Measured: the environment and the program's PSP both landed
+       on segment 0x0071 and the PSP overwrote the environment. */
+    uint16_t elargest = 0;
+    uint16_t env_seg = mcb_alloc(PARA(256), 0x0008, &elargest);
+    if (env_seg) {
+        uint8_t e[256];
+        memset(e, 0, sizeof(e));
+        /* A minimal but real environment. COMSPEC is what a program looks for
+           when it wants to spawn a shell. */
+        static const char vars[] = "COMSPEC=C:\\COMMAND.COM\0PATH=C:\\\0";
+        memcpy(e, vars, sizeof(vars) - 1);
+        unsigned k = sizeof(vars) - 1;
+        e[k++] = 0;                     /* end of the strings */
+        e[k++] = 0x01; e[k++] = 0x00;   /* one string follows */
+        /* "DF/DF.EXE" -> "C:\DF\DF.EXE": the guest's own notation. */
+        e[k++] = 'C'; e[k++] = ':'; e[k++] = '\\';
+        for (const char *c = path; *c && k < sizeof(e) - 1; c++)
+            e[k++] = (*c == '/') ? '\\' : dos_up(*c);
+        e[k] = 0;
+        x86_guest_copy_in(SEG(env_seg), e, sizeof(e));
+    }
+
     uint16_t largest = 0;
     uint16_t block = mcb_alloc(want, 0, &largest);
     uint16_t granted = want;
@@ -624,6 +708,24 @@ int x86_dos_exec(const char *path, const char *cmdline)
 
     uint16_t psp = block;
     uint16_t load_seg = (uint16_t)(psp + PARA(256));
+
+    /* Claim the program's own block. It was allocated with owner 0 -- which is
+       mcb_alloc's spelling of FREE -- so the running program's memory stayed on
+       the free list and the next AH=48h could hand it out from under itself.
+       DOS puts the PSP segment here, and that is also what a program walking
+       the MCB chain to find its own block looks for. */
+    {
+        mcb_t pm;
+        if (mcb_read((uint16_t)(block - 1u), &pm)) {
+            pm.owner = psp;
+            mcb_write((uint16_t)(block - 1u), &pm);
+        }
+        mcb_t em;
+        if (env_seg && mcb_read((uint16_t)(env_seg - 1u), &em)) {
+            em.owner = psp;             /* DOS owns the env to the child PSP */
+            mcb_write((uint16_t)(env_seg - 1u), &em);
+        }
+    }
 
     /* Copy the image in, a page at a time so it can cross granules. */
     f_lseek(&f, hdr_bytes);
@@ -660,7 +762,7 @@ int x86_dos_exec(const char *path, const char *cmdline)
     /* Top of memory as the program sees it: the end of what it was GRANTED,
        not of what it minimally needed. A Borland startup compares its own top
        against this field and refuses to run if it does not fit. */
-    psp_build(psp, (uint16_t)(psp + granted), cmdline);
+    psp_build(psp, (uint16_t)(psp + granted), cmdline, env_seg);
 
     /* Entry state, exactly as the header specifies. */
     /* Segment arithmetic wraps at 16 bits; the base must be built from the
@@ -1228,11 +1330,27 @@ static int dos_int21_dispatch(uint8_t func)
         x86_set_al(1);                          /* one drive in the system */
         return 1;
     case 0x47: {                                /* get current directory */
-        /* Root, always: FF_FS_RPATH is 0, so there is no other answer to give
-           and an empty string IS the correct encoding of "\". */
+        /*
+         * The CWD, in DOS notation and WITHOUT a leading backslash -- which is
+         * what the DOS API specifies and what a caller re-joins with one.
+         *
+         * "Root, always" was not a free answer. DOS/4GW's stub asks here and
+         * then opens `<cwd>\DOS4GW.EXE` as an ABSOLUTE path; told the root, it
+         * opened `\DOS4GW.EXE`, got "file not found" for a file that is in
+         * \DF, printed three lines and exited with errorlevel 1 -- measured,
+         * x86_dos_path_log held `DF/dos4gw.exe` (its earlier AH=43h, which had
+         * been relative and so got the prefix) next to a bare `dos4gw.exe`.
+         */
         uint32_t lin = cpu_state_ptr->segs[3].base + (uint16_t)r[6];
-        uint8_t z = 0;
-        x86_guest_copy_in(lin, &z, 1);
+        const char *c = x86_dos_get_cwd();
+        char buf[64];
+        unsigned i = 0;
+        while (c[i] && i < sizeof(buf) - 1) {
+            buf[i] = (c[i] == '/') ? '\\' : c[i];
+            i++;
+        }
+        buf[i] = 0;
+        x86_guest_copy_in(lin, buf, i + 1);
         x86_set_ax(0x0100);
         ok_clear_cf();
         return 1;
