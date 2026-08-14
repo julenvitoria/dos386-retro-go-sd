@@ -1402,30 +1402,76 @@ def present_checks(b, syms):
     # indistinguishable from a menu that has finished drawing. On hardware that
     # was 62 quiet fallbacks against 94 flips, with `x86_modey_mid_draw` reading
     # zero because it was only ever counted on the STALE path. This arm bursts:
-    # 22 frames of stores, 3 with none, through a 300-frame guest frame.
+    # 20 frames of stores then a pause of 2, 3, 5 or 7, through a 300-frame
+    # guest frame, flipping every 30 as hardware measured (flip_gap_max=34)
+    # -- the VARIETY of the gaps matters, see bursty_next() in tests/main.c.
     r = run(5)
     if r is None:
         return False
-    if r[0] > 3 or r[1] > 3:
+    if r[0] > 6 or r[1] > 6:
         print(f"FAIL: entering a level the loop painted {r[0]} frames "
               f"({r[1]} of them mid-draw) and did not converge; the quiet "
               f"back-off is not working.")
         return False
     if r[2] != 0 or r[3] != 0 or r[4] != 0:
         print(f"FAIL: in a settled level the frame loop painted {r[2]} of 1500 "
-              f"frames of a guest that draws in BURSTS and flips every 300 "
+              f"frames of a guest that draws in BURSTS and flips every 30 "
               f"({r[3]} mid-draw, {r[4]} quiet fallbacks). Every one of them is "
               f"a store-free gap INSIDE the redraw mistaken for a finished "
               f"page -- the one aliased page put on the panel with the "
               f"raycaster partway across it. Caught at successive rotations "
               f"that is the scene repeated across the viewport.")
         return False
-    if r[5] != 300:
-        print(f"FAIL: flip gap measured {r[5]}, expected 300")
+    if r[5] != 30:
+        print(f"FAIL: flip gap measured {r[5]}, expected 30")
         return False
     if r[6] < 1:
         print("FAIL: a bursty title that stopped flipping was never painted "
               "again in 12000 frames -- refusing its quiet gaps froze it.")
+        return False
+
+    # PROMPTNESS. Every arm above asserts a paint did NOT happen; none asserts
+    # one happened SOON, and that asymmetry is exactly how a 32-frame quiet
+    # back-off shipped and froze WOLF3D's intro: "press a button to skip and it
+    # freezes the image for a moment and then jumps to where you tried to get
+    # to". The intro and menus DO NOT FLIP (flips=2 across the whole signon and
+    # title phase against 94 by the end of a level), so the quiet rule is their
+    # only presentation path and its latency is their frame time. This arm plays
+    # a level first, so the menu inherits whatever the raycaster taught the
+    # policy -- which is the case that broke.
+    MENU_LATENCY_MAX = 12       # ~0.2 s. Anything slower is visible.
+    INTRO_REVEAL_MAX = 6        # a screen drawn in pieces must show progress
+    r = run(6)
+    if r is None:
+        return False
+    print(f"  promptness: in-frame gap {r[5]}, menu-A latency {r[1]}, "
+          f"menu-B first reveal {r[3]}, level-2 paints {r[4]}/{r[6]}")
+    if r[0] != 0:
+        print(f"FAIL: painted {r[0]} times while the menu was still drawing.")
+        return False
+    if r[1] > MENU_LATENCY_MAX:
+        print(f"FAIL: a menu that went quiet just after a level was not painted "
+              f"for {r[1]} frames (limit {MENU_LATENCY_MAX}; this guest's "
+              f"measured in-frame gap is {r[5]}). The menus are paying the "
+              f"raycaster's bill, which is what a MONOTONIC back-off does.")
+        return False
+    if r[2] != 1:
+        print(f"FAIL: a quiet menu was painted {r[2]} times in 400 frames; "
+              f"expected exactly 1 (0 is frozen, more is a wasted budget).")
+        return False
+    if r[3] > INTRO_REVEAL_MAX:
+        print(f"FAIL: an intro screen drawn in pieces, by a guest that has not "
+              f"flipped in hundreds of frames, showed nothing for {r[3]} frames "
+              f"(limit {INTRO_REVEAL_MAX}). It draws straight into the page it "
+              f"is displaying and there is no page flip coming to rescue it, so "
+              f"the panel holds the OLD screen for the whole draw and then swaps "
+              f"-- 'it freezes the image for a moment and then jumps to where "
+              f"you tried to get to'. Being a title that flips has to DECAY.")
+        return False
+    if r[4] != 0 or r[6] != 0:
+        print(f"FAIL: the level after the menus painted {r[4]} frames "
+              f"({r[6]} mid-draw). The intro's promptness was bought by "
+              f"forgetting what the raycaster taught the policy.")
         return False
 
     r = run(2)
@@ -1463,6 +1509,7 @@ def present_checks(b, syms):
 
     print("PASS: Mode Y presentation policy "
           "(0 mid-draw paints at 20- and 300-frame flip gaps, bursty or not, "
+          "a menu painted within 12 frames of going quiet after a level, "
           "1 quiet paint, 3 stale paints, no freeze)")
     return True
 

@@ -103,6 +103,12 @@
                                     /* account taken of a raycaster's         */
                                     /* WITHIN-FRAME store-free gaps. The      */
                                     /* state hardware was captured in         */
+#ifndef X86_MODEY_BACKOFF_NEGCTL
+#define X86_MODEY_BACKOFF_NEGCTL 0  /* the DOUBLING back-off that replaced it */
+#endif                              /* and froze the intro/menus for ~0.5 s:  */
+                                    /* monotonic, so the menus paid           */
+                                    /* gameplay's bill. Must fail the         */
+                                    /* PROMPTNESS arm                         */
 
 /* Plane offsets alias into one 16 KB page: 4 * 0x4000 == 0x10000, the aperture
    exactly. A 320x200 page needs 16,000 of those 16,384, so the top 384 are
@@ -807,27 +813,83 @@ void x86_vga_planar_start_write(void)
  * successive gaps at successive rotations, the scene repeated across the
  * viewport.
  *
- * The fix has the same shape as the staleness bound's, because it is the same
- * problem: there is NO signal that separates "quiet because finished" from
- * "quiet in the middle of a frame". So the quiet rule is made SELF-CORRECTING
- * instead. For a title that has flipped and has STORED SINCE that flip -- i.e.
- * one that is demonstrably partway through a redraw -- the quiet run required
- * before the loop may paint starts at the flat two frames and DOUBLES every
- * time such a paint is taken, so a guest's within-frame gaps stop authorising
- * paints after a couple of them and stay silent for the rest of the level.
+ * There is NO signal that separates "quiet because finished" from "quiet in the
+ * middle of a frame", so the rule cannot be right first time and has to learn.
  *
- * It is CLAMPED rather than unbounded, because the cost of a floor that is too
- * high is latency on a genuinely static screen: a title that flips (WOLF3D's
- * menus do) and then draws once and waits must still be shown promptly. Half a
- * second is the accepted worst case there, against a defect that was on the
- * panel continuously.
+ * ===========================================================================
+ * AND WHY THE FIRST VERSION OF THAT LEARNING BROKE THE INTRO AND THE MENUS
+ * ===========================================================================
  *
- * A title that has NEVER flipped is untouched -- it keeps the flat two frames,
- * and it is the only kind of title the quiet rule now serves without argument.
+ * It was a DOUBLING BACK-OFF, in the staleness bound's shape: every quiet paint
+ * taken mid-redraw doubled the quiet run required for the next one, clamped at
+ * 32 frames. It fixed gameplay and was reported from hardware as a regression:
+ *
+ *   "there's an issue in the intro/menu. If you press a button to skip, it just
+ *    freezes the image for a moment and then jumps to where you tried to get
+ *    to."
+ *
+ * That is the clamp, seen from the sofa. ~0.5 s of paint latency on a screen
+ * that is finished, so the states between are never shown and the panel appears
+ * to teleport. Three things made it inevitable and each is worth stating:
+ *
+ *  1. WOLF3D'S INTRO AND MENUS DO NOT FLIP. Measured, and it is the whole
+ *     reason they depend on this rule at all: `flips=2` across the entire
+ *     signon/title/menu phase (docs/08 section 4, and the hardware capture that
+ *     motivated the gameplay fix -- 2 flips at t=0, 94 by the end of a level).
+ *     They draw into the page they are already displaying and call
+ *     VW_SetScreen with an UNCHANGED value, which x86_vga_planar_start_write()
+ *     correctly ignores. So a flip cannot rescue them: the quiet rule IS their
+ *     presentation path, and its latency is their frame time.
+ *  2. `modey_flipper` is sticky for the whole arming, so the two early flips
+ *     were enough to put every later menu under the raycaster's rule.
+ *  3. The back-off was MONOTONIC. It converged on the worst thing the guest had
+ *     ever done and then stayed there, so the menus paid gameplay's bill.
+ *
+ * TWO THINGS CHANGED, and (2) is the one that answers the report.
+ *
+ * (1) The requirement is no longer a back-off, it is a MEASUREMENT: the longest
+ * store-free gap this guest has been SEEN to take in the middle of a redraw --
+ * a quiet run with unpainted stores banked behind it that ended because the
+ * guest STORED AGAIN rather than because we painted it. A gap that ends in more
+ * stores is, by construction, a gap inside a frame; nothing else observable
+ * says so. The loop may take a quiet paint mid-redraw only when the aperture
+ * has been quiet for LONGER than any such gap, which is the smallest rule that
+ * excludes every gap this guest has actually shown -- and, crucially, is a
+ * property of the raycaster's own behaviour rather than a number that only ever
+ * grows. WOLF3D's in-frame gaps are a few frames, so a menu is painted a few
+ * frames after it goes quiet instead of half a second.
+ *
+ * Two details that are not decoration:
+ *
+ *  - The measurement is taken ONLY while `modey_dirty`. The long quiet after a
+ *    flip -- game logic, AI, the tic wait -- has nothing banked behind it and is
+ *    not evidence about redraws. Counting it would learn most of a guest frame
+ *    and put us straight back at the clamp, which is the regression again.
+ *  - It is still CLAMPED, at the same 32 frames, but now as a bound on how bad
+ *    the measurement is allowed to get rather than as the destination.
+ *
+ * (2) `modey_flipper` DECAYS -- see modey_is_flipping(). Being a title that
+ * flips is not a permanent property earned by two flips during the signon; it
+ * is a description of what the guest is doing NOW. WOLF3D's intro and menus
+ * draw straight into the page they are displaying, and on real hardware you
+ * WATCH them being drawn. Holding the old screen until the new one is finished
+ * is the "freezes and then jumps" report almost word for word, and it is not a
+ * latency after the guest goes quiet -- it is the whole DRAW that is hidden.
+ * Once the guest has not flipped for several times its own worst flip gap, the
+ * flat two-frame rule comes back and the intro is progressively revealed again,
+ * which is exactly the behaviour it had before any of this work.
+ *
+ * A title that has never flipped AT ALL was always untouched, and now a title
+ * that has stopped flipping rejoins it.
+ *
+ * THE TEST SUITE HAD THE SAME BLIND SPOT AS THE CODE, and that is why this
+ * shipped: every presentation arm asserted that paints did NOT happen, and not
+ * one asserted that a paint happened SOON. `which == 6` is the promptness arm,
+ * and it fails against the doubling back-off.
  */
 #define X86_MODEY_IDLE_FRAMES   2u    /* frames since the last present         */
 #define X86_MODEY_QUIET_FRAMES  2u    /* consecutive frames with NO store      */
-#define X86_MODEY_QUIET_CLAMP   32u   /* ~0.5 s: the floor may not exceed this */
+#define X86_MODEY_QUIET_CLAMP   32u   /* ~0.5 s: the measurement's upper bound */
 #define X86_MODEY_STALE_FRAMES  60u   /* ~1 s: nothing may freeze indefinitely */
 #define X86_MODEY_FLIP_SLACK    8u    /* x the worst flip gap, once it flips   */
 #define X86_MODEY_GAP_CLAMP     0x100000u  /* keeps the product in range       */
@@ -851,17 +913,68 @@ static uint32_t modey_quiet;       /* consecutive frames with no planar store */
 static uint32_t modey_stores_seen; /* x86_vga_planar_stores a frame ago       */
 static uint32_t modey_dirty;       /* stores since the last frame put on show */
 static uint32_t modey_flipper;     /* this title has flipped at least once    */
+static uint32_t modey_flip_age;    /* frames since the last flip -- the decay */
 static uint32_t modey_stores_flip; /* x86_vga_planar_stores at the last flip  */
 static uint32_t modey_stale_floor = X86_MODEY_STALE_FRAMES;
-/* How long the aperture must have been quiet before the loop may paint a title
-   that is partway through a redraw. Starts flat and backs off; see the block
-   comment above. */
+/*
+ * The longest store-free gap this guest has been SEEN to take in the middle of
+ * a redraw -- quiet, with unpainted stores banked, ended by MORE STORES rather
+ * than by a paint. A mid-redraw quiet paint needs a longer run than this. It is
+ * host-visible because it is the number that decides menu latency, and reading
+ * it off a target is how "the menus are slow" stops being a guess.
+ */
+volatile uint32_t x86_modey_inframe_gap;
+/* The doubling back-off, kept only for X86_MODEY_BACKOFF_NEGCTL. */
 static uint32_t modey_quiet_floor = X86_MODEY_QUIET_FRAMES;
+/* Consecutive quiet frames, reset ONLY by the guest storing again -- never by a
+   paint, which is what makes a run we painted inside still measurable. */
+static uint32_t modey_gap;
 
 /* How long the screen must have stood unpainted before the staleness bound may
    fire. Flat until this title flips; afterwards the larger of a multiple of its
    own worst flip gap and the floor the back-off has reached, so that a flip
    always beats it to the paint. */
+/*
+ * IS THIS GUEST FLIPPING *NOW*?
+ *
+ * `modey_flipper` is sticky for the whole arming, and that is what put
+ * WOLF3D's intro and menus under the raycaster's rule: they inherit two flips
+ * made during the signon and then never flip again. A title that last presented
+ * a page thousands of frames ago is not "a title that flips" -- it is a title
+ * that draws straight into the page it is displaying, which is what an intro
+ * screen and a menu do, and on real hardware you WATCH those being drawn.
+ * Suppressing their intermediate states is not more correct, it is less: it is
+ * the reported "freezes the image for a moment and then jumps to where you
+ * tried to get to", which is the panel holding the OLD screen for the whole
+ * time the new one is being painted into memory.
+ *
+ * So the evidence decays, against the same threshold the anti-freeze bound
+ * already uses: a title that has not flipped in several times its own worst
+ * flip gap has stopped flipping, whatever it did earlier. Gameplay flips every
+ * 20-34 frames on hardware and is never near it; the intro crosses it in a few
+ * seconds and gets the flat two-frame rule back -- exactly the behaviour it had
+ * before any of this, which is the behaviour that was not complained about.
+ */
+static uint32_t modey_stale_limit(void);
+
+static int modey_is_flipping(void)
+{
+#if X86_MODEY_BACKOFF_NEGCTL
+    /* THE NEGATIVE CONTROL, and it is the OTHER half of what regressed: being a
+       title that flips was a permanent property earned by two flips during the
+       signon. With this and the doubling above, the policy is byte for byte the
+       one the owner reported the intro freeze against, and the PROMPTNESS arm
+       must fail here or it is grading nothing. */
+    return (int)modey_flipper;
+#else
+    /* The anti-freeze bound's own threshold: it is already this file's
+       definition of "long enough without a flip that something must be
+       wrong". Reusing it means there is ONE number for "this guest has
+       stopped flipping" rather than two that can disagree. */
+    return modey_flipper && modey_flip_age < modey_stale_limit();
+#endif
+}
+
 static uint32_t modey_stale_limit(void)
 {
     uint32_t gap;
@@ -882,9 +995,14 @@ static uint32_t modey_stale_limit(void)
 void x86_video_modey_policy_reset(void)
 {
     modey_flipper = 0;
+    modey_flip_age = 0;
     modey_stores_flip = x86_vga_planar_stores;
     modey_stale_floor = X86_MODEY_STALE_FRAMES;
     modey_quiet_floor = X86_MODEY_QUIET_FRAMES;
+    /* Per-arming, like the rest of the policy state: the in-frame gaps of
+       whatever ran before are not evidence about this guest. */
+    x86_modey_inframe_gap = 0;
+    modey_gap = 0;
     x86_video_modey_presented(0);
 }
 
@@ -895,6 +1013,7 @@ void x86_video_modey_presented(int from_flip)
         if (modey_idle > x86_modey_flip_gap_max)
             x86_modey_flip_gap_max = modey_idle;
         modey_flipper = 1;
+        modey_flip_age = 0;
         modey_stores_flip = x86_vga_planar_stores;
     }
     modey_idle = 0;
@@ -916,7 +1035,32 @@ int x86_video_modey_paint_due(void)
     stores = x86_vga_planar_stores;
     if (stores == modey_stores_seen) {
         modey_quiet++;
+        modey_gap++;
     } else {
+        /*
+         * A quiet run just ENDED IN MORE STORES. Was it a pause INSIDE a
+         * redraw? Three conditions, and each one is doing work:
+         *
+         *   - this guest flips, so it presents its own finished frames;
+         *   - the stores the run sat on top of were made SINCE the last flip,
+         *     so the page was mid-redraw underneath it (`modey_stores_seen` is
+         *     still the pre-resume count at this point, which is the value that
+         *     matters -- the new stores are the resumption, not the evidence);
+         *   - it was short enough that we could plausibly have painted inside
+         *     it. A run longer than the clamp is not evidence about redraws
+         *     however it ended: it is a menu waiting for a key, and learning it
+         *     is precisely the ~0.5 s latency this design replaced.
+         *
+         * `modey_gap` is deliberately NOT the same counter as `modey_quiet`:
+         * `modey_quiet` is reset by a paint, and a run we painted inside is
+         * exactly the run we most need to measure, or the rule never converges
+         * and the same pause is repainted every guest frame for the level.
+         */
+        if (modey_gap != 0u && modey_gap <= X86_MODEY_QUIET_CLAMP
+            && modey_is_flipping() && modey_stores_seen != modey_stores_flip
+            && modey_gap > x86_modey_inframe_gap)
+            x86_modey_inframe_gap = modey_gap;
+        modey_gap = 0;
         modey_quiet = 0;
         modey_dirty = 1;    /* there is something NEW to show, once it settles */
     }
@@ -924,6 +1068,7 @@ int x86_video_modey_paint_due(void)
 
     modey_idle++;
     modey_stale++;
+    modey_flip_age++;
 
 #if X86_MODEY_TIMER_NEGCTL
     /* THE NEGATIVE CONTROL: the escape hatch as it shipped -- a timer, with no
@@ -952,12 +1097,22 @@ int x86_video_modey_paint_due(void)
            what is in the page is newer than the frame it last called complete.
            A quiet run inside that is a gap in a redraw, not a finished picture
            -- see the block comment above, and the 62 fallbacks on hardware. */
-        const int midredraw = (modey_flipper && stores != modey_stores_flip);
+        const int midredraw = (modey_is_flipping()
+                               && stores != modey_stores_flip);
+        uint32_t need;
+
 #if X86_MODEY_QUIET_NEGCTL
-        const uint32_t need = X86_MODEY_QUIET_FRAMES;   /* the shipped rule */
+        need = X86_MODEY_QUIET_FRAMES;      /* the rule that shipped first  */
+#elif X86_MODEY_BACKOFF_NEGCTL
+        need = midredraw ? modey_quiet_floor    /* the doubling that froze  */
+                         : X86_MODEY_QUIET_FRAMES;  /* the intro and menus  */
 #else
-        const uint32_t need = midredraw ? modey_quiet_floor
-                                        : X86_MODEY_QUIET_FRAMES;
+        /* LONGER than any in-frame gap this guest has shown, and no longer.
+           The menus are not charged for the raycaster's worst pause: this is a
+           measurement of the guest, not a number that only grows. */
+        need = X86_MODEY_QUIET_FRAMES;
+        if (midredraw && x86_modey_inframe_gap >= need)
+            need = x86_modey_inframe_gap + 1u;
 #endif
         if (modey_quiet >= need && modey_idle >= X86_MODEY_IDLE_FRAMES) {
             x86_modey_fallbacks++;
@@ -969,10 +1124,8 @@ int x86_video_modey_paint_due(void)
                 x86_modey_mid_draw++;
                 if (n > x86_modey_mid_draw_max)
                     x86_modey_mid_draw_max = n;
-                /* BACK OFF: this title's within-frame gaps are at least this
-                   long, so the next one must be longer to authorise a paint. */
                 if (modey_quiet_floor < X86_MODEY_QUIET_CLAMP)
-                    modey_quiet_floor *= 2u;
+                    modey_quiet_floor *= 2u;    /* BACKOFF_NEGCTL only */
             }
             modey_idle = 0;
             modey_stale = 0;

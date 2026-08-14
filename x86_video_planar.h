@@ -124,6 +124,11 @@ extern volatile uint32_t x86_modey_flip_gap_max;
    policy is showing half-drawn pages again. */
 extern volatile uint32_t x86_modey_mid_draw;
 extern volatile uint32_t x86_modey_mid_draw_max;
+/* The longest store-free pause this guest has been seen to take in the MIDDLE
+   of a redraw, in frame-loop iterations. It is what a mid-redraw quiet paint
+   must now exceed, so it is also this title's menu latency -- read it off a
+   target before arguing about whether the menus are slow. */
+extern volatile uint32_t x86_modey_inframe_gap;
 
 /* ---- host-visible witnesses; all of this is the deliverable -------------- */
 extern volatile uint32_t x86_vga_planar_stores;   /* stores that took the hook */
