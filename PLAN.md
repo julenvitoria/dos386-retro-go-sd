@@ -1,126 +1,100 @@
-# TinyEMU x86 ARM Thumb v2 Project Plan
+# Plan
 
-**Goal**: Rewrite the 32-bit x86 component of TinyEMU into ARM Thumb v2 assembly, heavily optimized for the STM32H7B0VB MCU running Retro-Go.
+**Goal**: rewrite TinyEMU's 32-bit x86 core as ARM Thumb-2 assembly for the
+STM32H7B0VB running Retro-Go.
 
-This project is broken down into three major architectural phases, each bound by extreme memory and performance constraints. Detailed technical implementation blueprints for each phase are maintained in the `docs/` directory.
+State: [`STATUS.md`](STATUS.md). Running: [`TOOLING.md`](TOOLING.md). Design:
+[`docs/`](docs/). **Roadmap and backlog — a list, not a narrative.**
 
-## Phase 1: Memory Architecture & Paging
-**Objective**: Emulate a DOS machine's RAM within the AXI SRAM available.
+## Phase 1 — memory architecture
 
-**Measured budget (2026-08-12)**: RAM_EMU is 724 KB (`__RAM_EMU_LENGTH__`), plus
-~150 KB released as a *bonus pool* when the LCD runs in LUT8 — the framebuffer
-pool is statically 300 KB for the largest mode, and LUT8 frees the upper half.
-Total ~874 KB, but as **two disjoint regions**, and the bonus is uncached
-(`._ram_uc`). The pool allocator must span both.
-**Strategy**: 
-- **Done**: checked address translation. `host = lin + k` from a flat DTCM
-  table; unmapped pages hold `FOLD_INVALID` so one `ADDS`+`BMI` validates every
-  access at zero cost. Entries are offsets, not bases.
-- **Next**: COW on top of it — a second (write) map, a page pool, dirty tracking
-  from day one, and loud exhaustion. NOR backing is measurement-gated: the prior
-  project found ~100% of NOR-backable *data* granules get written anyway, so
-  measure the code-vs-data split before building it.
-- The fold table is pinned to 0-wait-state DTCM (16 KB for a 16 MB window).
-- Eviction policy is **not** the lever: the prior project measured LRU capped at
-  2.1x over FIFO, while the pool-size cliff is 350x. Spend effort on bytes of
-  AXI, not on policy.
-**Blueprint**: [`docs/01_memory_architecture.md`](docs/01_memory_architecture.md)
+Emulate a DOS machine's RAM inside the AXI available: RAM_EMU 724 KB plus
+~150 KB released as a bonus pool when the LCD runs LUT8, as **two disjoint
+regions**.
 
-## Phase 2: CPU Pipeline Optimization
-**Objective**: Port `x86_cpu.c` to Thumb v2 assembly with maximum Instructions Per Clock (IPC).
-**Strategy**:
-- The Cortex-M7 is a superscalar dual-issue processor. Assembly must be hand-interleaved to avoid Read-After-Write (RAW) data dependencies, ensuring both issue ports remain busy.
-- The core execution loop is pinned to the 64KB ITCM for instantaneous instruction fetching.
-- Critical x86 state variables (EIP, EFLAGS, Context Pointer) are permanently mapped to high ARM registers (`R8`-`R11`).
-**Blueprint**: [`docs/02_cpu_pipeline_optimization.md`](docs/02_cpu_pipeline_optimization.md)
+- **Done**: checked translation. `host = lin + k` from a flat DTCM table;
+  unmapped pages hold `FOLD_INVALID` so one `ADDS`+`BMI` validates every access
+  at zero cost. Entries are offsets, not bases.
+- **Done**: the granule seam — [`docs/10`](docs/10_granule_seam.md).
+- **In progress**: pager eviction, and donating spare guest frames to the arena
+  — [`docs/12`](docs/12_memory_tiers.md).
+- **Measurement-gated**: NOR backing. Re-measure the code-vs-data split first;
+  it is currently 100% write, which kills the premise
+  ([`docs/12`](docs/12_memory_tiers.md) §3).
+- Eviction *policy* is not the lever: LRU was measured capped at 2.1x over FIFO
+  while the pool-size cliff is 350x. Spend effort on bytes, not policy.
 
-## Phase 3: Device Emulation & High-Level Emulation (HLE)
-**Objective**: Implement minimal PC hardware and optimize disk I/O.
-**Strategy**:
-- **VGA**: 32KB of VRAM is permanently allocated. For EGA 256KB mode, the extra 224KB is dynamically borrowed from the guest RAM AXI pool.
-- **Disk I/O**: Instead of emulating an IDE controller and double-caching sectors, we will High-Level Emulate (HLE) DOS FatFs. By hooking INT 21h, we bypass the guest OS block layer and route file requests directly to the host FatFs library.
-**Blueprint**: [`docs/03_devices_and_hle.md`](docs/03_devices_and_hle.md)
+Blueprint: [`docs/01`](docs/01_memory_architecture.md).
 
-## Testing & Validation Hierarchy
-gwemu is the basis; validation occurs strictly in this order. See `TOOLING.md`.
-1. **gwemu, bare-metal** (`test_core.elf`): Thumb v2 logic and ITCM/DTCM/AXI
-   placement, isolated from Retro-Go.
-2. **gwemu + Retro-Go**: the packed core inside the real firmware — ABI, ITCM
-   segment, DTCM allocation, SD/video/input/audio.
-3. **Real Hardware**: the only tier that sees the pipeline. Deterministic to
-   ~1e-7, so it is the *precise* instrument, not merely the authoritative one.
+## Phase 2 — interpreter
 
-## Execution Strategy
+Thumb-2 with maximum IPC; hot loop in ITCM; `R8`-`R11` reserved for CPU state
+(the contract is in `CLAUDE.md` and is binding).
 
-Steps 1 and 2 (build system, linker layout, CPU core foundation, DTCM/ITCM
-placement, retro-go core packaging) are **complete and verified on hardware**.
+Measured on hardware: **+12.9%** work across the decode round and threading the
+opcode's fold to every fetch of its instruction. `LEA` is the decode floor to
+watch — it touches no memory, so its cost is ModRM decode alone.
+
+Blueprint: [`docs/02`](docs/02_cpu_pipeline_optimization.md).
+
+## Phase 3 — devices and HLE
+
+Minimal PC hardware; DOS file I/O translated straight to FatFs rather than
+emulating a block device. Video: mode 13h, Mode Y and EGA 0Dh render pixel-exact
+([`docs/08`](docs/08_vga_mode13h.md)); timing model in
+[`docs/11`](docs/11_pit_and_interrupt_controller.md).
+
+Blueprint: [`docs/03`](docs/03_devices_and_hle.md).
+
+## Validation hierarchy
+
+Strictly in this order — see `TOOLING.md`, and `CLAUDE.md` on never skipping a
+tier.
+
+1. **gwemu bare-metal** — Thumb-2 logic, ITCM/DTCM/AXI placement, no Retro-Go.
+2. **gwemu + Retro-Go** — ABI, DTCM allocation, SD, video, input, audio.
+3. **Hardware** — the only tier that sees the pipeline, and the only one that
+   sees peripheral initialisation or real memory ordering.
 
 ## Backlog
 
-Ordered within each queue. `STATUS.md` holds the evidence for each; this is the
-list, not the history.
+### Queue A — Dark Forces and the memory tier: CLOSED
 
-**Queue A — Dark Forces and the memory tier: CLOSED, measured 2026-08-14.**
-Verdicts only; evidence in `STATUS.md`.
+Verdicts only; evidence in [`docs/12`](docs/12_memory_tiers.md) and
+[`docs/13`](docs/13_title_status.md).
+
 1. Dark Forces exercises the MCB arena and **the arena is correct** — its one
    refusal is real DOS semantics. DF dies in its first frame slice.
-2. **DPMI/VCPI/XMS OUT OF SCOPE.** DF wants ~8 MB against 640 KB of frames, and
-   the read-mostly premise is dead: zero read-only pages in WOLF3D's or KEEN4's
-   working set. Do not half-build DPMI.
-3. Protected mode **sized, not started** (~1,225 lines of tiny386 C; V86 not
-   needed since INT 21h is HLE'd). Gated on a title that needs it and fits in
-   640 KB. There is none.
-4. Pager exercised. **Defect found: eviction is not implemented at all** —
-   eight `x86_pg_*` counters and `x86_livemap_holds()` have no callers.
-   Being implemented now.
-5. **Keen 4 levels: REACHABLE — the "not fixable" verdict is RETRACTED.** It
-   quoted the prior port's budget, not ours. 26 spare pager frames (106,496 B)
-   against a 53,248 B deficit to the 48 KB/plane size that renders correctly.
-   `x86_pg_donated` + `x86_arena_add_region()` are the designed-in route.
-   Being implemented with eviction, since donating frames without it turns a
-   shortfall into a hard fault.
+2. **DPMI/VCPI/XMS OUT OF SCOPE.** ~8 MB wanted against 640 KB, and zero
+   read-only pages in any working set. Do not half-build DPMI.
+3. Protected mode **sized, not started** (~1,225 lines; V86 not needed). Gated
+   on a title that needs it *and* fits in 640 KB. There is none.
+4. Pager exercised. **Eviction is not implemented** — now in progress.
+5. **Keen 4's levels are REACHABLE** — the "not fixable" verdict is retracted.
 
-**Queue B — the planar store path first, then rendering**
+### Queue B — the planar store path first, then rendering
 
-B0. **The planar store path halves the interpreter for graphics titles** —
-Wolf3D ~1.4 M ips in Mode Y against ~3.0 M in text, PC samples landing in
-`x86_vga_planar_store`. Every guest store to `A000:*` pays: range check →
-out-of-line stub → **C call** → `x86_vga_cell()` page fold → write-mode switch
-→ map-mask loop, ~45 cycles for what is usually one byte. Four changes, in
-order, each measured:
-   1. **Precompute a mode index** at `OUT` time. Sequencer/GC state only changes
-      on a port write, so collapse (write mode, map mask, bit mask, set/reset,
-      ALU) into one index there and make the store path a table dispatch
-      instead of re-testing five registers per store.
-   2. **Fast-path the dominant case.** Wolf3D's compiled scalers write ONE
-      plane at a time: write mode 0, no set/reset, bit mask 0xFF, single-plane
-      map mask. That is `aperture[4*a + p] = v` and nothing else. A write-mode-1
-      + map-mask-0x0F fast path already exists; this is the other half.
-   3. **Keep the hot cases out of C.** The push/pop and ABI around the call is a
-      real fraction of the cost; the top one or two cases belong inline in the
-      assembly stub, falling back to the C pipeline for the rest.
-   4. **Batch `REP STOS`/`MOVS`.** They pay the whole chain per element today.
-      The prior port kept a separate planar REP loop for exactly this — a lift,
-      not an invention.
-
-   **Measurement is part of the task, not a follow-up.** Baselines to beat:
-   Wolf3D ~1.4 M ips in Mode Y and ~3.0 M in text (TOPBENCH), `asm_metrics`
-   static counts against the committed `tests/asm_baseline.json`, and
-   `x86_vga_planar_stores`. Hardware profiling (`profile_opcodes.py --target
-   hardware`) is the owner's to run — leave a recipe.
-
+0. **The planar store path halves the interpreter for graphics titles** (~1.4 M
+   ips in Mode Y against ~3.0 M in text). Four changes, each measured:
+   precompute a mode index at `OUT` time; fast-path the dominant single-plane
+   write-mode-0 case; keep the hot cases out of C; batch `REP STOS`/`MOVS`.
+   Baselines to beat and the counters to read are in
+   [`docs/09`](docs/09_frame_pacing_and_clocks.md) §7.
 1. A **golden-screenshot gate** with programmatic comparison. Two "runs fine,
    renders garbage" regressions shipped in one session because nothing in the
-   suite can see a picture.
-2. Wolf3D's off-screen VRAM cache is too small: 8,192 offsets, discards above
-   `0xE300`. Corrupts every cached picture. ~12 KB of arena is free.
+   suite can see a picture. A golden captured from a broken build blesses the
+   bug, so each must be eye-verified once and that verification recorded.
+2. Wolf3D's off-screen VRAM cache is too small — discards above `0xE300`.
 3. Fold-trap the VGA aperture check so non-planar titles pay nothing for it.
 4. Keen's watchdog reset and half-height intro.
-5. A/B the DMA2D blit on hardware — merged, off, and unverified.
+5. A/B the DMA2D blit on hardware — merged, off, unverified.
 6. Retro-go overlay legibility over 256-colour modes.
 
-**Not scheduled, but live:** Mode Y still paints mid-draw frames
-(`x86_modey_mid_draw`). VBE 320x240
-(`DOS_MODE_VBE240` in the prior port) is the only mode that fills the panel and
-reduces the blit to one memcpy — not ported. All three are bigger than most of
-the list above.
+### Not scheduled, but live
+
+- Mode Y still paints mid-draw frames (`x86_modey_mid_draw`).
+- **VBE 320x240** (`DOS_MODE_VBE240` in the prior port) is the only mode that
+  fills the panel and reduces the blit to one `memcpy` — not ported. Note it is
+  a *custom* mode number: little period software will ask for it.
+- An adapter-advertisement Options entry (CGA / EGA+VGA / VGA-only), so a title
+  that cannot render what we claim becomes a switch, not a black screen.

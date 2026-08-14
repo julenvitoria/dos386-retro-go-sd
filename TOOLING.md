@@ -783,7 +783,7 @@ mean, and **the worst single occurrence** — worst-case is what stutter is made
 of and a mean cannot contain one. The frame-time histogram and `frame_overruns`
 come from the counters that already existed.
 
-Measured under gwemu (see STATUS.md for the numbers): the instrument costs
+Measured under gwemu: the instrument costs
 **~91 cycles per enter/exit pair**, calibrated on the target by
 `x86_zones_calibrate` and printed in the report as both a share of frame time
 and a share of WORK. It is a lower bound and says so. It is per-FRAME and
