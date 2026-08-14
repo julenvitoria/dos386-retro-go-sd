@@ -33,6 +33,9 @@ volatile uint32_t x86_pg_wb_file      = 0;
 volatile uint32_t x86_pg_wb_bytes     = 0;
 volatile uint32_t x86_pg_wb_opens     = 0;
 volatile uint32_t x86_pg_wb_us_worst  = 0;
+/* TOTAL time in writeback. _worst says whether the cost is a tail; only a
+   total can be divided into a frame budget, and attribution needed one. */
+volatile uint32_t x86_pg_wb_us_total  = 0;
 volatile uint32_t x86_pg_io_errors    = 0;
 volatile uint32_t x86_pg_exhausted    = 0;
 volatile uint32_t x86_pg_unmapped     = 0;
@@ -377,6 +380,7 @@ static void writeback(uint32_t page, const uint8_t *host)
     {
         uint32_t per_us = x86_disk_cycles_per_us;
         uint32_t us = per_us ? (dt / per_us) : 0u;
+        x86_pg_wb_us_total += us;
         if (us > x86_pg_wb_us_worst)
             x86_pg_wb_us_worst = us;
     }
