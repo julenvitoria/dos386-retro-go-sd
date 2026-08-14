@@ -30,6 +30,92 @@ Failing and pre-existing: `test_screen.py`'s text-mode CLUT assertion (entries
 17-19), and `test_core_retrogo.py`'s blitter/CLUT assertions whenever a real
 `.dsk` is on the card — those expect `demo_guest`'s pattern.
 
+## The suite can see a picture now, and the first thing it saw was Keen
+
+`scripts/golden_screens.py check` boots a title, reconstructs what the LTDC is
+scanning out, and compares it against a stored golden PIXEL BY PIXEL. It exists
+because two "the guest runs happily and the screen is garbage" regressions
+shipped in one session with every tier-1 test green.
+
+| title | renderer | state | evidence |
+|---|---|---|---|
+| WOLF3D | Mode Y | verified | id credits screen, **0 of 76,800 px differ over 3 runs** |
+| ALLEYCAT | CGA mode 4 | verified | title screen, 0 px outside the two masked bands |
+| KEEN4 | EGA 0Dh | **known_bad** | the clipped intro, below |
+
+**A golden captured from a broken build blesses the bug**, so an image on its
+own is not a golden: it needs an attestation sidecar naming who verified it,
+when, and what they saw, and its sha256 is checked on load. `known_bad` records
+a defect WITH A PICTURE — it fails the gate and is summarised apart from a
+regression, so a real one cannot hide behind a bug someone already knew about.
+
+**The capture point is an instruction count, not a sleep.** A flat 0.2 s poll
+overshoots by a MILLION guest instructions and lands on a different frame every
+run; with adaptive polling the overshoot is a fraction of a frame and WOLF3D,
+ALLEYCAT and KEEN4 all reproduce bit-exactly. What that could NOT freeze is
+anything driven by guest PIT time: Alley Cat's cat walks the fence and its
+copyright line alternates between two equally correct strings, so those two
+bands are masked — with a written reason the manifest enforces, and their
+contents still counted and printed. `tests/test_goldens.py` grades the
+comparator itself against synthetic images, with a negative control seen to
+fail for each shipped failure mode.
+
+## Wolf3D's cached pictures — the cache stopped 5 KB short of the window
+
+Wolf3D caches pictures off-screen and blits them out with latch copies while
+text goes straight to the visible page. That is exactly why the device's
+episode-select screen had perfect text around six thumbnails of noise: the
+cache was a fixed 8,192 plane offsets ending at 0xE2FF, and the title writes
+right up to 0xFFFF.
+
+| | fixed 8,192 | fitted, no CGA loan | fitted + loan |
+|---|---|---|---|
+| cache offsets | 8,192 | 11,264 | **15,616** (0xC300..0xFFFF) |
+| `x86_vga_modey_lost_cache` | 16,896 | 4,352 | **0** |
+| `x86_vga_planar_lost` | 18,432 | 5,888 | 1,536 (all `_tail`) |
+| `x86_arena_largest` | 12,288 | 0 | 12,288 |
+
+The middle column is a measurement, not a guess: two new counters,
+`x86_vga_modey_lost_lo`/`_hi`, read 0xEF00 and 0xFFFF there. **A discard COUNT
+cannot say how much bigger the cache needs to be** — 16,896 discards reads the
+same whether they are one offset past the end or spread over 8 KB — and sizing
+it by guessing is what left the first attempt 4,352 stores short.
+
+Two traps paid for. The fit's first try is the exact maximum and NOT the
+maximum rounded down to a page: 0x3D00 offsets is 62,464 B, which the arena
+rounds up to 16 pages internally, so masking down first asked for 15,360 and
+left the top 256 offsets uncached with 16 KB still free. And releasing the
+cache had to move BEFORE reclaiming the CGA loan on the way back to text —
+with the 62,464-byte cache held there are only 15,360 bytes free, the CGA
+re-claim cannot place, the loan stays out and the old early return then never
+released the cache either. `tests/main.c`'s new `modeyfit` arm caught that,
+which is why it checks the way back as well as the way in.
+`-DX86_MODEY_CACHE_NEGCTL=1` grades the arm and is seen to fail.
+
+**Not confirmed by picture, and that is the honest limit.** gwemu DOES reach
+Wolf3D gameplay — `timelines/wolf3d-ingame.tl` gets to floor 1 with a correct
+status bar, face and weapon, which contradicts what was assumed — but neither
+the episode-select screen nor gameplay was visibly corrupt at tier 2 before or
+after: the two captures are pixel-identical. Only the device can close it.
+
+## Keen 4's intro is clipped by the START ADDRESS, not by the Offset
+
+Measured under gwemu at the golden capture point: `crtc_offset=0x20` (row pitch
+64), `crtc_start=15360`, card `x86_vga_ega_card_offsets=19456`. So
+`(19456 - 15360) / 64` = **exactly the 64 rows that render**, and the golden
+image's last non-black guest row is 63. The prediction that the intro widens
+the Offset to 0x40 is **wrong** — it keeps the menu's Offset and displays from
+a high start.
+
+200 rows therefore need `15360 + 200*64` = 28,160 offsets = **112,640 bytes**
+against the 77,824 fitted. The arena is 143,360 and the 13h aperture holds
+65,536 of it — but for 0Dh that aperture is only a CPU READ SHADOW, so
+fold-trapping reads (Queue B item 3) is what would free it. The discard cost
+is the same defect: `x86_vga_planar_lost` is 275,603 under gwemu (5,598,852 on
+hardware) and every one of those stores is Keen writing past the card, each
+paying the full hook, C call and `x86_vga_cell()` lookup before being thrown
+away. A card that covered the intro would collapse both.
+
 ## Phase 0/1 — baseline and CPU foundations
 
 Complete except below.

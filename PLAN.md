@@ -74,13 +74,22 @@ list, not the history.
    Recorded so it is not re-proposed.
 
 **Queue B — rendering, then the interpreter**
-1. A **golden-screenshot gate** with programmatic comparison. Two "runs fine,
-   renders garbage" regressions shipped in one session because nothing in the
-   suite can see a picture.
-2. Wolf3D's off-screen VRAM cache is too small: 8,192 offsets, discards above
-   `0xE300`. Corrupts every cached picture. ~12 KB of arena is free.
-3. Fold-trap the VGA aperture check so non-planar titles pay nothing for it.
-4. Keen's watchdog reset and half-height intro.
+1. ~~A **golden-screenshot gate** with programmatic comparison.~~ **DONE**:
+   `scripts/golden_screens.py` + `tests/test_goldens.py`. WOLF3D (Mode Y) and
+   ALLEYCAT (CGA) bit-exact; KEEN4 (EGA 0Dh) recorded `known_bad`.
+2. ~~Wolf3D's off-screen VRAM cache is too small.~~ **DONE**: fitted from the
+   arena, 8,192 -> 15,616 offsets, the whole `0xC300..0xFFFF` window;
+   `lost_cache` 16,896 -> 0. Not confirmed by picture — gwemu never showed the
+   corruption, so the device is the only witness left.
+3. Fold-trap the VGA aperture check (~80 sites x 4 instructions) so non-planar
+   titles pay nothing. **Now also blocks item 4**: for 0Dh the 64 KB aperture
+   claim is only a CPU READ SHADOW, and trapping reads would free it.
+4. Keen's watchdog reset and the clipped intro. **DIAGNOSED, prediction was
+   WRONG**: the intro does not widen the Offset. Measured `crtc_offset=0x20`
+   (pitch 64) with `crtc_start=15360` against a 19,456-offset card, so
+   `(19456-15360)/64` = exactly the 64 rows that render. 200 rows need
+   `15360 + 200*64` = 28,160 offsets = 112,640 B against the 77,824 fitted;
+   the aperture holds the other 65,536 (see item 3).
 5. A/B the DMA2D blit on hardware — merged, off, and unverified.
 6. Retro-go overlay legibility over 256-colour modes.
 

@@ -188,6 +188,17 @@ def capture_frame(args, entry, name):
         fw_syms = get_symbols(image.elf)
         clut, clut_src = read_active_clut(b, fw_syms, core)
         witness = {k: _read_u32(b, core, k) for k in WITNESS}
+        # The CRTC geometry, read straight out of the register file. "How many
+        # rows does the fitted card cover?" is pitch and start, and neither is
+        # a global -- x86_vga_row_pitch() and x86_vga_crtc_start() derive them
+        # from vga_regs. A clipped picture asks this question first and it is
+        # not worth a re-run to answer.
+        if "vga_regs" in core:
+            crtc = bytes(b.read_memory(core["vga_regs"], 32))
+            off = crtc[0x13]
+            witness["crtc_offset"] = off
+            witness["row_pitch"] = (off * 2) if off else 80
+            witness["crtc_start"] = (crtc[0x0C] << 8) | crtc[0x0D]
         b.resume()
     finally:
         target.stop()
