@@ -32,6 +32,15 @@ class SDCardManager:
         """Create a directory. Must tolerate it already existing."""
         raise NotImplementedError
 
+    def remove(self, remote_path):
+        """Delete a file. Must tolerate it being absent.
+
+        Needed because composing onto an EXISTING card is not the same as
+        composing onto a fresh one: whatever the last run left behind is still
+        there. /CONFIG is the one that bites -- it preselects a ROM.
+        """
+        raise NotImplementedError
+
 
 class QemuSDCardManager(SDCardManager):
     """An SD image file, reached with mtools."""
@@ -48,6 +57,10 @@ class QemuSDCardManager(SDCardManager):
 
     def mkdir(self, remote_path):
         subprocess.run(["mmd", "-i", self.spec, f"::{remote_path}"],
+                       check=False, capture_output=True)
+
+    def remove(self, remote_path):
+        subprocess.run(["mdel", "-i", self.spec, f"::{remote_path}"],
                        check=False, capture_output=True)
 
     def listing(self, remote_path="/"):
@@ -71,6 +84,12 @@ class HardwarePhysicalSDCardManager(SDCardManager):
         os.makedirs(os.path.join(self.mount_path, remote_path.lstrip("/")),
                     exist_ok=True)
 
+    def remove(self, remote_path):
+        try:
+            os.remove(os.path.join(self.mount_path, remote_path.lstrip("/")))
+        except FileNotFoundError:
+            pass
+
 
 class HardwareProbeSDCardManager(SDCardManager):
     """The device's own card, written over the debug probe. The sdpush path."""
@@ -91,6 +110,12 @@ class HardwareProbeSDCardManager(SDCardManager):
     def mkdir(self, remote_path):
         # gnwmanager creates parents on write; nothing to do.
         pass
+
+    def remove(self, remote_path):
+        remote = remote_path if remote_path.startswith("/") else "/" + remote_path
+        # No delete in the gnwmanager API we use; truncating to zero bytes is
+        # enough for /CONFIG, whose parser rejects a short file.
+        self.gnw.sd_write_file(remote, b"")
 
 
 def create_image(path, size_mb=128, label="RETROGO", script=None):
@@ -142,9 +167,12 @@ def compose(manager, core_bin=None, core_name="dos", rom=None, rom_dir="dos",
     if core_bin:
         manager.push_file(core_bin, f"cores/{core_name}.bin")
 
-    if rom:
-        base = os.path.splitext(rom)[0]
-        manager.push_file(rom, f"roms/{rom_dir}/{os.path.basename(rom)}")
+    # `rom` may be one path or many: a card for interactive use wants the whole
+    # library, an automated capture wants exactly one title.
+    roms = [] if not rom else ([rom] if isinstance(rom, str) else list(rom))
+    for one in roms:
+        base = os.path.splitext(one)[0]
+        manager.push_file(one, f"roms/{rom_dir}/{os.path.basename(one)}")
         if sidecars:
             for ext in (".cfg", ".dosmeta", ".jpg"):
                 if os.path.exists(base + ext):
@@ -154,3 +182,9 @@ def compose(manager, core_bin=None, core_name="dos", rom=None, rom_dir="dos",
 
     if config:
         manager.push_file(config, "CONFIG")
+    else:
+        # Populating an EXISTING card (--keep, or a card from a gwemu profile)
+        # leaves any CONFIG already on it in place, so "no config" silently
+        # keeps preselecting whatever the last run chose. Not writing one is
+        # not the same as not having one.
+        manager.remove("CONFIG")

@@ -979,6 +979,42 @@ python3 scripts/make_retrogo_config.py --out build/CONFIG --rom dos ALLEYCAT.dsk
 Preselects a ROM (so no launcher navigation is needed) and disables idle
 standby. Called automatically by `make retrogo_media`.
 
+### `sdcard.py` — one ROM or the whole library
+
+```bash
+# a card for INTERACTIVE use: every DOS title, no preselection
+python3 scripts/sdcard.py --image build/sd-menu.img --no-config \
+    --core dos.bin --all-roms references/game-and-watch-retro-go-sd/roms/dos
+
+# populate an EXISTING card (e.g. one from a gwemu profile) instead of recreating
+python3 scripts/sdcard.py --image existing.img --keep --no-config \
+    --core dos.bin --all-roms references/game-and-watch-retro-go-sd/roms/dos
+```
+
+`--rom` is repeatable and `--all-roms DIR` takes every `.dsk` in a directory,
+with `.cfg`/`.dosmeta`/`.jpg` sidecars. More than one ROM REFUSES to write a
+`/CONFIG` rather than picking one arbitrarily — `/CONFIG` preselects exactly
+one title.
+
+**`--no-config` DELETES an existing `/CONFIG`, it does not merely skip writing
+one.** Composing onto an existing card is not composing onto a fresh one: a
+`/CONFIG` left by a previous run keeps preselecting its title, so "no config"
+that only skipped the write left the card still booting straight into a game.
+A gwemu profile's bundled card is exactly this case.
+
+**A gwemu profile's SD is a qcow2**, which mtools cannot touch. Convert,
+compose, convert back:
+
+```bash
+P=~/.local/share/gwemu/gwemu/profiles/<profile>
+cp "$P/sdcard.qcow2" "$P/sdcard.qcow2.bak"
+qemu-img convert -f qcow2 -O raw "$P/sdcard.qcow2" build/run/sd.img
+python3 scripts/sdcard.py --image build/run/sd.img --keep --no-config \
+    --core dos.bin --all-roms references/game-and-watch-retro-go-sd/roms/dos
+qemu-img convert -f raw -O qcow2 build/run/sd.img "$P/sdcard.qcow2.new"
+mv "$P/sdcard.qcow2.new" "$P/sdcard.qcow2"
+```
+
 ### `gwemu_run.py` — an INTERACTIVE session the harness cannot close
 
 ```bash

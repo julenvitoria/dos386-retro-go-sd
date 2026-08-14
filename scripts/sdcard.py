@@ -52,7 +52,15 @@ def main():
                    help="populate an existing image instead of recreating it")
     p.add_argument("--core", default="dos.bin", help="packed core .bin")
     p.add_argument("--core-name", default="dos", help="-> /cores/<name>.bin")
-    p.add_argument("--rom", default=DEFAULT_ROM, help="guest .dsk")
+    p.add_argument("--rom", action="append", default=None,
+                   help="guest .dsk -> /roms/<dir>/. Repeatable: pass it once "
+                        "per title to build a card with the whole library "
+                        "(what an INTERACTIVE session wants). Defaults to one "
+                        "title so an automated capture stays deterministic")
+    p.add_argument("--all-roms", metavar="DIR",
+                   help="add every .dsk in DIR (with .cfg/.dosmeta/.jpg "
+                        "sidecars). Implies no single preselected title, so "
+                        "use with --no-config")
     p.add_argument("--rom-dir", default="dos", help="-> /roms/<dir>/")
     p.add_argument("--content", default=DEFAULT_CONTENT,
                    help="firmware sd_content tree (fonts/lang/bios)")
@@ -70,14 +78,26 @@ def main():
                    help="do not write /CONFIG (leaves the launcher showing)")
     args = p.parse_args()
 
-    for path in (args.core, args.rom):
+    if args.all_roms:
+        import glob
+        found = sorted(glob.glob(os.path.join(args.all_roms, "*.dsk")))
+        if not found:
+            sys.exit(f"no .dsk files in {args.all_roms}")
+        args.rom = (args.rom or []) + found
+    if not args.rom:
+        args.rom = [DEFAULT_ROM]
+
+    for path in [args.core] + list(args.rom):
         if path and not os.path.exists(path):
             sys.exit(f"missing {path} -- build it first "
                      f"(make -f Makefile.core pack)")
 
     config = None
     if not args.no_config:
-        startup = rom_path(args.rom_dir, os.path.basename(args.rom))
+        if len(args.rom) != 1:
+            sys.exit("--no-config is required when more than one ROM is on "
+                     "the card: /CONFIG preselects exactly one title")
+        startup = rom_path(args.rom_dir, os.path.basename(args.rom[0]))
         os.makedirs(os.path.dirname(args.config_out) or ".", exist_ok=True)
         with open(args.config_out, "wb") as fh:
             fh.write(build_config(startup_file=startup,
