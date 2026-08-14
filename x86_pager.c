@@ -37,6 +37,9 @@ volatile uint32_t x86_pg_io_errors    = 0;
 volatile uint32_t x86_pg_exhausted    = 0;
 volatile uint32_t x86_pg_unmapped     = 0;
 volatile uint32_t x86_pg_donated      = 0;
+volatile uint32_t x86_pg_donate_bytes = 0;
+volatile uint32_t x86_pg_donate_refused = 0;
+volatile uint32_t x86_pg_reclaim_busy = 0;
 
 /* ---- per-page state ------------------------------------------------------
  *
@@ -104,6 +107,15 @@ static x86_pg_write_fn backing_write;
 
 static uint32_t own_first, own_count;
 
+/* The clock hand. One index, not a list: see the policy note in x86_pager.h. */
+static uint32_t victim_hand;
+
+/* The extent currently lent to the arena, so it can be taken back exactly. */
+static uint8_t *donated_base;
+static uint32_t donated_frames;
+static uint32_t donated_lo;      /* its first frame index, kept for the return */
+static uint32_t donate_reserve = X86_PG_DONATE_RESERVE;
+
 #define DWT_CYCCNT (*(volatile uint32_t *)0xE0001004)
 
 static uint8_t *frame_addr(uint32_t f)
@@ -126,7 +138,11 @@ void x86_pager_reset(void)
     memset(extents, 0, sizeof(extents));
     extent_count = frame_count = free_count = 0;
     own_first = own_count = 0;
+    victim_hand = 0;
+    donated_base = NULL;
+    donated_frames = donated_lo = 0;
     x86_pg_frames_total = x86_pg_frames_free = x86_pg_resident = 0;
+    x86_pg_donated = x86_pg_donate_bytes = 0;
 }
 
 int x86_pager_add_frames(void *base, uint32_t bytes)
@@ -293,6 +309,452 @@ static uint32_t take_free_frame(void)
     return f;
 }
 
+/* ---- eviction ------------------------------------------------------------
+ *
+ * The dirty test is a COMPARISON, not a permission bit and not a guess. See
+ * the header: this is the whole reason the previous project's 566 MB of
+ * pagefile traffic and 98.6% wasted writes do not happen here.
+ */
+
+/* Word-at-a-time, because a frame is 4 KB aligned and the answer is almost
+   always "yes, still zero" -- which is the case that has to be cheap. */
+static int page_all_zero(const uint8_t *p)
+{
+    const uint32_t *w = (const uint32_t *)(const void *)p;
+    for (uint32_t i = 0; i < X86_PG_SIZE / 4u; i++) {
+        if (w[i])
+            return 0;
+    }
+    return 1;
+}
+
+/* The NOR snapshot page backing `page`, or NULL if the snapshot does not cover
+   it (a NOR-tier page whose snapshot went away has no authority to compare
+   against and must be treated as dirty). */
+static const uint8_t *nor_page_of(uint32_t page)
+{
+    if (!nor_base || page < nor_first || page >= nor_first + nor_pages)
+        return NULL;
+    return nor_base + (page - nor_first) * X86_PG_SIZE;
+}
+
+static void writeback(uint32_t page, const uint8_t *host)
+{
+    if (!backing_write) {
+        /* No pagefile at all. The bytes are GONE, and that is data loss rather
+           than a slow path -- exactly the same rule fill_frame() applies to a
+           failed read. The tier is left alone so a refill produces zeroes, and
+           the counter is the only thing that can say the guest's memory is no
+           longer what it wrote. */
+        x86_pg_io_errors++;
+        return;
+    }
+    uint32_t t0 = DWT_CYCCNT;
+    int rc = backing_write(page, host);
+    uint32_t dt = DWT_CYCCNT - t0;
+
+    x86_pg_wb_opens++;
+    if (rc != 0) {
+        x86_pg_io_errors++;
+        return;
+    }
+    /* Only now is FILE tier true. Marking it before the write succeeds would
+       point a later fill at a slot that was never written. */
+    pg_flags[page] = (uint8_t)((pg_flags[page] & ~PG_TIER_MASK) | PG_TIER_FILE);
+    x86_pg_wb_file++;
+    x86_pg_wb_bytes += X86_PG_SIZE;
+    {
+        uint32_t per_us = x86_disk_cycles_per_us;
+        uint32_t us = per_us ? (dt / per_us) : 0u;
+        if (us > x86_pg_wb_us_worst)
+            x86_pg_wb_us_worst = us;
+    }
+}
+
+/* Take `f` away from whatever page holds it. The frame is NOT returned to the
+   free list -- the caller is about to use it, and a round trip through the list
+   is a window in which something else could take it. */
+/*
+ * Is this page byte-identical to its tier's authoritative copy?
+ *
+ * The exact test, shared by the eviction itself and by the VICTIM PICKER --
+ * which needs it because a pool with no pagefile may only ever evict a page it
+ * can drop. Two implementations of "clean" that could disagree is how a page
+ * gets chosen as droppable and then written, or worse, chosen and then lost.
+ */
+static int page_is_clean(uint32_t page, const uint8_t *host)
+{
+    uint32_t tier = pg_flags[page] & PG_TIER_MASK;
+
+    if (tier == PG_TIER_NOR) {
+        const uint8_t *snap = nor_page_of(page);
+        return snap && memcmp(host, snap, X86_PG_SIZE) == 0;
+    }
+    /* ZERO is clean while it is still zero. FILE has no in-memory authority,
+       but the same scan gives its one free case away: a page the guest has
+       zeroed out again reverts to ZERO tier and never reaches the card. */
+    return page_all_zero(host);
+}
+
+/* Take `f` away from whatever page holds it. The frame is NOT returned to the
+   free list -- the caller is about to use it, and a round trip through the list
+   is a window in which something else could take it. */
+static void evict_frame(uint32_t f)
+{
+    uint32_t page = frame_page[f];
+    uint8_t *host = frame_addr(f);
+
+    /* Unmap FIRST. Everything below reads the frame as the page's final
+       contents, and an interpreter that could still reach it through the fold
+       would be racing its own writeback. */
+    fold_clear(page);
+
+    if (host) {
+        if (page_is_clean(page, host)) {
+            if ((pg_flags[page] & PG_TIER_MASK) == PG_TIER_FILE) {
+                /* It was dirty once and is all zeroes again: back to ZERO tier,
+                   and the pagefile slot it used to own is simply abandoned. */
+                pg_flags[page] &= (uint8_t)~PG_TIER_MASK;
+                x86_pg_wb_zero++;
+            }
+            x86_pg_drop_clean++;        /* reverts to its tier, no SD I/O */
+        } else {
+            writeback(page, host);
+        }
+    }
+
+    frame_page[f]  = NO_FRAME;
+    pg_frame[page] = NO_FRAME;
+    pg_flags[page] &= (uint8_t)~PG_RESIDENT;
+    pg_hot[page] = 0;
+    if (x86_pg_resident)
+        x86_pg_resident--;
+    x86_pg_evictions++;
+}
+
+/*
+ * Choose a victim and free its frame. NO_FRAME means every resident page is
+ * vetoed, which is the only remaining route to x86_pg_exhausted.
+ *
+ * Two passes of the clock. The first gives a page with any hotness left a
+ * second chance and halves it; the second takes the first page the vetoes
+ * allow, so a pool in which everything is hot still makes progress instead of
+ * reporting exhaustion for a page it could have had.
+ */
+static uint32_t evict_one(uint32_t exclude_page)
+{
+    if (!frame_count)
+        return NO_FRAME;
+    if (victim_hand >= frame_count)
+        victim_hand = 0;
+
+    for (uint32_t pass = 0; pass < 2u; pass++) {
+        for (uint32_t i = 0; i < frame_count; i++) {
+            uint32_t f = victim_hand;
+            victim_hand = victim_hand + 1u;
+            if (victim_hand >= frame_count)
+                victim_hand = 0;
+
+            uint32_t p = frame_page[f];
+            if (p == NO_FRAME || p >= X86_PG_PAGES)
+                continue;
+            if (p == exclude_page || !(pg_flags[p] & PG_RESIDENT))
+                continue;
+            /* The two vetoes. Pinned is display storage; the ring is a raw host
+               pointer nobody will hand back. Both are in x86_arena.h. */
+            if (x86_page_is_pinned(p))
+                continue;
+            if (pass == 0 && pg_hot[p]) {
+                pg_hot[p] >>= 1;            /* second chance */
+                continue;
+            }
+            if (x86_livemap_holds(p))
+                continue;
+            /* WITHOUT A PAGEFILE, ONLY A DROPPABLE PAGE MAY GO.
+             *
+             * src/main.c wires no backing store today, and evicting a modified
+             * page with nowhere to put it is not a slow path -- it is silent
+             * data loss. MEASURED on KEEN4 under gwemu before this check
+             * existed: 38 evictions, 38 x86_pg_io_errors, 38 pages of the
+             * guest's memory gone. So the picker asks the same exact question
+             * the eviction would, and a pool with nothing droppable left
+             * reports exhaustion -- a clean X86_EXIT_MEM_FAULT and a counter
+             * rather than a guest quietly reading rubbish. */
+            if (!backing_write) {
+                uint8_t *h = frame_addr(f);
+                if (!h || !page_is_clean(p, h))
+                    continue;
+            }
+            evict_frame(f);
+            return f;
+        }
+    }
+    return NO_FRAME;
+}
+
+/* ---- donating frames to the arena --------------------------------------- */
+
+/* Whole pages inside [start, start+span): both ends rounded INWARD, which is
+   exactly what x86_arena_add_region() will do to the same extent. Computing it
+   the same way here is what makes "did we donate enough" answerable before
+   anything moves. */
+static uint32_t usable_bytes(uint32_t start, uint32_t span)
+{
+    uint32_t lo = (start + X86_PG_SIZE - 1u) & ~(X86_PG_SIZE - 1u);
+    uint32_t hi = (start + span) & ~(X86_PG_SIZE - 1u);
+    return (hi > lo) ? (hi - lo) : 0u;
+}
+
+/* Frames whose index is no longer covered by any extent are LENT OUT. They
+   keep their index -- renumbering would repoint every frame in the pool -- and
+   frame_addr() is the single place that knows. */
+static int frame_live(uint32_t f)
+{
+    return frame_addr(f) != NULL;
+}
+
+static void rebuild_free_list(void)
+{
+    free_count = 0;
+    for (uint32_t f = 0; f < frame_count; f++) {
+        if (frame_page[f] == NO_FRAME && frame_live(f))
+            free_list[free_count++] = (uint16_t)f;
+    }
+    x86_pg_frames_free = free_count;
+    x86_pg_frames_total = frame_count - donated_frames;
+}
+
+/* Merge extents that are adjacent in BOTH frame index and address. A mode
+   change donates and reclaims on every entry to and exit from 0Dh, and without
+   this the pool would fragment into MAX_EXTENTS after four of them and then
+   refuse to take its own memory back. */
+static void extents_normalize(void)
+{
+    int again = 1;
+    while (again) {
+        again = 0;
+        for (uint32_t a = 0; a < extent_count && !again; a++) {
+            for (uint32_t b = 0; b < extent_count; b++) {
+                if (a == b)
+                    continue;
+                if (extents[a].first + extents[a].count != extents[b].first)
+                    continue;
+                if (extents[a].base + extents[a].count * X86_PG_STRIDE
+                    != extents[b].base)
+                    continue;
+                extents[a].count += extents[b].count;
+                for (uint32_t i = b + 1u; i < extent_count; i++)
+                    extents[i - 1u] = extents[i];
+                extent_count--;
+                again = 1;
+                break;
+            }
+        }
+    }
+}
+
+void x86_pager_set_donate_reserve(uint32_t frames)
+{
+    donate_reserve = frames;
+}
+
+/*
+ * Donate one contiguous run of frames.
+ *
+ * The run may be ANYWHERE inside an extent, not just at its top, and that is
+ * not generality for its own sake. Frames are handed out from the top of the
+ * free list, so after a title has settled the resident frames are the HIGH
+ * ones and the idle ones are LOW -- a donor that could only take the top would
+ * have to evict a live working set to reach memory that was free all along.
+ * Taking a run from the middle splits the extent in two, which costs one
+ * extent slot and no renumbering.
+ *
+ * The run is scored by how many resident pages it would displace and the
+ * cheapest wins, so a donation costs nothing at all when enough of the pool is
+ * idle -- which is the case this exists for.
+ */
+uint32_t x86_pager_donate_to_arena(uint32_t bytes)
+{
+    uint32_t best_lo = 0, best_n = 0, best_cost = 0xFFFFFFFFu, best_got = 0;
+    uint32_t best_ext = 0;
+
+    if (!bytes || !extent_count || donated_frames || extent_count >= MAX_EXTENTS)
+        goto refuse;
+    /*
+     * NO PAGEFILE, NO DONATION. MEASURED, KEEN4, gwemu tier 2.
+     *
+     * With a backing store wired this is the whole point of the feature: the
+     * donation placed a 245,760 B EGA card (60 KB/plane, against 8 KB/plane
+     * shipped) out of 60 idle frames, x86_pg_io_errors stayed 0 and the two
+     * evictions it cost were both clean drops.
+     *
+     * Without one it is unsafe, and not subtly: guest RAM fell to 100 frames,
+     * Keen 4's working set does not fit in that, only 2 pages were ever
+     * droppable, and the guest took X86_EXIT_MEM_FAULT with x86_pg_exhausted=1
+     * -- loud and non-corrupting, but the title stops. No reserve fixes it,
+     * because a card big enough to be worth having (the reference wants
+     * 65,536/plane; nothing between 8 KB and 64 KB renders,
+     * references/8086tiny/docs/video/11-ega-planar.md:299-330) costs more
+     * frames than the guest can spare.
+     *
+     * So the mechanism ships DORMANT and becomes live the moment src/main.c
+     * calls x86_pager_set_backing() with an SD pagefile. That is one call in a
+     * file this does not own, and it is the only thing between here and the
+     * card.
+     */
+    if (!backing_write)
+        goto refuse;
+    {
+        /* The smallest run that can possibly cover `bytes` after BOTH ends are
+           rounded inward. Each end can lose up to a page. */
+        uint32_t n = (bytes + 2u * X86_PG_SIZE - 2u + X86_PG_STRIDE - 1u)
+                     / X86_PG_STRIDE;
+        uint32_t live = frame_count - donated_frames;
+        if (!n || live < donate_reserve || n > live - donate_reserve)
+            goto refuse;
+
+        for (uint32_t e = 0; e < extent_count; e++) {
+            if (extents[e].count < n)
+                continue;
+            for (uint32_t lo = extents[e].first;
+                 lo + n <= extents[e].first + extents[e].count; lo++) {
+                uint32_t start = (uint32_t)(uintptr_t)extents[e].base
+                                 + (lo - extents[e].first) * X86_PG_STRIDE;
+                uint32_t got = usable_bytes(start, n * X86_PG_STRIDE);
+                if (got < bytes)
+                    continue;
+                uint32_t cost = 0;
+                int ok = 1;
+                for (uint32_t f = lo; f < lo + n; f++) {
+                    uint32_t p = frame_page[f];
+                    if (p == NO_FRAME)
+                        continue;
+                    /* The two vetoes, and one more: with no pagefile an
+                       eviction of a dirty page is DATA LOSS, so a pool with no
+                       backing store may only donate frames that are already
+                       free. src/main.c has no pagefile today, which makes this
+                       the rule that actually governs on the target. */
+                    if (!backing_write
+                        || (p < X86_PG_PAGES
+                            && (x86_page_is_pinned(p) || x86_livemap_holds(p)))) {
+                        ok = 0;
+                        break;
+                    }
+                    cost++;
+                }
+                if (!ok || cost >= best_cost)
+                    continue;
+                best_cost = cost; best_lo = lo; best_n = n;
+                best_got = got; best_ext = e;
+                if (!cost)
+                    break;              /* free run: nothing beats it */
+            }
+            if (!best_cost)
+                break;
+        }
+        if (best_cost == 0xFFFFFFFFu)
+            goto refuse;
+
+        uint8_t *base = extents[best_ext].base
+                        + (best_lo - extents[best_ext].first) * X86_PG_STRIDE;
+        if (x86_arena_add_region(base, best_n * X86_PG_STRIDE) != 0)
+            goto refuse;
+
+        for (uint32_t f = best_lo; f < best_lo + best_n; f++) {
+            if (frame_page[f] != NO_FRAME)
+                evict_frame(f);
+        }
+
+        /* Split the extent around the run. The tail becomes a new extent with
+           its own base and its ORIGINAL frame indices, so frame_addr() keeps
+           answering the same question for every frame that stayed. */
+        extent_t *e = &extents[best_ext];
+        uint32_t tail_first = best_lo + best_n;
+        uint32_t tail_count = e->first + e->count - tail_first;
+        e->count = best_lo - e->first;
+        if (tail_count) {
+            extents[extent_count].base  = base + best_n * X86_PG_STRIDE;
+            extents[extent_count].first = tail_first;
+            extents[extent_count].count = tail_count;
+            extent_count++;
+        }
+        if (!e->count) {
+            for (uint32_t i = best_ext + 1u; i < extent_count; i++)
+                extents[i - 1u] = extents[i];
+            extent_count--;
+        }
+
+        victim_hand = 0;
+        donated_base = base;
+        donated_frames = best_n;
+        donated_lo = best_lo;
+        x86_pg_donated = best_n;
+        x86_pg_donate_bytes = best_got;
+        rebuild_free_list();
+        return best_got;
+    }
+refuse:
+    x86_pg_donate_refused++;
+    return 0;
+}
+
+/*
+ * Donate the largest run between `max_bytes` and `min_bytes`, stepping down a
+ * page at a time. The EGA card is sized by what fits, so asking once for the
+ * maximum and giving up would leave a smaller card unbuilt -- and putting the
+ * ladder here rather than in the video path keeps the refusal counter honest:
+ * one refusal for a donation that could not be made at all, not one per rung.
+ */
+uint32_t x86_pager_donate_upto(uint32_t max_bytes, uint32_t min_bytes)
+{
+    uint32_t refused = x86_pg_donate_refused;
+    for (uint32_t want = max_bytes; want >= min_bytes; want -= X86_PG_SIZE) {
+        uint32_t got = x86_pager_donate_to_arena(want);
+        if (got) {
+            x86_pg_donate_refused = refused;
+            return got;
+        }
+        if (want < min_bytes + X86_PG_SIZE)
+            break;
+    }
+    x86_pg_donate_refused = refused + 1u;
+    return 0;
+}
+
+int x86_pager_reclaim_from_arena(void)
+{
+    if (!donated_frames)
+        return 0;
+    /* The arena rounded the extent's start UP to a page, so the base it holds
+       is not the base we lent it. Round the same way rather than hand it an
+       address it will not recognise. */
+    uint8_t *arena_base = (uint8_t *)(uintptr_t)
+        (((uint32_t)(uintptr_t)donated_base + X86_PG_SIZE - 1u)
+         & ~(X86_PG_SIZE - 1u));
+    if (x86_arena_drop_last_region(arena_base) != 0) {
+        /* The display still holds pages in there. Refusing is the only safe
+           answer and the frames stay lent -- with eviction that costs the guest
+           speed, where taking them back would cost it correctness. */
+        x86_pg_reclaim_busy++;
+        return -1;
+    }
+    if (extent_count < MAX_EXTENTS) {
+        extents[extent_count].base  = donated_base;
+        extents[extent_count].first = donated_lo;
+        extents[extent_count].count = donated_frames;
+        extent_count++;
+        for (uint32_t i = 0; i < donated_frames; i++)
+            frame_page[donated_lo + i] = NO_FRAME;
+        donated_base = NULL;
+        donated_frames = 0;
+        extents_normalize();
+        rebuild_free_list();
+    }
+    x86_pg_donated = 0;
+    x86_pg_donate_bytes = 0;
+    return 0;
+}
+
 uint8_t *x86_pager_slack(uint32_t page)
 {
     if (!pg_flags || page >= X86_PG_PAGES || !(pg_flags[page] & PG_RESIDENT))
@@ -331,11 +793,15 @@ uint32_t x86_pager_fault(uint32_t lin, int write)
     }
 
     uint32_t f = take_free_frame();
+    if (f == NO_FRAME)
+        f = evict_one(page);        /* make room; see the header for the rules */
     if (f == NO_FRAME) {
-        /* LOUD. A pool that silently eats stores is indistinguishable from one
-           that works, and this project has hit silent allocation failure five
-           times. The guest takes a clean memory fault and the counter says
-           exactly why. */
+        /* LOUD, and now it means something much narrower than "the pool is
+           full": every resident page is PINNED or LIVE-MAPPED, so there was no
+           legal victim. A pool that silently eats stores is indistinguishable
+           from one that works, and this project has hit silent allocation
+           failure five times. The guest takes a clean memory fault and the
+           counter says exactly why. */
         x86_pg_exhausted++;
         return 0;
     }

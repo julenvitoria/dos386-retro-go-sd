@@ -142,6 +142,26 @@ int x86_arena_add_region(void *base, uint32_t bytes)
     return 0;
 }
 
+int x86_arena_drop_last_region(void *base)
+{
+    if (!region_count)
+        return -1;
+    arena_region_t *r = &regions[region_count - 1u];
+    if (base && (uint8_t *)base != r->base)
+        return -1;              /* not the extent the caller lent us */
+    for (uint32_t i = 0; i < r->pages; i++) {
+        if (page_owner[r->first + i])
+            return -1;          /* something is still reading it */
+    }
+    total_pages -= r->pages;
+    memset(r, 0, sizeof(*r));
+    region_count--;
+    x86_arena_regions = region_count;
+    x86_arena_bytes   = total_pages * X86_ARENA_PAGE;
+    arena_recount();
+    return 0;
+}
+
 /* Find a run of `pages` free pages inside ONE region. Returns the bitmap index
    or ARENA_MAX_PAGES if there is none. Blocks may not span regions: the
    regions are disjoint extents of AXI and a "contiguous" run across two of

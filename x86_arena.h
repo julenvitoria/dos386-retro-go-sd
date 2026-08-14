@@ -77,6 +77,18 @@
    slot left or the extent holds no whole page. */
 int x86_arena_add_region(void *base, uint32_t bytes);
 
+/*
+ * Give the LAST region back. Returns 0 if it went, -1 if it did not.
+ *
+ * Only the last, and only when nothing in it is claimed. Regions index a single
+ * page_owner[] by a running `first`, so removing one from the middle would
+ * renumber every region above it and silently repoint every live claim -- and
+ * "the display is now reading someone else's pages" is not a failure a counter
+ * would catch. The pager's donated extent is always the last one, which is the
+ * only caller this needs to serve.
+ */
+int x86_arena_drop_last_region(void *base);
+
 /* Drop every region and every claim. The core calls it once before it builds
    the arena so a re-init cannot inherit half a map, and the tier-1 harness
    calls it to run against an arena whose size IT chose -- a test that asserts

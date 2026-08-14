@@ -46,6 +46,48 @@
  * pages that were genuinely modified at some point, so it does not contain the
  * read-only code and tables that made the previous project's figures so bad --
  * those are NOR tier and are never written.
+ *
+ * ...with ONE exception, and it is free. The ZERO scan is one pass over 4 KB
+ * and a FILE-tier page gets the same pass for nothing: a page the guest has
+ * zeroed out again (a freed DOS block, a cleared buffer) REVERTS to ZERO tier
+ * and is dropped with no write. x86_pg_wb_zero counts those -- "was dirty, but
+ * became all-zero" -- and they are the only FILE-tier eviction that does not
+ * reach the card.
+ *
+ * ---- Which counter says what -------------------------------------------
+ *
+ *   x86_pg_evictions   every victim, whatever happened to it.
+ *   x86_pg_drop_clean  every eviction that cost NO backing-store write, i.e.
+ *                      the ZERO/NOR match AND the FILE-became-zero revert.
+ *   x86_pg_wb_zero     the FILE-became-zero subset of drop_clean.
+ *   x86_pg_wb_file     evictions actually written to the pagefile.
+ *   x86_pg_io_errors   a writeback that could not land. THE PAGE IS GONE.
+ *   drop_clean + wb_file + io_errors == evictions, always. A run where that
+ *   does not hold has lost a page somewhere without saying so, which is the
+ *   shape of every memory bug this project has shipped.
+ *
+ * The victim picker refuses a page it cannot write when no backing store is
+ * set, so io_errors should stay 0 -- exhaustion (a clean X86_EXIT_MEM_FAULT)
+ * is the right answer there and losing a page is not. That rule is not
+ * hypothetical: MEASURED on KEEN4 under gwemu before it existed, 38 evictions
+ * and 38 io_errors, i.e. 38 pages of the guest's memory silently gone.
+ *
+ * ---- What a victim may NOT be -------------------------------------------
+ *
+ * Two vetoes, both from x86_arena.h and both paid for by the previous project:
+ * a PINNED page is display storage the blitter reads every frame, and a page in
+ * the LIVE-POINTER RING has a raw host pointer outstanding that no caller will
+ * ever release. The prior port measured 5 evictions of the second kind
+ * producing 26,329 wrong bytes with its own `cow_lost == 0` green throughout,
+ * which is why "no counter complained" is not evidence here.
+ *
+ * ---- Policy: a clock, deliberately --------------------------------------
+ *
+ * PLAN.md Phase 1 records the measurement that settles this: eviction POLICY
+ * was worth at most 2.1x in the prior project while the pool-SIZE cliff was
+ * 350x. So this is a second-chance clock over the hotness byte the fault path
+ * and the EIP sampler already maintain -- no list, no per-access bookkeeping,
+ * no DTCM. The care goes into the dirty test being EXACT instead.
  */
 #ifndef X86_PAGER_H
 #define X86_PAGER_H
@@ -134,6 +176,48 @@ uint8_t *x86_pager_slack(uint32_t page);
    the same page's life and a shared global would hide which. */
 void x86_pager_set_nor(const void *base, uint32_t bytes, uint32_t first_page);
 
+/*
+ * ---- Donating frames to the VRAM arena ----------------------------------
+ *
+ * Measured on this tree: the arena is 143,360 B and 100% used in EGA 0Dh,
+ * while KEEN4 peaks at 134 of 160 guest frames. The idle frames are the only
+ * place a bigger EGA card can come from, and PLAN.md Phase 3 always intended
+ * this -- "the extra 224 KB is dynamically borrowed from the guest RAM AXI
+ * pool".
+ *
+ * The catch is CONTIGUITY. An EGA claim is one run of 4*offsets bytes and a
+ * block may not span arena regions, so a donation is a run of frames taken off
+ * the TOP OF THE LAST EXTENT -- frames f..f+n-1 are n*X86_PG_STRIDE contiguous
+ * bytes -- handed to x86_arena_add_region(), which rounds both ends inward to a
+ * page. Scattered frames would be useless.
+ *
+ * It is REVERSIBLE and it is SAFE ONLY BECAUSE EVICTION EXISTS. Donating
+ * shrinks guest RAM below a working set that was measured once; without a
+ * victim picker the next page beyond it is a hard X86_EXIT_MEM_FAULT, with one
+ * it is a page-in. That is why the two landed together.
+ *
+ * x86_pager_donate_to_arena() gives back the bytes actually donated (0 = it
+ * refused, and x86_pg_donate_refused says so). Frames in the run are evicted
+ * first; a frame that cannot be evicted -- pinned, or live-mapped -- refuses
+ * the whole donation rather than shrinking it, because a caller that asked for
+ * 196,608 B and silently got 106,496 gets the noise the arena's
+ * never-partially-satisfy rule exists to prevent.
+ */
+#define X86_PG_DONATE_RESERVE 100u   /* frames guest RAM keeps, come what may */
+/* Change the floor. The default is sized for THIS part (160 frames, KEEN4's
+   134-frame peak, a 63 KB/plane card); the tier-1 harness sets its own so the
+   arms below are arithmetic the test can state rather than the shipping
+   constant. */
+void x86_pager_set_donate_reserve(uint32_t frames);
+uint32_t x86_pager_donate_to_arena(uint32_t bytes);
+/* The ladder: the largest run between the two, or 0. One refusal, not one per
+   rung -- the EGA card is sized by what fits, so asking once for the maximum
+   and giving up would leave a smaller card unbuilt. */
+uint32_t x86_pager_donate_upto(uint32_t max_bytes, uint32_t min_bytes);
+/* Take the donated extent back. No-op (and counted) if the arena still has a
+   claim inside it -- the frames stay lent until the display lets go. */
+int x86_pager_reclaim_from_arena(void);
+
 /* Hotness. Fed by faults (free) and by guest-EIP samples taken at each
    interpreter exit. Decayed by halving, which is one pass over 2 KB. */
 void x86_pager_note_eip(uint32_t lin);
@@ -160,5 +244,8 @@ extern volatile uint32_t x86_pg_io_errors;
 extern volatile uint32_t x86_pg_exhausted;      /* no victim could be found   */
 extern volatile uint32_t x86_pg_unmapped;       /* faults outside our window  */
 extern volatile uint32_t x86_pg_donated;        /* frames given to the arena  */
+extern volatile uint32_t x86_pg_donate_bytes;   /* bytes the arena took       */
+extern volatile uint32_t x86_pg_donate_refused; /* donations refused outright */
+extern volatile uint32_t x86_pg_reclaim_busy;   /* reclaims the arena vetoed  */
 
 #endif /* X86_PAGER_H */

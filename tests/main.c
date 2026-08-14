@@ -128,7 +128,7 @@ volatile uint32_t run_dosexec_flag = 0;
 volatile uint32_t dosexec_r[16];
 
 volatile uint32_t run_nor_flag = 0;
-volatile uint32_t nor_r[24];
+volatile uint32_t nor_r[40];
 
 volatile uint32_t run_a20_flag = 0;
 volatile uint32_t a20_r[24];
@@ -148,7 +148,34 @@ volatile uint32_t run_arena_flag = 0;
 volatile uint32_t arena_r[32];
 
 volatile uint32_t run_pager_flag = 0;
-volatile uint32_t pager_r[24];
+volatile uint32_t pager_r[72];
+
+/* The pagefile, as a plain RAM buffer.
+ *
+ * This is the whole point of x86_pg_read_fn/x86_pg_write_fn living in
+ * x86_pager.h rather than the pager knowing what an SD card is: eviction and
+ * page-in are exercised end to end at tier 1 with no card, no FatFs and no
+ * firmware. Carved out of the TOP of test_ram for the same reason the arena
+ * region is -- 32 KB of new .bss does not fit in any region of this harness.
+ * 8 slots, one per page of the pager window. */
+#define PGF_OFF    (720u * 1024u)
+#define PGF_SLOTS  8u
+static uint32_t pgf_first_slot;         /* slot 0 of the buffer, in pages */
+static uint32_t pgf_writes, pgf_reads, pgf_fail;
+static int pgf_read(uint32_t slot, void *dst)
+{
+    if (slot - pgf_first_slot >= PGF_SLOTS) { pgf_fail++; return -1; }
+    memcpy(dst, test_ram + PGF_OFF + (slot - pgf_first_slot) * 4096u, 4096u);
+    pgf_reads++;
+    return 0;
+}
+static int pgf_write(uint32_t slot, const void *src)
+{
+    if (slot - pgf_first_slot >= PGF_SLOTS) { pgf_fail++; return -1; }
+    memcpy(test_ram + PGF_OFF + (slot - pgf_first_slot) * 4096u, src, 4096u);
+    pgf_writes++;
+    return 0;
+}
 
 volatile uint32_t run_seam_flag = 0;
 volatile uint32_t seam_r[24];
@@ -1435,6 +1462,13 @@ static FATFS dosfile_fs;
 #define NOR_TEST_SEG    (NOR_TEST_FIRST * 4096u / 16u)   /* 0xC800 */
 #define NOR_FAKE_BASE   ((uint8_t *)0x90000000u)
 
+/* A window for the NOR-TIER EVICTION arm (section 4 below). Distinct from the
+   COW window above: that one is x86_nor.c's, this one is the pager's, and
+   sharing them would make a failure ambiguous between two mechanisms. */
+#define NORPG_FIRST     (0xC0000u >> 12)
+#define NORPG_PAGES     4u
+#define NORPG_MEM_OFF   (700u * 1024u)
+
 static uint8_t nor_test_ram[NOR_TEST_BYTES]
     __attribute__((aligned(4096)));
 
@@ -1547,6 +1581,88 @@ static void nor_test_run(void)
         uint32_t host = guest_page_table[idx] + (idx << 12);
         nor_r[23] = (host >> 31) & 1u;
     }
+
+    /*
+     * ---- 4. NOR-TIER EVICTION: the compare against the snapshot ------------
+     *
+     * The other half of x86_nor.c's life. Sections 1-3 cover a page coming OUT
+     * of NOR by copy-on-write; this covers a page that was pulled into a pager
+     * FRAME and is then evicted -- where the snapshot is the authoritative
+     * copy, so the eviction is a memcmp and a page that still matches costs no
+     * SD I/O at all. It is the branch of the dirty test that x86_pager.h's
+     * "a NOR-tier page is compared against its snapshot" names, and nothing
+     * else in the tree exercises it.
+     *
+     * The pager's own window, not the COW pool: two mechanisms, two pools, and
+     * the point here is the pager's.
+     */
+    x86_pager_reset();
+    x86_livemap_clear();
+    x86_pager_own(NORPG_FIRST, NORPG_PAGES);
+    x86_pager_add_frames(test_ram + NORPG_MEM_OFF, X86_PG_POOL_BYTES(2));
+    x86_pager_set_nor(NOR_FAKE_BASE, NORPG_PAGES * 4096u, NORPG_FIRST);
+    for (uint32_t i = 0; i < NORPG_PAGES; i++)
+        guest_page_table[NORPG_FIRST + i] = FOLD_INVALID;
+    {
+        uint32_t fn0 = x86_pg_fill_nor, ev0 = x86_pg_evictions;
+        uint32_t dc0 = x86_pg_drop_clean, wf0 = x86_pg_wb_file;
+
+        uint32_t h0 = x86_pager_fault(NORPG_FIRST << 12, 0);
+        uint32_t h1 = x86_pager_fault((NORPG_FIRST + 1u) << 12, 0);
+        nor_r[24] = x86_pg_fill_nor - fn0;              /* 2: both from NOR */
+        /* The frame really holds the snapshot's bytes. */
+        nor_r[25] = (h0 && memcmp((void *)(uintptr_t)h0, NOR_FAKE_BASE,
+                                  4096u) == 0);
+        nor_r[26] = (h1 && memcmp((void *)(uintptr_t)h1,
+                                  NOR_FAKE_BASE + 4096u, 4096u) == 0);
+
+        /* Neither was written, so the victim still equals its snapshot and
+           must be DROPPED. */
+        x86_livemap_clear();
+        x86_pager_fault((NORPG_FIRST + 2u) << 12, 0);
+        nor_r[27] = x86_pg_evictions - ev0;             /* 1 */
+        nor_r[28] = x86_pg_drop_clean - dc0;            /* 1 */
+        nor_r[29] = x86_pg_wb_file - wf0;               /* 0: no SD I/O */
+    }
+
+    /* The negative control: one byte differs from the snapshot, so neither
+       page can be dropped -- and with no pagefile wired there is nowhere to
+       put it. The fault must be REFUSED, loudly, rather than the page being
+       evicted and lost. Same setup, same pressure, one byte changed. */
+    x86_pager_reset();
+    x86_livemap_clear();
+    x86_pager_own(NORPG_FIRST, NORPG_PAGES);
+    x86_pager_add_frames(test_ram + NORPG_MEM_OFF, X86_PG_POOL_BYTES(2));
+    x86_pager_set_nor(NOR_FAKE_BASE, NORPG_PAGES * 4096u, NORPG_FIRST);
+    for (uint32_t i = 0; i < NORPG_PAGES; i++)
+        guest_page_table[NORPG_FIRST + i] = FOLD_INVALID;
+    {
+        uint32_t ev0 = x86_pg_evictions, dc0 = x86_pg_drop_clean;
+        uint32_t io0 = x86_pg_io_errors, ex1 = x86_pg_exhausted;
+        uint32_t h0 = x86_pager_fault(NORPG_FIRST << 12, 1);
+        uint32_t h1 = x86_pager_fault((NORPG_FIRST + 1u) << 12, 1);
+        if (h0) *(uint8_t *)(uintptr_t)(h0 + 4095u) ^= 0xFF;
+        if (h1) *(uint8_t *)(uintptr_t)(h1 + 4095u) ^= 0xFF;
+        x86_livemap_clear();
+        nor_r[30] = (x86_pager_fault((NORPG_FIRST + 2u) << 12, 0) == 0);
+        nor_r[31] = x86_pg_evictions - ev0;             /* 0: nothing went */
+        nor_r[32] = x86_pg_drop_clean - dc0;            /* 0: NOT clean */
+        nor_r[33] = x86_pg_io_errors - io0;             /* 0: nothing was lost */
+        nor_r[34] = x86_pg_exhausted - ex1;             /* 1: loud instead */
+        /* The pages the guest modified are STILL THERE. That is the property
+           the whole check exists for -- a MEM_FAULT the guest can see beats a
+           page it cannot. */
+        nor_r[35] = (h0 && *(uint8_t *)(uintptr_t)(h0 + 4095u)
+                     == (uint8_t)~NOR_FAKE_BASE[4095]);
+    }
+
+    /* Leave nothing behind for the arms that run after this one. */
+    x86_pager_set_nor(NULL, 0, 0);
+    for (uint32_t i = 0; i < NORPG_PAGES; i++)
+        guest_page_table[NORPG_FIRST + i] = FOLD_INVALID;
+    x86_livemap_clear();
+    x86_pager_reset();
+    nor_r[36] = x86_pg_frames_total;                    /* 0 */
 }
 
 /*
@@ -1831,10 +1947,15 @@ static void arena_test_run(void)
 #define PGT_MEM_OFF (700u * 1024u)      /* page-aligned inside test_ram */
 static void pager_test_run(void)
 {
-    for (uint32_t i = 0; i < 24; i++)
+    for (uint32_t i = 0; i < 72; i++)
         pager_r[i] = 0;
 
     x86_pager_reset();
+    pgf_first_slot = PGT_FIRST;
+    pgf_writes = pgf_reads = pgf_fail = 0;
+    memset(test_ram + PGF_OFF, 0xEE, PGF_SLOTS * 4096u);
+    x86_pager_set_backing(pgf_read, pgf_write);
+    x86_livemap_clear();
     x86_pager_own(PGT_FIRST, PGT_PAGES);
     pager_r[0] = (x86_pager_add_frames(test_ram + PGT_MEM_OFF,
                                        X86_PG_POOL_BYTES(PGT_FRAMES)) == 0);
@@ -1887,17 +2008,23 @@ static void pager_test_run(void)
     }
 
     /*
-     * Four more pages against three remaining frames.
+     * Five pages against four frames. The fifth used to be a hard
+     * X86_EXIT_MEM_FAULT; with a victim picker it is an EVICTION, and the page
+     * that leaves is written to the pagefile because the guest put 0x5A in it.
      *
      *   MOV AX,0C000h  / MOV DS,AX
      *   MOV [1000h],AL   A2 00 10
      *   MOV [2000h],AL   A2 00 20
-     *   MOV [3000h],AL   A2 00 30    <- the last frame
-     *   MOV [4000h],AL   A2 00 40    <- nothing left: clean MEM_FAULT
+     *   MOV [3000h],AL   A2 00 30    <- the last free frame
+     *   MOV [4000h],AL   A2 00 40    <- evicts one
      *   HLT
      */
+    uint32_t ev0 = x86_pg_evictions, dc0 = x86_pg_drop_clean;
+    uint32_t wf0 = x86_pg_wb_file,   wb0 = x86_pg_wb_bytes;
+    uint32_t ff0 = x86_pg_fill_file, io0 = x86_pg_io_errors;
     static const uint8_t prog_full[] = {
         0xB8, 0x00, 0xC0,  0x8E, 0xD8,
+        0xB0, 0x5A,                         /* MOV AL,5Ah -- every page DIRTY */
         0xA2, 0x00, 0x10,
         0xA2, 0x00, 0x20,
         0xA2, 0x00, 0x30,
@@ -1912,31 +2039,257 @@ static void pager_test_run(void)
     cpu_state_dtcm.pit_counter = 0xFFFFFFFF;
     x86_cpu_interp_asm();
 
-    pager_r[11] = cpu_state_dtcm.exit_reason;            /* 5 = MEM_FAULT */
-    pager_r[12] = x86_pg_resident;                       /* 4, not 5 */
+    pager_r[11] = cpu_state_dtcm.exit_reason;            /* 6 = HLT, not 5 */
+    pager_r[12] = x86_pg_resident;                       /* 4: the pool size */
     pager_r[13] = x86_pg_frames_free;                    /* 0 */
-    pager_r[14] = x86_pg_exhausted - ex0;                /* 1: loud */
+    pager_r[14] = x86_pg_exhausted - ex0;                /* 0: nothing faulted */
+    pager_r[15] = x86_pg_evictions - ev0;                /* exactly one */
+    /* It held 0x5A, so it was DIRTY and had to be written. A drop here would
+       be the bug the whole compare-at-eviction rule exists to avoid getting
+       wrong in the other direction. */
+    pager_r[16] = x86_pg_wb_file - wf0;                  /* 1 */
+    pager_r[17] = x86_pg_drop_clean - dc0;               /* 0 */
+    pager_r[18] = x86_pg_wb_bytes - wb0;                 /* 4096 */
+    pager_r[19] = pgf_writes;                            /* 1 */
+    pager_r[20] = x86_pg_io_errors - io0;                /* 0 */
+    /* The victim really is unmapped -- a page still on the fast path would be
+       a frame handed to two pages at once. */
+    /* Frames come off the free list from the top, so page C0 took frame 3 and
+       page C3 took frame 0 -- and frame 0 is where the clock hand starts. The
+       victim is C3, and naming it is the point: a check against "some page"
+       cannot tell an eviction from a frame handed out twice. */
+    pager_r[21] = (guest_page_table[PGT_FIRST + 3u] == FOLD_INVALID
+                   && guest_page_table[PGT_FIRST] != FOLD_INVALID);
 
-    /* The HOST side faults too, and reports exhaustion the same way rather
-       than returning a pointer into nothing. DOS loads a program by copying
-       into memory the guest has never touched, so this path carries every
-       program load in the system. */
-    pager_r[15] = (x86_guest_ptr(0xC5000u, 16) == NULL);
-    pager_r[16] = x86_pg_exhausted - ex0;                /* 2 */
+    /*
+     * The ROUND TRIP. Read the evicted page back through the guest and the
+     * byte the guest wrote must still be there. This is the arm that fails if
+     * the writeback wrote the wrong slot, the fill read the wrong slot, or the
+     * tier was moved to FILE before the write succeeded.
+     */
+    static const uint8_t prog_back[] = {
+        0xB8, 0x00, 0xC0,  0x8E, 0xD8,
+        0xA0, 0x00, 0x30,                   /* MOV AL,[3000h] -- the victim */
+        0xF4,
+    };
+    memcpy(test_ram, prog_back, sizeof(prog_back));
+    memset(&cpu_state_dtcm, 0, sizeof(cpu_state_dtcm));
+    for (int i = 0; i < 6; i++)
+        cpu_state_dtcm.segs[i].limit = 0xFFFFFFFF;
+    cpu_state_dtcm.pit_reload = 0xFFFFFFFF;
+    cpu_state_dtcm.pit_counter = 0xFFFFFFFF;
+    x86_cpu_interp_asm();
+    pager_r[22] = cpu_state_dtcm.exit_reason;            /* 6 = HLT */
+    pager_r[23] = cpu_state_dtcm.regs[0] & 0xFFu;        /* 0x5A, from the file */
+    pager_r[24] = x86_pg_fill_file - ff0;                /* 1: it came from FILE */
+    pager_r[25] = pgf_reads;                             /* 1 */
+
+    /*
+     * A ZERO-TIER PAGE THAT IS STILL ZERO IS DROPPED WITH NO WRITE.
+     *
+     * This is the rule the whole design is for. A fresh pool, one page touched
+     * by a READ (so it fills from ZERO and is never modified), then enough
+     * pressure to evict it: the pagefile must not be touched at all.
+     */
+    x86_pager_reset();
+    x86_livemap_clear();
+    x86_pager_own(PGT_FIRST, PGT_PAGES);
+    x86_pager_add_frames(test_ram + PGT_MEM_OFF, X86_PG_POOL_BYTES(2));
+    for (uint32_t i = 0; i < PGT_PAGES; i++)
+        guest_page_table[PGT_FIRST + i] = FOLD_INVALID;
+    pgf_writes = pgf_reads = 0;
+    ev0 = x86_pg_evictions; dc0 = x86_pg_drop_clean; wf0 = x86_pg_wb_file;
+
+    /* Two reads fill two frames from ZERO and leave them untouched; the third
+       read has to evict one of them. */
+    x86_pager_fault(0xC0000u, 0);
+    x86_pager_fault(0xC1000u, 0);
+    x86_livemap_clear();
+    x86_pager_fault(0xC2000u, 0);
+    pager_r[26] = x86_pg_evictions - ev0;                /* 1 */
+    pager_r[27] = x86_pg_drop_clean - dc0;               /* 1: dropped */
+    pager_r[28] = x86_pg_wb_file - wf0;                  /* 0 */
+    pager_r[29] = pgf_writes;                            /* 0: no SD I/O AT ALL */
+
+    /* ...and the NEGATIVE CONTROL for exactly that arm. Same pool, same
+       pressure, but one byte of the page is non-zero. A dirty-detection that
+       always said "clean" would pass the arm above; it cannot pass this one. */
+    x86_pager_reset();
+    x86_livemap_clear();
+    x86_pager_own(PGT_FIRST, PGT_PAGES);
+    x86_pager_add_frames(test_ram + PGT_MEM_OFF, X86_PG_POOL_BYTES(2));
+    for (uint32_t i = 0; i < PGT_PAGES; i++)
+        guest_page_table[PGT_FIRST + i] = FOLD_INVALID;
+    pgf_writes = 0;
+    ev0 = x86_pg_evictions; dc0 = x86_pg_drop_clean; wf0 = x86_pg_wb_file;
+    {
+        /* BOTH pages, so the arm does not depend on which one the clock picks
+           -- and the LAST byte of each, not the first: a scan that only looked
+           at the head would still call these clean. */
+        uint32_t h = x86_pager_fault(0xC0000u, 1);
+        if (h)
+            *(uint8_t *)(uintptr_t)(h + 4095u) = 0x01;
+        h = x86_pager_fault(0xC1000u, 1);
+        if (h)
+            *(uint8_t *)(uintptr_t)(h + 4095u) = 0x01;
+    }
+    x86_livemap_clear();
+    x86_pager_fault(0xC2000u, 0);
+    pager_r[30] = x86_pg_evictions - ev0;                /* 1 */
+    pager_r[31] = x86_pg_drop_clean - dc0;               /* 0: NOT clean */
+    pager_r[32] = x86_pg_wb_file - wf0;                  /* 1 */
+    pager_r[33] = pgf_writes;                            /* 1 */
+
+    /*
+     * The two VETOES, which are the reason x86_livemap_holds() exists. The
+     * prior port measured 5 evictions of a live-mapped page producing 26,329
+     * wrong bytes with cow_lost == 0 green throughout.
+     */
+    x86_pager_reset();
+    x86_livemap_clear();
+    x86_pager_own(PGT_FIRST, PGT_PAGES);
+    x86_pager_add_frames(test_ram + PGT_MEM_OFF, X86_PG_POOL_BYTES(2));
+    for (uint32_t i = 0; i < PGT_PAGES; i++)
+        guest_page_table[PGT_FIRST + i] = FOLD_INVALID;
+    ex0 = x86_pg_exhausted;
+    uint32_t lh0 = x86_livemap_hits;
+    x86_pager_fault(0xC0000u, 0);
+    x86_pager_fault(0xC1000u, 0);
+    /* Pin one, hand a host pointer into the other: no legal victim exists. */
+    x86_pin_pages(PGT_FIRST, 1);
+    x86_livemap_clear();
+    x86_livemap_note(PGT_FIRST + 1u);
+    pager_r[34] = (x86_pager_fault(0xC2000u, 0) == 0);   /* refused */
+    pager_r[35] = x86_pg_exhausted - ex0;                /* 1: loud */
+    pager_r[36] = (x86_livemap_hits > lh0);              /* the ring vetoed */
+    pager_r[37] = x86_pg_resident;                       /* still 2 */
+    /* Lift ONE veto and the same fault succeeds -- which is what says the two
+       arms above measured the veto and not a broken pool. */
+    x86_unpin_pages(PGT_FIRST, 1);
+    pager_r[38] = (x86_pager_fault(0xC2000u, 0) != 0);
+    pager_r[39] = x86_pg_exhausted - ex0;                /* still 1 */
+
+    /* The HOST side faults the same way. DOS loads a program by copying into
+       memory the guest has never touched, so this path carries every program
+       load in the system. */
+    x86_livemap_clear();
+    pager_r[40] = (x86_guest_ptr(0xC5000u, 16) != NULL);
 
     /* An address outside the window is NOT a page fault -- it is a genuinely
        unmapped address, and conflating the two would turn a guest's own wild
        pointer into a silent allocation. */
     uint32_t un0 = x86_pg_unmapped;
-    pager_r[17] = (x86_pager_fault(0x00500000u, 1) == 0);
-    pager_r[18] = (x86_pg_unmapped - un0);               /* 1 */
+    pager_r[41] = (x86_pager_fault(0x00500000u, 1) == 0);
+    pager_r[42] = (x86_pg_unmapped - un0);               /* 1 */
 
     /* Leave nothing behind: the window goes back to unmapped and the pager
        lets go of the frames it was lent out of test_ram. */
+    x86_unpin_pages(PGT_FIRST, PGT_PAGES);
+    x86_livemap_clear();
+    x86_pager_set_backing(NULL, NULL);
     for (uint32_t i = 0; i < PGT_PAGES; i++)
         guest_page_table[PGT_FIRST + i] = FOLD_INVALID;
     x86_pager_reset();
-    pager_r[19] = x86_pg_frames_total;
+    pager_r[43] = x86_pg_frames_total;
+    pager_r[44] = pgf_fail;                              /* 0: no stray slot */
+
+    /*
+     * ---- DONATION: spare guest frames become an EGA card --------------------
+     *
+     * Five frames, a reserve of one. 8,192 bytes needs a run of four (each end
+     * of a run can lose a page to inward rounding), which is 16,416 bytes of
+     * stride and yields 16,384 usable -- the donation says what it GOT rather
+     * than what it was asked for, and the arithmetic is the test's own.
+     */
+    x86_arena_reset();
+    x86_pager_reset();
+    x86_livemap_clear();
+    x86_pager_set_donate_reserve(1);
+    x86_pager_set_backing(pgf_read, pgf_write);
+    pgf_first_slot = PGT_FIRST;
+    x86_pager_own(PGT_FIRST, PGT_PAGES);
+    x86_pager_add_frames(test_ram + PGT_MEM_OFF, X86_PG_POOL_BYTES(5));
+    for (uint32_t i = 0; i < PGT_PAGES; i++)
+        guest_page_table[PGT_FIRST + i] = FOLD_INVALID;
+
+    /* PINNED pages inside every candidate run refuse the whole donation.
+       Frames are handed out from the top of the free list, so these two land
+       in frames 4 and 3 -- and both runs of four contain frame 3. */
+    uint32_t dr0 = x86_pg_donate_refused;
+    x86_pager_fault(0xC0000u, 0);
+    x86_pager_fault(0xC1000u, 0);
+    x86_pin_pages(PGT_FIRST, 2);
+    x86_livemap_clear();
+    pager_r[45] = (x86_pager_donate_to_arena(8192u) == 0);
+    pager_r[46] = x86_pg_donate_refused - dr0;           /* 1: loud */
+    pager_r[47] = x86_pg_frames_total;                   /* 5: nothing moved */
+    x86_unpin_pages(PGT_FIRST, 2);
+
+    /* Asking for more than the reserve leaves is refused OUTRIGHT, not shrunk.
+       Half a donation is a shrunken guest for a card that was never placed --
+       the arena's own never-partially-satisfy rule. */
+    pager_r[48] = (x86_pager_donate_to_arena(200000u) == 0);
+    pager_r[49] = x86_pg_donate_refused - dr0;           /* 2 */
+
+    /* WITH NO PAGEFILE, ONLY FREE FRAMES MAY BE DONATED. src/main.c wires no
+       backing store today, so on the target this is the rule that actually
+       governs: evicting a dirty page with nowhere to put it is data loss, and
+       a bigger EGA card is not worth the guest's memory. */
+    x86_pager_set_backing(NULL, NULL);
+    pager_r[50] = (x86_pager_donate_to_arena(8192u) == 0);
+    pager_r[51] = x86_pg_donate_refused - dr0;           /* 3 */
+    x86_pager_set_backing(pgf_read, pgf_write);
+
+    /* And now the real thing. The run with the FEWEST resident frames wins, so
+       it takes frames 0-3 and evicts the one live page in it. */
+    x86_livemap_clear();
+    ev0 = x86_pg_evictions;
+    pager_r[52] = x86_pager_donate_to_arena(8192u);      /* 16384 */
+    pager_r[53] = x86_pg_donated;                        /* 4 frames */
+    pager_r[54] = x86_pg_evictions - ev0;                /* 1: the cheapest run */
+    pager_r[55] = x86_pg_frames_total;                   /* 1 left for the guest */
+    pager_r[56] = x86_arena_bytes;                       /* 16384 */
+    /* The guest still WORKS on what is left -- which is the whole safety
+       argument for donating at all. */
+    pager_r[57] = (x86_pager_fault(0xC3000u, 1) != 0);
+    {
+        void *blk = NULL;
+        pager_r[58] = (x86_arena_claim(X86_ARENA_ID_EGA, 1, 16384u, &blk) == 0);
+        /* The claim really lands in the donated extent -- an arena that grew
+           its byte count without the memory being there would pass every
+           check above. */
+        pager_r[59] = (blk != NULL
+                       && (uint8_t *)blk >= test_ram + PGT_MEM_OFF
+                       && (uint8_t *)blk <  test_ram + PGT_MEM_OFF
+                                            + X86_PG_POOL_BYTES(5));
+        /* Reclaiming while the display holds it must FAIL, not take the pages
+           out from under the blitter. */
+        uint32_t rb0 = x86_pg_reclaim_busy;
+        pager_r[60] = (x86_pager_reclaim_from_arena() != 0);
+        pager_r[61] = x86_pg_reclaim_busy - rb0;         /* 1 */
+        pager_r[62] = x86_pg_frames_total;               /* still 1 */
+        x86_arena_release(X86_ARENA_ID_EGA);
+    }
+    /* Released: it comes back, and guest RAM is whole again. */
+    pager_r[63] = (x86_pager_reclaim_from_arena() == 0);
+    pager_r[64] = x86_pg_frames_total;                   /* 5 */
+    pager_r[65] = x86_arena_bytes;                       /* 0 */
+    pager_r[66] = x86_pg_donated;                        /* 0 */
+    /* One extent again, not two: a mode change donates and reclaims every time
+       0Dh comes and goes, and without the merge the pool would fragment into
+       its four slots and refuse to take its own memory back. */
+    pager_r[67] = (x86_pager_donate_to_arena(8192u) == 16384u);
+    pager_r[68] = (x86_pager_reclaim_from_arena() == 0);
+    pager_r[69] = (x86_pager_donate_to_arena(8192u) == 16384u);
+    pager_r[70] = (x86_pager_reclaim_from_arena() == 0);
+    pager_r[71] = x86_pg_frames_total;                   /* still 5 */
+
+    x86_pager_set_backing(NULL, NULL);
+    x86_pager_set_donate_reserve(X86_PG_DONATE_RESERVE);
+    for (uint32_t i = 0; i < PGT_PAGES; i++)
+        guest_page_table[PGT_FIRST + i] = FOLD_INVALID;
+    x86_arena_reset();
+    x86_pager_reset();
 }
 
 /* ---- the granule seam ----------------------------------------------------
