@@ -20,6 +20,7 @@
 #include "x86_arena.h"
 #include "x86_pager.h"
 #include "x86_video_planar.h"
+#include "x86_vprof.h"
 /* The 8x8 table is still the BIOS INT 1Fh/43h font (x86_hle.c hands it to the
    guest); the renderer draws from the narrow tables. */
 /*
@@ -515,7 +516,12 @@ uint8_t *x86_video_vram(void)
  * blank rows above and below rather than stretched -- CGA pixels are not
  * square, but scaling costs a multiply per pixel and looks worse.
  */
-void x86_video_render(uint8_t *dst, uint32_t stride)
+/* The renderer proper. x86_video_render() below is the cycle bracket around
+   it; see x86_vprof.h. In Mode Y this call IS the de-interleave blit -- 64,000
+   bytes into a framebuffer the firmware's MPU maps strongly-ordered and
+   NON-BUFFERABLE -- which is exactly why it is worth timing apart from the
+   rest of the paint. */
+static void video_render_body(uint8_t *dst, uint32_t stride)
 {
     /* Clear the letterbox. 320x200 into a 240-row panel leaves 20 rows top
        and bottom; leaving them alone means they keep whatever the firmware or
@@ -1993,4 +1999,11 @@ static void text_render(uint8_t *dst, uint32_t stride)
 int x86_video_is_text(void)
 {
     return cur_desc->kind == VM_TEXT;
+}
+
+void x86_video_render(uint8_t *dst, uint32_t stride)
+{
+    X86_VPROF_BEGIN(rn);
+    video_render_body(dst, stride);
+    X86_VPROF_END(rn, render);
 }

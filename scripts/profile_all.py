@@ -144,9 +144,17 @@ WORKLOADS = {
 # Standing counters worth having in every report. Grouped so the report can
 # print them under headings rather than as one wall of names.
 COUNTER_GROUPS = [
+    # x86_modey_presents and x86_vga_modey_armed are in the FIRST group on
+    # purpose. A Mode Y title's menus and its gameplay differ by ~2x in
+    # instructions per second and by ~18x in planar stores, and a report of the
+    # menus is indistinguishable from a report of gameplay in every other row
+    # here. presents CONSTANT means the timeline never reached the game --
+    # which has produced two full 57-second runs of confident wrong data.
     ("throughput", ["guest_ips_achieved", "guest_fps_achieved", "guest_kips",
                     "guest_slice_now", "guest_insn_deficit", "guest_exec_ms",
-                    "guest_insns_total", "frames_rendered", "guest_uptime_ms"]),
+                    "guest_insns_total", "frames_rendered", "guest_uptime_ms",
+                    "x86_modey_presents", "x86_vga_modey_armed",
+                    "x86_vga_planar_stores"]),
     ("frame tail", ["frame_ms_last", "frame_ms_worst", "frame_ms_worst2",
                     "frame_overruns", "panel_ms_min", "frame_10us_avg",
                     "frame_hist_from"]),

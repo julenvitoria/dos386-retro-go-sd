@@ -82,6 +82,7 @@
 #include "cutils.h"
 #include "x86_cpu.h"
 #include "x86_video_planar.h"
+#include "x86_vprof.h"
 
 /* ---------------------------------------------------------------------------
  * NEGATIVE CONTROLS. Each one compiles a specific bug back in and each is
@@ -762,7 +763,9 @@ static void planar_byte(uint32_t a, uint8_t v)
         x86_vga_planar_aperture[a] = ega_read_byte(a);
 }
 
-PLANAR_HOT void x86_vga_planar_store(uint32_t off, uint32_t val, uint32_t size)
+/* The measured body. x86_vga_planar_store() below is the bracket; with
+   X86_VPROF=0 it is a plain tail call the compiler folds away entirely. */
+PLANAR_HOT static void planar_store_body(uint32_t off, uint32_t val, uint32_t size)
 {
     uint8_t *ap = x86_vga_planar_aperture;
     uint32_t i;
@@ -818,9 +821,21 @@ PLANAR_HOT void x86_vga_planar_store(uint32_t off, uint32_t val, uint32_t size)
                rather than a four-way test of the Map Mask. `p` is 4-byte
                aligned by construction (every cell is `base + 4*a`), but
                memcpy says so without relying on it. */
+            /* VPROF: the CELL bracket -- the read-modify-write of the four
+               interleaved plane bytes and NOTHING else. This is the one split
+               that decides what the store path actually costs: everything
+               outside it is code (the call, vga_cell's page reduction, the
+               class test) and everything inside it is a single 4-byte access
+               to plane storage. A scaler writes a vertical column, so
+               consecutive stores are 80 plane offsets = 320 BYTES apart and
+               each one is its own cache line. If the cost is here, no amount
+               of moving code to ITCM can reach it -- and two such moves have
+               already been measured as no help. */
+            X86_VPROF_BEGIN(cl);
             memcpy(&q, p, 4);
             q = (q & ~m) | (((val >> (8u * i)) & 0xFFu) * 0x01010101u & m);
             memcpy(p, &q, 4);
+            X86_VPROF_END(cl, cell);
             if (!x86_vga_modey_armed && a < EGA_SHADOW_OFFSETS)
                 ap[a] = ega_read_byte(a);
         }
@@ -861,6 +876,24 @@ PLANAR_HOT void x86_vga_planar_store(uint32_t off, uint32_t val, uint32_t size)
     for (i = 0; i < size; i++)
         planar_byte((off + i) & (X86_VGA_APERTURE_BYTES - 1u),
                     (uint8_t)(val >> (8u * i)));
+}
+
+/*
+ * The interpreter's entry point. This is the ONE bracket in the project that
+ * fires per guest store rather than per frame or per service call -- ~180,000
+ * times a second in Mode Y gameplay -- so its cost is not noise and the header
+ * says exactly how it is reported (raw, corrected by x86_vprof_ovh, and graded
+ * against guest_ips_achieved on a clean build).
+ *
+ * With X86_VPROF=0 this is a bare tail call into a static function that has
+ * exactly one caller, which the compiler inlines away: the shipping path keeps
+ * the code it had.
+ */
+PLANAR_HOT void x86_vga_planar_store(uint32_t off, uint32_t val, uint32_t size)
+{
+    X86_VPROF_BEGIN(st);
+    planar_store_body(off, val, size);
+    X86_VPROF_END(st, store);
 }
 
 /* ---------------------------------------------------------------------------
