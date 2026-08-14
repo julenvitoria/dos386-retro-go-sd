@@ -55,7 +55,36 @@ gwemu is the basis; validation occurs strictly in this order. See `TOOLING.md`.
 Steps 1 and 2 (build system, linker layout, CPU core foundation, DTCM/ITCM
 placement, retro-go core packaging) are **complete and verified on hardware**.
 
-**`STATUS.md` carries the live task order.** In short: absolute-pointer dispatch
-(−4 instructions per dispatched instruction), audit the `TBH` tables, lazy
-PF/AF, finish flag coverage — then Phase 2's segmentation, prefixes and real
-16-bit support, which is what Alley Cat actually needs.
+## Backlog
+
+Ordered within each queue. `STATUS.md` holds the evidence for each; this is the
+list, not the history.
+
+**Queue A — Dark Forces and the memory tier**
+1. Re-measure Dark Forces. The MCB arena is fixed but DF issues zero INT 21h
+   calls since the launch-path revert, so the arena is unexercised by it.
+2. **Decide DPMI/VCPI/XMS in or out of scope by MEASURING first** — the
+   code-vs-data write split for a DOS/4GW image. DF wants ~8 MB against ~840 KB
+   of AXI. Do not half-build it; the answer may be "out of scope".
+3. Protected mode: descriptor walk, far transfers, IRET privilege change,
+   paging. Sized against `references/tiny386`. `CR0` has never been non-zero.
+4. Exercise the pager. ZERO/NOR/FILE tiers are built and **no guest has ever
+   run against them**.
+5. Keen 4 levels are **not fixable** — 256 KB card against ~145 KB of arena.
+   Recorded so it is not re-proposed.
+
+**Queue B — rendering, then the interpreter**
+1. A **golden-screenshot gate** with programmatic comparison. Two "runs fine,
+   renders garbage" regressions shipped in one session because nothing in the
+   suite can see a picture.
+2. Wolf3D's off-screen VRAM cache is too small: 8,192 offsets, discards above
+   `0xE300`. Corrupts every cached picture. ~12 KB of arena is free.
+3. Fold-trap the VGA aperture check so non-planar titles pay nothing for it.
+4. Keen's watchdog reset and half-height intro.
+5. A/B the DMA2D blit on hardware — merged, off, and unverified.
+6. Retro-go overlay legibility over 256-colour modes.
+
+**Not scheduled, but live:** the planar store path roughly halves the
+interpreter for graphics titles (Wolf3D ~1.4 M ips in Mode Y against ~3.0 M in
+text). Mode Y still paints mid-draw frames in gameplay
+(`x86_modey_mid_draw`). Both are bigger than most of the above.

@@ -1,17 +1,34 @@
 # Status
 
-Last verified 2026-08-13. How to run: [`TOOLING.md`](TOOLING.md). Roadmap: [`PLAN.md`](PLAN.md).
+Last verified 2026-08-14. How to run: [`TOOLING.md`](TOOLING.md). Backlog and
+roadmap: [`PLAN.md`](PLAN.md).
 
 ## Verification state
 
 | Tier | State |
 |---|---|
-| 1. gwemu bare-metal | 268/268 `test_opcodes.py`, plus `test_video`/`test_text`/`test_dos`/`test_keyboard`/`test_osk`/`test_screen`/`test_disk_cache`; `test_audio` runs natively, no target |
+| 1. gwemu bare-metal | 273/273 `test_opcodes.py`, plus `test_video` (Mode Y and EGA 0Dh 64000/64000), `test_seam`, `test_pit`, `test_dos`, `test_text`, `test_keyboard`, `test_osk`, `test_disk_cache`, `test_paging`, `test_nor` |
 | 2. gwemu + retro-go | `core_dtcm_ok=1`, bonus pool 153,600 B, 1,000,001 insns — matches tier 1 |
-| 3. Hardware | 50.50 cyc/insn, 5.54 MIPS |
+| 3. Hardware | 2.78 M insn/s stock, **3.8 M overclocked**, 59 fps, ~1.3 frame overruns/s |
 
-Cycles/insn: 57.50 pre-fold → 50.00 fold + absolute dispatch → 50.50 with
-segmentation, unchanged through the 66/67 axes, segment loads and REP.
+**Throughput is paced, not raw.** One loop iteration is one frame (the loop
+swaps unconditionally and the swap paces to the panel), so guest throughput is
+`max_slice x fps` and the binding constraint is `GUEST_EXEC_PCT` (85%) of the
+display period — NOT `MAX_SLICE_CEIL`, which sits far above where the regulator
+settles. `panel_ms_min` is a minimum with an upward leak and is floored at the
+latch; deriving the period from `guest_fps_achieved` instead is a runaway
+(overrun lowers fps, which raises the period, which raises the budget) and was
+measured doing exactly that.
+
+Interpreter, measured on hardware over 25 s of TOPBENCH (text mode, so it
+measures the interpreter and not the blit): **+12.9% work** across the decode
+round and threading the opcode's fold to every fetch of its instruction.
+`LEA` is the decode floor to watch — it touches no memory, so its cost is
+ModRM decode alone.
+
+Failing and pre-existing: `test_screen.py`'s text-mode CLUT assertion (entries
+17-19), and `test_core_retrogo.py`'s blitter/CLUT assertions whenever a real
+`.dsk` is on the card — those expect `demo_guest`'s pattern.
 
 ## Phase 0/1 — baseline and CPU foundations
 
