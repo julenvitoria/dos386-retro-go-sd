@@ -227,6 +227,66 @@ void x86_seam_flush(void)
     cpu_state_ptr->seam_n = 0;
 }
 
+/*
+ * THE CODE-STREAM SEAM, and why it is a DIFFERENT mechanism to the data one
+ * above even though it is the same defect.
+ *
+ * The dispatch folds the opcode byte and threads that granule's k to every
+ * later fetch of the same instruction (cpu->code_k, see cpu_exec.S). That is
+ * only sound while the whole instruction lives in the opcode's granule, so the
+ * dispatch proves `offset <= 0xFF0` -- 16 bytes, the longest x86 instruction --
+ * and lands HERE when it cannot.
+ *
+ * The pull/push slack cannot serve this case. X86_PG_SLACK is EIGHT bytes and
+ * an opcode at offset 0xFFF can be followed by fourteen more, so the slack is
+ * short by design; and slack is refused outright for a fixed mapping or a
+ * NOR-backed page, which is exactly where a boot stub or an XIP'd overlay
+ * executes. A refusal there would be a wrong INSTRUCTION, not a wrong operand.
+ *
+ * So the instruction is STAGED instead: sixteen bytes, each folded on its own,
+ * copied into DTCM, and code_k re-pointed at the buffer. Every fetch site is
+ * then byte-identical to the fast path -- `LDR code_k` + `ADD R10` -- and there
+ * is no per-site slow path anywhere in the interpreter. The buffer is only
+ * read, never written, so nothing has to be pushed back at the boundary; the
+ * next dispatch re-folds and overwrites it.
+ *
+ * A byte that cannot be folded at all stages as ZERO rather than faulting. The
+ * fetch that actually needs it is what must fault, and it cannot: the guest may
+ * legitimately have a two-byte instruction two bytes below an unmapped page.
+ * Staging zero and letting the real length decide is the only correct order.
+ * x86_code_reloc_faults counts those bytes so the case is not silent.
+ */
+volatile uint32_t x86_code_relocs      = 0;
+volatile uint32_t x86_code_reloc_faults = 0;
+
+void *x86_code_reloc(uint32_t lin)
+{
+    uint8_t *buf = cpu_state_ptr->code_buf;
+
+    x86_code_relocs++;
+    for (uint32_t i = 0; i < sizeof(cpu_state_ptr->code_buf); i++) {
+        uint32_t a = lin + i;
+        uint32_t k = guest_page_table_ptr[a >> FOLD_SHIFT];
+
+        if (k == FOLD_INVALID) {
+            x86_pager_fault(a, 0);
+            k = guest_page_table_ptr[a >> FOLD_SHIFT];
+            if (k == FOLD_INVALID) {
+                x86_code_reloc_faults++;
+                buf[i] = 0;
+                continue;
+            }
+        }
+        /* A NOR-backed granule folds to 0x9xxxxxxx, which is memory-mapped XIP
+           and plainly readable -- the write trap exists for stores, and there
+           are none here. */
+        buf[i] = *(const volatile uint8_t *)(uintptr_t)(a + k);
+    }
+
+    cpu_state_ptr->code_k = (uint32_t)(uintptr_t)buf - lin;
+    return buf;
+}
+
 void x86_seam_reset(void)
 {
     seam_pool_full = 0;

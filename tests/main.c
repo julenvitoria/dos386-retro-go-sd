@@ -158,6 +158,13 @@ volatile uint32_t seam_r[24];
    exist. If it ever fails, the arm is wrong about something other than the
    seam. Driven from the host so one build answers both. */
 volatile uint32_t seam_contiguous = 0;
+/* THE CODE-STREAM SEAM. Which straddle the arm places at the granule boundary:
+   0 = the displacement, 1 = the immediate, 2 = the opcode itself (so the ModRM
+   and its displacement are both on the far side). Driven from the host so one
+   build answers all three -- see code_seam_test_run(). */
+volatile uint32_t code_seam_case = 0;
+volatile uint32_t run_code_seam_flag = 0;
+volatile uint32_t code_seam_r[16];
 
 volatile uint32_t run_video_flag = 0;
 volatile uint32_t video_blit_cycles = 0;
@@ -2093,6 +2100,148 @@ static void seam_test_run(void)
     guest_page_table[SEAM_FIRST + 1] = FOLD_INVALID;
 }
 
+/* ---- the CODE-STREAM seam -------------------------------------------------
+ *
+ * The arm above straddles the boundary with an OPERAND. This one straddles it
+ * with the INSTRUCTION, which is a different mechanism and, until the dispatch
+ * started threading cpu->code_k, a case no tier-1 arm could reach.
+ *
+ * The threading is what makes it matter. The dispatch folds the opcode byte's
+ * granule and hands that one k to every later fetch of the same instruction --
+ * ModRM, SIB, displacement, immediate. `host = lin + k` holds for ONE granule,
+ * so an instruction that crosses the boundary would take its displacement or
+ * its immediate out of the LOW granule's frame: eight bytes of slack, and then
+ * an unrelated guest page. The dispatch proves the instruction fits before it
+ * threads anything and stages it into DTCM when it does not (x86_code_reloc).
+ *
+ * THIS ARM IS THE ONLY THING THAT CAN SEE EITHER BEHAVIOUR. Every other tier-1
+ * fold is identity over test_ram or a pager walking one extent in order, and
+ * under both `ptr + 1` is right across a boundary by accident. Here the two
+ * granules are 48 KB apart and the low one's slack is painted 0xEE, so a
+ * threaded-but-unproven fetch reads 0xEE and says so.
+ *
+ * Three cases, one per position the straddle can occupy, plus the fourth shape
+ * folded into case 2 -- an opcode that is the LAST byte of its granule, whose
+ * ModRM and displacement are therefore both on the far side.
+ *
+ *   0  DISPLACEMENT.  8B 06 20 00  mov ax,[0020h]   at 0FFDh
+ *                     disp16 lands on 0FFFh/1000h.
+ *   1  IMMEDIATE.     B8 34 12     mov ax,1234h     at 0FFEh
+ *                     imm16 lands on 0FFFh/1000h.
+ *   2  OPCODE.        89 06 40 00  mov [0040h],ax   at 0FFFh
+ *                     the opcode is the granule's last byte; ModRM and disp16
+ *                     are all in the neighbour.
+ *
+ * Each stores its answer at 0040h, well inside the low granule, so reading it
+ * back cannot itself straddle. Run tests/test_seam.py --code-negative for the
+ * build that threads without proving, in which every one of these must fail.
+ */
+static void code_seam_poke_prog(void)
+{
+    uint32_t lo = SEAM_FIRST << 12;
+
+    /* The word the displacement case loads, and a known-clear result slot. */
+    seam_poke(lo + 0x0020, 0x78);
+    seam_poke(lo + 0x0021, 0x56);
+    seam_poke(lo + 0x0040, 0x00);
+    seam_poke(lo + 0x0041, 0x00);
+
+    switch (code_seam_case) {
+    case 0:                                  /* displacement across */
+        seam_poke(lo + 0x0FFD, 0x8B);        /* mov ax,[disp16]     */
+        seam_poke(lo + 0x0FFE, 0x06);
+        seam_poke(lo + 0x0FFF, 0x20);        /* disp low  -- last byte  */
+        seam_poke(lo + 0x1000, 0x00);        /* disp high -- NEIGHBOUR  */
+        seam_poke(lo + 0x1001, 0xA3);        /* mov [0040h],ax */
+        seam_poke(lo + 0x1002, 0x40);
+        seam_poke(lo + 0x1003, 0x00);
+        seam_poke(lo + 0x1004, 0xF4);        /* hlt */
+        break;
+    case 1:                                  /* immediate across */
+        seam_poke(lo + 0x0FFE, 0xB8);        /* mov ax,imm16 */
+        seam_poke(lo + 0x0FFF, 0x34);        /* imm low  -- last byte  */
+        seam_poke(lo + 0x1000, 0x12);        /* imm high -- NEIGHBOUR  */
+        seam_poke(lo + 0x1001, 0xA3);
+        seam_poke(lo + 0x1002, 0x40);
+        seam_poke(lo + 0x1003, 0x00);
+        seam_poke(lo + 0x1004, 0xF4);
+        break;
+    default:                                 /* opcode is the last byte */
+        seam_poke(lo + 0x0FFF, 0x89);        /* mov [disp16],ax        */
+        seam_poke(lo + 0x1000, 0x06);        /* ModRM    -- NEIGHBOUR  */
+        seam_poke(lo + 0x1001, 0x40);        /* disp low -- NEIGHBOUR  */
+        seam_poke(lo + 0x1002, 0x00);
+        seam_poke(lo + 0x1003, 0xF4);
+        break;
+    }
+}
+
+static void code_seam_test_run(void)
+{
+    static const uint16_t start_ip[3] = { 0x0FFD, 0x0FFE, 0x0FFF };
+    static const uint16_t expect[3]   = { 0x5678, 0x1234, 0xABCD };
+    uint32_t c = code_seam_case < 3 ? code_seam_case : 2;
+
+    for (uint32_t i = 0; i < 16; i++)
+        code_seam_r[i] = 0;
+
+    uint32_t rel0 = x86_code_relocs, o0 = x86_seam_overflow;
+
+    /* The same deliberately non-contiguous fold the operand arm installs: one
+       frame from each of two extents 48 KB apart, so granule N+1 is emphatically
+       not the host memory after granule N. */
+    x86_pager_reset();
+    guest_page_table[SEAM_FIRST]     = FOLD_INVALID;
+    guest_page_table[SEAM_FIRST + 1] = FOLD_INVALID;
+    x86_pager_own(SEAM_FIRST, 2);
+    x86_pager_add_frames(test_ram + SEAM_LOW_OFF,  X86_PG_POOL_BYTES(1));
+    x86_pager_add_frames(test_ram + SEAM_HIGH_OFF, X86_PG_POOL_BYTES(1));
+    seam_poke(SEAM_FIRST << 12, 0);
+    seam_poke((SEAM_FIRST + 1u) << 12, 0);
+
+    code_seam_poke_prog();
+
+    /* Paint the low granule's slack. An instruction fetched with an unproven
+       threaded k reads THESE bytes for everything past the boundary, and 0xEE
+       is visible on sight where a zero would read as a plausible encoding. */
+    uint8_t *slack = x86_pager_slack(SEAM_FIRST);
+    code_seam_r[6] = (slack != NULL);
+    if (slack)
+        memset(slack, 0xEE, X86_PG_SLACK);
+    code_seam_r[7] = (guest_page_table[SEAM_FIRST]
+                      != guest_page_table[SEAM_FIRST + 1]);
+
+    memset(&cpu_state_dtcm, 0, sizeof(cpu_state_dtcm));
+    for (int i = 0; i < 6; i++) {
+        cpu_state_dtcm.segs[i].limit = 0xFFFFFFFF;
+        cpu_state_dtcm.segs[i].sel   = SEAM_SEG;
+        cpu_state_dtcm.segs[i].base  = (uint32_t)SEAM_SEG << 4;
+    }
+    cpu_state_dtcm.regs[0] = 0xABCD;   /* EAX -- case 2's stored value */
+    cpu_state_dtcm.eip = start_ip[c];
+    cpu_state_dtcm.pit_reload  = 0xFFFFFFFF;
+    cpu_state_dtcm.pit_counter = 0xFFFFFFFF;
+    x86_cpu_interp_asm();
+
+    uint32_t lo = SEAM_FIRST << 12;
+    code_seam_r[0] = cpu_state_dtcm.exit_reason;                 /* 6 = HLT */
+    code_seam_r[1] = seam_peek(lo + 0x0040)
+                     | (seam_peek(lo + 0x0041) << 8);
+    code_seam_r[2] = expect[c];
+    code_seam_r[3] = cpu_state_dtcm.regs[0] & 0xFFFF;   /* AX */
+    code_seam_r[4] = x86_code_relocs - rel0;
+    code_seam_r[5] = x86_seam_overflow - o0;
+    code_seam_r[8] = code_seam_case;
+    code_seam_r[9] = slack ? slack[0] : 0xFFFFFFFFu;
+    code_seam_r[10] = cpu_state_dtcm.eip;
+
+    /* Leave the two granules the way the rest of the harness expects them --
+       0xC0000 is past the end of test_ram, so UNMAPPED. */
+    x86_pager_reset();
+    guest_page_table[SEAM_FIRST]     = FOLD_INVALID;
+    guest_page_table[SEAM_FIRST + 1] = FOLD_INVALID;
+}
+
 static void dosfile_test_run(void)
 {
     static const uint8_t hle_vectors[] = {
@@ -2371,6 +2520,11 @@ void Reset_Handler(void) {
         if (run_seam_flag == 1) {
             seam_test_run();
             run_seam_flag = 0;
+        }
+
+        if (run_code_seam_flag == 1) {
+            code_seam_test_run();
+            run_code_seam_flag = 0;
         }
 
         if (run_dos_flag == 1) {

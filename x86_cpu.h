@@ -126,6 +126,25 @@ struct X86CPUState {
        state and the flush is behind a CBZ, so a guest that never straddles
        pays a load and a not-taken branch and nothing else. */
     uint32_t seam_n;
+    /* THE CODE FOLD, threaded from the dispatch to every in-stream fetch.
+     *
+     * The dispatch already folds the opcode byte's linear address. Every other
+     * byte of the same instruction -- the ModRM, the SIB, the displacement, the
+     * immediate -- used to re-fold from scratch: UBFX + LDR + ADDS + the sign
+     * trap, and on a multi-byte one the three-instruction SEAM_CHECK on top.
+     * `code_k` carries the opcode granule's fold constant instead, so a site is
+     * `LDR code_k` + `ADD R10`, and the SEAM_CHECK and the trap are gone.
+     *
+     * IT IS ONLY VALID INSIDE ONE GRANULE, which is the whole difficulty. The
+     * dispatch therefore proves, once, that the opcode byte is at granule
+     * offset <= 0xFF0 -- so all 16 bytes of the longest possible x86
+     * instruction share the opcode's k -- and takes .code_reloc otherwise.
+     * `code_buf` is where that cold path stages the instruction: 16 bytes of
+     * DTCM filled by folding EACH byte separately, with `code_k` re-pointed at
+     * the buffer. Every fetch site then works unchanged, at one address in 273
+     * as at the other 272. See cpu_exec.S's dispatch and x86_code_reloc(). */
+    uint32_t code_k;
+    uint8_t  code_buf[16];
 };
 typedef struct X86CPUState X86CPUState;
 
@@ -565,6 +584,13 @@ extern volatile uint32_t x86_seam_syncs;    /* straddles SERVED             */
 extern volatile uint32_t x86_seam_writes;   /* bytes a straddling store put back */
 extern volatile uint32_t x86_seam_overflow; /* straddles NOT served -- LOUD */
 extern volatile uint32_t x86_seam_flushes;
+
+/* The code-stream seam. Called from the dispatch when the opcode byte sits in
+   the last fifteen bytes of its granule, so cpu->code_k cannot cover the whole
+   instruction; stages sixteen bytes into DTCM and re-points code_k. */
+void *x86_code_reloc(uint32_t lin);
+extern volatile uint32_t x86_code_relocs;       /* instructions staged        */
+extern volatile uint32_t x86_code_reloc_faults; /* bytes that would not fold  */
 
 #define FOLD_K(host, idx)  ((uint32_t)(host) - ((uint32_t)(idx) << FOLD_SHIFT))
 

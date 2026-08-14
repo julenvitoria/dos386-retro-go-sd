@@ -34,6 +34,13 @@
 #ifndef X86_SEAM_FIX
 #define X86_SEAM_FIX 1
 #endif
+    /* The code-stream seam. 1 is the NEGATIVE CONTROL: the dispatch threads
+       the opcode granule's fold constant to every fetch site WITHOUT first
+       proving the instruction fits in that granule, which is the straddle
+       defect exactly. See the dispatch and tests/test_seam.py --code-negative. */
+#ifndef X86_CODE_THREAD_UNSAFE
+#define X86_CODE_THREAD_UNSAFE 0
+#endif
 
     .equ REGS_OFFSET, CPU_REGS
     .equ REG_ESP_OFFSET, CPU_ESP
@@ -164,6 +171,63 @@
         B 96b
         .popsection
 #endif
+    .endm
+
+    /* ---------------------------------------------------------------- *
+     * THE CODE FOLD, threaded.
+     *
+     * Every byte of an instruction after the opcode -- ModRM, SIB,
+     * displacement, immediate -- used to re-fold from the linear EIP on its
+     * own: UBFX + LDR + ADDS + the sign trap, and on a two- or four-byte one
+     * the three-instruction SEAM_CHECK in front. That is four to seven
+     * instructions to recompute something the dispatch resolved microseconds
+     * earlier for the byte immediately below.
+     *
+     * The dispatch now leaves the opcode granule's k in cpu->code_k, so a
+     * fetch site is two instructions and no branch. R10 is the linear address
+     * of the byte wanted, exactly as before, so nothing about a site's
+     * bookkeeping changes -- only how the pointer is arrived at.
+     *
+     * WHY THIS IS NOT THE GRANULE SEAM ALL OVER AGAIN. `host = lin + k` holds
+     * for ONE granule, and an instruction is up to fifteen bytes, so an opcode
+     * near the top of a page would thread a k that is wrong for its own
+     * immediate -- one address in 273, silently reading a stranger's page. The
+     * dispatch proves the whole instruction fits BEFORE it threads anything
+     * (see .fetch_next_byte_no_reset) and stages it into DTCM when it does not.
+     * The proof is at the dispatch and it is unconditional, which is why no
+     * site needs a check, a fallback or a second code path.
+     *
+     * NO MEM_TRAP HERE, deliberately. The dispatch already trapped this exact
+     * granule for the opcode byte: an absent page took .mem_fault, and a
+     * NOR-backed one came back with the same 0x9xxxxxxx pointer, which is XIP
+     * and readable. Every byte a site fetches is in that granule by
+     * construction, so a second trap could only ever repeat an answer.
+     * ---------------------------------------------------------------- */
+    .macro CODE_PTR dest_ptr
+        LDR.W \dest_ptr, [R8, #CPU_CODE_K]
+        ADD \dest_ptr, \dest_ptr, R10
+    .endm
+
+    /* The dispatch site's read trap. Identical to MEM_TRAP_R except that it
+       re-derives code_k after the fact: a fold MISS is served by
+       x86_pager_fault(), which installs a NEW entry, so the k the fast path
+       stored one instruction earlier is stale by the time the stub returns.
+       Recovering it from the resolved pointer needs no second table walk. */
+    .macro MEM_TRAP_R_CODE ptr, lin
+        BMI 89f
+88:
+        .pushsection .itcram_hot.norslow, "ax", %progbits
+89:     PUSH {R0-R3, R12, LR}
+        MOV R0, \ptr
+        BL x86_nor_slow_r
+        POP {R0-R3, R12, LR}
+        LDR \ptr, [R8, #CPU_NOR_PTR]
+        CMP \ptr, #0
+        BEQ .mem_fault
+        SUB.W R12, \ptr, \lin
+        STR.W R12, [R8, #CPU_CODE_K]
+        B 88b
+        .popsection
     .endm
 
     .macro MEM_GET_PTR_R dest_ptr, vaddr
@@ -695,8 +759,44 @@ x86_cpu_interp_asm:
     // every handler to sit near .fetch_decode_loop.
     UBFX R0, R10, #12, #12
     LDR.W R0, [R9, R0, LSL #2]
+    /* THREAD THE FOLD. R0 is still the raw k here -- one granule's worth of
+       host offset -- and every later fetch of this instruction wants exactly
+       it. Stored before the ADDS so no register has to be recovered; the trap
+       stub below re-derives it in the rare case the fold missed and the pager
+       installed a different frame. */
+    STR.W R0, [R8, #CPU_CODE_K]
     ADDS R0, R0, R10
-    MEM_TRAP_R R0
+    MEM_TRAP_R_CODE R0, R10
+    /* ...AND PROVE IT COVERS THE WHOLE INSTRUCTION.
+     *
+     * k is per granule. An x86 instruction is at most fifteen bytes, so the
+     * threaded k is sound for every byte of it iff the opcode sits at granule
+     * offset 0xFF0 or below. That is the ONE thing standing between this
+     * optimisation and reading a stranger's page once every 273 instruction
+     * addresses -- the granule seam, on the instruction stream instead of the
+     * operand.
+     *
+     * Two instructions, in SEAM_CHECK's shape and for its reason: 0xFF0 is not
+     * a Thumb-2 modified immediate but 0x00F00000 is, so shifting the offset to
+     * the top of a scratch register and testing the carry out of a CMN needs no
+     * literal pool inside ITCM.
+     *
+     *     LSLS  R12, R10, #20        ; granule offset, at the top of R12
+     *     CMN   R12, #0x00F00000     ; carry out iff offset >= 0xFF1
+     *
+     * The branch is NOT taken 4,081 times in 4,096 and both instructions are
+     * independent of the LDRB -> LDR PC chain below, so they slot into its
+     * load-use shadow. R12 is scratch and dead here.
+     *
+     * X86_CODE_THREAD_UNSAFE=1 removes the proof and keeps the threading. That
+     * is the NEGATIVE CONTROL for tests/test_seam.py --code-negative: it is the
+     * defect this whole block exists to prevent, and a test that cannot fail
+     * against it is not testing the straddle. */
+#if !X86_CODE_THREAD_UNSAFE
+    LSLS R12, R10, #20
+    CMN R12, #0x00F00000
+    BCS .code_reloc
+#endif
     LDRB R0, [R0]
     ADD R10, R10, #1
 #if X86_PROFILE
@@ -914,6 +1014,33 @@ x86_cpu_interp_asm:
 
 // A guest access hit an unmapped page. Loud, not silent: the old code wrote
 // into ITCM here and carried on until the corrupted instruction was executed.
+/* The opcode is in the last fifteen bytes of its granule, so no single k covers
+ * the instruction. x86_code_reloc() stages sixteen bytes into DTCM, folding
+ * each on its own, and re-points cpu->code_k at the buffer -- after which every
+ * fetch site is byte-identical to the fast path and none of them knows or cares
+ * which page the instruction came off. Read x86_seam.c's block for why the
+ * pull/push slack cannot serve this and staging is the only correct answer.
+ *
+ * Out of line but IN ITCM: BCS reaches +/-1 MB and .text is linked into RAM_EMU
+ * ~600 MB away, the same constraint MEM_TRAP's stubs live under.
+ *
+ * R0 comes back holding the staged opcode's host pointer, so the dispatch
+ * resumes at the LDRB with nothing to redo. R2 is the live mode record and R6
+ * the segment descriptor -- both reserved, both preserved across the call by
+ * the PUSH; R1, R3, R4 and R12 are dead here and are saved only to keep the
+ * frame eight-byte aligned and the AAPCS clobber set covered. */
+.code_reloc:
+    PUSH {R1-R4, R12, LR}
+    MOV R0, R10
+    BL x86_code_reloc
+    POP {R1-R4, R12, LR}
+    LDRB R0, [R0]
+    ADD R10, R10, #1
+#if X86_PROFILE
+    PROF_DISPATCH R0, R12, R1, R3, R4
+#endif
+    LDR.W PC, [R2, R0, LSL #2]
+
 .mem_fault:
     MOV R0, #X86_EXIT_MEM_FAULT
     STR R0, [R8, #CPU_EXIT_REASON]

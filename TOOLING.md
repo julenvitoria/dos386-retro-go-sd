@@ -1162,6 +1162,37 @@ python3 tests/test_seam.py --negative    # the negative control, and it MUST
                                          # in BOTH builds, because a fixed
                                          # mapping's fold entries compare equal
                                          # and x86_seam_sync() early-outs.
+                                         # It also runs the CODE-STREAM arm
+                                         # first: the dispatch threads the
+                                         # opcode granule's fold constant to
+                                         # every later fetch of the SAME
+                                         # instruction (cpu->code_k), so an
+                                         # instruction crossing the boundary
+                                         # would take its ModRM, displacement or
+                                         # immediate off the wrong page. Three
+                                         # cases place the straddle at each of
+                                         # those positions in turn, the third
+                                         # with the opcode as the granule's LAST
+                                         # byte, and each asserts that
+                                         # x86_code_relocs moved -- a case that
+                                         # passes without staging passed by
+                                         # accident.
+python3 tests/test_seam.py --code-negative
+                                         # the code-stream negative control, and
+                                         # it is a DIFFERENT build to --negative:
+                                         # X86_CODE_THREAD_UNSAFE=1 keeps the
+                                         # threading and removes the proof that
+                                         # the instruction fits in the granule.
+                                         # All three cases then read the painted
+                                         # 0xEE slack as instruction bytes. Only
+                                         # the executed RESULT is inverted --
+                                         # whether the guest still reaches HLT is
+                                         # not a property of the defect (a
+                                         # corrupted immediate runs perfectly and
+                                         # computes the wrong number), and
+                                         # inverting the exit reason would have
+                                         # made the control fire for the wrong
+                                         # reason.
 python3 tests/test_core_retrogo.py       # tier 2
 python3 tests/test_timeline.py           # tier 2: replays a timeline through
                                          # the HARDWARE player (shadow word at

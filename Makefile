@@ -56,6 +56,10 @@ CFLAGS += -DX86_DOS_PSP_SHIFT=$(X86_DOS_PSP_SHIFT)
 
 X86_SEAM_FIX ?= 1
 CFLAGS += -DX86_SEAM_FIX=$(X86_SEAM_FIX)
+# The code-stream seam's NEGATIVE CONTROL. 1 threads the opcode granule's
+# fold to every fetch site without first proving the instruction fits in it.
+X86_CODE_THREAD_UNSAFE ?= 0
+CFLAGS += -DX86_CODE_THREAD_UNSAFE=$(X86_CODE_THREAD_UNSAFE)
 
 X86_PROFILE ?= 0
 CFLAGS += -DX86_PROFILE=$(X86_PROFILE)

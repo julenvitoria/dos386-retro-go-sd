@@ -392,21 +392,14 @@ OP .op_mov_r32_imm32
     AND.W R2, R0, #7
     MOV.W R2, R2, LSL #2
     ADD.W R2, R2, #8
-    SEAM_CHECK R3, R10
-    UBFX R3, R10, #12, #12
-    LDR.W R3, [R9, R3, LSL #2]
-    ADDS R3, R3, R10
-    MEM_TRAP_R R3
+    CODE_PTR R3
     LD_V R3, R3
     EIP_ADV_V
     STREG_V R3, R2
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_alu_eb_gb
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -447,10 +440,7 @@ L(ALU_TABLE_EB_GB):
     ALU_TABLE_M L(ALU_TABLE_EB_GB), L(ALU_DISPATCH_8), 8
 
 OP .op_alu_ev_gv
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -486,10 +476,7 @@ L(ALU_TABLE_EV_GV):
     ALU_TABLE_M L(ALU_TABLE_EV_GV), L(ALU_DISPATCH_32), 
 
 OP_AGNOSTIC .op_alu_gb_eb
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -532,10 +519,7 @@ L(ALU_TABLE_GB_EB):
     ALU_TABLE_M L(ALU_TABLE_GB_EB), L(ALU_DISPATCH_8_GB_EB), 8
 
 OP .op_alu_gv_ev
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -573,10 +557,7 @@ L(ALU_TABLE_GV_EV):
     ALU_TABLE_M L(ALU_TABLE_GV_EV), L(ALU_DISPATCH_32_GV_EV), 
 
 OP_AGNOSTIC .op_alu_al_imm8
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     ADD.W R2, R8, #8
@@ -589,11 +570,7 @@ L(ALU_TABLE_AL):
     ALU_TABLE_M L(ALU_TABLE_AL), L(ALU_DISPATCH_8_AL), 8
 
 OP .op_alu_eax_imm32
-    SEAM_CHECK R5, R10
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LD_V R5, R5
     EIP_ADV_V
     ADD.W R2, R8, #8
@@ -606,19 +583,13 @@ L(ALU_TABLE_EAX):
     ALU_TABLE_M L(ALU_TABLE_EAX), L(ALU_DISPATCH_32_EAX), 
 
 OP_AGNOSTIC .op_alu_eb_imm8_80
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     UBFX R12, R1, #3, #3
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
     BLO.N L(ALU_EB_IMM8_80_MEM)
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     AND.W R2, R1, #7
@@ -631,10 +602,7 @@ OP_AGNOSTIC .op_alu_eb_imm8_80
 L(ALU_EB_IMM8_80_MEM):
     LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
     BLX R12
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     UBFX R2, R7, #12, #12
@@ -651,20 +619,13 @@ L(ALU_TABLE_EB_IMM8_80):
     ALU_TABLE_M L(ALU_TABLE_EB_IMM8_80), L(ALU_DISPATCH_EB_IMM8_80), 8
 
 OP .op_alu_ev_imm32_81
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     UBFX R12, R1, #3, #3
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
     BLO.N L(ALU_EV_IMM32_81_MEM)
-    SEAM_CHECK R5, R10
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LD_V R5, R5
     EIP_ADV_V
     AND.W R2, R1, #7
@@ -675,11 +636,7 @@ OP .op_alu_ev_imm32_81
 L(ALU_EV_IMM32_81_MEM):
     LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
     BLX R12
-    SEAM_CHECK R5, R10
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LD_V R5, R5
     EIP_ADV_V
     SEAM_CHECK R2, R7
@@ -697,19 +654,13 @@ L(ALU_TABLE_EV_IMM32_81):
     ALU_TABLE_M L(ALU_TABLE_EV_IMM32_81), L(ALU_DISPATCH_EV_IMM32_81), 
 
 OP .op_alu_ev_imm8_83
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     UBFX R12, R1, #3, #3
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
     BLO.N L(ALU_EV_IMM8_83_MEM)
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     AND.W R2, R1, #7
@@ -720,10 +671,7 @@ OP .op_alu_ev_imm8_83
 L(ALU_EV_IMM8_83_MEM):
     LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
     BLX R12
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     SEAM_CHECK R2, R7
@@ -745,10 +693,7 @@ L(ALU_TABLE_EV_IMM8_83):
    program branching on a bit test always took the same path. 84 did not even
    compute it: the handler decoded the ModRM and returned. */
 OP_AGNOSTIC .op_test_eb_gb_84
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -786,10 +731,7 @@ L(TEST_EB_GB_84_MEM):
     B.N L(TEST_EB_GB_84_FLAGS)
 
 OP .op_test_ev_gv_85
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -822,10 +764,7 @@ L(TEST_EV_GV_85_MEM):
     B.N L(TEST_EV_GV_85_FLAGS)
 
 OP_AGNOSTIC .op_xchg_eb_gb_86
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -862,10 +801,7 @@ L(XCHG_EB_GB_86_MEM):
     B.W .fetch_decode_loop
 
 OP .op_xchg_ev_gv_87
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -896,10 +832,7 @@ L(XCHG_EV_GV_87_MEM):
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_mov_eb_gb_88
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -938,10 +871,7 @@ L(MOV_EB_GB_MEM):
     B.W .fetch_decode_loop
 
 OP .op_mov_ev_gv_89
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -976,10 +906,7 @@ L(MOV_EV_GV_MEM):
     B.W .fetch_decode_loop
 
 OP .op_lea_8D
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -1008,10 +935,7 @@ OP .op_lea_8D
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_mov_gb_eb_8A
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -1049,10 +973,7 @@ L(MOV_GB_EB_MEM):
     B.W .fetch_decode_loop
 
 OP .op_mov_gv_ev_8B
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -1085,10 +1006,7 @@ L(MOV_GV_EV_MEM):
     B.W .fetch_decode_loop
 
 OP .op_pop_ev_8F
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -1197,10 +1115,7 @@ OP .op_mov_moffs32_eax_A3
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_test_al_imm8_A8
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     LDRB.W R3, [R8, #8]
@@ -1210,11 +1125,7 @@ OP_AGNOSTIC .op_test_al_imm8_A8
     B.W .fetch_decode_loop
 
 OP .op_test_eax_imm32_A9
-    SEAM_CHECK R5, R10
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LD_V R5, R5
     EIP_ADV_V
     LDREG_V R3, #REG_EAX
@@ -1450,10 +1361,7 @@ OP_AGNOSTIC .op_mov_r8_imm8
     MOV.W R2, R2, LSR #2
     ADD.W R2, R2, R3, LSL #2
     ADD.W R2, R2, #8
-    UBFX R3, R10, #12, #12
-    LDR.W R3, [R9, R3, LSL #2]
-    ADDS R3, R3, R10
-    MEM_TRAP_R R3
+    CODE_PTR R3
     LDRB R3, [R3, #0]
     ADD.W R10, R10, #1
     STRB.W R3, [R8, R2]
@@ -1466,11 +1374,7 @@ OP .op_ret_C3
     B.W .fetch_decode_loop
 
 OP .op_ret_imm16_C2
-    SEAM_CHECK R5, R10
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRH R5, [R5, #0]              @ bytes to drop; always 16 bits
     POP_V R4, R0, R12
     LDR.W R3, [R8, #SEG_CS_BASE]
@@ -1490,18 +1394,12 @@ OP .op_leave_C9
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_mov_eb_imm8_C6
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
     BLO.N L(MOV_EB_IMM8_C6_MEM)
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     AND.W R2, R1, #7
@@ -1517,10 +1415,7 @@ OP_AGNOSTIC .op_mov_eb_imm8_C6
 L(MOV_EB_IMM8_C6_MEM):
     LDR.W R12, [R2, #REC_MODRM_FN]
     BLX R12
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     MEM_GET_PTR R12, R7
@@ -1528,19 +1423,12 @@ L(MOV_EB_IMM8_C6_MEM):
     B.W .fetch_decode_loop
 
 OP .op_mov_ev_imm32_C7
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
     BLO.N L(MOV_EV_IMM_C7_MEM)
-    SEAM_CHECK R5, R10
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LD_V R5, R5
     EIP_ADV_V
     AND.W R2, R1, #7
@@ -1551,11 +1439,7 @@ OP .op_mov_ev_imm32_C7
 L(MOV_EV_IMM_C7_MEM):
     LDR.W R12, [R2, #REC_MODRM_FN]
     BLX R12
-    SEAM_CHECK R5, R10
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LD_V R5, R5
     EIP_ADV_V
     MEM_GET_PTR R12, R7
@@ -1569,10 +1453,7 @@ L(MOV_EV_IMM_C7_MEM):
    carry out of bit 15 left the overflow in the high half of ESI, which a
    16-bit relocator then used as an address. */
 OP .op_shift_ev_imm8_C1
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -1581,10 +1462,7 @@ OP .op_shift_ev_imm8_C1
     ADD.W R2, R8, R2, LSL #2
     ADD.W R2, R2, #8
     LD_V R3, R2
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     AND.W R5, R5, #31
@@ -1599,30 +1477,21 @@ L(SHIFT_EV_IMM8_C1_MEM):
     MEM_TRAP_R R2
     VGA_LATCH R2, R12
     LD_V R3, R2
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     AND.W R5, R5, #31
     B.N L(SHIFT_DISPATCH_32)
 
 OP .op_shift_ev_1_D1
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     MOV.W R5, #1
     B.N L(SHIFT_EV_DECODE)
 
 OP .op_shift_ev_cl_D3
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     LDRB.W R5, [R8, #12]
@@ -1809,10 +1678,7 @@ L(SHIFT_DONE):
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_shift_eb_imm8_C0
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -1823,10 +1689,7 @@ OP_AGNOSTIC .op_shift_eb_imm8_C0
     ADD.W R2, R3, R2, LSR #2
     ADD.W R2, R2, #8
     LDRB R3, [R2, #0]
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     AND.W R5, R5, #31
@@ -1840,30 +1703,21 @@ L(SHIFT_EB_IMM8_C0_MEM):
     MEM_TRAP_R R2
     VGA_LATCH R2, R12
     LDRB R3, [R2, #0]
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     AND.W R5, R5, #31
     B.N L(SHIFT_DISPATCH_8)
 
 OP_AGNOSTIC .op_shift_eb_1_D0
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     MOV.W R5, #1
     B.N L(SHIFT_EB_DECODE)
 
 OP_AGNOSTIC .op_shift_eb_cl_D2
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     LDRB.W R5, [R8, #12]
@@ -2308,11 +2162,7 @@ L(DECODE_MODRM_32):
     MOVEQ R12, #SEG_SS_SEL
     CMP R1, #128
     BLO.N L(MODRM_MOD1)
-    SEAM_CHECK R5, R10
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDR R5, [R5, #0]
     ADD.W R10, R10, #4
     ADD R7, R5
@@ -2320,10 +2170,7 @@ L(DECODE_MODRM_32):
 L(MODRM_MOD1):
     /* The rm==5 -> SS default is hoisted above the mod1/mod2 split: both arms
        need it and neither mod0 nor the SIB path does. */
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     ADD R7, R5
@@ -2331,19 +2178,12 @@ L(MODRM_MOD1):
 L(MODRM_MOD0):
     CMP R3, #5                     @ rm still unscaled in R3
     BNE.N L(MODRM_SEG)
-    SEAM_CHECK R7, R10
-    UBFX R7, R10, #12, #12
-    LDR.W R7, [R9, R7, LSL #2]
-    ADDS R7, R7, R10
-    MEM_TRAP_R R7
+    CODE_PTR R7
     LDR R7, [R7, #0]
     ADD.W R10, R10, #4
     B.N L(MODRM_SEG)
 L(MODRM_SIB):
-    UBFX R3, R10, #12, #12
-    LDR.W R3, [R9, R3, LSL #2]
-    ADDS R3, R3, R10
-    MEM_TRAP_R R3
+    CODE_PTR R3
     LDRB R3, [R3, #0]
     ADD.W R10, R10, #1
     AND.W R4, R3, #7
@@ -2360,11 +2200,7 @@ L(SIB_HAS_BASE):
     LDR R7, [R4, #8]
     B.N L(SIB_DO_INDEX)
 L(SIB_BASE_DISP32):
-    SEAM_CHECK R7, R10
-    UBFX R7, R10, #12, #12
-    LDR.W R7, [R9, R7, LSL #2]
-    ADDS R7, R7, R10
-    MEM_TRAP_R R7
+    CODE_PTR R7
     LDR R7, [R7, #0]
     ADD.W R10, R10, #4
 L(SIB_DO_INDEX):
@@ -2383,20 +2219,13 @@ L(SIB_ADD_DISP):
     BLO.N L(SIB_DISP8)
     B.N L(SIB_DISP32)
 L(SIB_DISP8):
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     ADD R7, R5
     B.N L(MODRM_SEG)
 L(SIB_DISP32):
-    SEAM_CHECK R5, R10
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDR R5, [R5, #0]
     ADD.W R10, R10, #4
     ADD R7, R5
@@ -2431,11 +2260,7 @@ L(DECODE_MODRM_32):
     CMP R1, #64
     BHS.N L(M16_RM6_BP)
     /* mod=00 rm=110: disp16, no base register at all, segment stays DS. */
-    SEAM_CHECK R7, R10
-    UBFX R7, R10, #12, #12
-    LDR.W R7, [R9, R7, LSL #2]
-    ADDS R7, R7, R10
-    MEM_TRAP_R R7
+    CODE_PTR R7
     LDRH R7, [R7, #0]
     ADD.W R10, R10, #2
     B.N L(MODRM_SEG)
@@ -2482,20 +2307,13 @@ L(M16_DISP):
     BLO.N L(M16_WRAP)
     CMP R1, #128
     BHS.N L(M16_DISP16)
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     ADD R7, R7, R5
     B.N L(M16_WRAP)
 L(M16_DISP16):
-    SEAM_CHECK R5, R10
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRH R5, [R5, #0]
     ADD.W R10, R10, #2
     ADD R7, R7, R5
@@ -2515,11 +2333,7 @@ L(MODRM_SEG):
     BX LR
 
 OP .op_call_rel32_E8
-    SEAM_CHECK R5, R10
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDS_V R5, R5                   @ displacement is SIGNED
     EIP_ADV_V
     /* Push IP, not the linear EIP: R10 carries CS.base folded in, and the
@@ -2533,11 +2347,7 @@ OP .op_call_rel32_E8
     B.W .fetch_decode_loop
 
 OP .op_jmp_rel32_E9
-    SEAM_CHECK R5, R10
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDS_V R5, R5                   @ displacement is SIGNED
     EIP_ADV_V
     ADD R10, R10, R5
@@ -2545,20 +2355,14 @@ OP .op_jmp_rel32_E9
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_jmp_rel8_EB
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     ADD R10, R5
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_grp4_FE
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -2611,10 +2415,7 @@ L(GRP4_STORE):
     B.W .fetch_decode_loop
 
 OP .op_grp5_FF
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -2702,10 +2503,7 @@ L(GRP5_PUSH):
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_jcc_rel8_7X
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     AND.W R2, R0, #15
@@ -2867,21 +2665,14 @@ OP .op_popa_61
     B.W .fetch_decode_loop
 
 OP .op_push_imm32_68
-    SEAM_CHECK R5, R10
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LD_V R5, R5
     EIP_ADV_V
     PUSH_V R5, R4, R12
     B.W .fetch_decode_loop
 
 OP .op_imul_imm32_69
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -2902,11 +2693,7 @@ L(IMUL69_MEM):
     VGA_LATCH R2, R12
     LD_V R3, R2
 L(IMUL69_DO):
-    SEAM_CHECK R5, R10
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LD_V R5, R5
     EIP_ADV_V
     MUL.W R3, R3, R5
@@ -2917,20 +2704,14 @@ L(IMUL69_DO):
     B.W .fetch_decode_loop
 
 OP .op_push_imm8_6A
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     PUSH_V R5, R4, R12
     B.W .fetch_decode_loop
 
 OP .op_imul_imm8_6B
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -2951,10 +2732,7 @@ L(IMUL6B_MEM):
     VGA_LATCH R2, R12
     LD_V R3, R2
 L(IMUL6B_DO):
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     MUL.W R3, R3, R5
@@ -2965,20 +2743,13 @@ L(IMUL6B_DO):
     B.W .fetch_decode_loop
 
 OP .op_enter_C8
-    SEAM_CHECK R5, R10
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRH R5, [R5, #0]
     ADD.W R10, R10, #2
     /* ENTER's nesting-level byte. The value is discarded (level nesting is not
        implemented), but the fetch stays: it advances EIP and it faults on an
        unmapped page, which is what the real instruction does. */
-    UBFX R12, R10, #12, #12
-    LDR.W R12, [R9, R12, LSL #2]
-    ADDS R12, R12, R10
-    MEM_TRAP_R R12
+    CODE_PTR R12
     LDRB R12, [R12, #0]
     ADD.W R10, R10, #1
     LDR.W R3, [R8, #REG_EBP]
@@ -3010,11 +2781,7 @@ OP .op_retf_imm16_CA
        and used raw ESP as a linear address with a 4-byte slot. Pop IP then CS,
        install CS so the base is recomputed, rebuild the linear EIP from it,
        and only then drop the caller's arguments. */
-    SEAM_CHECK R5, R10
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRH R5, [R5, #0]              @ bytes to drop; always 16 bits
     PUSH {R5, LR}
     POP_V R4, R3, R12              @ IP
@@ -3034,10 +2801,7 @@ OP .op_retf_imm16_CA
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_aam_D4
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     CMP R5, #0
@@ -3050,10 +2814,7 @@ OP_AGNOSTIC .op_aam_D4
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_aad_D5
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     LDRB.W R3, [R8, #8]
@@ -3089,10 +2850,7 @@ OP_AGNOSTIC .op_xlat_D7
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_loopnz_E0
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     CNT_LOAD R3
@@ -3109,10 +2867,7 @@ OP_AGNOSTIC .op_loopnz_E0
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_loopz_E1
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     CNT_LOAD R3
@@ -3129,10 +2884,7 @@ OP_AGNOSTIC .op_loopz_E1
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_loop_E2
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     CNT_LOAD R3
@@ -3146,10 +2898,7 @@ OP_AGNOSTIC .op_loop_E2
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_jcxz_E3
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
     CNT_LOAD R3
@@ -3235,10 +2984,7 @@ OP_AGNOSTIC .op_in_al_dx_EC
     B.N L(DO_IN_B)
 
 OP_AGNOSTIC .op_in_al_imm8_E4
-    UBFX R0, R10, #12, #12
-    LDR.W R0, [R9, R0, LSL #2]
-    ADDS R0, R0, R10
-    MEM_TRAP_R R0
+    CODE_PTR R0
     LDRB R0, [R0, #0]
     ADD.W R10, R10, #1
 L(DO_IN_B):
@@ -3253,10 +2999,7 @@ OP .op_in_eax_dx_ED
     B.N L(DO_IN_V)
 
 OP .op_in_eax_imm8_E5
-    UBFX R0, R10, #12, #12
-    LDR.W R0, [R9, R0, LSL #2]
-    ADDS R0, R0, R10
-    MEM_TRAP_R R0
+    CODE_PTR R0
     LDRB R0, [R0, #0]
     ADD.W R10, R10, #1
 L(DO_IN_V):
@@ -3271,10 +3014,7 @@ OP_AGNOSTIC .op_out_dx_al_EE
     B.N L(DO_OUT_B)
 
 OP_AGNOSTIC .op_out_imm8_al_E6
-    UBFX R0, R10, #12, #12
-    LDR.W R0, [R9, R0, LSL #2]
-    ADDS R0, R0, R10
-    MEM_TRAP_R R0
+    CODE_PTR R0
     LDRB R0, [R0, #0]
     ADD.W R10, R10, #1
 L(DO_OUT_B):
@@ -3289,10 +3029,7 @@ OP .op_out_dx_eax_EF
     B.N L(DO_OUT_V)
 
 OP .op_out_imm8_eax_E7
-    UBFX R0, R10, #12, #12
-    LDR.W R0, [R9, R0, LSL #2]
-    ADDS R0, R0, R10
-    MEM_TRAP_R R0
+    CODE_PTR R0
     LDRB R0, [R0, #0]
     ADD.W R10, R10, #1
 L(DO_OUT_V):
@@ -3313,10 +3050,7 @@ OP_AGNOSTIC .op_lahf_9F
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_grp3_eb_F6
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -3361,10 +3095,7 @@ L(GRP3_F6_DISPATCH):
    bumped the counter its wait loops poll: keys arrived, nothing happened.
    Normalized to bit 31 like the A8 byte form so SF/ZF describe the byte. */
 L(GRP3_F6_TEST):
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LDRB R5, [R5, #0]
     ADD.W R10, R10, #1
     AND.W R3, R3, R5               @ TEST sets flags and discards the result
@@ -3453,10 +3184,7 @@ L(DIVIDE_ERROR):
     B.W L(HANDLE_INTERRUPT)
 
 OP .op_grp3_ev_F7
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -3494,11 +3222,7 @@ L(GRP3_F7_DISPATCH):
     BEQ.W L(GRP3_F7_IDIV)
     B.W .exit_loop
 L(GRP3_F7_TEST):
-    SEAM_CHECK R5, R10
-    UBFX R5, R10, #12, #12
-    LDR.W R5, [R9, R5, LSL #2]
-    ADDS R5, R5, R10
-    MEM_TRAP_R R5
+    CODE_PTR R5
     LD_V R5, R5
     EIP_ADV_V
     ANDS.W R3, R3, R5              @ TEST sets flags and discards the result
@@ -3733,10 +3457,7 @@ L(SET_SREG_NOLOG):
 
 /* MOV Sreg, Ew (8E). The source is always 16 bits regardless of operand size. */
 OP_AGNOSTIC .op_mov_seg_Ew_8E
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -3765,10 +3486,7 @@ L(MOV_SREG_SET):
 
 /* MOV Ew, Sreg (8C). Always a 16-bit store. */
 OP_AGNOSTIC .op_mov_Ew_seg_8C
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -3804,10 +3522,7 @@ OP .op_les_C4
 OP .op_lds_C5
     MOV.W R0, #3                   @ DS
 L(LOAD_FAR_PTR):
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -3888,18 +3603,10 @@ OP .op_jmp_far_EA
 OP .op_call_far_9A
     MOV.W R0, #1
 L(FAR_IMM):
-    SEAM_CHECK R3, R10
-    UBFX R3, R10, #12, #12
-    LDR.W R3, [R9, R3, LSL #2]
-    ADDS R3, R3, R10
-    MEM_TRAP_R R3
+    CODE_PTR R3
     LD_V R4, R3                    @ new offset
     EIP_ADV_V
-    SEAM_CHECK R3, R10
-    UBFX R3, R10, #12, #12
-    LDR.W R3, [R9, R3, LSL #2]
-    ADDS R3, R3, R10
-    MEM_TRAP_R R3
+    CODE_PTR R3
     LDRH R5, [R3, #0]              @ new selector
     ADD.W R10, R10, #2
     CMP R0, #0
@@ -4057,10 +3764,7 @@ OP_AGNOSTIC .op_rep_F3
     MOV.W R4, #1                   @ REP/REPE: stop once ZF becomes 0
 L(REP_ENTER):
     /* Peek at the string opcode without consuming it. */
-    UBFX R3, R10, #12, #12
-    LDR.W R3, [R9, R3, LSL #2]
-    ADDS R3, R3, R10
-    MEM_TRAP_R R3
+    CODE_PTR R3
     LDRB R0, [R3, #0]
 
     /* Only string opcodes repeat; on anything else the prefix is ignored,
@@ -4135,10 +3839,7 @@ L(REP_ONE):
  * the stub runs on re-entry and unwinds the guest's INT frame.
  * =========================================================================== */
 OP_AGNOSTIC .op_hypercall_0F0B
-    UBFX R3, R10, #12, #12
-    LDR.W R3, [R9, R3, LSL #2]
-    ADDS R3, R3, R10
-    MEM_TRAP_R R3
+    CODE_PTR R3
     LDRB R3, [R3, #0]              @ service selector
     ADD.W R10, R10, #1
     LDR.W R4, [R8, #CPU_HLE_ENABLED]   @ CBZ needs a low register

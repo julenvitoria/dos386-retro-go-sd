@@ -3,10 +3,7 @@ OP .op_0f_0F
        in R3 so R2 keeps pointing at the record -- the two-byte opcodes that
        take a ModRM still need its decoder pointer. */
     LDR.W R3, [R2, #REC_TABLE_0F]
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD R10, R10, #1
 #if X86_PROFILE
@@ -20,10 +17,7 @@ L(opcode_0f_dispatch_target):
 
 
 OP .op_0f_01
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     BL L(DECODE_MODRM_32)
@@ -80,10 +74,7 @@ OP .op_into_CE
     B.N L(HANDLE_INTERRUPT)
 
 OP .op_int_imm8_CD
-    UBFX R4, R10, #12, #12
-    LDR.W R4, [R9, R4, LSL #2]
-    ADDS R4, R4, R10
-    MEM_TRAP_R R4
+    CODE_PTR R4
     LDRB R4, [R4, #0]
     ADD.W R10, R10, #1
     B.N L(HANDLE_INTERRUPT)
@@ -211,11 +202,7 @@ OP .op_iret_CF
    jumped by a number assembled out of the following instruction. */
 OP .op_0f_jcc_rel32
     UBFX R2, R1, #0, #4
-    SEAM_CHECK R4, R10
-    UBFX R4, R10, #12, #12
-    LDR.W R4, [R9, R4, LSL #2]
-    ADDS R4, R4, R10
-    MEM_TRAP_R R4
+    CODE_PTR R4
     LDS_V R4, R4
     EIP_ADV_V
     BL L(EVAL_COND)
@@ -227,10 +214,7 @@ OP .op_0f_jcc_rel32
 
 OP .op_0f_setcc
     UBFX R2, R1, #0, #4
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -279,10 +263,7 @@ OP_AGNOSTIC .op_0f_mov_r32_cr_20
 OP_AGNOSTIC .op_0f_mov_cr_r32_22
     MOV.W R4, #1
 L(OP_0F_CR):
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     AND.W R2, R1, #7               @ the r32
@@ -303,10 +284,7 @@ L(OP_0F_CR):
     B.W .fetch_decode_loop
 
 OP .op_0f_movzx_gv_eb
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -336,10 +314,7 @@ L(OP_0F_MOVZX_GV_EB_WRITE):
     B.W .fetch_decode_loop
 
 OP .op_0f_movzx_gv_ew
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -368,10 +343,7 @@ L(OP_0F_MOVZX_GV_EW_WRITE):
     B.W .fetch_decode_loop
 
 OP .op_0f_movsx_gv_eb
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
@@ -401,10 +373,7 @@ L(OP_0F_MOVSX_GV_EB_WRITE):
     B.W .fetch_decode_loop
 
 OP .op_0f_movsx_gv_ew
-    UBFX R1, R10, #12, #12
-    LDR.W R1, [R9, R1, LSL #2]
-    ADDS R1, R1, R10
-    MEM_TRAP_R R1
+    CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
