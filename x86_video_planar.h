@@ -96,6 +96,27 @@ uint32_t x86_vga_modey_row(uint32_t a);
    with no LCD still resolve; the frame loop overrides it. */
 void x86_video_page_flip(void);
 
+/* ---- the presentation policy, and why it is HERE and not in the frame loop -
+ *
+ * It has to be testable without an LCD: the artefact it fixes (a timed blit
+ * catching the one aliased page mid-redraw) is a question about WHICH FRAMES
+ * ARE PAINTED, which a pixel test cannot ask and a device cannot be asked
+ * safely. So the decision lives in the core beside the store counter it reads,
+ * and the frame loop only obeys it. tests/test_video.py drives it directly.
+ */
+/* Called once per frame-loop iteration. Non-zero: the loop must paint. In
+   Mode Y that is only when the guest's page is QUIET (hence complete), or when
+   the last-resort staleness bound fires. Every other mode: always. */
+int  x86_video_modey_paint_due(void);
+/* "A frame has just been put on the panel." from_flip distinguishes the
+   guest's own page flip from the loop's fallback, for the gap counters. */
+void x86_video_modey_presented(int from_flip);
+
+extern volatile uint32_t x86_modey_fallbacks;
+extern volatile uint32_t x86_modey_stale_paints;
+extern volatile uint32_t x86_modey_flip_gap;
+extern volatile uint32_t x86_modey_flip_gap_max;
+
 /* ---- host-visible witnesses; all of this is the deliverable -------------- */
 extern volatile uint32_t x86_vga_planar_stores;   /* stores that took the hook */
 extern volatile uint32_t x86_vga_planar_lost;     /* stores with no storage    */

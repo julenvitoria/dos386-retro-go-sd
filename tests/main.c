@@ -192,6 +192,23 @@ volatile uint32_t text_scroll_arg = 0;      /* (attr << 8) | lines */
 volatile uint32_t run_planar_flag = 0;
 volatile uint32_t planar_r[12];
 
+/*
+ * MODE Y PRESENTATION POLICY -- which frames the loop paints.
+ *
+ * This is not a pixel question and no pixel test can ask it: at 64000/64000
+ * exact, the shipped defect was that the frame loop blitted the ONE aliased
+ * page WHILE THE GUEST WAS STILL DRAWING INTO IT, every 8 frames, because the
+ * escape hatch was a timer. On the device that is half a raycast viewport, and
+ * a menu highlight caught between its erase and its redraw.
+ *
+ * So the harness drives x86_video_modey_paint_due() directly, one call per
+ * modelled frame, against a modelled guest: x86_vga_planar_stores is the signal
+ * the policy reads and "the guest drew this frame" is exactly an increment of
+ * it. No LCD, no CPU, no timing -- three scenarios and a count of paints.
+ */
+volatile uint32_t run_present_flag = 0;
+volatile uint32_t present_r[8];
+
 // Latched fault state, for the host to read over the debug backend.
 volatile uint32_t fault_active = 0;   // 0 = none, else VECTACTIVE
 volatile uint32_t fault_cfsr = 0;
@@ -537,6 +554,79 @@ static void planar_test_run(void)
     planar_r[9] = x86_vga_latch_miss;
     planar_r[10] = x86_vga_ega_armed;
     planar_r[11] = x86_arena_free;
+}
+
+/*
+ * Model one frame-loop iteration: the guest ran a slice (storing `stores`
+ * bytes into the aperture and flipping or not), then the loop asked the policy.
+ * Returns 1 if the loop would have painted.
+ */
+static int present_frame(unsigned stores, int flipped)
+{
+    int paint;
+
+    x86_vga_planar_stores += stores;
+    if (flipped)
+        x86_video_modey_presented(1);   /* the device also paints both buffers */
+    paint = x86_video_modey_paint_due();
+    if (paint)
+        x86_video_modey_presented(0);   /* exactly what src/main.c does */
+    return paint;
+}
+
+static void present_test_run(uint32_t which)
+{
+    unsigned i, paints = 0;
+
+    for (i = 0; i < 8; i++)
+        present_r[i] = 0;
+    /* The witnesses are cumulative on the device and must not be cumulative
+       ACROSS scenarios here, or each arm reads the one before it. */
+    x86_modey_fallbacks = 0;
+    x86_modey_stale_paints = 0;
+    x86_modey_flip_gap = 0;
+    x86_modey_flip_gap_max = 0;
+    x86_vga_modey_arm(0);
+    x86_vga_modey_arm(1);
+    present_r[7] = x86_vga_modey_armed;
+
+    if (which == 1) {
+        /* GAMEPLAY. WOLF3D draws a whole frame and flips, and the guest is far
+           slower than the panel, so a flip arrives every 20 modelled frames
+           with stores in every one of them. The page is NEVER complete except
+           at the flip, so the loop must paint EXACTLY NEVER: the flip path is
+           the only present. The timer hatch painted 2 of every 20 here, and
+           each was a half-drawn raycast. */
+        for (i = 0; i < 200; i++)
+            paints += (unsigned)present_frame(1000u, (i % 20u) == 19u);
+        present_r[0] = paints;
+        present_r[1] = x86_modey_fallbacks;
+        present_r[2] = x86_modey_stale_paints;
+        present_r[3] = x86_modey_flip_gap_max;
+    } else if (which == 2) {
+        /* MENU. The guest redraws the highlight -- erase, then draw, over a
+           few frames -- and then WAITS for a key, flipping nothing. Nothing may
+           be painted while it is drawing; once it is quiet it must be painted,
+           ONCE, and not again while nothing changes. */
+        for (i = 0; i < 4; i++)
+            paints += (unsigned)present_frame(500u, 0);
+        present_r[0] = paints;              /* must be 0: drawing */
+        paints = 0;
+        for (i = 0; i < 30; i++)
+            paints += (unsigned)present_frame(0u, 0);
+        present_r[1] = paints;              /* must be 1: quiet, painted once */
+        present_r[2] = x86_modey_stale_paints;
+    } else {
+        /* PATHOLOGICAL. A title that stores forever and never flips must not
+           be a frozen screen: the staleness bound is the only thing that may
+           fire, and it must, at about once a second and no faster. */
+        for (i = 0; i < 180; i++)
+            paints += (unsigned)present_frame(1u, 0);
+        present_r[0] = paints;
+        present_r[1] = x86_modey_fallbacks;
+        present_r[2] = x86_modey_stale_paints;
+    }
+    x86_vga_modey_arm(0);
 }
 
 /* Put guest 0xA0000/0xB8000 back on test_ram, so an arm that runs after this
@@ -1871,6 +1961,10 @@ void Reset_Handler(void) {
         if (run_planar_flag == 3) {
             planar_test_unmap();
             run_planar_flag = 0;
+        }
+        if (run_present_flag) {
+            present_test_run(run_present_flag);
+            run_present_flag = 0;
         }
         if (run_video_flag == 4) {
             x86_video_set_mode((uint8_t)text_mode_arg);

@@ -1586,18 +1586,27 @@ static void core_repaint(void)
 #ifndef X86_MODEY_PRESENT_ON_FLIP
 #define X86_MODEY_PRESENT_ON_FLIP 1     /* 0 takes it back to the tearing model */
 #endif
-/* How many frames without a flip before the frame loop paints anyway. A title
-   that stops flipping -- a menu, a pause, a title screen -- must not be a
-   FROZEN screen. */
-#define MODEY_IDLE_FRAMES 8
+/* When the frame loop may paint a Mode Y screen itself is decided by
+   x86_video_modey_paint_due() in x86_video_planar.c -- a QUIET aperture, not a
+   timer. A timer is what caught the page mid-redraw; the reasoning is there. */
 
 volatile uint32_t x86_modey_presents;   /* host-visible: flips actually painted */
-static uint32_t modey_idle;             /* frames since the last flip present  */
 
-void x86_video_page_flip(void)
+/*
+ * Paint BOTH buffers. This is the whole of Mode Y's presentation and it is not
+ * belt and braces.
+ *
+ * The frame loop calls GW_LCD_SWAP unconditionally, every iteration, whether or
+ * not it painted -- and it must, because the swap is also the loop's pacing.
+ * So the panel alternates between the two buffers at the panel rate, and any
+ * Mode Y paint that touched only the ACTIVE one leaves the two holding
+ * DIFFERENT PICTURES. That is the reported "the selection appears doubled and
+ * pops back and forth before settling": not a compositing artefact at all, but
+ * two buffers disagreeing and the swap showing each in turn. The flip path
+ * always painted both; the frame loop's fallback painted one, which is the bug.
+ */
+static void modey_paint_both(const gw_firmware_abi_t *abi)
 {
-#if X86_MODEY_PRESENT_ON_FLIP
-    const gw_firmware_abi_t *abi = gw_firmware_abi();
     for (unsigned which = 0; which < 2; which++) {
         uint8_t *fb = (uint8_t *)abi->lcd_ctl(GW_LCD_BUFFER,
                                               which ? GW_LCD_BUF_INACTIVE
@@ -1607,24 +1616,24 @@ void x86_video_page_flip(void)
         x86_video_render(fb, FRAME_W);
         x86_osk_draw(fb, FRAME_W);
     }
+}
+
+void x86_video_page_flip(void)
+{
+#if X86_MODEY_PRESENT_ON_FLIP
+    modey_paint_both(gw_firmware_abi());
     x86_modey_presents++;
-    modey_idle = 0;
 #endif
 }
 
-/* Does the frame loop still owe this frame a paint? Yes for every mode except
-   a Mode Y title that is flipping for itself, and yes again after
-   MODEY_IDLE_FRAMES without a flip. */
+/* Does the frame loop still owe this frame a paint? The DECISION lives in the
+   core (x86_video_modey_paint_due), beside the store counter it reads and where
+   tests/test_video.py can drive it without an LCD; this is only the switch that
+   takes the whole scheme back to the tearing model. */
 static int frame_owes_paint(void)
 {
 #if X86_MODEY_PRESENT_ON_FLIP
-    if (!x86_vga_is_unchained())
-        return 1;
-    if (modey_idle++ >= MODEY_IDLE_FRAMES) {
-        modey_idle = 0;
-        return 1;
-    }
-    return 0;
+    return x86_video_modey_paint_due();
 #else
     return 1;
 #endif
@@ -2071,12 +2080,22 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         fb_addr = (uint32_t)fb;
         if (fb) {
             /* A Mode Y title paints itself on its own page flips, so the frame
-               boundary owes it nothing -- until MODEY_IDLE_FRAMES pass without
-               one, which is what keeps a title that STOPS flipping from being a
-               frozen screen. Every other mode owes a paint every frame. */
+               boundary owes it nothing until the guest goes quiet -- which is
+               the only moment the ONE aliased page is a complete picture, and
+               is what keeps a title that STOPS flipping from being a frozen
+               screen. Every other mode owes a paint every frame.
+               When we do paint a Mode Y screen we paint BOTH buffers, for the
+               reason on modey_paint_both(); every other mode paints the active
+               one and lets the swap carry it, which is correct because it
+               repaints unconditionally every frame. */
             if (frame_owes_paint()) {
-                x86_video_render(fb, FRAME_W);
-                x86_osk_draw(fb, FRAME_W);
+                if (x86_vga_is_unchained()) {
+                    modey_paint_both(abi);
+                    x86_video_modey_presented(0);
+                } else {
+                    x86_video_render(fb, FRAME_W);
+                    x86_osk_draw(fb, FRAME_W);
+                }
             }
             fb_sample = *(volatile uint32_t *)(fb + 20 * FRAME_W);
         }
