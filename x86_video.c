@@ -2005,5 +2005,5 @@ void x86_video_render(uint8_t *dst, uint32_t stride)
 {
     X86_VPROF_BEGIN(rn);
     video_render_body(dst, stride);
-    X86_VPROF_END(rn, x86_vprof_render);
+    X86_VPROF_END(rn, render);
 }

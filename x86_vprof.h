@@ -72,20 +72,40 @@
 #define X86_VPROF 0
 #endif
 
-/* Host-visible even when the instrument is compiled out, so probe.py --watch
-   resolves the symbols and reads honest zeroes rather than failing. */
-typedef struct {
-    volatile uint32_t lo;
-    volatile uint32_t hi;
-    volatile uint32_t n;
-    volatile uint32_t worst;
-} x86_vprof_acc_t;
+/*
+ * Host-visible even when the instrument is compiled out, so probe.py --watch
+ * resolves every symbol on any build and reads a truthful zero on an
+ * uninstrumented one. A host tool that cannot tell "instrument off" from
+ * "symbol missing" is how a measurement gets silently skipped.
+ *
+ * FOUR SEPARATE SYMBOLS PER PHASE, not a struct, and that is the whole reason
+ * this shape was chosen: probe.py's --watch takes a symbol NAME and reads one
+ * word at it, so a struct is only readable with --dump, which prints once at
+ * the END of a run. Differencing an accumulator across a measurement WINDOW --
+ * which is the only way to profile gameplay rather than gameplay plus the
+ * menus that preceded it -- needs each field to be its own watchable symbol.
+ *
+ *   _cyc    low 32 bits of the 64-bit self-time
+ *   _hi     high 32 bits. CYCCNT wraps every ~15 s at 280 MHz, and a delta
+ *           differenced across samples is exact modulo 2^32 as long as the
+ *           sample interval keeps it under that
+ *   _n      occurrences
+ *   _worst  worst SINGLE occurrence. Stutter is a tail property and a mean
+ *           cannot contain one -- the same reason x86_zones.h carries one
+ */
+#define X86_VPROF_DECL(name)                    \
+    extern volatile uint32_t x86_vprof_##name##_cyc;   \
+    extern volatile uint32_t x86_vprof_##name##_hi;    \
+    extern volatile uint32_t x86_vprof_##name##_n;     \
+    extern volatile uint32_t x86_vprof_##name##_worst
 
-extern x86_vprof_acc_t x86_vprof_frame;
-extern x86_vprof_acc_t x86_vprof_store;
-extern x86_vprof_acc_t x86_vprof_paint;
-extern x86_vprof_acc_t x86_vprof_render;
-extern x86_vprof_acc_t x86_vprof_osk;
+X86_VPROF_DECL(frame);
+X86_VPROF_DECL(store);
+X86_VPROF_DECL(paint);
+X86_VPROF_DECL(render);
+X86_VPROF_DECL(osk);
+X86_VPROF_DECL(cell);
+
 /* Paints reached from the guest's own page flip vs from the frame loop's
    fallback. x86_modey_presents counts only the first, which is why "10 frames
    per second" has never been the whole paint count. */
@@ -98,20 +118,18 @@ extern volatile uint32_t x86_vprof_reset;  /* host writes 1; cleared at frame */
 
 #define X86_VPROF_CYCCNT (*(volatile uint32_t *)0xE0001004u)
 
-static inline void x86_vprof_add(x86_vprof_acc_t *a, uint32_t d)
-{
-    uint32_t lo = a->lo + d;
-    if (lo < a->lo)
-        a->hi++;
-    a->lo = lo;
-    a->n++;
-    if (d > a->worst)
-        a->worst = d;
-}
-
 #define X86_VPROF_BEGIN(name)  uint32_t vprof_t_##name = X86_VPROF_CYCCNT
-#define X86_VPROF_END(name, acc) \
-    x86_vprof_add(&(acc), X86_VPROF_CYCCNT - vprof_t_##name)
+#define X86_VPROF_END(name, acc)                                        \
+    do {                                                                \
+        uint32_t vprof_d = X86_VPROF_CYCCNT - vprof_t_##name;           \
+        uint32_t vprof_lo = x86_vprof_##acc##_cyc + vprof_d;            \
+        if (vprof_lo < x86_vprof_##acc##_cyc)                           \
+            x86_vprof_##acc##_hi++;                                     \
+        x86_vprof_##acc##_cyc = vprof_lo;                               \
+        x86_vprof_##acc##_n++;                                          \
+        if (vprof_d > x86_vprof_##acc##_worst)                          \
+            x86_vprof_##acc##_worst = vprof_d;                          \
+    } while (0)
 #define X86_VPROF_COUNT(c)     ((c)++)
 
 void x86_vprof_calibrate(uint32_t iterations);

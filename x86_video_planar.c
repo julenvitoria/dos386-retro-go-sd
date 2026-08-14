@@ -821,9 +821,21 @@ PLANAR_HOT static void planar_store_body(uint32_t off, uint32_t val, uint32_t si
                rather than a four-way test of the Map Mask. `p` is 4-byte
                aligned by construction (every cell is `base + 4*a`), but
                memcpy says so without relying on it. */
+            /* VPROF: the CELL bracket -- the read-modify-write of the four
+               interleaved plane bytes and NOTHING else. This is the one split
+               that decides what the store path actually costs: everything
+               outside it is code (the call, vga_cell's page reduction, the
+               class test) and everything inside it is a single 4-byte access
+               to plane storage. A scaler writes a vertical column, so
+               consecutive stores are 80 plane offsets = 320 BYTES apart and
+               each one is its own cache line. If the cost is here, no amount
+               of moving code to ITCM can reach it -- and two such moves have
+               already been measured as no help. */
+            X86_VPROF_BEGIN(cl);
             memcpy(&q, p, 4);
             q = (q & ~m) | (((val >> (8u * i)) & 0xFFu) * 0x01010101u & m);
             memcpy(p, &q, 4);
+            X86_VPROF_END(cl, cell);
             if (!x86_vga_modey_armed && a < EGA_SHADOW_OFFSETS)
                 ap[a] = ega_read_byte(a);
         }
@@ -881,7 +893,7 @@ PLANAR_HOT void x86_vga_planar_store(uint32_t off, uint32_t val, uint32_t size)
 {
     X86_VPROF_BEGIN(st);
     planar_store_body(off, val, size);
-    X86_VPROF_END(st, x86_vprof_store);
+    X86_VPROF_END(st, store);
 }
 
 /* ---------------------------------------------------------------------------

@@ -54,6 +54,9 @@ not a power switch.
 
 from __future__ import annotations
 
+import atexit
+import os
+import signal
 import threading
 import time
 from dataclasses import dataclass, field
@@ -365,6 +368,7 @@ class ShadowWordPlayer(Player):
         self._done = threading.Event()
         self.t0 = None
         self.error = None
+        self._guard_installed = False
 
     # -- plumbing ---------------------------------------------------------
     def _write(self, mask):
@@ -389,10 +393,56 @@ class ShadowWordPlayer(Player):
                       f"once a frame and may not see them: "
                       + ", ".join(f"{b}@{d:.3f}s({(r-d)*1000:.0f}ms)"
                                   for b, d, r in risky[:6]))
+        self._install_guard()
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name="timeline")
         self._thread.start()
         return self
+
+    # -- THE INTERRUPTED-RUN GUARD ----------------------------------------
+    #
+    # The shadow word OVERRIDES the physical buttons on every input poll, and
+    # it lives in D2 SRAM -- which SURVIVES RESET. So a run that dies without
+    # zeroing it does not merely end: it strands the DEVICE, pinning a fake
+    # button state through every later session until something clears it, and
+    # the owner's own presses stop registering. That is not a hypothetical --
+    # it cost a session, with the symptom looking exactly like a guest input
+    # bug.
+    #
+    # The player's thread is a daemon, so a killed process never reaches its
+    # own cleanup. atexit covers a normal exit and an uncaught exception;
+    # SIGINT and SIGTERM do not run atexit at all, so they are chained
+    # explicitly. Same shape as the project's temp-file rule: a finally, plus
+    # a guard for the paths a finally cannot see.
+    def _install_guard(self):
+        if self._guard_installed:
+            return
+        self._guard_installed = True
+        atexit.register(self._release_quietly)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                prev = signal.getsignal(sig)
+            except (ValueError, OSError):
+                continue            # not the main thread: nothing to install
+            def handler(signum, frame, _prev=prev):
+                self._release_quietly()
+                if callable(_prev):
+                    _prev(signum, frame)
+                elif _prev == signal.SIG_DFL:
+                    signal.signal(signum, signal.SIG_DFL)
+                    os.kill(os.getpid(), signum)
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                pass                # not the main thread
+
+    def _release_quietly(self):
+        """Zero the shadow word, best effort, from any exit path."""
+        self._stop.set()
+        try:
+            self._write(0)
+        except Exception:
+            pass                    # a dead probe must not mask the real error
 
     def _run(self):
         try:

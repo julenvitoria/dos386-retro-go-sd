@@ -850,7 +850,7 @@ python3 scripts/probe.py --retrogo --timeline timelines/start-preselected-game.t
 #### `X86_VPROF=1` — where the cycles go INSIDE the video path
 
 ```bash
-make -f Makefile.core clean && make -f Makefile.core pack X86_VPROF=1 X86_ZONES=1
+make -f Makefile.core clean && make -f Makefile.core pack X86_VPROF=1
 python3 scripts/probe.py --retrogo --target hardware --no-flash \
     --timeline timelines/wolf3d-owner.tl --watch vprof,planar \
     --dump x86_vprof_frame:4x4  --dump x86_vprof_store:4x4 \
@@ -880,6 +880,7 @@ DTCM — the pool is the scarcest thing in the project):
 | `x86_vprof_paint` | `modey_paint_both()` — BOTH buffers, render + OSK |
 | `x86_vprof_render` | `x86_video_render()` alone: in Mode Y this IS the de-interleave blit |
 | `x86_vprof_osk` | `x86_osk_draw()` alone |
+| `x86_vprof_cell` | inside the PL_PLANE loop: the 4-byte read-modify-write of one plane cell and nothing else. **DIFFERENTIAL USE ONLY — see the warning below** |
 
 Each is `{lo, hi, n, worst}` — 64-bit because CYCCNT wraps every ~15 s at
 280 MHz and a 32-bit accumulator would wrap inside a measurement window.
@@ -904,6 +905,25 @@ times a second and are noise; `store` fires ~180,000 times a second in Mode Y
 gameplay and is the one bracket that perturbs its own measurement. Grade the
 perturbation rather than assuming it: quote `guest_ips_achieved` on this build
 against the same workload on a clean one.
+
+**`X86_VPROF=1` AND `X86_ZONES=1` TOGETHER DO NOT FIT, AND THE FAILURE IS
+SILENT.** Both alone are fine. Together they push `__CORE_BSS_END__` past
+RAM_EMU, `guest_ram` comes back NULL, `core_ready` stays 0 and the emulator
+simply never starts — `guest_insns_total` reads 0 and every zone and bracket
+reads a plausible zero. Take the two as SEPARATE PASSES, exactly as
+`profile_all.py` already does for zones and opcodes.
+
+**THE `cell` BRACKET IS NOT A VALID ABSOLUTE NUMBER.** DWT->CYCCNT lives on the
+private peripheral bus, which is strongly ordered: a read of it inside a
+store-heavy loop drains the store buffer, so the bracket does not merely
+observe the region, it serialises it. The calibrated `x86_vprof_ovh` (~12
+cycles) is measured in a tight loop where the PPB accesses overlap and it
+UNDERSTATES this badly. The honest figure comes from comparing the two builds:
+`x86_vprof_store` mean is **234 cycles without the cell bracket and 284 with
+it**, so one bracket pair costs ~42 cycles in situ, not 12. Use `cell` to
+compare two arms of an A/B where the artefact is common to both — which is
+exactly how plane-storage placement was settled — and never quote it as the
+cost of a plane access.
 
 `x86_vprof_reset` is the window control — the host writes 1, the target clears
 every accumulator at the next **frame boundary**, so a window never opens
@@ -1760,6 +1780,20 @@ the cell with `ldr.w rX,[rY,#4084]`, so the address never appears as four
 consecutive bytes.** `retrogo_build.verify_remote_input(elf)` disassembles
 `buttons_get` and checks the arithmetic; the build fails if the define did not
 take.
+
+**AN INTERRUPTED RUN USED TO STRAND THE DEVICE, AND NOW DOES NOT.** The shadow
+word OVERRIDES the physical buttons on every input poll and it lives in D2
+SRAM, which SURVIVES RESET -- so a run killed mid-flight left a fake button
+state pinned through every later session, and the owner's own presses stopped
+registering. It presents exactly like a guest input bug and it cost a session.
+The player's thread is a daemon, so a killed process never reached its own
+cleanup; `ShadowWordPlayer` now registers an `atexit` handler AND chains
+`SIGINT`/`SIGTERM` to zero the word first. If a run ever does die in a way that
+escapes those, clear it by hand before anyone touches the device:
+
+```bash
+python3 scripts/probe.py --target hardware --no-flash --zero 0x30001FF4:4
+```
 
 **`quit` on hardware stops injecting** — buttons released, shadow word zeroed,
 the player finishes. There is no process to kill, and the device keeps running;

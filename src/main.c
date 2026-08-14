@@ -2646,10 +2646,10 @@ static void modey_paint_both(const gw_firmware_abi_t *abi)
         {
             X86_VPROF_BEGIN(ok);
             x86_osk_draw(fb, FRAME_W);
-            X86_VPROF_END(ok, x86_vprof_osk);
+            X86_VPROF_END(ok, osk);
         }
     }
-    X86_VPROF_END(pt, x86_vprof_paint);
+    X86_VPROF_END(pt, paint);
 }
 
 void x86_video_page_flip(void)
@@ -3483,7 +3483,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
 
         /* ZONES: close the frame. Charges the last stretch to the root, which
            is the residual, and closes the frame occurrence. */
-        X86_VPROF_END(fr, x86_vprof_frame);
+        X86_VPROF_END(fr, frame);
         X86_ZONE_FRAME_END();
     }
 }

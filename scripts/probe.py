@@ -80,14 +80,24 @@ WATCH_GROUPS = {
         # deliberate -- a host that cannot tell "instrument off" from "symbol
         # missing" is how a measurement gets silently skipped.
         #
-        # The five ACCUMULATORS are {lo, hi, n, worst} structs and --watch
-        # reads one word, so it shows only `lo`. Read them whole with
-        #   --dump x86_vprof_frame:4x4 --dump x86_vprof_store:4x4 ...
-        # These are the scalars, plus the context needed to trust them.
+        # Every field is its OWN symbol so that a window can be measured by
+        # DIFFERENCING two samples. A run that starts at boot spends its first
+        # 27 s in menus, and a cumulative total cannot be told apart from a
+        # gameplay one -- which is exactly the mistake this group exists to
+        # make impossible.
+        "x86_vprof_frame_cyc", "x86_vprof_frame_n", "x86_vprof_frame_worst",
+        "x86_vprof_store_cyc", "x86_vprof_store_n", "x86_vprof_store_worst",
+        "x86_vprof_paint_cyc", "x86_vprof_paint_n", "x86_vprof_paint_worst",
+        "x86_vprof_render_cyc", "x86_vprof_render_n",
+        "x86_vprof_render_worst",
+        "x86_vprof_osk_cyc", "x86_vprof_osk_n",
+        "x86_vprof_cell_cyc", "x86_vprof_cell_n", "x86_vprof_cell_worst",
         "x86_vprof_paint_flip", "x86_vprof_paint_loop", "x86_vprof_ovh",
-        "x86_modey_presents", "x86_modey_fallbacks", "x86_modey_mid_draw",
-        "x86_vga_modey_armed", "guest_insns_total", "guest_ips_achieved",
-        "guest_fps_achieved", "frames_rendered", "x86_disk_cycles_per_us",
+        # The gate on every one of these runs: presents must CLIMB, or the
+        # numbers describe the menus.
+        "x86_modey_presents", "x86_modey_fallbacks", "x86_vga_modey_armed",
+        "guest_insns_total", "x86_vga_planar_stores", "frames_rendered",
+        "x86_disk_cycles_per_us",
     ],
 }
 
