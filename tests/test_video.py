@@ -1354,6 +1354,80 @@ def modeyfit_checks(b, syms):
     return True
 
 
+def modeypage_checks(b, syms):
+    """Mode Y's REAL page storage, and the property no pixel test can see.
+
+    Every pixel arm in this suite renders one frame from one page and passes
+    64000/64000 with all three of Wolf3D's display starts folded onto the same
+    bytes. The defect only shows when the guest DRAWS page N+1 while the panel
+    is showing page N -- which is the raycaster's every frame, and what the
+    owner sees as walls rendered twice, once in perspective and once
+    unstretched, with the doors split and out of order.
+
+    So this asserts the property itself: a write to page 1 must not disturb
+    page 0. Its negative control -- the same write with the alias -- is SEEN TO
+    FAIL in the same run, which is what makes the positive half a check.
+    """
+    for n in ("run_modeypage_flag", "modeypage_r"):
+        if n not in syms:
+            print(f"missing symbol {n}")
+            return False
+    b.write_uint32(syms["run_modeypage_flag"], 1)
+    if not wait_flag(b, syms["run_modeypage_flag"], 0, "Mode Y page arm hung"):
+        return False
+    r = [b.read_uint32(syms["modeypage_r"] + 4 * i) for i in range(24)]
+    print(f"  stride={r[0]} aliased_pages={r[1]} -> real={r[5]} | "
+          f"alias: page0={r[2]:#04x} (clobbered) hits={r[4]} | "
+          f"real: page0={r[7]:#04x} page1={r[8]:#04x} page2={r[9]:#04x} "
+          f"hits={r[10]} spill={r[13]} | half: pages={r[16]} "
+          f"page0={r[17]:#04x} then {r[19]:#04x} loud={r[20]}")
+
+    checks = [
+        ("the learned stride is Wolf3D's",            r[0], 16640),
+        ("one page: the aliased fold",                r[1], 1),
+        # ---- NEGATIVE CONTROL. Without this failing, everything below is a
+        # statement about a test that cannot fail.
+        ("alias: page 1 CLOBBERS page 0",             r[2], 0x22),
+        ("  ... page 1 holds it too",                 r[3], 0x22),
+        ("  ... and the loud counter fired",          r[4] > 0, True),
+        # ---- the property being bought
+        ("three real pages",                          r[5], 3),
+        ("  ... the counter reset with them",         r[6], 0),
+        ("page 0 UNDISTURBED by a page 1 write",      r[7], 0x11),
+        ("  ... page 1 holds its own byte",           r[8], 0x22),
+        ("  ... page 2 holds its own byte",           r[9], 0x33),
+        ("  ... nothing aliased",                     r[10], 0),
+        ("three pages are three PLACES",              r[11], 1),
+        ("  ... page 0 is still the aperture",        r[12], 1),
+        ("a whole page 1 fill spills nothing",        r[13], 0),
+        ("  ... page 0's byte survived it",           r[14], 0x11),
+        ("  ... still nothing aliased",               r[15], 0),
+        # ---- the half-funded rung, which is still worth taking
+        ("one extra page: two real",                  r[16], 2),
+        ("  ... page 0 undisturbed by page 1",        r[17], 0x44),
+        ("  ... quiet so far",                        r[18], 0),
+        ("  ... page 2 aliases onto page 0",          r[19], 0x66),
+        ("  ... LOUDLY",                              r[20], 1),
+        ("page 2 without page 1 is refused",          r[21], 1),
+    ]
+    bad = 0
+    for name, got, want in checks:
+        ok = got == want
+        bad += not ok
+        print(f"  {'PASS' if ok else 'FAIL'}: {name}: {got}"
+              + ("" if ok else f" (expected {want})"))
+    if bad:
+        print(f"FAIL: Mode Y real pages: {bad} of {len(checks)} checks")
+        return False
+    print(f"PASS: Mode Y real page storage ({len(checks)} checks): a write to "
+          f"page 1 leaves page 0 alone with real pages and OVERWRITES it with "
+          f"the alias (negative control seen to fail); the half-funded rung "
+          f"still protects the displayed page and says which page aliased")
+    b.write_uint32(syms["run_planar_flag"], 3)
+    wait_flag(b, syms["run_planar_flag"], 0, "planar unmap hung")
+    return True
+
+
 def egafit_checks(b, syms):
     """The ENLARGED EGA card: the CGA loan, the compaction, and the refusal.
 
@@ -1657,6 +1731,11 @@ def main(args):
         if not modey_checks(b, syms):
             return False
         if not present_checks(b, syms):
+            return False
+        # Right after the Mode Y arms, while the planar remap is up: this one
+        # is the only arm that asserts what the pixel arms structurally cannot
+        # see -- that the three display pages are three PLACES.
+        if not modeypage_checks(b, syms):
             return False
         if not ega_checks(b, syms):
             return False

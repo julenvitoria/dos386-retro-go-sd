@@ -61,7 +61,7 @@
 
 #define X86_ARENA_PAGE     4096u
 #define X86_ARENA_REGIONS  4u     /* disjoint AXI extents the arena may use */
-#define X86_ARENA_CLAIMS   4u     /* one per consumer; see the ids below */
+#define X86_ARENA_CLAIMS   5u     /* one per consumer; see the ids below */
 #define X86_ARENA_BLOCKS   8u     /* blocks in a single claim (EGA needs 4) */
 
 /* Claim ids. One per consumer, fixed rather than allocated, so a leaked claim
@@ -69,7 +69,12 @@
 #define X86_ARENA_ID_CGA    0u    /* 0xB8000, 32 KB */
 #define X86_ARENA_ID_VGA13  1u    /* 0xA0000, 64 KB linear */
 #define X86_ARENA_ID_EGA    2u    /* 0xA0000, 4 planes x 64 KB */
-#define X86_ARENA_ID_SPARE  3u
+#define X86_ARENA_ID_SPARE  3u    /* Mode Y's off-screen cache */
+/* Mode Y's REAL display pages 1 and 2, 64 KB each, out of frames donated by
+   the pager. Its own id rather than SPARE's second block because the cache is
+   sized by a fitting walk and these are fixed -- one claim that could be
+   partially satisfied is exactly what the all-or-nothing rule forbids. */
+#define X86_ARENA_ID_MODEYP 4u
 
 /* Give the arena an extent of AXI. Both ends are rounded INWARD to a page --
    an arena that hands out a partial page at either end is an arena that hands
