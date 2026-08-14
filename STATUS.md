@@ -1239,13 +1239,20 @@ Cost of all of the above: **400 bytes** of core (`__CORE_BSS_END__` 0x240593d0
 `test_text`, `test_keyboard`, `test_osk`, `test_audio`, `test_disk_cache`,
 `test_nor`.
 
-## Commander Keen 4 — reaches its startup screen, dies on the EGA gate
+## ~~Commander Keen 4 — reaches its startup screen, dies on the EGA gate~~ SUPERSEDED
+
+> Two claims below are refuted; the section is kept for the chain of reasoning.
+> (1) `--text` read the banner as a DETECTION result. "Detected Sound Hardware:
+> PC Speaker" is a printed LABEL that stays **dim** — see "Keen 4's detection
+> screen" above, which measured the attributes. (2) The outcome itself: since
+> `5de7e70` Keen does **not** stop at the EGA gate. See "Keen 4 on HEAD" below.
 
 First run of `KEEN4.dsk`, measured under gwemu (tier 2). It gets **further than
 any title here has**: its full 80x25 startup banner renders
 (`build/artifacts/keen4_startup.png`, `--text`) — title box, "Video Modes
-Available", "Detected Sound Hardware: PC Speaker", "Initializing... Please
-Wait". 7.2 M instructions, 418 sectors, `x86_dos_last_error=0`.
+Available", "Detected Sound Hardware: PC Speaker" (**a dim label, not a
+detection**), "Initializing... Please Wait". 7.2 M instructions, 418 sectors,
+`x86_dos_last_error=0`.
 
 The DOS and BIOS surface underneath it is **clean, and that is a measurement,
 not an assumption**. `x86_dos_file_log` holds three calls for the whole run and
@@ -1303,8 +1310,80 @@ Fixed here, and it is the reason the numbers above are trustworthy:
 `guest_halted=1`, `guest_exit_reason=4`**. It now stops when the guest does, and
 the rate falls to 0 — measured before (3.0 M/s forever) and after (0).
 
+## Keen 4 on HEAD — `5de7e70` traded a logged stop for a silent black screen
+
+**Re-measured under gwemu at `5de7e70`; every Keen number above it predates that
+commit and the prediction in `x86_bios.c:543-545` — "Commander Keen 4 is EGA-only
+and still stops at that gate" — is WRONG.** Keen never needed AH=12h: it takes
+the VGA answer from AH=1Ah and walks straight through.
+
+`probe_report.py --title keen4` (`build/artifacts/probe_keen4_gwemu.md`):
+
+| | pre-`5de7e70` (recorded) | HEAD (measured) |
+|---|---|---|
+| `INT 10h AH=1Ah` | AX=0x1a00 (AL=0) | **AX=0x1a1a, BX=0x0008** |
+| mode 0Dh requested | never | **yes, ×1 — refused** |
+| `x86_video_mode_log` | 1 adopt + 1 follow | `01005003`, `03000103`, **`05000d03`** = tag 5, asked 0x0D, mode 3 stays |
+| ports 0x201 / 0x388 / 0x40 | **never touched** | IN 0x201 ×10,002, IN 0x388 ×348, OUT 0x388/0x389 ×6 |
+| IN 0x3DA | ~15 k / 50 M | 41,302 / 64.7 M |
+| screen | banner: `0x5d`×1115, `0x5f`×159, 8 attrs | **`0x07`×2000, ONE attribute, 0 of 76,800 pixels non-zero** |
+
+`guest_halted=0`, `guest_exit_reason=3` (timer), `guest_insns_total` 64,743,225
+in 22 s, `x86_disk_reads=618` (was 418 — it now reads the 200 extra sectors of
+`EGAGRAPH.CK4` the AH=12h comment predicted), `x86_vga_dac_writes=0`.
+
+**Not one value cell ever became bright and the `xxxxx` placeholders were never
+replaced — because the banner is GONE.** `screenshot.py --attr` on HEAD returns a
+blank cleared screen. This is not "the same screen, still undetected": Keen now
+clears text mode, switches to 0Dh, and draws everything after that into EGA
+planes that do not exist.
+
+**Causation proved, not inferred.** Rebuilding HEAD with the single line
+`x86_bios.c:545` changed back to `x86_set_al(0x00)` reproduces the old banner
+byte for byte — `0x5d`×1114, `0x5f`×159, 9 attributes, 56,440 non-zero pixels
+(`build/artifacts/keen4_counterfactual_al0.png`; the recorded 1115 vs 1114 is one
+cursor cell). Nothing else about Keen changed.
+
+**This is the exact failure `x86_bios.c:493-504` refuses AH=12h to prevent, and
+it arrived through AH=1Ah instead.** The old reasoning at "EGA is the wall" —
+"claiming VGA through AH=1Ah is the same move wearing a different hat" — was
+right about Keen and wrong about Wolf3D. **The fix is not to revert it** (that
+re-breaks Wolf3D's `VW_VideoID`); it is mode 0Dh.
+
+### Where the guest actually spins — it is NOT the 0x3DA loop
+
+Measured with `X86_TRACE_EIP` (`SHIFT 16`, `SKIP 30 M`): **all 64 samples, spanning
+~4.2 M instructions, land in linear `0x15C70`–`0x15CC8`** — an 88-byte routine.
+Disassembling the guest bytes (`probe.py --guest 0x15c40:160`) it is Id's
+`IN_Ack`-style "wait for a key":
+
+```
+15C70  cmp word [CC4A],0      ; MousePresent
+15C7F  push cs; call ...      ; GetMouseButtons -- while(...) at 15C85
+15C8E  cmp word [bx+CC46],0   ; JoysPresent[si], si = 0..1
+15CAC  push si; push cs; call ; GetJoyButtons(si) -- while(...) at 15CB6
+15CC1  mov al,[A545]; or ax,ax; jz <back to 15C70>   ; LastScan
+```
+
+That names the 10,002 reads of port 0x201 (the joystick button poll) and it
+retires the old "15 k reads of 0x3DA is unexplained" note: **0x3DA is not where
+the time goes.** In the steady state `x86_io_log` shows short runs of 23-39 reads
+each, interleaved with `OUT 3D4,0C/0D` (CRTC start-address = page flip),
+`OUT 3C0` and `OUT 20` — i.e. the display refresh in the timer ISR, which took
+zero of the 64 EIP samples. The long `IN 3DA x4095` runs are one-off, from the
+planar clear before the loop is reached. `x86_hle_log`'s 32 newest entries are
+**all INT 08h**: after the refusal Keen makes no further BIOS or DOS calls.
+
+Not measured: whether Keen would render correctly given 0Dh — nothing here tests
+the planar path, only that the guest is alive, blind and waiting for input.
+
 ## Open defects
 
+- **Keen 4 shows a BLANK screen since `5de7e70`** — AH=1Ah answering VGA lets it
+  past the video gate into mode 0Dh, which `x86_video` refuses, and it then waits
+  for a keypress it cannot show a prompt for. Measured, with the counterfactual
+  build; see "Keen 4 on HEAD" above. Do not revert (Wolf3D needs the VGA answer);
+  the fix is EGA planar 0Dh.
 - **A segment override in front of `REP` survives only the first element.**
   `rep_resume` is the address of the F2/F3 prefix, not of the whole prefix run,
   so `26 F3 A4` (`ES: REP MOVSB`) rewinds to the `F3` and every element after
