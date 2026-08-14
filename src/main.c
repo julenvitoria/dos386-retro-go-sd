@@ -1444,9 +1444,9 @@ static const uint16_t cpu_profile_kips[] = {
     KIPS_486SX_25, KIPS_486DX2_66, KIPS_486DX4_100,
 };
 static const char *const cpu_profile_name[] = {
-    "Max", "8088 4.77 (330k)", "286 8MHz (800k)", "286 12MHz (1200k)",
-    "386SX 16 (2500k)", "386DX 33 (6000k)",
-    "486SX 25 (9000k)", "486DX2 66 (24000k)", "486DX4 100 (40000k)",
+    "Max", "8088 4.77 (330)", "286 8MHz (800)", "286 12MHz (1.2k)",
+    "386SX 16 (2.5k)", "386DX 33 (6k)",
+    "486SX 25 (9k)", "486DX2 66 (24k)", "486DX4 100 (40k)",
 };
 #define CPU_PROFILE_COUNT ((int)(sizeof(cpu_profile_kips) / sizeof(cpu_profile_kips[0])))
 /* The two arrays are indexed by the same variable; a mismatch reads off the
@@ -2143,10 +2143,11 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
              */
             {
                 /*
-                 * THE REFERENCE IS THE DISPLAY PERIOD, AND panel_ms_min IS NOT
-                 * IT. Measured on silicon during TOPBENCH: panel_ms_min read
-                 * 6 ms and leaked up to 11 over 42 s, while guest_fps_achieved
-                 * sat at 59 -- a real period of ~16.9 ms. It is a MINIMUM with
+                 * THE REFERENCE IS THE DISPLAY PERIOD, AND AN UNFLOORED
+                 * panel_ms_min IS NOT IT. Measured on silicon during TOPBENCH:
+                 * panel_ms_min read 6 ms and leaked up to 11 over 42 s, while
+                 * guest_fps_achieved sat at 59 -- a real period of ~16.9 ms.
+                 * It is a MINIMUM with
                  * a decay (`panel_ms_min++` every 512 frames), so it latches
                  * on the shortest iteration ever completed -- which happens
                  * during boot, in menus, and any frame the guest spent halted
@@ -2159,16 +2160,21 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                  * and the score crept upward as the leak raised the budget.
                  * That crawl is what looked "uncanny" from outside.
                  *
-                 * The loop swaps every iteration and the swap paces to the
-                 * panel, so whenever we are keeping up the ITERATION period IS
-                 * the display period -- and guest_fps_achieved measures it
-                 * directly. Clamped at both ends: a fps reading below 50 means
-                 * we are already dropping frames, and letting the target grow
-                 * on that reading is a runaway (slower -> bigger budget ->
-                 * slower). panel_ms_min stays as the published witness.
+                 * DERIVING IT FROM guest_fps_achieved WAS TRIED AND IS WRONG.
+                 * The measured rate is corrupted by the very overrun it would
+                 * be used to correct: budget too big -> frames dropped -> fps
+                 * falls -> the "period" reads longer -> budget grows again.
+                 * Measured on silicon: fps 59 -> 43, guest_panel_ms_used
+                 * pinned at its 20 ms clamp, exec 20 ms against a 16.9 ms
+                 * frame. The clamp bounded the runaway; it did not stop it.
+                 *
+                 * panel_ms_min is the right source after all -- its ONLY fault
+                 * was latching 6 ms during boot, when iterations really are
+                 * short. A sane floor fixes that completely, and it does not
+                 * feed back on anything we are regulating. Measured reading
+                 * once the guest is running: 16 ms, which is the panel.
                  */
-                uint32_t fps = guest_fps_achieved;
-                uint32_t panel = fps ? (1000u / fps) : 16u;
+                uint32_t panel = panel_ms_min ? panel_ms_min : 16u;
                 if (panel < PANEL_MS_MIN_SANE) panel = PANEL_MS_MIN_SANE;
                 if (panel > PANEL_MS_MAX_SANE) panel = PANEL_MS_MAX_SANE;
                 uint32_t target = panel * GUEST_EXEC_PCT;   /* x100 */
