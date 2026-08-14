@@ -539,8 +539,18 @@ int x86_bios_video(uint8_t func)
          * one: we DO have the DAC and 13h that AL=1Ah/BL=08h describes.
          *
          * AH=12h/BL=10h is deliberately left alone -- see the comment above.
-         * Commander Keen 4 is EGA-only and still stops at that gate, which is
-         * the failure this call's old comment was really protecting.
+         *
+         * CORRECTION, measured at this commit: the sentence that stood here --
+         * "Commander Keen 4 is EGA-only and still stops at that gate" -- was a
+         * PREDICTION and it is false. Keen never needs AH=12h. It takes AL=1Ah
+         * here, asks for mode 0Dh (x86_video_mode_log tag 5, aux 0x0D), and
+         * then runs forever against a BLANK screen: screenshot.py --attr goes
+         * from the 8-attribute startup banner to one attribute over all 2000
+         * cells, 0 non-zero pixels. Rebuilding with x86_set_al(0x00) below
+         * restores the banner exactly, so this line is the whole cause.
+         * The trade is still the right one -- Wolf3D hard-stops without it --
+         * but it is a trade, not a free win, and mode 0Dh is what pays it off.
+         * See STATUS.md, "Keen 4 on HEAD".
          */
         x86_set_al(0x1A);
         /* BX must be written, both halves. A BIOS that answers AL=1Ah and
