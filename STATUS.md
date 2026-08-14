@@ -1516,6 +1516,145 @@ loads art and runs, but there is no visible frame to confirm a menu), and how
 much of the 32,768-byte card is ever written (only the first 8,192 bytes were
 dumped; the frame's 0 non-zero pixels covers the rest indirectly).
 
+## Keen 4's LEVELS ARE NOT FIXABLE ON THIS DEVICE — settled, do not re-propose
+
+The arithmetic is `references/8086tiny/docs/video/11-ega-planar.md:299-330` and
+is not re-derived here. The reference measured, over a 1.2 G-instruction run at
+each plane size: 8 KB/plane (a 32 KB card) discards 24,982,090 writes and draws
+garbage; 16 KB/plane discards 21,231,084 and draws garbage; **64 KB/plane — a
+256 KB card, 262,144 B — discards 0 and is correct.** Keen's write AND read
+high-water is plane offset 65,536, because the Galaxy engine caches tiles and
+sprites in video memory above the visible page. **Nothing between 8 KB and 64 KB
+per plane buys a partial picture**, and our own run confirmed the degradation is
+worse, not better, in the middle (`x86_video.c:869-876`, and the Keen planar
+section above: 0 of 76,800 pixels).
+
+Against that, our arena, **measured on KEEN4 under gwemu at `a643f08`**
+(`probe.py --watch x86_arena_*`): `x86_arena_bytes=143,360`,
+`x86_arena_used=143,360`, `x86_arena_free=0`, `x86_arena_largest=0`. The whole
+arena is 140 KB and is already **100% committed** with the 32 KB card in it. A
+256 KB card is 262,144 B. There is no allocation, policy or eviction change that
+closes a 118,784 B gap against a pool with zero bytes free — the prior port's
+own route (the per-title COW spare) was refuted there too, at
+`11-ega-planar.md:331-390`.
+
+**0Dh gets Keen's banner and its menus. It will not get its levels.** Anything
+proposing otherwise must first produce 256 KB, and the number to beat is
+`x86_arena_free=0`.
+
+## Dark Forces re-measured, and DOS/4GW ruled OUT OF SCOPE — measured, not judged
+
+Re-measured at `a643f08` + the memory-call trace, gwemu tier 2,
+`probe_report.py --rom .../STAR_WARS_DARKFORCES.dsk` and `probe.py --dos-log`.
+
+**Where it gets.** `guest_halted=1`, `guest_exit_reason=4` (UNIMPLEMENTED),
+`exit_info=0x63` — opcode `ARPL` — at **CS:EIP `0393:005E`, linear `0x398E`**.
+Dumping guest `0x3980` (`probe.py --guest 0x3980:32`) shows that address holds
+`"onment on exec\r\n$Not enough memory"`: **the guest is executing DOS/4GW's own
+message strings.** `guest_insns_total=0`, which is not a broken counter — the
+counter only accrues on a frame the guest did not halt in (`src/main.c:2776`),
+so DF dies inside its FIRST frame slice. Pager at the stop: 7 pages resident,
+`x86_pg_exhausted=0`, `x86_seam_overflow=0`, `x86_code_relocs=4`.
+
+**The arena is exercised now, and it is not the defect.** 3 × `AH=48h`,
+15 × `AH=4Ah`, **0 × `AH=49h`**. The full sequence is legible via the memory
+calls now in the file trace. It converges — it terminates with a coherent
+answer at every step, and the one failure is CORRECT DOS semantics:
+
+* `[12]` `48h` BX=1 → seg `0x03a9`; `[13]` `4Ah` ES=`03a9` BX=`ffff` → CF=1
+  AX=8, `[14]` retry at BX=`9c56` → ok. The classic grab-all/shrink dance,
+  answered exactly as DOS answers it.
+* `[16]` `4Ah` ES=`03a9` BX=`9c51`, `[17]` `48h` BX=4 → seg `0x9ffb`. Block
+  `0x03a9` now owns the arena from `0x03a9` to `0x9FFA`.
+* `[22]` `4Ah` ES=`0071` BX=`0537` → **CF=1 AX=8**. Block `0x0071` cannot grow
+  past `0x0337` because block `0x03a9` sits immediately above it and is
+  ALLOCATED. Real DOS refuses this too.
+
+DOS/4GW then prints "Not enough memory" one byte at a time (30 × `AH=40h`,
+CX=1), issues `AH=4Bh AL=03h` (load overlay, **unanswered**), `1Ah`, two `29h`,
+and wanders into its own data. **The MCB arena audit is confirmed good against
+the title it was fixed for.**
+
+**Why DPMI/VCPI/XMS is OUT OF SCOPE, with the numbers.**
+
+1. DF wants ~8 MB flat. The pager holds `x86_pg_frames_total=160` frames —
+   **640 KB**. That is 12.5×, and it is not a policy problem.
+2. The read-mostly premise that NOR-XIP rests on is FALSE for every guest we
+   can actually run. Measured, gwemu tier 2, whole runs:
+   **WOLF3D** (210 M insns, alive): `x86_pg_resident=104`, `_faults_w=104`,
+   **`_faults_r=0`**, `_fill_zero=104`, `_fill_nor=0`, `_fill_file=0`.
+   **KEEN4**: `_resident=134`, `_faults_w=134`, **`_faults_r=0`**.
+   **Zero pages in either title's working set are read-only.** 100% of resident
+   pages became resident through a write — the same shape the prior project
+   measured ("~100% of NOR-backable data granules get written anyway"), now
+   confirmed on this tree. A protected-mode game's linear heap will not be
+   better than a real-mode game's, and it is 12.5× larger.
+3. The dependency chain to get one frame of Dark Forces is: XMS + VCPI + DPMI
+   servers, `CR0.PE`, the descriptor walk, far transfers and gates, `IRET`
+   across privileges, paging with a real TLB — every item of it (see below) —
+   and then the memory still is not there.
+
+**Dark Forces is out of scope. Do not half-build DPMI.** `x86_int_vec_log` held
+only vector `0x21` for an entire run; we provide none of INT 31h, INT 2Fh
+AX=1687h/4300h, INT 67h AX=DE00h or INT 15h AH=88h, and that stays true.
+
+## Protected mode, SIZED against `references/tiny386` — not started
+
+Sized only, because the item above says the memory it would reach is not there.
+`CR0` has never been non-zero on this tree (measured again on DF: `CR0=0` at the
+stop). Line counts are C in `references/tiny386/i386.c`, and our cost is higher
+because every one of these is Thumb-2 in ITCM or a call out of it:
+
+| piece | tiny386 | notes |
+|---|---:|---|
+| `read_desc` + `set_seg` + `clear_segs` (GDT/LDT walk) | `i386.c:1048-1135`, ~88 lines | the entry point; every `MOV Sreg` becomes a walk |
+| paging + software TLB (`tlb_clear`/`tlb_refill`/`translate*`/`segcheck`) | `i386.c:527-724`, ~198 lines | `x86_cpu.h:47-75` already reserves 2 KB of `tlb_*` arrays that **nothing references** — that is the backing, and it is the same 2 KB the 8 MB aliasing bug needs |
+| far `CALL`/`JMP` + call gates (`pmcall`, `task_switch`) | `i386.c:4214-4509`, ~296 lines | |
+| interrupts with privilege change (`call_isr`, `__call_isr_check_cs`) | `i386.c:4510-4848`, ~339 lines | |
+| `IRET`/far `RET` across privileges (`pmret` + helpers) | `i386.c:4849-5041`, ~193 lines | |
+| `LAR`/`LSL`/`VERR`/`VERW`, `check_ioperm` | `i386.c:3335-3360`, `3536-3620`, ~111 lines | |
+
+**~1,225 lines of C**, plus the CPL and segment-limit checks tiny386 threads
+into `cpu_exec1` itself (`i386.c:2274-2500`, macro-expanded per opcode) — which
+in our design means touching the R6 descriptor contract in every handler, and
+that is the part that is not a line count.
+
+**V86 is NOT needed for the HLE machine we are.** V86 exists to run real-mode
+DOS under a protected-mode supervisor; our INT 21h never reaches guest code, so
+there is no DOS to run down there. tiny386 carries 18 `VM`-flag sites
+(`i386.c:2289`, `2301`, `2455`, `2478`, …) that we would simply not have.
+
+**Do not start this without a title that needs it AND fits in 640 KB.** DF does
+not fit; nothing else in `references/.../roms/dos` sets `CR0` at all.
+
+## The pager, exercised by a real guest for the first time
+
+WOLF3D and KEEN4, gwemu tier 2, `probe.py --retrogo --watch x86_pg_*`. Numbers
+in the DPMI section above. The three findings:
+
+1. **It works and it is quiet.** `x86_pg_exhausted=0`, `x86_pg_unmapped=0`,
+   `x86_pg_io_errors=0`, `x86_seam_overflow=0` across both titles.
+   `_frames_total=160` (the full 640 KB, no frame lost to alignment).
+2. **No title has ever come close to pressure.** WOLF3D peaks at 104 of 160
+   frames, KEEN4 at 134 of 160. The pool never empties, so
+   `take_free_frame()`'s failure arm is dead code in practice.
+3. **EVICTION IS NOT IMPLEMENTED, and the header says otherwise.**
+   `x86_pager.h:117-162` documents eviction-time dirty detection by comparison
+   against the tier's authoritative copy, and declares
+   `x86_pg_evictions`, `_drop_clean`, `_wb_zero`, `_wb_file`, `_wb_bytes`,
+   `_wb_opens`, `_wb_us_worst`, `_donated`. **Nothing in the tree increments any
+   of them** — `x86_pager.c:287-293` is the whole of victim selection: if the
+   free list is empty it returns `NO_FRAME` and the guest takes
+   `X86_EXIT_MEM_FAULT`. `--gc-sections` drops all eight symbols from
+   `dos_core.elf`, which is how this was found: `probe.py` could not resolve
+   them. `x86_livemap_hits` (`x86_arena.c:355`) is also GC'd — the eviction veto
+   ring is armed but never consulted, because nothing evicts.
+   The NOR and FILE tiers are equally untouched by a real guest:
+   `x86_nor_attached=0`, `_fill_nor=0`, `_fill_file=0` in both titles.
+   `tests/test_paging.py` and `test_nor.py` exercise the tiers directly at tier
+   1; **no guest has driven an eviction, and none can, because there is no code
+   to drive.**
+
 ## Open defects
 
 - ~~**Keen 4 shows a BLANK screen since `5de7e70`**~~ — the REFUSAL is gone: 0Dh

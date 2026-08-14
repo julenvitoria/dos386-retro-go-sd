@@ -60,18 +60,25 @@ placement, retro-go core packaging) are **complete and verified on hardware**.
 Ordered within each queue. `STATUS.md` holds the evidence for each; this is the
 list, not the history.
 
-**Queue A — Dark Forces and the memory tier**
-1. Re-measure Dark Forces. The MCB arena is fixed but DF issues zero INT 21h
-   calls since the launch-path revert, so the arena is unexercised by it.
-2. **Decide DPMI/VCPI/XMS in or out of scope by MEASURING first** — the
-   code-vs-data write split for a DOS/4GW image. DF wants ~8 MB against ~840 KB
-   of AXI. Do not half-build it; the answer may be "out of scope".
-3. Protected mode: descriptor walk, far transfers, IRET privilege change,
-   paging. Sized against `references/tiny386`. `CR0` has never been non-zero.
-4. Exercise the pager. ZERO/NOR/FILE tiers are built and **no guest has ever
-   run against them**.
-5. Keen 4 levels are **not fixable** — 256 KB card against ~145 KB of arena.
-   Recorded so it is not re-proposed.
+**Queue A — Dark Forces and the memory tier: CLOSED, measured 2026-08-14.**
+Evidence in `STATUS.md`; the verdicts, so they are not re-opened by guess:
+1. ~~Re-measure Dark Forces.~~ Done. It exercises the arena now (48h ×3,
+   4Ah ×15, 49h ×0) and **the arena is correct** — the one refusal is real DOS
+   semantics. DF dies in its FIRST frame slice at `0393:005E` executing its own
+   "Not enough memory" string, exit reason 4, opcode `0x63`.
+2. ~~Decide DPMI/VCPI/XMS.~~ **OUT OF SCOPE.** DF wants ~8 MB against the
+   pager's 160 frames = 640 KB, and the read-mostly premise is dead: WOLF3D
+   `_faults_r=0/_faults_w=104`, KEEN4 `0/134`. **Zero read-only pages in either
+   working set.** Do not half-build DPMI.
+3. Protected mode: **sized, not started** (~1,225 lines of tiny386 C, table in
+   `STATUS.md`; V86 not needed since INT 21h is HLE'd). Gated on a title that
+   needs it AND fits in 640 KB. There is none.
+4. ~~Exercise the pager.~~ Done, WOLF3D and KEEN4: quiet, `_exhausted=0`, peak
+   104/160 and 134/160 frames. **New defect found: eviction is not implemented
+   at all** — eight documented `x86_pg_*` counters and `x86_livemap_holds()`
+   have no callers and are GC'd out of the ELF.
+5. ~~Keen 4 levels.~~ **NOT FIXABLE, settled**: 262,144 B of card wanted against
+   `x86_arena_bytes=143,360` measured 100% used, `x86_arena_free=0`.
 
 **Queue B — rendering, then the interpreter**
 1. A **golden-screenshot gate** with programmatic comparison. Two "runs fine,
