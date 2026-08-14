@@ -1,0 +1,29 @@
+{
+  "because": "first capture",
+  "insns": 250000000,
+  "renderer": "Mode Y (unchained 13h)",
+  "sha256": "ed1292d37d8f18cd8bb2aae8987a2b43fc12990b066292ace7648fabbc0561a2",
+  "shows": "Wolfenstein 3D id Software credits screen in Mode Y (unchained 13h): red field, the id logo blitted from off-screen VRAM at the top, all eight credit lines legible in yellow/blue/white. Verified by eye against the DOSBox-X reference layout.",
+  "state": "verified",
+  "timeline": "timelines/start-preselected-game.tl",
+  "title": "WOLF3D",
+  "verified_at": "2026-08-14T16:55:38+02:00",
+  "verified_by": "agent-QueueB (viewed at capture)",
+  "witness": {
+    "clut_src": "ext_clut (256 entries)",
+    "frames_rendered": 1281,
+    "guest_insns_total": 251266988,
+    "ltdc": {
+      "fmt": 5,
+      "lines": 240,
+      "pitch": 320
+    },
+    "x86_arena_largest": 12288,
+    "x86_vga_ega_card_offsets": 0,
+    "x86_vga_latch_miss": 768,
+    "x86_vga_modey_lost_cache": 16896,
+    "x86_vga_modey_lost_nocache": 0,
+    "x86_vga_planar_lost": 18432,
+    "x86_video_mode_byte": 19
+  }
+}

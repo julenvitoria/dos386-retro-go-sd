@@ -248,7 +248,7 @@ volatile uint32_t text_scroll_arg = 0;      /* (attr << 8) | lines */
  */
 #define PLANAR_CODE_BASE 0x3000u
 volatile uint32_t run_planar_flag = 0;
-volatile uint32_t planar_r[12];
+volatile uint32_t planar_r[20];
 
 /*
  * MODE Y PRESENTATION POLICY -- which frames the loop paints.
@@ -602,8 +602,14 @@ static void planar_test_init(void)
     x86_arena_add_region(arena_test_mem, 8u * 4096u);
     x86_bios_init();
     x86_hle_install(hle_vectors, sizeof(hle_vectors));
-    for (unsigned i = 0; i < 12; i++)
+    for (unsigned i = 0; i < 20; i++)
         planar_r[i] = 0;
+    /* Reset the write-class mix with the arm, not with the process: the
+       coverage assertion is about the stores THIS arm makes, and an earlier
+       arm's leftovers would make it pass without entering anything. */
+    x86_vga_planar_cls_plane = 0;
+    x86_vga_planar_cls_copy = 0;
+    x86_vga_planar_cls_general = 0;
 }
 
 static void planar_test_run(void)
@@ -621,6 +627,20 @@ static void planar_test_run(void)
     planar_r[9] = x86_vga_latch_miss;
     planar_r[10] = x86_vga_ega_armed;
     planar_r[11] = x86_arena_free;
+    /* The off-screen cache, in the only two terms that matter: how far up the
+       window it reaches, and whether anything was thrown away past it. A
+       discard COUNT alone cannot say how much bigger the cache needs to be --
+       _hi and _lo can. */
+    planar_r[12] = x86_vga_modey_cache_offs;
+    planar_r[13] = x86_vga_modey_lost_cache;
+    planar_r[14] = x86_vga_modey_lost_hi;
+    planar_r[15] = x86_vga_modey_lost_lo;
+    /* Write-class mix. The host asserts all three are non-zero: that is what
+       makes "64000/64000 exact" a statement about the two FAST paths and not
+       only about the general one. */
+    planar_r[16] = x86_vga_planar_cls_plane;
+    planar_r[17] = x86_vga_planar_cls_copy;
+    planar_r[18] = x86_vga_planar_cls_general;
 }
 
 /*
@@ -841,6 +861,87 @@ static void egafit_test_run(void)
     egafit_r[15] = x86_arena_deficit;                       /* > 0 */
 
     /* Leave nothing behind: the standard buffers and an empty arena. */
+    x86_arena_reset();
+    x86_video_init(cga_test_vram, cga_test_palette);
+    x86_video_set_aperture(vga_test_aperture, vga_test_pal);
+    x86_video_map();
+}
+
+/*
+ * The Mode Y OFF-SCREEN CACHE, fitted against the layout the real core claims.
+ *
+ * The cache was a fixed 8,192 offsets covering 0xC300..0xE2FF, and Wolfenstein
+ * 3D's cached pictures came out as noise because it writes them right up to
+ * 0xFFFF: measured on the device, 16,896 stores discarded and 4,928 latch
+ * loads reading an absent cell; measured under gwemu after the fit was made
+ * adaptive, x86_vga_modey_lost_lo/_hi read 0xEF00 and 0xFFFF with 11,264
+ * offsets fitted, which is what said the shortfall is the TAIL of the window
+ * rather than some interior hole.
+ *
+ * This arm runs the same fit the core runs, on the same 143,360-byte arena,
+ * and asserts the cache reaches 0x10000 -- because the ARITHMETIC working out
+ * is not evidence that a contiguous run exists. It has its own negative
+ * control (a small arena, where the fit must give something smaller and must
+ * still not refuse), and -DX86_MODEY_CACHE_NEGCTL=1 grades the check itself.
+ */
+volatile uint32_t run_modeyfit_flag = 0;
+volatile uint32_t modeyfit_r[16];
+
+static void modeyfit_test_run(void)
+{
+    void *cga = NULL, *v13 = NULL;
+
+    for (unsigned i = 0; i < 16; i++)
+        modeyfit_r[i] = 0;
+
+    x86_arena_reset();
+    x86_arena_add_region(arena_test_mem, 35u * 4096u);
+    modeyfit_r[0] = (x86_arena_claim(X86_ARENA_ID_CGA, 1, X86_VRAM_BYTES,
+                                     &cga) == 0);
+    modeyfit_r[1] = (x86_arena_claim(X86_ARENA_ID_VGA13, 1,
+                                     X86_VGA_APERTURE_BYTES, &v13) == 0);
+    modeyfit_r[2] = x86_arena_largest;              /* 45,056 */
+    x86_video_init(cga, cga_test_palette);
+    x86_video_set_aperture(v13, vga_test_pal);
+    x86_video_map();
+    /* Text FIRST: mode_select() short-circuits a set to the mode already up,
+       and the arm before this one leaves a graphics mode behind. */
+    x86_video_set_mode(0x03);
+
+    x86_video_set_mode(0x13);
+    modeyfit_r[3] = x86_video_mode();                       /* 0x13 */
+    modeyfit_r[4] = x86_vga_modey_cache_offs;               /* 15,616 */
+    modeyfit_r[5] = x86_arena_held(X86_ARENA_ID_CGA);       /* 0: lent */
+    modeyfit_r[6] = x86_arena_largest;
+
+    /* Scribble the cache, so a text buffer that came back holding cache bytes
+       rather than blanks cannot pass by being incidentally zero. */
+    if (x86_vga_modey_cache_offs)
+        memset((void *)x86_vga_modey_cache_ptr(), 0xEE,
+               4u * x86_vga_modey_cache_offs);
+
+    x86_video_set_mode(0x03);
+    modeyfit_r[7]  = x86_video_mode();                      /* 3 */
+    modeyfit_r[8]  = x86_arena_held(X86_ARENA_ID_CGA);      /* 1: returned */
+    modeyfit_r[9]  = *(const uint16_t *)x86_video_vram();   /* 0x0720 */
+    modeyfit_r[10] = x86_vga_modey_cache_offs;              /* 0: released */
+
+    /* ---- the negative control: an arena with no room for the full cache.
+       A SMALLER cache is the right answer here, not a refusal -- 13h itself
+       does not need the cache to render, only Mode Y's off-screen writes do,
+       and refusing the mode over it would lose a whole mode to a cache. */
+    x86_arena_reset();
+    x86_arena_add_region(arena_test_mem, 26u * 4096u);
+    x86_arena_claim(X86_ARENA_ID_CGA, 1, X86_VRAM_BYTES, &cga);
+    x86_arena_claim(X86_ARENA_ID_VGA13, 1, X86_VGA_APERTURE_BYTES, &v13);
+    x86_video_init(cga, cga_test_palette);
+    x86_video_set_aperture(v13, vga_test_pal);
+    x86_video_map();
+    x86_video_set_mode(0x03);
+    x86_video_set_mode(0x13);
+    modeyfit_r[11] = x86_video_mode();                      /* still 0x13 */
+    modeyfit_r[12] = x86_vga_modey_cache_offs;              /* < 15,616, > 0 */
+
     x86_arena_reset();
     x86_video_init(cga_test_vram, cga_test_palette);
     x86_video_set_aperture(vga_test_aperture, vga_test_pal);
@@ -3191,6 +3292,10 @@ void Reset_Handler(void) {
         if (run_egafit_flag == 1) {
             egafit_test_run();
             run_egafit_flag = 0;
+        }
+        if (run_modeyfit_flag == 1) {
+            modeyfit_test_run();
+            run_modeyfit_flag = 0;
         }
         if (run_planar_flag == 3) {
             planar_test_unmap();

@@ -38,6 +38,20 @@ at a display start of 0 and an Offset of 40 the correct de-interleave IS the
 linear read. A mutation that is a no-op at the geometry under test cannot grade
 anything.
 
+  CACHE    -DX86_MODEY_CACHE_NEGCTL=1   the off-screen cache goes back to the
+                                        fixed 8,192 offsets it shipped as,
+                                        ending at 0xE2FF. WOLFENSTEIN 3D WRITES
+                                        CACHED PICTURES UP TO 0xFFFF (measured:
+                                        16,896 stores discarded on the device,
+                                        and x86_vga_modey_lost_lo/_hi read
+                                        0xEF00/0xFFFF under gwemu once the fit
+                                        was made adaptive), so everything above
+                                        0xE2FF was thrown away and every
+                                        picture blitted back out of it was
+                                        noise. Graded by the modeyfit arm,
+                                        which asserts the cache reaches the top
+                                        of the window.
+
   FLIP     -DX86_MODEY_PRESENT_ON_FLIP=0  the reference's own switch
                                         (-DDOS_MODEY_PRESENT_ON_FLIP=0), which
                                         takes the whole scheme back to the
@@ -74,6 +88,7 @@ ARMS = [
     ("BLIT",   "-DX86_MODEY_BLIT_NEGCTL=1",   False, "--modey-only"),
     ("PAGE",   "-DX86_MODEY_PAGE_NEGCTL=1",   False, "--modey-only"),
     ("FLIP",   "-DX86_MODEY_PRESENT_ON_FLIP=0", False, "--present-only"),
+    ("CACHE",  "-DX86_MODEY_CACHE_NEGCTL=1",  False, "--modeyfit-only"),
     ("LEARN",  "-DX86_MODEY_PAGE0=16384",     True,  "--modey-only"),
 ]
 
@@ -112,7 +127,7 @@ def main():
     if fail:
         print("PLANAR CONTROLS FAIL")
         return 1
-    print("PLANAR CONTROLS PASS (5/5 negative controls caught, stride learning "
+    print("PLANAR CONTROLS PASS (6/6 negative controls caught, stride learning "
           "proven from a wrong default)")
     return 0
 

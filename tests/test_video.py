@@ -897,14 +897,32 @@ def modey_checks(b, syms, quiet=False):
                      tries=600):
         return False
 
-    r = [b.read_uint32(syms["planar_r"] + 4 * i) for i in range(12)]
+    r = [b.read_uint32(syms["planar_r"] + 4 * i) for i in range(20)]
     mode, bda, unchained, page = r[0], r[1], r[2], r[3]
     stores, lost, flips = r[4], r[5], r[6]
     say(f"  mode={mode:#04x} bda449={bda:#04x} unchained={unchained} "
         f"page={page} stores={stores} lost={lost} flips={flips} "
         f"latch={r[8]}/{r[9]} exit={r[7]:#x}")
+    say(f"  write classes: plane={r[16]} copy={r[17]} general={r[18]}")
 
     ok = True
+    # COVERAGE, and it gates. The store path has two fast classes decided at
+    # OUT time; if this guest program never entered one of them, then
+    # "64000/64000 exact" says nothing about it and the fast path has no
+    # oracle. A fast path with no oracle is how a wrong register combination
+    # becomes silent corruption, which is the failure this area repeats.
+    # This arm is where the two FAST classes are graded -- a Mode Y title's
+    # frame is made of exactly these two idioms and nothing else, which is why
+    # `general` is 0 here and is graded by the EGA 0Dh arm instead.
+    for name, n in (("plane", r[16]), ("copy", r[17])):
+        if n == 0:
+            print(f"FAIL: not one store took the '{name}' write class, so the "
+                  f"64,000-pixel comparison does not grade it. Either the "
+                  f"guest program stopped exercising that idiom or the "
+                  f"classification in planar_reclass() no longer selects it. "
+                  f"A fast path with no oracle is how a wrong register "
+                  f"combination becomes silent corruption.")
+            ok = False
     if mode != 0x13 or bda != 0x13:
         print(f"FAIL: mode 13h was never adopted (mode {mode:#x}, BDA {bda:#x})")
         ok = False
@@ -1190,9 +1208,22 @@ def ega_checks(b, syms):
                      tries=600):
         return False
 
-    r = [b.read_uint32(syms["planar_r"] + 4 * i) for i in range(12)]
+    r = [b.read_uint32(syms["planar_r"] + 4 * i) for i in range(20)]
     print(f"  mode={r[0]:#04x} bda449={r[1]:#04x} ega_armed={r[10]} "
           f"stores={r[4]} lost={r[5]} arena_free={r[11]} exit={r[7]:#x}")
+    print(f"  write classes: plane={r[16]} copy={r[17]} general={r[18]}")
+    # THE GENERAL PATH'S coverage lives here, not in the Mode Y arm: 0Dh is
+    # where set/reset, the ALU, write modes 2 and 3 and partial Bit Masks are
+    # driven, and those are precisely the combinations planar_reclass() must
+    # NOT claim for a fast path. A zero here would mean the classification had
+    # started claiming them, and the pixels would be the only thing left to
+    # notice -- which is the same as noticing nothing until a title breaks.
+    if r[18] == 0:
+        print("FAIL: not one store took the 'general' write class. 0Dh drives "
+              "set/reset, the ALU and partial bit masks, and planar_reclass() "
+              "must never claim those for a fast path -- a 0 here means it "
+              "just did.")
+        return False
     if r[0] != 0x0D or r[1] != 0x0D:
         print(f"FAIL: mode 0Dh was not adopted (mode {r[0]:#x}, BDA {r[1]:#x}). "
               f"If the arena could not place 32,768 bytes the mode is REFUSED, "
@@ -1236,6 +1267,88 @@ def ega_checks(b, syms):
           "+ set/reset + write mode 1 + word OUTs + CRTC Offset/start + pel pan "
           "+ the card bound)")
 
+    b.write_uint32(syms["run_planar_flag"], 3)
+    wait_flag(b, syms["run_planar_flag"], 0, "planar unmap hung")
+    return True
+
+
+MODEY_CACHE_BASE = 0xC300       # X86_MODEY_CACHE
+WINDOW_OFFSETS = 0x10000        # the A segment decodes 64 KB per plane
+
+
+def modeyfit_checks(b, syms):
+    """The Mode Y off-screen cache, fitted against the real arena layout.
+
+    Wolfenstein 3D caches its pictures off-screen and blits them out with latch
+    copies, so text (drawn straight to the visible page) stayed perfect while
+    every cached picture turned to noise: the cache was a fixed 8,192 offsets
+    ending at 0xE2FF and the title writes up to 0xFFFF. The core fits it now,
+    and this asserts the fit on the layout the core actually claims -- the
+    arithmetic working out is NOT evidence that a contiguous run exists,
+    which is exactly the fragmentation trap the EGA work found.
+    """
+    for n in ("run_modeyfit_flag", "modeyfit_r"):
+        if n not in syms:
+            print(f"missing symbol {n}")
+            return False
+    b.write_uint32(syms["run_modeyfit_flag"], 1)
+    if not wait_flag(b, syms["run_modeyfit_flag"], 0, "Mode Y fit arm hung"):
+        return False
+    r = [b.read_uint32(syms["modeyfit_r"] + 4 * i) for i in range(16)]
+    top = MODEY_CACHE_BASE + r[4]
+    print(f"  claims={r[0]}{r[1]} largest_before={r[2]} mode={r[3]:#04x} "
+          f"cache={r[4]} (0x{MODEY_CACHE_BASE:04x}..0x{top - 1:04x}) "
+          f"cga_held={r[5]} largest_after={r[6]} | back: mode={r[7]:#04x} "
+          f"cga_held={r[8]} cell={r[9]:#06x} cache={r[10]} | "
+          f"control: mode={r[11]:#04x} cache={r[12]}")
+
+    if not (r[0] and r[1]):
+        print("FAIL: the harness could not make the core's own two claims")
+        return False
+    if r[2] != 45056:
+        print(f"FAIL: expected 45,056 bytes free before the loan, got {r[2]}")
+        return False
+    if r[3] != 0x13:
+        print(f"FAIL: mode 13h was not adopted (mode {r[3]:#x})")
+        return False
+    if top != WINDOW_OFFSETS:
+        print(f"FAIL: the cache is {r[4]} plane offsets and reaches "
+              f"0x{top:04x}, not 0x{WINDOW_OFFSETS:04x}. Everything from there "
+              f"to the top of the window is DISCARDED, and Wolfenstein 3D "
+              f"writes cached pictures over that whole range -- measured "
+              f"0xEF00..0xFFFF under gwemu. {4 * r[4]} bytes is not enough; "
+              f"{4 * (WINDOW_OFFSETS - MODEY_CACHE_BASE)} is.")
+        return False
+    if r[5]:
+        print("FAIL: the CGA claim is still held while 13h is up, so the "
+              "cache got only what was left over. Lending it is what makes "
+              "the full window fit.")
+        return False
+    if r[7] != 0x03 or not r[8] or r[10]:
+        print(f"FAIL: returning to text did not give the CGA claim back and "
+              f"release the cache (mode {r[7]:#x}, held {r[8]}, cache {r[10]})")
+        return False
+    if r[9] != 0x0720:
+        print(f"FAIL: the text buffer came back as {r[9]:#06x}, not blank "
+              f"(0x0720). Its pages held cache bytes and were not cleared, so "
+              f"the guest's screen is cache data read as glyphs.")
+        return False
+    # ---- the negative control: a small arena. A cache is not worth refusing a
+    # whole mode over, so the right answer is a SMALLER cache, not a refusal.
+    if r[11] != 0x13:
+        print(f"FAIL: 13h was refused ({r[11]:#x}) because the full cache did "
+              f"not fit. 13h renders from the aperture and does not need the "
+              f"cache at all; only Mode Y's off-screen writes do.")
+        return False
+    if not (0 < r[12] < r[4]):
+        print(f"FAIL: against a small arena the fit gave {r[12]} offsets, "
+              f"expected something smaller than {r[4]} and non-zero. The walk "
+              f"down is what makes a tight arena degrade instead of refuse.")
+        return False
+    print(f"PASS: Mode Y cache 8,192 -> {r[4]} plane offsets ({4 * r[4]} B) "
+          f"covering 0x{MODEY_CACHE_BASE:04x}..0x{top - 1:04x}, the whole "
+          f"off-screen window; CGA lent and returned blank; a tight arena "
+          f"degrades to {r[12]} offsets rather than refusing the mode")
     b.write_uint32(syms["run_planar_flag"], 3)
     wait_flag(b, syms["run_planar_flag"], 0, "planar unmap hung")
     return True
@@ -1474,6 +1587,11 @@ def main(args):
             # guest program, so nothing else has to run first.
             time.sleep(0.5)
             return present_checks(b, syms)
+        if getattr(args, "modeyfit_only", False):
+            # The fit arm alone, for the CACHE control. It builds its own arena
+            # and its own video buffers, so nothing has to run before it.
+            time.sleep(0.5)
+            return modeyfit_checks(b, syms)
         if getattr(args, "modey_only", False):
             # The single arm scripts/run_planar_controls.py builds and re-runs
             # once per control. Nothing else runs, so a control's verdict is
@@ -1545,7 +1663,11 @@ def main(args):
         # LAST: it re-points the video layer at arena blocks of its own and
         # rebuilds the arena around them, so nothing may run after it that
         # expects the harness's standard buffers still to be claimed.
-        return egafit_checks(b, syms)
+        if not egafit_checks(b, syms):
+            return False
+        # LAST for the same reason egafit is: it rebuilds the arena around
+        # blocks of its own.
+        return modeyfit_checks(b, syms)
     finally:
         runner.stop()
 
@@ -1558,6 +1680,9 @@ if __name__ == "__main__":
                    help="run only the Mode Y arm (the controls driver uses this)")
     p.add_argument("--present-only", action="store_true",
                    help="run only the Mode Y presentation-policy arm")
+    p.add_argument("--modeyfit-only", action="store_true",
+                   help="run only the Mode Y off-screen-cache FIT arm (the "
+                        "CACHE control in scripts/run_planar_controls.py)")
     p.add_argument("--quiet", action="store_true",
                    help="suppress the PASS chatter; the exit code is the verdict")
     args = p.parse_args()

@@ -332,6 +332,7 @@ python3 scripts/probe.py --retrogo --wait-magic --set guest_kips=330     # 8088
 | `x86_kb_pushes` / `x86_kb_pops` / `x86_kb_peek_hits` | the BDA ring's producer and its two consumers. "The guest polls INT 16h forever" has two opposite causes -- nothing was queued, or something dequeued it first -- and only these three separate them. `pushes == pops == peek_hits` means every key was queued, seen and taken; `pushes > 0` with `pops == 0` is the reported failure |
 | `x86_dos_file_log` / `x86_dos_path_log` | The **first 96** file-family INT 21h calls, four words each -- `(func << 8) \| AL`, `(CF << 16) \| AX`, `BX`, `CX:DX` -- plus the last sixteen paths. Read it with **`probe.py --dos-log`**, which decodes it to one line per call. It **SATURATES rather than wrapping**, and that is the point: a guest stuck in a loop overwrote a 32-slot ring with the loop body in milliseconds, so the call that ISSUED the handle the loop was failing on was always gone -- WOLF3D's 32 identical AH=42h slots said nothing, and with 96 saturating slots the answer was in entry 2. The old two-word form also could not say WHICH handle, which is the only question a failing seek raises. `x86_dos_file_calls` counts every call whether recorded or not; write 0 to `x86_dos_file_log_idx` to re-arm for a later phase. `x86_hle_log` cannot answer a file question at all: a guest polling the keyboard fills all 32 of its slots between one open and the next. **The MEMORY calls `48h`/`49h`/`4Ah` also take a slot** -- an arena that refuses an allocation is unreadable as a bare count, which is exactly how Dark Forces' 15 `4Ah` calls sat unexplained -- but they are NOT counted in `x86_dos_file_calls`, and for them slot+3 is `(ES << 16) \| DX`, since ES is the block for `49h`/`4Ah` and DX means nothing there. `--dos-log` prints those as `BX=... paras ES=...` |
 | `x86_io_log` | Every port access, **coalesced by (direction, port)** into 32 runs, decoded by **`probe.py --io-log`**. Coalescing is what makes it useful: a mode-13h palette upload is 768 consecutive writes to 0x3C9 and would flush every other port out of a raw ring. What it shows is the SHAPE of a guest's hardware conversation -- which register files it programs, in what order -- and that named WOLF3D's wall in one run: `OUT 3D4,0F / OUT 3D5,66 / IN 3D5` reading back 0xFF, i.e. a CRTC write-then-read-back probe against a register file that did not exist. It also caught the FIX overshooting -- answering the 0x3B4/0x3B5 mono alias too made the guest conclude MONO and poll 0x3BA 32,000 times |
+| `x86_vga_planar_stores` / `_cls_plane` / `_cls_copy` / `_cls_general` | Guest stores that took the planar hook, split by WRITE CLASS -- the class is decided at `OUT` time, not per store. `_plane` is the CPU byte straight into the enabled planes (write mode 0, no Set/Reset, Bit Mask 0xFF, no rotate, no ALU); `_copy` is the write-mode-1 latched page copy; `_general` is everything else and is the only class still paying the full pipeline. **The MIX is the number that says whether a fast path is earning its risk**, and `_general` is the one to watch: WOLF3D in Mode Y gameplay reads 0 there, so the fast paths cover its whole frame. The class counters count PER BYTE while `_stores` counts per store, so a guest doing word stores makes them exceed it -- that is not a discrepancy. Read the set with `probe.py --watch planar` |
 | `x86_disk_reads` / `x86_disk_backend_reads` | guest-side `disk_read()` calls and how many of them reached the SD card. The RATIO is the sector cache's whole point, it is exact under gwemu, and it is the number to quote — TOPBENCH boots on 115 / 7 |
 | `vga_aperture_ok` / `x86_vga13_ok` | is the mode 13h aperture (64 KB, bonus pool) and its palette block backed? A 0 in `x86_vga13_ok` means a guest asking for 13h is REFUSED and logged (event tag 5) rather than drawing into the open-bus filler -- which is the right behaviour, but it is a whole mode silently missing |
 | `x86_vga_dac_writes` | DAC bytes the guest has streamed through 0x3C9. **0 while a screen is black says the guest never got as far as the palette**, which separates "13h is broken" from "the guest never reached video" -- the distinction WOLF3D turned on |
@@ -386,6 +387,7 @@ x86_arena_refusals,x86_arena_deficit,x86_pinned_pages,x86_a20_state
 
 | Symbol | Meaning |
 |---|---|
+| `x86_vga_modey_cache_offs` / `_lost_cache` / `_lost_lo` / `_lost_hi` | The Mode Y off-screen cache: the plane offsets FITTED (it is sized from the arena, not fixed -- 15,616 on the shipping layout, covering 0xC300..0xFFFF), stores discarded past it, and **the lowest and highest offset a discard happened at**. The last two are the point: a discard COUNT cannot say how much bigger the cache needs to be -- 16,896 discards reads the same whether they are one offset past the end or spread over 8 KB -- and these named the shortfall as the window's TAIL in one run |
 | `x86_arena_bytes` / `_used` / `_free` / `_largest` | the display's AXI, as one pool instead of three permanent blocks. **`_largest` is the number that decides whether a mode fits**, not `_free`: a claim's block must be contiguous, so a fragmented arena can have room for an EGA plane and no run to put it in |
 | `x86_vga_ega_card_offsets` | the EGA 0Dh card actually fitted, in PLANE OFFSETS (one offset is four interleaved bytes, so the card is 4x this). Sized from the arena at the mode set, not fixed: 0Dh lends the CGA claim out and pulls the 13h aperture down to the bottom, which is 19,456 offsets on the shipping layout against the 8,192 that cut Keen 4's intro off at row 128. Read it with `x86_vga_planar_lost` and `x86_vga_latch_miss` -- a small card shows up there first |
 | `x86_arena_deficit` | bytes the LAST refused claim could not place. This is what a refusal message quotes -- "EGA needs 118,784 bytes more than exist" is actionable and "EGA failed" is not |
@@ -626,6 +628,66 @@ and line count, reads that memory and the firmware's CLUT, and rebuilds the
 frame. It also prints a coarse text map of the result, so a black or garbage
 capture is obvious without opening the file. `tests/test_screen.py` does this
 for one expected image; this is the general form.
+
+### `golden_screens.py` — the golden-screenshot GATE
+
+```bash
+python3 scripts/golden_screens.py list                       # what is covered
+python3 scripts/golden_screens.py check                      # THE GATE
+python3 scripts/golden_screens.py check --title WOLF3D
+python3 scripts/golden_screens.py repeat --title ALLEYCAT --runs 3
+python3 scripts/golden_screens.py capture --title KEEN4      # candidate only
+python3 scripts/golden_screens.py capture --title KEEN4 --bless \
+    --verified-by doug --shows "Keen 4 intro, EGA 0Dh, full height"
+```
+
+`screenshot.py` captures a picture; this **compares** it. Two "the guest runs
+happily and the screen is garbage" regressions shipped in one session and every
+tier-1 test passed through both, because nothing in the suite could see a
+picture. Each title is booted from its own freshly-built SD image, run to a
+fixed `guest_insns_total`, captured from the LTDC, and diffed against
+`tests/goldens/<TITLE>.png` pixel by pixel. Failures print **where**: a
+bounding box, a 16x12 block map and the worst pixel with both colours. A count
+alone cannot tell a palette off by one level from six thumbnails of noise.
+
+Four rules it is built around, each closing a way this gate could be worthless:
+
+1. **A golden captured from a BROKEN build blesses the bug.** So an image is
+   never a golden on its own: it needs a `<TITLE>.json` sidecar naming who
+   verified it by eye, when, and what they saw. `check` refuses a golden whose
+   sidecar is missing, incomplete, `unverified` or `known_bad`. The sha256 in
+   the sidecar is checked on load, so an image swapped underneath its
+   attestation is an error rather than a new baseline.
+2. **Re-blessing is visible.** `--bless` over an existing golden requires
+   `--because`, prints the pixel difference against the image it replaces, and
+   pushes the old attestation onto a `history` list. There is no silent
+   overwrite.
+3. **`known_bad` is a defect WITH A PICTURE.** It fails the gate — an
+   outstanding defect is not a pass — but it is summarised separately from a
+   regression, so a real regression cannot hide behind a bug someone already
+   knew about. `KEEN4.png` is one: the half-height EGA 0Dh intro.
+4. **The capture point is an instruction count, not a sleep.** `guest_insns_total`
+   is polled with adaptive sleeps so the overshoot is a fraction of a guest
+   frame; a flat 0.2 s poll overshoots by a MILLION instructions and lands on a
+   different frame every run. Prove a new capture point with `repeat` before
+   blessing it — "it looked the same" is not the proof, two identical frames are.
+
+**A mask is the last resort and never a wider tolerance.** Some elements are
+driven by guest TIME, not by the instruction stream — Alley Cat's cat walks off
+the PIT tick and its copyright line alternates between two equally correct
+strings — and no instruction-count capture point can freeze those. The manifest
+may declare `mask` rectangles, but only with a written `mask_reason` (enforced),
+and masked pixels are still counted and printed (`m` in the block map). A
+tolerance wide enough to absorb a moving sprite is wide enough to absorb the
+corruption the gate exists to catch.
+
+`tests/test_goldens.py` is the tier-1 half: it drives the comparator and the
+attestation rules against synthetic images with **negative controls for every
+failure this project has actually shipped** — a one-pixel shift, a rectangle of
+noise in an otherwise perfect screen, a uniform level shift, a half-height
+render, a defect one pixel outside a mask, and a golden with no attestation. It
+needs no target and runs in under a second, and it also re-checks the shipped
+goldens' hashes.
 
 ### `profile_opcodes.py` — which x86 opcodes burn the cycles
 
@@ -1082,6 +1144,12 @@ python3 tests/test_screen.py             # what the LTDC actually scans out,
                                          # reconstructed to build/artifacts/screen.png
                                          # (checks whichever mode the core is
                                          # in -- text if a guest is running)
+python3 tests/test_goldens.py            # the golden gate's COMPARATOR and its
+                                         # attestation rules, against synthetic
+                                         # images with a negative control for
+                                         # each shipped failure mode. No target,
+                                         # under a second. The gate itself is
+                                         # scripts/golden_screens.py check
 python3 tests/test_disk_cache.py         # .dsk sector cache + read-ahead:
 python3 tests/test_disk_cache.py --sweep # backend calls + hit rate across
                                          # several cache geometries. The stream
@@ -1469,6 +1537,7 @@ Importable support only — no CLIs.
 | `refx86.py` | Unicorn run of that image, sampled like the target's own sampler |
 | `refdos.py` | A minimal DOS/BIOS for the reference, so it can run PAST the first INT 21h and say what the program should do. Deliberately not modelled on our x86_dos.c -- mirroring it would make the two agree on the same mistake. It has no port I/O, so it cannot follow a program that times against the CGA retrace |
 | `textmode.py` | Host-side model of the CGA text renderer: CP437 font load (4x8 by default, the table the renderer uses), the 80x25 -> palette-index render at 4x8 cells, AH=06 scrolling, and a readable CP437 dump. Shared by `test_text.py` (seeded pattern) and `test_screen.py` (the live guest) |
+| `golden.py` | The golden gate's comparator and its attestation object: an 8-bit-truecolour PNG reader (deliberately strict -- a decoder that coped with other shapes would let a differently-quantised golden in), a masked pixel comparison that reports WHERE it differs, and `Golden`, which refuses to be a golden at all without a record of who verified it and what they saw. Kept separate from `golden_screens.py` because it is the part that has to be right and the only part testable without a target |
 | `verify.py` | Symbol-region checks and ELF-vs-target section comparison |
 | `builder.py`, `runner.py` | Tier-1 build convenience |
 

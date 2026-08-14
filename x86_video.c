@@ -1209,6 +1209,62 @@ static uint32_t ega_fit_offsets(void)
    the card" is the first question a clipped picture raises. */
 volatile uint32_t x86_vga_ega_card_offsets;
 
+/*
+ * The Mode Y off-screen cache, sized to the arena rather than fixed.
+ *
+ * It was a flat 8,192 offsets, covering 0xC300..0xE2FF. Measured on hardware,
+ * WOLF3D's episode-select screen threw away 16,896 stores above 0xE300 and
+ * missed 4,928 latch loads, and the picture said the same thing: perfect text
+ * (drawn straight to the visible page) around six thumbnails of pure noise
+ * (cached off-screen, then blitted out with latch copies). Wolf3D's off-screen
+ * writes reach 0xEBFF, so the cache has to run to 0xEC00 -- 10,496 offsets --
+ * and the shipping layout leaves 12,288 bytes of arena unclaimed.
+ *
+ * So it is fitted the way the EGA card is: ask for the most that could ever be
+ * addressed and walk down a page at a time until the arena takes it. A
+ * re-claim releases the old block INSIDE claim_inner(), so the cache's own
+ * 32 KB is part of what the larger claim is placed into -- and this is exactly
+ * the fragmentation subtlety the EGA work found, where releasing a claim by
+ * hand leaves two holes because claims sit in init order. `x86_arena_largest`
+ * is the number that says whether it worked.
+ *
+ * The maximum is what the mode can ADDRESS, not what a title wants: the A
+ * segment decodes 64 KB per plane, so 0xC300 + 0x3D00 lands exactly on 0x10000
+ * and there is nothing above it to cache.
+ */
+#define X86_MODEY_CACHE_MAX   0x3D00u       /* 0x10000 - X86_MODEY_CACHE */
+#define MODEY_OFFS_PER_PAGE   (X86_ARENA_PAGE / 4u)
+
+/* The NEGATIVE CONTROL for the fit: pin the cache back to the fixed 8,192
+   offsets it shipped as. scripts/run_planar_controls.py builds this arm and
+   requires tests/test_video.py's Mode Y check to FAIL on it -- without that,
+   "the cache reaches the top of the window" is a check that cannot fail. */
+#ifndef X86_MODEY_CACHE_NEGCTL
+#define X86_MODEY_CACHE_NEGCTL 0
+#endif
+
+static uint32_t modey_fit_offsets(void)
+{
+    if (X86_MODEY_CACHE_NEGCTL)
+        return x86_arena_would_fit(X86_ARENA_ID_SPARE, 1,
+                                   4u * X86_MODEY_CACHE_OFFSETS)
+               ? X86_MODEY_CACHE_OFFSETS : 0u;
+
+    /* The FIRST try is the exact maximum, not the maximum rounded DOWN to a
+       page. 0x3D00 offsets is 62,464 bytes, which the arena rounds up to 16
+       pages internally; masking down first asks for 15,360 offsets instead and
+       leaves the top 256 offsets of the window uncached -- measured as 256
+       discarded stores at 0xFF00..0xFFFF with 16 KB of arena still free. */
+    uint32_t off = X86_MODEY_CACHE_MAX;
+
+    while (off >= MODEY_OFFS_PER_PAGE) {
+        if (x86_arena_would_fit(X86_ARENA_ID_SPARE, 1, 4u * off))
+            return off;
+        off = (off - 1u) & ~(MODEY_OFFS_PER_PAGE - 1u);
+    }
+    return 0;
+}
+
 static void planar_storage_follow(uint8_t kind)
 {
     void *blk = NULL;
@@ -1257,23 +1313,56 @@ static void planar_storage_follow(uint8_t kind)
     x86_vga_ega_card_offsets = 0;
     /* Give the borrowed frames back BEFORE anything else claims: a reclaim is
        refused while the arena still holds a page in the donated extent, and
-       cga_storage_reclaim() below is exactly such a claim. */
+       every claim below is exactly such a claim. The CGA reclaim itself moved
+       into the arms below, because the cache has to be released first -- see
+       the comment there. */
     x86_pager_reclaim_from_arena();
-    cga_storage_reclaim();
-    if (cga_lent)
-        return;                 /* the loan is outstanding: claim nothing */
     if (kind != VM_VGA8) {
+        /* RELEASE THE CACHE BEFORE RECLAIMING CGA, not after. Now that 13h
+           lends the CGA claim out as well, the cache is 62,464 bytes and the
+           arena has only 15,360 free while it is held -- so reclaiming first
+           cannot place the 32,768-byte CGA block, leaves the loan outstanding,
+           and the old early return then never released the cache either. The
+           mode goes back to text with no text buffer and a cache nobody owns.
+           Caught by tests/test_video.py's modeyfit arm, which is why that arm
+           checks the way BACK as well as the way in. */
         x86_arena_release(X86_ARENA_ID_SPARE);
         x86_vga_modey_set_cache(NULL, 0);
+        cga_storage_reclaim();
         return;
     }
+    /*
+     * 13h LENDS THE CGA CLAIM OUT TOO, for the same reason 0Dh does.
+     *
+     * Measured: with the cache fitted out of unclaimed arena alone it reaches
+     * 11,264 offsets (to 0xEEFF) and WOLF3D still discards 4,352 stores --
+     * x86_vga_modey_lost_lo/_hi read 0xEF00 and 0xFFFF, i.e. the title writes
+     * cached pictures right up to the top of the window and the shortfall is
+     * exactly the tail. Covering it needs 62,464 bytes against the 45,056 that
+     * exist without the loan.
+     *
+     * Nothing is lost by lending. The CGA claim holds the 80x25 cell buffer and
+     * the mode-4 pixel planes; in 13h neither is displayed -- every writer of
+     * it already stands down on cga_storage_ok(), and the renderer reads the
+     * aperture. Contents are not preserved, which is safe by the same single
+     * mechanism as 0Dh's loan: every return to text goes through INT 10h AH=00
+     * and x86_video_set_mode() clears the cell buffer after mode_select().
+     */
+    x86_arena_release(X86_ARENA_ID_SPARE);
+    x86_vga_modey_set_cache(NULL, 0);
+    cga_storage_lend();
+    /* Compact BEFORE measuring. Releasing a claim leaves two holes, because
+       claims sit in init order -- the EGA work found this the hard way, and
+       the arithmetic working out is not evidence that the RUN exists.
+       x86_arena_largest is. */
+    aperture_compact();
     /* The cache is claimed when 13h is ADOPTED, not when the guest unchains:
        unchaining happens inside an OUT to 0x3C4 and an arena claim there would
        put a placement walk on an I/O path, for storage that is only ever needed
        by a mode already up. */
-    if (x86_arena_claim(X86_ARENA_ID_SPARE, 1, 4u * X86_MODEY_CACHE_OFFSETS,
-                        &blk) == 0)
-        x86_vga_modey_set_cache(blk, X86_MODEY_CACHE_OFFSETS);
+    uint32_t offs = modey_fit_offsets();
+    if (offs && x86_arena_claim(X86_ARENA_ID_SPARE, 1, 4u * offs, &blk) == 0)
+        x86_vga_modey_set_cache(blk, offs);
     else
         x86_vga_modey_set_cache(NULL, 0);
 }
