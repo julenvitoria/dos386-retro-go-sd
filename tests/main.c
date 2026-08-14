@@ -532,7 +532,16 @@ static void planar_test_init(void)
     x86_video_set_aperture(vga_test_aperture, vga_test_pal);
     x86_video_map();
     x86_arena_reset();
-    x86_arena_add_region(arena_test_mem, ARENA_TEST_PAGES * 4096u);
+    /* EXACTLY 8 PAGES, and the number is the point. The EGA card is sized from
+       the arena now (x86_video.c, planar_storage_follow), so an arena of
+       whatever size would give this arm whatever card -- and the arm's whole
+       lower band, plus its read-back at window offset 0x5000, asserts that
+       stores PAST the fitted card are discarded. 32,768 bytes is one block of
+       4 x 8,192 offsets, the classic card these expectations are written
+       against, and it is also exactly Mode Y's off-screen cache. The
+       enlargement itself is tested by the egafit arm, against the layout the
+       real core claims. */
+    x86_arena_add_region(arena_test_mem, 8u * 4096u);
     x86_bios_init();
     x86_hle_install(hle_vectors, sizeof(hle_vectors));
     for (unsigned i = 0; i < 12; i++)
@@ -677,6 +686,93 @@ static void present_test_run(uint32_t which)
         present_r[2] = x86_modey_stale_paints;
     }
     x86_vga_modey_arm(0);
+}
+
+/* ---------------------------------------------------------------------------
+ * THE ENLARGED EGA CARD: the loan, the compaction, and the refusal.
+ *
+ * Run against the layout the REAL core claims, not one this arm invents: 35
+ * pages of arena, CGA (32,768) then the 13h aperture (65,536), in that order,
+ * because the order is what leaves the free space fragmented and is therefore
+ * half of what is under test. Expected, and every number is arithmetic:
+ *
+ *   before   143,360 - 32,768 - 65,536 = 45,056 free, all of it in one run
+ *   0Dh      the CGA claim is lent out and the aperture is pulled down into
+ *            the vacated bottom, leaving 77,824 contiguous = 19,456 offsets
+ *   back     the CGA claim is returned and the cell buffer is blank
+ *
+ * The negative control is 24 pages -- exactly CGA plus the aperture, nothing
+ * spare. 0Dh must be REFUSED and counted, not quietly given a card of zero:
+ * a mode adopted with nowhere for a pixel to go is a black screen with no
+ * cause, which is the failure the arena's all-or-nothing rule exists to stop.
+ */
+volatile uint32_t run_egafit_flag = 0;
+volatile uint32_t egafit_r[16];
+
+static void egafit_test_run(void)
+{
+    void *cga = NULL, *v13 = NULL;
+    uint32_t refused0;
+
+    for (unsigned i = 0; i < 16; i++)
+        egafit_r[i] = 0;
+
+    x86_arena_reset();
+    x86_arena_add_region(arena_test_mem, 35u * 4096u);
+    egafit_r[0] = (x86_arena_claim(X86_ARENA_ID_CGA, 1, X86_VRAM_BYTES,
+                                   &cga) == 0);
+    egafit_r[1] = (x86_arena_claim(X86_ARENA_ID_VGA13, 1,
+                                   X86_VGA_APERTURE_BYTES, &v13) == 0);
+    egafit_r[2] = x86_arena_largest;            /* 45,056 */
+    x86_video_init(cga, cga_test_palette);
+    x86_video_set_aperture(v13, vga_test_pal);
+    x86_video_map();
+    /* Text FIRST, always. mode_select() short-circuits a set to the mode
+       already up, and the arm that ran before this one leaves 0Dh up -- so
+       without this the whole test measures the PREVIOUS arm's card. */
+    x86_video_set_mode(0x03);
+
+    refused0 = x86_vga_ega_refused;
+    x86_video_set_mode(0x0D);
+    egafit_r[3] = x86_video_mode();                         /* 0x0D */
+    egafit_r[4] = x86_vga_ega_card_offsets;                 /* 19,456 */
+    egafit_r[5] = x86_arena_held(X86_ARENA_ID_CGA);         /* 0: lent */
+    egafit_r[6] = x86_vga_ega_armed;                        /* 1 */
+    egafit_r[7] = x86_vga_ega_refused - refused0;           /* 0 */
+
+    /* Scribble the whole card, so a text buffer that came back holding plane
+       bytes rather than blanks cannot pass by being incidentally zero. */
+    if (x86_vga_ega_planes())
+        memset((void *)x86_vga_ega_planes(), 0xEE,
+               4u * x86_vga_ega_plane_offsets());
+
+    x86_video_set_mode(0x03);
+    egafit_r[8]  = x86_video_mode();                        /* 3 */
+    egafit_r[9]  = x86_arena_held(X86_ARENA_ID_CGA);        /* 1: returned */
+    egafit_r[10] = *(const uint16_t *)x86_video_vram();     /* 0x0720 */
+    egafit_r[11] = x86_vga_ega_armed;                       /* 0 */
+
+    /* ---- the negative control: no spare page anywhere. */
+    x86_arena_reset();
+    x86_arena_add_region(arena_test_mem, 24u * 4096u);
+    x86_arena_claim(X86_ARENA_ID_CGA, 1, X86_VRAM_BYTES, &cga);
+    x86_arena_claim(X86_ARENA_ID_VGA13, 1, X86_VGA_APERTURE_BYTES, &v13);
+    x86_video_init(cga, cga_test_palette);
+    x86_video_set_aperture(v13, vga_test_pal);
+    x86_video_map();
+    x86_video_set_mode(0x03);
+    refused0 = x86_vga_ega_refused;
+    x86_video_set_mode(0x0D);
+    egafit_r[12] = x86_video_mode();                        /* NOT 0x0D */
+    egafit_r[13] = x86_vga_ega_refused - refused0;          /* >= 1 */
+    egafit_r[14] = x86_vga_ega_armed;                       /* 0 */
+    egafit_r[15] = x86_arena_deficit;                       /* > 0 */
+
+    /* Leave nothing behind: the standard buffers and an empty arena. */
+    x86_arena_reset();
+    x86_video_init(cga_test_vram, cga_test_palette);
+    x86_video_set_aperture(vga_test_aperture, vga_test_pal);
+    x86_video_map();
 }
 
 /* Put guest 0xA0000/0xB8000 back on test_ram, so an arm that runs after this
@@ -2007,6 +2103,10 @@ void Reset_Handler(void) {
         if (run_planar_flag == 2) {
             planar_test_run();
             run_planar_flag = 0;
+        }
+        if (run_egafit_flag == 1) {
+            egafit_test_run();
+            run_egafit_flag = 0;
         }
         if (run_planar_flag == 3) {
             planar_test_unmap();
