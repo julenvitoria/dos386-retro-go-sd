@@ -180,8 +180,10 @@ python3 scripts/ref_dos.py --engine dosbox --no-hooks --launch WOLF3D.EXE \
     --screen build/artifacts/w.png --save build/artifacts/w.bin
 ```
 
-That exact line reaches the **main menu** (slot 5) and the episode select
-(slots 1-4, 6-10), reproducibly across runs. It boots the image's OWN MS-DOS
+That exact line reaches the **episode select** in every slot; drop one press
+(`--keys space,space,space`) and every slot is the **main menu** instead. Which
+screen a given slot holds is a race between `--key-pace` and the title's own
+timing, so read the PNGs — do not cite a slot number. It boots the image's OWN MS-DOS
 (`imgmount 2 … -fs none` + `boot -l c`), not DOSBox-X's built-in DOS, so the
 software stack matches the QEMU engine and matches ours.
 
@@ -211,14 +213,42 @@ Four DOSBox-X traps, each of which produced silence rather than an error:
    exactly like one that hung. `--keys` is delivered with `autotype -w`, which
    is asynchronous and survives the `boot`.
 
-Two decoding rules in `state_screen()` that a naive reader gets wrong, both
-noted in the code: Wolf3D is **unchained**, so a pixel is
+Three decoding rules in `state_screen()` that a naive reader gets wrong, all
+noted in the code. Wolf3D is **unchained**, so a pixel is
 `plane = x & 3, offset = y*80 + (x >> 2)` over DOSBox-X's four-byte-interleaved
 VRAM — read linearly it comes out quarter-width and repeated, which looks like a
-rendering defect rather than a decoding one. And the DAC is located by scanning
-**forwards** for the first all-6-bit 768-byte run: any *shift* of the real table
-is also all-6-bit, so scanning backwards lands on the last valid shift and
-renders a correct frame in rotated colours.
+rendering defect rather than a decoding one. The 6-bit DAC is widened to 8 by
+**replication**, `(c<<2)|(c>>4)`, as DOSBox-X does — `c*255//63` is off by one
+on most values. And **neither the DAC nor the VRAM base is searched for by
+shape** (see below).
+
+##### The oracle was miscolouring every frame, and could not tell
+
+`state_screen()` used to take the first 768-byte window that was all-6-bit and
+varied as the palette, and take the last 2 MB of the component as VRAM. Both
+were plausible and both were wrong:
+
+* The scan matched `vga.dac + 6` — the true table shifted by ten bytes of
+  `combine[]`, i.e. three entries and one channel — so every index rendered as
+  its neighbour's colour with the channels rotated and Wolf3D's menus came out
+  **saturated blue** instead of dark red. Rotation alone leaves greys grey; it
+  was the index shift that made it visible, and nothing in the scan could tell
+  "found the palette" from "found something palette-shaped".
+* VRAM is *not* the tail: `vgapages`, `memsize`, `vga.lfb` and the
+  Paradise/Tseng/XGA blocks follow it, so every frame was read 1296 bytes late
+  — rolled up by four scanlines.
+
+Both are now read where DOSBox-X actually writes them, and **proven** there.
+`SerializeVga::getBytes()` (`references/dosbox-x/src/hardware/vga.cpp:2050`)
+writes one POD of `VGA_Dac` (`include/vga.h:573`), which carries the host-pixel
+cache `xlat32[256]` right after `rgb[256]` and rebuilds it from `rgb[]` on load
+(`vga_dac.cpp:501`) — so `xlat32[i] == pack(rgb[i] widened)` holds for all 256
+entries of the live DAC and for no shift of it, no fade buffer and no second
+palette the game keeps around. VRAM is located by arithmetic from the
+`vgapages` + `vga.mem.memsize` pair written after it (`vga_memory.cpp:3018`).
+If either check fails the script **raises**; there is no greyscale fallback and
+no "closest match", because a reference that renders the wrong colours without
+complaining silently invalidates every colour judgement made against it.
 
 **The image itself is healthy and that was checked host-side, not assumed.** All
 eight `.WL1` files plus `WOLF3D.EXE` are present on the MBR-partitioned FAT16

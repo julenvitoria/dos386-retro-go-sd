@@ -589,6 +589,19 @@ and pulls the whole low megabyte plus a rendered Mode-Y frame out of DOSBox-X
 `autosave=` save states, so there is an oracle at an arbitrary point now. The
 command and the four DOSBox-X traps are in [`TOOLING.md`](TOOLING.md).
 
+**The oracle was itself miscolouring every frame until 2026-08-14, and could
+not tell.** `state_screen()` took the first palette-SHAPED 768-byte run as the
+DAC and the last 2 MB as VRAM; it was matching `vga.dac + 6` (the true table
+shifted by ten bytes of `combine[]` — three entries and one channel), so Wolf3D
+menus rendered saturated **blue** instead of dark red, and the frame was read
+1296 bytes late, rolled up four scanlines. Both are now read from where
+`SerializeVga` writes them and PROVEN there — the DAC against DOSBox-X's own
+`xlat32[]` cache, VRAM by arithmetic from the `vgapages`/`memsize` pair — and a
+failed check raises instead of falling back. `ref_wolf3d_mainmenu.png`,
+`ref_wolf3d_episodes.png` and `w_*.png` are regenerated; the durable lesson is
+that **a heuristic that cannot fail is not a measurement**, and an oracle that
+is wrong quietly invalidates every judgement made against it.
+
 Checked host-side rather than assumed: the image is complete — all eight `.WL1`
 files and `WOLF3D.EXE` present on the MBR-partitioned FAT16 volume, every
 cluster chain at least as long as its directory size, `VSWAP.WL1` exactly
