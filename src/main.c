@@ -424,12 +424,20 @@ static uint32_t   rate_window_frames;
 #define TICK_NUM          1193182u    /* PIT input, Hz                       */
 #define TICK_DEN_MS      65536000u    /* 65536 (divisor) * 1000 (ms per s)   */
 #define TICK_CATCHUP_MAX        4u    /* ~220 ms of arrears, then drop       */
+/* IRQ 0s one frame may deliver. Each costs a sub-slice boundary and a guest
+   ISR entry, so a frame that owes hundreds (a debugger halt) must not try to
+   run them all back to back -- the arrears cap above is the time bound and
+   this is the per-frame one. Eight covers 140 Hz down to 17 fps. */
+#define TICK_IRQ_MAX            8u
 #define TICK_STALL_MS        1000u    /* longer than this is a stall, not lag */
-static uint32_t tick_acc;             /* ms * TICK_NUM, below one tick       */
+static uint32_t tick_acc;             /* ms * TICK_NUM, below one IRQ 0      */
+static uint32_t bda_acc;              /* the same, for the 18.2 Hz BDA count */
+static uint32_t tick_irqs_owed;       /* IRQ 0s this frame still has to give */
 static uint32_t tick_last_ms;
 volatile uint32_t guest_ticks = 0;          /* ticks handed to the guest     */
 volatile uint32_t guest_ticks_dropped = 0;  /* owed but refused (see above)  */
 volatile uint32_t guest_tick_irq_lost = 0;  /* tick IRQ the 1-deep slot ate  */
+volatile uint32_t guest_tick_divisor = 65536; /* PIT ch0 divisor in force    */
 volatile uint32_t guest_uptime_ms = 0;      /* host ms since the loop started */
 
 volatile uint32_t guest_exit_reason = 0;
@@ -1129,6 +1137,12 @@ static int mount_guest_disk(void)
 static void guest_reset(void)
 {
     memset(cpu_state_ptr, 0, sizeof(X86CPUState));
+    /* A reset machine's system timer is at its boot divisor again. Leaving a
+       previous guest's 140 Hz in place would run the next one's clock 7.7x
+       fast, which is the same defect in the opposite direction. */
+    x86_io.pit0_reload = 0;
+    x86_io.pit0_access = 0;
+    x86_io.pit0_latched = 0;
     for (int i = 0; i < 6; i++)
         cpu_state_ptr->segs[i].limit = 0xFFFF;   /* real mode: 64 KB segments */
     /* CS.D stays clear: real mode is 16-bit, which is now genuinely different
@@ -1838,6 +1852,27 @@ deliver:
     input_irqs += (uint32_t)x86_kbd_raise_irq(cpu_state_ptr);
 }
 
+/*
+ * Hand the guest one IRQ 0, if one is owed. The one-deep hard_int_pending slot
+ * is the emulated 8259A's whole model of priority: a keyboard IRQ already in it
+ * wins and the tick is COUNTED as lost rather than silently dropped, because a
+ * guest whose music or movement runs off INT 08h loses a beat here and how
+ * often that happens is exactly what nobody could see before.
+ */
+static void arm_tick_irq(void)
+{
+    if (!tick_irqs_owed)
+        return;
+    if (cpu_state_ptr->hard_int_pending) {
+        guest_tick_irq_lost++;
+        return;
+    }
+    cpu_state_ptr->hard_int_pending = 0x08;
+    cpu_state_ptr->pit_counter = 1;
+    tick_irqs_owed--;
+    guest_ticks++;
+}
+
 static void emulator_loop(const gw_firmware_abi_t *abi)
 {
     /* Give the I/O layer the host clock BEFORE the guest runs: it is what
@@ -1851,6 +1886,8 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
     guest_halted = 0;
     tick_last_ms = abi->HAL_GetTick();
     tick_acc = 0;
+    bda_acc = 0;
+    tick_irqs_owed = 0;
     x86_io.spk_window_ms = tick_last_ms;
     rate_window_ms = tick_last_ms;
     rate_window_insns = guest_insns_total;
@@ -1930,6 +1967,8 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                through. Re-base rather than let it read as owed ticks. */
             tick_last_ms = abi->HAL_GetTick();
             tick_acc = 0;
+            bda_acc = 0;
+            tick_irqs_owed = 0;
         }
 
         uint32_t frame_start_ms = abi->HAL_GetTick();
@@ -2036,33 +2075,56 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
             if (slice > max_slice)
                 slice = max_slice;
             guest_slice_now = slice;
-            cpu_state_ptr->pit_reload = slice;
 
-            /* --- clock 2: the BIOS tick. */
-            tick_acc += dt * TICK_NUM;
-            uint32_t owed = tick_acc / TICK_DEN_MS;
-            tick_acc -= owed * TICK_DEN_MS;
-            /* Time lost to a stall is still time: count it as dropped rather
-               than pretending the target was never away. */
-            owed += (stalled_ms * TICK_NUM) / TICK_DEN_MS;
+            /* --- clock 2: the BIOS tick, at the divisor the GUEST programmed.
+             *
+             * Channel 0 of the PIT is the system timer and the guest owns its
+             * divisor. 65536 (18.2065 Hz) is the boot value and what every
+             * guest that never touches port 0x40 keeps; a title that wants
+             * finer time programs its own and drives everything it paces --
+             * animation, movement, menu key-repeat -- off the resulting ISR.
+             * Wolfenstein 3D writes 0x214B, i.e. 140 Hz, which is 7.7x the
+             * boot rate: with the write dropped its whole sense of time ran at
+             * 13% of real, which is what "rotating is slow and the menu is
+             * sluggish" was. It is not a keyboard defect and not raw MIPS.
+             *
+             * The BDA 0x46C count stays on the 18.2065 Hz clock regardless --
+             * it is DOS's time of day, and it must not accelerate because a
+             * game reprogrammed the timer for itself. */
+            uint32_t div = x86_pit0_divisor();
+            guest_tick_divisor = div;
 
-            uint32_t emit = owed > TICK_CATCHUP_MAX ? TICK_CATCHUP_MAX : owed;
-            guest_ticks_dropped += owed - emit;
-            guest_ticks += emit;
-            for (uint32_t i = 0; i < emit; i++)
+            bda_acc += dt * TICK_NUM;
+            uint32_t bda_owed = bda_acc / TICK_DEN_MS;
+            bda_acc -= bda_owed * TICK_DEN_MS;
+            bda_owed += (stalled_ms * TICK_NUM) / TICK_DEN_MS;
+            if (bda_owed > TICK_CATCHUP_MAX)
+                bda_owed = TICK_CATCHUP_MAX;
+            for (uint32_t i = 0; i < bda_owed; i++)
                 x86_bios_tick();
 
-            if (emit) {
-                if (cpu_state_ptr->hard_int_pending) {
-                    /* One-deep slot, already holding the keyboard's IRQ 1.
-                       Counted, not hidden: a guest whose music runs off INT
-                       08h loses a beat here and we want to see how often. */
-                    guest_tick_irq_lost++;
-                } else {
-                    cpu_state_ptr->hard_int_pending = 0x08;
-                    cpu_state_ptr->pit_counter = 1;
-                }
-            }
+            uint32_t den = div * 1000u;         /* <= 65,536,000: fits */
+            tick_acc += dt * TICK_NUM;
+            uint32_t owed = tick_acc / den;
+            tick_acc -= owed * den;
+            /* Time lost to a stall is still time: count it as dropped rather
+               than pretending the target was never away. */
+            owed += (stalled_ms * TICK_NUM) / den;
+
+            /* The arrears cap is a TIME, not a count: 4 ticks was ~220 ms at
+               the boot divisor, and holding it at 4 while the guest asks for
+               140 Hz would throw away three quarters of its clock. */
+            uint32_t cap = (TICK_CATCHUP_MAX * 65536u) / div;
+            if (cap < TICK_CATCHUP_MAX)
+                cap = TICK_CATCHUP_MAX;
+            if (cap > TICK_IRQ_MAX)
+                cap = TICK_IRQ_MAX;
+            /* Anything last frame could not place (the one-deep slot was held
+               by the keyboard) is time the guest never got. Count it here
+               rather than letting the assignment below swallow it. */
+            guest_ticks_dropped += tick_irqs_owed;
+            tick_irqs_owed = owed > cap ? cap : owed;
+            guest_ticks_dropped += owed - tick_irqs_owed;
         }
 
         /*
@@ -2071,6 +2133,25 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
          * stops the guest rather than looping on the same instruction forever,
          * which would look exactly like a hang.
          */
+        /*
+         * ONE IRQ 0 PER FRAME IS A CEILING ON THE GUEST'S CLOCK, and at the
+         * boot divisor it was invisible: 18.2 Hz against a 60 Hz panel never
+         * needs two in a frame. A guest asking for 140 Hz needs two to eight,
+         * and the hard_int_pending slot is one deep -- so the frame's budget is
+         * cut into that many sub-slices and one interrupt is armed before each.
+         * The guest exits at every sub-slice boundary, which costs a handful of
+         * host cycles and nothing in the interpreter (delivery itself still
+         * happens IN-GUEST, see .handle_pit_or_irq).
+         */
+        uint32_t subs = tick_irqs_owed ? tick_irqs_owed : 1u;
+        if (subs > TICK_IRQ_MAX)
+            subs = TICK_IRQ_MAX;
+        uint32_t sub_slice = slice / subs;
+        if (sub_slice == 0)
+            sub_slice = slice;
+        cpu_state_ptr->pit_reload = sub_slice;
+        arm_tick_irq();
+
         uint32_t exec_start_ms = abi->HAL_GetTick();
         while (!guest_halted) {
             /*
@@ -2101,9 +2182,14 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
             if (reason == X86_EXIT_TIMER) {
                 cpu_state_ptr->exit_reason = 0;
                 /* The budget was spent, so that much of the debt is paid. */
-                guest_insn_debt -= (guest_insn_debt < slice)
-                                 ? guest_insn_debt : slice;
-                break;
+                guest_insn_debt -= (guest_insn_debt < sub_slice)
+                                 ? guest_insn_debt : sub_slice;
+                if (--subs == 0)
+                    break;
+                /* Another sub-slice: arm the next timer interrupt and go back
+                   in. Nothing else about the frame changes. */
+                arm_tick_irq();
+                continue;
             }
             if (reason == X86_EXIT_HLE_INT) {
                 cpu_state_ptr->exit_reason = 0;
@@ -2124,6 +2210,11 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                 cpu_state_ptr->exit_reason = 0;
                 if (!(cpu_state_ptr->eflags & 0x200u))
                     break;            /* interrupts masked: nothing can wake it */
+                /* A tick still owed for this frame is exactly what a HLT is
+                   waiting for, so give it one now rather than making it wait
+                   for the next frame -- at 140 Hz the frame is several ticks
+                   long and idling through them is time the guest never gets. */
+                arm_tick_irq();
                 if (cpu_state_ptr->hard_int_pending) {
                     /* Something is genuinely waiting. Pull the boundary in so
                        it lands now; EIP is already past the HLT, which is

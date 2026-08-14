@@ -281,14 +281,16 @@ PORT = {
     0x21: _e("unmodelled-port", "PIC interrupt mask -- in neither switch",
              "masking IRQ 0 or IRQ 1 has no effect here; the frame loop keeps "
              "delivering ticks and keys regardless"),
-    0x40: _e("unmodelled-port", "PIT channel 0 -- in neither switch",
-             "channel 0 is the SYSTEM TIMER, and its counter is readable. "
-             "Alley Cat reads it past 65,535 times in 28 s -- a latched "
-             "counter used as a fine clock or an entropy source. It floats "
-             "0xFF, i.e. a clock that never moves"),
+    0x40: _e("partial", "PIT channel 0 reload: the SYSTEM TIMER's rate",
+             "the WRITE is modelled -- the divisor drives how many IRQ 0s the "
+             "frame loop owes, which is what makes Wolfenstein 3D's 140 Hz "
+             "(0x214B) run at 140 Hz instead of 18.2. The READ is not: the "
+             "counter floats 0xFF, i.e. a clock that never moves, and Alley "
+             "Cat reads it past 65,535 times in 28 s as a fine clock or an "
+             "entropy source"),
     0x41: _e("unmodelled-port", "PIT channel 1 (DRAM refresh)"),
-    0x43: _e("partial", "PIT control word: only channel 2's access mode is "
-                        "modelled; a latch or a channel-0 program is dropped"),
+    0x43: _e("partial", "PIT control word: channels 0 and 2 keep their access "
+                        "mode; channel 1 and the latch command are dropped"),
     0x42: _e("implemented", "PIT channel 2 reload: the speaker's tone"),
     0x60: _e("implemented", "8042 keyboard data"),
     0x61: _e("implemented", "speaker gate + data"),

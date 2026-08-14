@@ -325,7 +325,8 @@ python3 scripts/probe.py --retrogo --wait-magic --set guest_kips=330     # 8088
 | `upper_filler_ok` | is 0xA0000-0xFFFFF backed? It comes from the bonus pool now, but a 0 here explains an option-ROM scan faulting |
 | `guest_insn_deficit` | instructions the emulated CPU owed and never ran. The answer to "I asked for a 386 — am I getting one?". Meaningful only in paced mode |
 | `guest_ips_achieved` / `guest_fps_achieved` | measured over a 1 s window. The number that matters in unthrottled mode |
-| `guest_ticks` / `guest_ticks_dropped` | 18.2065 Hz BIOS ticks emitted, and ones refused by the catch-up cap |
+| `guest_ticks` / `guest_ticks_dropped` | IRQ 0s handed to the guest, and ones refused by the catch-up cap or by the one-deep pending slot. **The rate is the GUEST's, not 18.2065 Hz**: it is the PIT input divided by whatever channel 0 holds |
+| `guest_tick_divisor` / `x86_pit0_writes` | the PIT channel 0 divisor in force, and how many times a guest has programmed port 0x40. 65536 is the boot value (18.2065 Hz); Wolfenstein 3D writes 0x214B (8523) for 140 Hz and paces its turning, animation and menu key-repeat off the resulting ISR. **A `guest_tick_divisor` of 65536 on a title whose `x86_pit0_writes` is non-zero means the program was dropped** -- which is what made Wolf3D's whole sense of time run at 13% of real. `guest_ticks / guest_uptime_ms` should read back as `1193182 / guest_tick_divisor` |
 | `panel_ms_min` | the display period, **learned** from the shortest iteration ever completed. Nothing assumes 60 fps |
 | `x86_kbd_read_log` / `x86_spk_log` | the last 32 bytes off port 0x60, and the last 32 writes that can move the speaker tone. `--dump x86_kbd_read_log:32x8` |
 | `x86_kb_pushes` / `x86_kb_pops` / `x86_kb_peek_hits` | the BDA ring's producer and its two consumers. "The guest polls INT 16h forever" has two opposite causes -- nothing was queued, or something dequeued it first -- and only these three separate them. `pushes == pops == peek_hits` means every key was queued, seen and taken; `pushes > 0` with `pops == 0` is the reported failure |
@@ -886,6 +887,16 @@ python3 tests/test_dos.py                # MCB arena, walked from the host, plus
                                          # 3Dh/3Fh/42h/3Eh/43h/4Eh/4Fh, the
                                          # not-found path, a drive-letter
                                          # prefix and a lower-case name
+python3 tests/test_pit.py                # PIT channel 0 -- the SYSTEM TIMER's
+                                         # divisor -- programmed by GUEST OUTs:
+                                         # the real Wolf3D sequence (0x214B =
+                                         # 140 Hz), lo-byte-only access keeping
+                                         # the high byte, a channel 2 program
+                                         # not disturbing it, and reload 0
+                                         # meaning 65536. --negative rebuilds
+                                         # with the port 0x40 case DELETED and
+                                         # requires a FAIL, restoring the source
+                                         # in a finally
 python3 tests/test_keyboard.py           # BDA ring -> INT 16h, consumed by
                                          # GUEST code: AH=01 peek + its ZF on
                                          # the IRET frame, AH=00 dequeue, the
