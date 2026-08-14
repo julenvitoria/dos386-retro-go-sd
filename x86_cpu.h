@@ -343,6 +343,11 @@ void x86_hle_set_zf(int set);
 int x86_video_map(void);
 uint8_t *x86_video_vram(void);
 void x86_video_render(uint8_t *dst, uint32_t stride);
+/* Optional 2-D engine offload for the CHAINED mode 13h blit only; NULL (the
+   default, and what the host tests build) keeps the CPU row loop. Contract and
+   the reason it is a hook rather than a call: x86_video.c. */
+extern int (*x86_video_blit_hook)(uint8_t *dst, const uint8_t *src,
+                                  uint32_t bytes);
 
 void x86_mem_pool_init(void *base, uint32_t bytes);
 uint32_t x86_mem_pool_free(void);

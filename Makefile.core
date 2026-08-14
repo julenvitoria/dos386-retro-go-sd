@@ -99,7 +99,17 @@ X86_PROBE ?= 0
 # scripts/trace_diff.py and `probe.py --dump x86_cs_log:16x4` need it on.
 X86_CS_LOG ?= 0
 
+# Chrom-ART (DMA2D) offload of the chained mode 13h blit, through the firmware
+# ABI's RGB565 M2M op. OFF by default and it is NOT an instrument -- it is an
+# UNVERIFIABLE optimisation: gwemu models the engine well enough to prove the
+# pixels but runs the transfer synchronously, so neither the timing nor the
+# placement of the wait can be checked below tier 3. The rationale, the price
+# and the strongly-ordered-framebuffer measurement it rests on are in src/main.c
+# on dma2d_blit_hook(). Build with X86_VIDEO_DMA2D=1 to A/B it on hardware.
+X86_VIDEO_DMA2D ?= 0
+
 CORE_C_DEFS := \
+-DX86_VIDEO_DMA2D=$(X86_VIDEO_DMA2D) \
 -DX86_SEAM_FIX=$(X86_SEAM_FIX) \
 -DX86_DOS_PSP_SHIFT=$(X86_DOS_PSP_SHIFT) \
 -DX86_PROFILE=$(X86_PROFILE) \
