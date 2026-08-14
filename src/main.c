@@ -713,11 +713,57 @@ volatile uint32_t run_benchmark_flag = 0;
    UPPER BOUND on what is left above it. See dtcm_state_init(). */
 volatile uint32_t core_dtcm_next = 0;
 volatile uint32_t core_dtcm_headroom_max = 0;
+/* Alignment padding the mode records actually paid. Was an unconditional 8,192
+   before they were allocated first; a non-zero value here means the firmware
+   allocated DTCM ahead of us and the saving is smaller than expected. */
+volatile uint32_t core_dtcm_mode_pad = 0;
 
 /* Allocate the 0-wait-state state from the firmware's DTCM bump pool. */
 static bool dtcm_state_init(void)
 {
     const gw_firmware_abi_t *abi = gw_firmware_abi();
+
+    /*
+     * MODE RECORDS FIRST, AND EXACTLY. They are the one tenant with an
+     * alignment requirement (8 KB, which the 66/67 EOR toggles depend on), and
+     * the old order paid for it twice: allocated LAST of the three at an
+     * arbitrary bump position, over-allocated by a whole 8 KB record so the
+     * base could be aligned INSIDE the block, and the padding was then dead
+     * for the session -- 8,192 bytes of a 106,496-byte pool, unconditionally.
+     *
+     * The bump pool's base is 8 KB-aligned, so asking FIRST usually needs no
+     * padding at all. "Usually" is not an invariant, though -- the firmware
+     * may have allocated before us -- so PROBE the pointer with a 1-byte ask
+     * and pay only the padding that is really needed. Same trick the guest-RAM
+     * pool uses for the same reason: a bump allocator will not tell you where
+     * it is, but it will hand you a byte.
+     *
+     * This is what funds the VGA aperture below. It was 2,300 bytes short.
+     */
+    /*
+     * DO NOT PROBE FOR THE ALIGNMENT. A 1-byte probe CONSUMES the aligned
+     * position it was meant to discover: the pool base is 8 KB-aligned, the
+     * probe takes byte 0, and the records then need 8,191 bytes of padding to
+     * reach the next boundary. Measured exactly that -- core_dtcm_mode_pad
+     * came back 8191 and the saving was ONE BYTE.
+     *
+     * Ask for the exact size and CHECK what came back instead. Being first,
+     * the answer is the pool base, which is aligned, so the common path pays
+     * nothing. Only if the firmware allocated ahead of us is the aligned
+     * ask needed, and only then is a block wasted.
+     */
+    uint8_t *mr = (uint8_t *)abi->mem_ctl(
+        GW_MEM_OP_ALLOC, GW_MEM_DTC, 1, X86_MODE_RECORDS_BYTES);
+    if (mr && ((uintptr_t)mr & (X86_MODE_RECORDS_ALIGN - 1u)) != 0u) {
+        /* Not aligned: the first block is unusable and stays leaked. Take the
+           over-allocated one and align inside it, which is the old behaviour. */
+        core_dtcm_mode_pad = X86_MODE_RECORDS_ALIGN;
+        mr = (uint8_t *)abi->mem_ctl(
+            GW_MEM_OP_ALLOC, GW_MEM_DTC, 1,
+            X86_MODE_RECORDS_BYTES + X86_MODE_RECORDS_ALIGN);
+    } else {
+        core_dtcm_mode_pad = 0;
+    }
 
     X86CPUState *st = (X86CPUState *)abi->mem_ctl(
         GW_MEM_OP_ALLOC, GW_MEM_DTC, 1, sizeof(X86CPUState));
@@ -725,12 +771,6 @@ static bool dtcm_state_init(void)
      * produce any of FOLD_ENTRIES, and a short table is read past its end. */
     uint32_t *pt = (uint32_t *)abi->mem_ctl(
         GW_MEM_OP_ALLOC, GW_MEM_DTC, FOLD_ENTRIES, sizeof(uint32_t));
-
-    /* Mode records. Over-allocated by one record so the base can be aligned
-     * up to 8 KB, which the 66/67 EOR toggles require. */
-    uint8_t *mr = (uint8_t *)abi->mem_ctl(
-        GW_MEM_OP_ALLOC, GW_MEM_DTC, 1,
-        X86_MODE_RECORDS_BYTES + X86_MODE_RECORDS_ALIGN);
 
     if (!st || !pt || !mr) {
         return false;   /* loud, not silent: core_dtcm_ok stays 0 */
