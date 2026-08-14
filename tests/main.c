@@ -8,6 +8,7 @@
 #include "../x86_video_planar.h"
 #include "../x86_pager.h"
 #include "../x86_xms.h"
+#include "../x86_ems.h"
 #include "../x86_profile.h"
 #include "../x86_osk.h"
 
@@ -2987,6 +2988,366 @@ static void xms_test_run(void)
     x86_pager_reset();
 }
 
+/* ===========================================================================
+ * EMS -- the MAPPED interface, driven by GUEST CODE doing the real sequence.
+ *
+ * x86_ems.h states the design point: XMS is a COPY interface and its bytes are
+ * never in the fold table, EMS is a MAPPED one and the four windows' bytes must
+ * be. This arm is the proof of the second half, and the only witness that can
+ * give it is a guest executing ordinary STOSW and MOV AX,ES:[SI] against
+ * E000:0000 -- nothing here calls x86_ems_int67() directly.
+ *
+ * THE PINNING PROPERTY IS ASSERTED, NOT ASSUMED, AND IT HAS A CONTROL. The pool
+ * is twelve frames for twenty-four backing pages, so pressure MUST evict. With
+ * logical page 0 mapped into window 0 its four granules are pinned and must
+ * come through untouched; logical page 1 is allocated but UNMAPPED, so it is an
+ * ordinary pager page and must be evicted by the same pressure. If the pin were
+ * a no-op the two would behave the same, which is what makes ems_r[32] a
+ * control rather than a restatement of ems_r[31].
+ * ===========================================================================
+ */
+volatile uint32_t run_ems_flag = 0;
+volatile uint32_t ems_r[40];
+
+/* All three regions come out of the arena arm's 160 KB (512-672 KB): the arms
+   never run at the same time and test_ram has no spare, which is the same
+   trade the XMS arm makes with the pagefile buffer. */
+#define EMS_FILL_OFF    (496u * 1024u)      /* the open-bus filler page      */
+#define EMS_POOL_OFF    (512u * 1024u)
+#define EMS_FRAMES      12u
+#define EMS_STORE_OFF   (576u * 1024u)
+#define EMS_TEST_PAGES  6u                  /* logical pages advertised      */
+#define EMS_SUBS        X86_EMS_SUBPAGES
+#define EMS_STORE_SLOTS (EMS_TEST_PAGES * EMS_SUBS)           /* 24 */
+#define EMS_FRAME_IDX   (X86_EMS_FRAME_LIN >> 12)
+
+static uint32_t emsb_fail;
+static int emsb_read(uint32_t slot, void *dst)
+{
+    uint32_t i = slot - X86_EMS_BACK_PAGE;
+    if (i >= EMS_STORE_SLOTS) { emsb_fail++; return -1; }
+    memcpy(dst, test_ram + EMS_STORE_OFF + i * 4096u, 4096u);
+    return 0;
+}
+static int emsb_write(uint32_t slot, const void *src)
+{
+    uint32_t i = slot - X86_EMS_BACK_PAGE;
+    if (i >= EMS_STORE_SLOTS) { emsb_fail++; return -1; }
+    memcpy(test_ram + EMS_STORE_OFF + i * 4096u, src, 4096u);
+    return 0;
+}
+
+#define EMS_RES     0x5000u
+#define EMS_NAME    0x4F00u
+#define EMS_CODE_A  0x4000u
+#define EMS_CODE_B  0x4400u
+#define EMS_CODE_C  0x4600u
+#define EMS_CODE_D  0x4800u
+
+/* ---- phase A: detect, allocate, map, WRITE THROUGH THE WINDOW, remap ----
+ * Results are words at EMS_RES + 2*n; the index in each comment is that n.
+ */
+static const uint8_t ems_code_a[] = {
+    0xB4, 0x3D, 0xB0, 0x00,             /* MOV AH,3Dh / MOV AL,0            */
+    0xBA, 0x00, 0x4F,                   /* MOV DX,EMS_NAME                  */
+    0xCD, 0x21,                         /* INT 21h -- open EMMXXXX0         */
+    0xA3, 0x00, 0x50,                   /* 0: the DOS handle                */
+    0x19, 0xC0,                         /* SBB AX,AX -- capture CF          */
+    0xA3, 0x02, 0x50,                   /* 1: 0 = CF clear = it opened      */
+    0xB4, 0x3E, 0x8B, 0x1E, 0x00, 0x50, /* MOV AH,3Eh / MOV BX,[handle]     */
+    0xCD, 0x21,                         /* INT 21h -- close it again        */
+
+    0xB4, 0x40, 0xCD, 0x67,             /* AH=40h manager status            */
+    0x88, 0x26, 0x04, 0x50,             /* 2: status, must be 0             */
+    0xB4, 0x41, 0xCD, 0x67,             /* AH=41h page frame segment        */
+    0x89, 0x1E, 0x06, 0x50,             /* 3: BX -- the frame               */
+    0x88, 0x26, 0x08, 0x50,             /* 4: status                        */
+    0xB4, 0x42, 0xCD, 0x67,             /* AH=42h pages free / total        */
+    0x89, 0x1E, 0x0A, 0x50,             /* 5: free                          */
+    0x89, 0x16, 0x0C, 0x50,             /* 6: total                         */
+    0xB4, 0x43, 0xBB, 0x04, 0x00,       /* AH=43h allocate 4 pages          */
+    0xCD, 0x67,
+    0x88, 0x26, 0x0E, 0x50,             /* 7: status                        */
+    0x89, 0x16, 0x10, 0x50,             /* 8: the EMS handle                */
+
+    /* map logical page 0 into physical window 0 */
+    0xB8, 0x00, 0x44, 0xBB, 0x00, 0x00,
+    0x8B, 0x16, 0x10, 0x50, 0xCD, 0x67,
+    0x88, 0x26, 0x12, 0x50,             /* 9: status                        */
+
+    /* ---- THE POINT OF THE ARM: 16 KB written with ORDINARY STORES ----
+       The value at each offset is (offset & 3FFFh) ^ key, so the same loop
+       verifies it in ANY window -- which is what phase C needs. 16 KB is four
+       granules, so this crosses three seams in each direction. */
+    0xB8, 0x00, 0xE0, 0x8E, 0xC0,       /* MOV AX,E000h / MOV ES,AX         */
+    0xBF, 0x00, 0x00,                   /* MOV DI,0                         */
+    0xB9, 0x00, 0x20,                   /* MOV CX,8192                      */
+    0x8B, 0xC7, 0x25, 0xFF, 0x3F,       /* MOV AX,DI / AND AX,3FFFh         */
+    0x35, 0x5A, 0x5A, 0xAB,             /* XOR AX,5A5Ah / STOSW             */
+    0xE2, 0xF5,                         /* LOOP                             */
+
+    /* remap the SAME window to logical page 1 and write a different key */
+    0xB8, 0x00, 0x44, 0xBB, 0x01, 0x00,
+    0x8B, 0x16, 0x10, 0x50, 0xCD, 0x67,
+    0x88, 0x26, 0x14, 0x50,             /* 10: status                       */
+    0xBF, 0x00, 0x00, 0xB9, 0x00, 0x20,
+    0x8B, 0xC7, 0x25, 0xFF, 0x3F,
+    0x35, 0xA3, 0xA3, 0xAB,
+    0xE2, 0xF5,
+
+    /* map logical page 0 BACK, and read it with ordinary loads */
+    0xB8, 0x00, 0x44, 0xBB, 0x00, 0x00,
+    0x8B, 0x16, 0x10, 0x50, 0xCD, 0x67,
+    0x88, 0x26, 0x16, 0x50,             /* 11: status                       */
+    0xBE, 0x00, 0x00,                   /* MOV SI,0                         */
+    0xB9, 0x00, 0x20,                   /* MOV CX,8192                      */
+    0xBB, 0x00, 0x00,                   /* MOV BX,0 -- the accumulator      */
+    0x26, 0x8B, 0x04,                   /* MOV AX,ES:[SI]                   */
+    0x8B, 0xEE, 0x81, 0xE5, 0xFF, 0x3F, /* MOV BP,SI / AND BP,3FFFh         */
+    0x33, 0xC5, 0x35, 0x5A, 0x5A,       /* XOR AX,BP / XOR AX,5A5Ah         */
+    0x0B, 0xD8, 0x46, 0x46,             /* OR BX,AX / INC SI / INC SI       */
+    0xE2, 0xEC,                         /* LOOP                             */
+    0x89, 0x1E, 0x18, 0x50,             /* 12: 0 iff every word matched     */
+    0xF4,
+};
+
+/* ---- phase B: the same verify, re-run after the pool has been squeezed --- */
+static const uint8_t ems_code_b[] = {
+    0xB8, 0x00, 0xE0, 0x8E, 0xC0,
+    0xBE, 0x00, 0x00, 0xB9, 0x00, 0x20, 0xBB, 0x00, 0x00,
+    0x26, 0x8B, 0x04,
+    0x8B, 0xEE, 0x81, 0xE5, 0xFF, 0x3F,
+    0x33, 0xC5, 0x35, 0x5A, 0x5A,
+    0x0B, 0xD8, 0x46, 0x46,
+    0xE2, 0xEC,
+    0x89, 0x1E, 0x1A, 0x50,             /* 13                               */
+    0xF4,
+};
+
+/* ---- phase C: logical page 1 into window 1, and it must have SURVIVED ----
+ * It was unmapped throughout the pressure above, so it was evicted to the
+ * store and has to come back from it. That is the whole cost curve this design
+ * exists for: cold pages pay, mapped ones do not.
+ */
+static const uint8_t ems_code_c[] = {
+    0xB8, 0x01, 0x44, 0xBB, 0x01, 0x00,
+    0x8B, 0x16, 0x10, 0x50, 0xCD, 0x67,
+    0x88, 0x26, 0x1C, 0x50,             /* 14: status                       */
+    0xB8, 0x00, 0xE0, 0x8E, 0xC0,
+    0xBE, 0x00, 0x40,                   /* MOV SI,4000h -- window 1         */
+    0xB9, 0x00, 0x20, 0xBB, 0x00, 0x00,
+    0x26, 0x8B, 0x04,
+    0x8B, 0xEE, 0x81, 0xE5, 0xFF, 0x3F,
+    0x33, 0xC5, 0x35, 0xA3, 0xA3,
+    0x0B, 0xD8, 0x46, 0x46,
+    0xE2, 0xEC,
+    0x89, 0x1E, 0x1E, 0x50,             /* 15                               */
+    0xF4,
+};
+
+/* ---- phase D: the refusals, the queries, and the memory coming back ----- */
+static const uint8_t ems_code_d[] = {
+    0xB8, 0x04, 0x44,                   /* AH=44h AL=4 -- no such window    */
+    0x8B, 0x16, 0x10, 0x50, 0xBB, 0x00, 0x00, 0xCD, 0x67,
+    0x88, 0x26, 0x20, 0x50,             /* 16: 8Bh physical page out of range */
+    0xB8, 0x00, 0x44,                   /* AH=44h BX=99 -- no such page     */
+    0x8B, 0x16, 0x10, 0x50, 0xBB, 0x63, 0x00, 0xCD, 0x67,
+    0x88, 0x26, 0x22, 0x50,             /* 17: 8Ah logical page out of range */
+    0xB4, 0x4C, 0xBA, 0x09, 0x00, 0xCD, 0x67,
+    0x88, 0x26, 0x24, 0x50,             /* 18: 83h invalid handle           */
+    0xB4, 0x46, 0xCD, 0x67,
+    0xA3, 0x26, 0x50,                   /* 19: AX -- 0032h, LIM 3.2         */
+    0xB4, 0x4B, 0xCD, 0x67,
+    0x89, 0x1E, 0x28, 0x50,             /* 20: handles, incl. the driver's  */
+    0xB4, 0x4C, 0x8B, 0x16, 0x10, 0x50, 0xCD, 0x67,
+    0x89, 0x1E, 0x2A, 0x50,             /* 21: pages owned                  */
+    0xB4, 0x42, 0xCD, 0x67,
+    0x89, 0x1E, 0x2C, 0x50,             /* 22: free while held              */
+    0xB4, 0x45, 0x8B, 0x16, 0x10, 0x50, 0xCD, 0x67,
+    0x88, 0x26, 0x2E, 0x50,             /* 23: deallocate status            */
+    0xB4, 0x42, 0xCD, 0x67,
+    0x89, 0x1E, 0x30, 0x50,             /* 24: free after                   */
+    0xB4, 0x99, 0xCD, 0x67,
+    0x88, 0x26, 0x32, 0x50,             /* 25: 84h -- loud, not silent      */
+    0xF4,
+};
+
+/* Squeeze the pool. Logical pages 2..5 only: 0 is the one under test and 1 is
+   the unpinned control, and touching either would rewrite the very bytes the
+   arm is about to check. */
+static void ems_pressure(void)
+{
+    for (uint32_t p = 2u * EMS_SUBS; p < EMS_TEST_PAGES * EMS_SUBS; p++) {
+        /* The ring is the victim picker's OTHER veto and it would mask the pin
+           we are trying to prove, so it is cleared before every touch. */
+        x86_livemap_clear();
+        uint8_t *q = (uint8_t *)x86_guest_ptr((X86_EMS_BACK_PAGE + p) << 12, 1);
+        if (q)
+            *q = (uint8_t)(p + 1u);     /* non-zero: it must really be written */
+    }
+    x86_livemap_clear();
+}
+
+static void ems_test_run(void)
+{
+    static const uint8_t hle_vectors[] = {
+        0x08, 0x09, 0x10, 0x11, 0x12, 0x15, 0x16, 0x1A, 0x20, 0x21, 0x2F,
+    };
+    uint32_t r13_clean = 0xFFFFu;
+
+    for (uint32_t i = 0; i < 40; i++)
+        ems_r[i] = 0;
+    emsb_fail = 0;
+
+    /* ---- the machine: a page frame region that looks like the real one ---
+       Sixteen fold entries over 0xE0000 all pointing at ONE 0xFF page, which is
+       exactly what src/main.c's open-bus filler does, and exactly what
+       x86_ems_set_backing() checks for before it claims the region. */
+    memset(test_ram + EMS_FILL_OFF, 0xFF, 4096);
+    for (uint32_t i = 0; i < X86_EMS_FRAME_BYTES / 4096u; i++)
+        guest_page_table[EMS_FRAME_IDX + i] =
+            FOLD_K((uint32_t)test_ram + EMS_FILL_OFF, EMS_FRAME_IDX + i);
+
+    /* ---- the pager: TWELVE frames for TWENTY-FOUR backing pages ---------- */
+    memset(test_ram + EMS_STORE_OFF, 0, EMS_STORE_SLOTS * 4096u);
+    x86_pager_reset();
+    x86_livemap_clear();
+    x86_pager_own(0, 0);                 /* only the aux window is ours here */
+    x86_pager_own_aux(X86_EMS_BACK_PAGE, EMS_TEST_PAGES * EMS_SUBS);
+    x86_pager_set_backing(emsb_read, emsb_write);
+    x86_pager_add_frames(test_ram + EMS_POOL_OFF, X86_PG_POOL_BYTES(EMS_FRAMES));
+    for (uint32_t i = 0; i < EMS_TEST_PAGES * EMS_SUBS; i++)
+        guest_page_table[X86_EMS_BACK_PAGE + i] = FOLD_INVALID;
+
+    /* ---- low memory: the stubs, the name, the code ---------------------- */
+    x86_video_init(cga_test_vram, cga_test_palette);
+    x86_video_set_aperture(vga_test_aperture, vga_test_pal);
+    x86_bios_init();
+    x86_hle_install(hle_vectors, sizeof(hle_vectors));
+    /* AFTER the frame is mapped and after the IVT is planted -- both are
+       preconditions x86_ems_set_backing() checks or writes. */
+    ems_r[34] = (x86_ems_set_backing(EMS_TEST_PAGES) == 0);
+    ems_r[35] = x86_ems_frame_refused;
+
+    /* The DIRECT detection route, which some titles use instead of opening the
+       device: the INT 67h vector's SEGMENT, then eight bytes at offset 0x0A. */
+    {
+        uint8_t v[4], nm[8];
+        x86_guest_copy_out(v, 0x67u * 4u, 4);
+        uint32_t seg = (uint32_t)(v[2] | (v[3] << 8));
+        x86_guest_copy_out(nm, (seg << 4) + 0x0Au, 8);
+        ems_r[36] = (memcmp(nm, "EMMXXXX0", 8) == 0);
+    }
+
+    memcpy(&test_ram[EMS_NAME], "EMMXXXX0", 9);
+    memset(&test_ram[EMS_RES], 0, 0x80);
+    memcpy(&test_ram[EMS_CODE_A], ems_code_a, sizeof(ems_code_a));
+    memcpy(&test_ram[EMS_CODE_B], ems_code_b, sizeof(ems_code_b));
+    memcpy(&test_ram[EMS_CODE_C], ems_code_c, sizeof(ems_code_c));
+    memcpy(&test_ram[EMS_CODE_D], ems_code_d, sizeof(ems_code_d));
+
+    /* ---- phase A -------------------------------------------------------- */
+    kbd_test_reset_cpu(EMS_CODE_A);
+    if (kbd_test_run_to_halt() != X86_EXIT_HALT)
+        return;                             /* every result stays 0: LOUD */
+
+    /* The premise the pinning claim rests on: the four granules of one logical
+       page are NOT contiguous host memory, so a pin that protected only the
+       first would be visible. Frames come off a LIFO free list, so they
+       descend -- asserted rather than assumed. */
+    ems_r[28] = (guest_page_table[EMS_FRAME_IDX + 0]
+                 != guest_page_table[EMS_FRAME_IDX + 1]);
+    ems_r[26] = (x86_page_is_pinned(X86_EMS_BACK_PAGE)
+                 && x86_page_is_pinned(X86_EMS_BACK_PAGE + 1)
+                 && x86_page_is_pinned(X86_EMS_BACK_PAGE + 2)
+                 && x86_page_is_pinned(X86_EMS_BACK_PAGE + 3));
+    ems_r[27] = x86_ems_pinned_pages;
+
+    /* ---- squeeze the pool, with window 0 still mapped -------------------- */
+    {
+        uint32_t fold0[EMS_SUBS];
+        for (uint32_t i = 0; i < EMS_SUBS; i++)
+            fold0[i] = guest_page_table[EMS_FRAME_IDX + i];
+        uint32_t ev0 = x86_pg_evictions;
+
+        ems_pressure();
+
+        ems_r[29] = (x86_pg_evictions > ev0);
+        ems_r[30] = (x86_pg_exhausted == 0);
+        int held = 1;
+        for (uint32_t i = 0; i < EMS_SUBS; i++)
+            if (guest_page_table[EMS_FRAME_IDX + i] != fold0[i]
+                || guest_page_table[X86_EMS_BACK_PAGE + i] == FOLD_INVALID)
+                held = 0;
+        ems_r[31] = held;
+
+        /* THE CONTROL. Logical page 1's four granules are allocated but NOT
+           mapped, so nothing pins them and the same pressure must have taken at
+           least one. If this reads 0 the pressure never bit and ems_r[31] above
+           is proving nothing. */
+        int lost = 0;
+        for (uint32_t i = 0; i < EMS_SUBS; i++)
+            if (guest_page_table[X86_EMS_BACK_PAGE + EMS_SUBS + i]
+                == FOLD_INVALID)
+                lost = 1;
+        ems_r[32] = lost;
+    }
+
+    /* ---- phase B: the mapped page still reads back byte for byte -------- */
+    kbd_test_reset_cpu(EMS_CODE_B);
+    (void)kbd_test_run_to_halt();
+    r13_clean = (uint32_t)(test_ram[EMS_RES + 26]
+                           | (test_ram[EMS_RES + 27] << 8));
+
+    /* ---- THE NEGATIVE CONTROL ON THE COMPARE ITSELF ---------------------
+       One byte of the mapped page, flipped through the window, and the same
+       verify re-run. If phase B's accumulator were vacuous this would still
+       come back zero. */
+    {
+        uint8_t *p = (uint8_t *)x86_guest_ptr(X86_EMS_FRAME_LIN + 100u, 1);
+        if (p) {
+            *p ^= 0xFF;
+            kbd_test_reset_cpu(EMS_CODE_B);
+            (void)kbd_test_run_to_halt();
+            ems_r[33] = ((test_ram[EMS_RES + 26]
+                          | (test_ram[EMS_RES + 27] << 8)) != 0);
+            p = (uint8_t *)x86_guest_ptr(X86_EMS_FRAME_LIN + 100u, 1);
+            if (p)
+                *p ^= 0xFF;
+        }
+        x86_livemap_clear();
+    }
+
+    /* ---- phase C: the evicted, unmapped page comes back from the store --- */
+    kbd_test_reset_cpu(EMS_CODE_C);
+    (void)kbd_test_run_to_halt();
+
+    /* ---- phase D: the refusals and the accounting ------------------------ */
+    ems_r[37] = x86_ems_maps;
+    kbd_test_reset_cpu(EMS_CODE_D);
+    (void)kbd_test_run_to_halt();
+
+    for (uint32_t i = 0; i < 26; i++)
+        ems_r[i] = (uint32_t)(test_ram[EMS_RES + i * 2]
+                              | (test_ram[EMS_RES + i * 2 + 1] << 8));
+    /* The loop above has just re-read slot 13 from the guest's LAST run of
+       phase B -- the CORRUPTED one. The clean reading was saved before the
+       byte was flipped; the corrupted one is ems_r[33]'s business alone. */
+    ems_r[13] = r13_clean;
+
+    ems_r[38] = x86_ems_pinned_pages;   /* deallocate released every pin */
+    ems_r[39] = x86_pg_io_errors + emsb_fail;
+
+    x86_ems_set_backing(0);
+    x86_pager_own_aux(0, 0);
+    x86_pager_set_backing(NULL, NULL);
+    for (uint32_t i = 0; i < EMS_TEST_PAGES * EMS_SUBS; i++)
+        guest_page_table[X86_EMS_BACK_PAGE + i] = FOLD_INVALID;
+    for (uint32_t i = 0; i < X86_EMS_FRAME_BYTES / 4096u; i++)
+        guest_page_table[EMS_FRAME_IDX + i] = FOLD_INVALID;
+    x86_pager_reset();
+}
+
 /* ---- the granule seam ----------------------------------------------------
  *
  * host = lin + k, and k is per 4 KB granule. Two adjacent guest granules are
@@ -3563,6 +3924,11 @@ void Reset_Handler(void) {
         if (run_xms_flag == 1) {
             xms_test_run();
             run_xms_flag = 0;
+        }
+
+        if (run_ems_flag == 1) {
+            ems_test_run();
+            run_ems_flag = 0;
         }
 
         if (run_pager_flag == 1) {

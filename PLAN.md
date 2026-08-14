@@ -105,8 +105,14 @@ The groundwork Queue A just landed is what makes this a road rather than a wall.
    MEASURED: WOLF3D uses it unprompted (278 moves, 430,636 B, 0 errors) at a 4%
    frame cost — 31% until the file handle was held open.
    [`docs/12`](docs/12_memory_tiers.md) §6.
-2. **EMS** (`EMMXXXX0`, INT 67h, a page frame in the UMB region). Independent of
-   XMS and cheaper; several titles probe for it and we currently answer absent.
+2. ~~**EMS**~~ — built (LIM 3.2). The OPPOSITE shape to XMS: a MAPPED interface,
+   so the four 16 KB windows at `E000:0000` MUST be folded and AXI-resident.
+   `AH=44h` says exactly when the hot set changes, so the rule is **pin on map,
+   release on unmap** — the arena's own pin bitmap, the victim picker's existing
+   first veto. Logical pages are pager pages at linear 4 MB (a second owned
+   window), unreachable by any real-mode `seg:off`, so an unmapped one is an
+   ordinary cold page. Advertises 1024 KB, **0 with no pagefile**.
+   `tests/test_ems.py`, 40 checks, pin control seen to fail. `x86_ems.h`.
 3. **DPMI** (INT 2Fh AX=1687h, INT 31h) — needs 1 and the descriptor walk from
    4. This is what DOS/4GW actually asks for; VCPI is the fallback it tries
    first and may not be needed.

@@ -150,6 +150,21 @@ void x86_pager_set_backing(x86_pg_read_fn rd, x86_pg_write_fn wr);
    exactly as they are -- VRAM, the mode 13h aperture, the open-bus filler and
    the BIOS id page are fixed mappings and must never be paged. */
 void x86_pager_own(uint32_t first_page, uint32_t count);
+/*
+ * A SECOND, disjoint window, for storage the guest cannot address directly.
+ *
+ * EMS needs its logical pages to BE pager pages -- they are mapped into the
+ * page frame and read by ordinary instructions, so they have to be able to
+ * occupy a frame (x86_ems.h) -- but they live at linear 4 MB, ten megabytes
+ * above anything a real-mode segment:offset can name.
+ *
+ * A second window rather than one widened one, deliberately. Widening
+ * x86_pager_own() to cover [0, 5 MB) would make every page between 640 KB and
+ * 4 MB ownable, and a stray guest access up there would quietly be handed a
+ * frame instead of the clean X86_EXIT_MEM_FAULT it has earned. The two windows
+ * are checked separately and nothing between them is ours.
+ */
+void x86_pager_own_aux(uint32_t first_page, uint32_t count);
 
 /*
  * Service a fold miss. `lin` is the faulting guest linear address; `write` is

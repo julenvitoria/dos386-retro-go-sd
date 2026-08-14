@@ -243,6 +243,48 @@ it ever tracks the move count, that decision has been reverted.
 * **A20** (`AH=03h`-`07h`) drives `x86_a20_set()` — the machine's own gate, the
   one the 8042 path in `x86_io.c` moves. There is no second A20 model.
 
+## 6d. EMS — the same allocator problem with the OPPOSITE residency rule
+
+§6 opens by saying XMS has no fast path *because no guest instruction ever
+dereferences an XMS byte*. **EMS is the inverse and that one sentence is the
+whole difference.** It puts a 64 KB page frame at `E000:0000`, four 16 KB
+windows, and the guest maps a logical page in with `INT 67h AH=44h` and then
+reads and writes it with `MOV`, `STOSW`, `REP MOVSB`. So:
+
+* **A mapped page MUST be folded and AXI-resident.** Backing it the way XMS is
+  backed would fault on every access — a cliff, not a slope.
+* **But only 64 KB is live, and `AH=44h` says exactly when that changes.** The
+  hot set is bounded at four logical pages and it is *explicitly signalled*,
+  which is better information than the pager ever gets from faults: it arrives
+  before the access instead of after it.
+
+Hence **pin on map, release on unmap**, using `x86_pin_pages()` — the arena's
+own bitmap and already the victim picker's first veto (§4). Not a second
+mechanism: a mapped EMS page is the same kind of object as a VRAM page, memory
+something outside the interpreter is reading.
+
+Logical pages **are pager pages**, at guest page 1024 (linear 4 MB) in a SECOND
+owned window (`x86_pager_own_aux`). Three arithmetic properties make that safe:
+no real-mode `seg:off` can name it (`FFFF:FFFF` = 0x10FFEF), it is far above
+guest RAM's pages 0..159, and its pagefile slots land at 4–5 MB, below the XMS
+store at 8 MB. A window is widened rather than shared so that nothing between
+640 KB and 4 MB becomes ownable by accident.
+
+An UNMAPPED logical page is cold by definition: an ordinary pager page that may
+be evicted to the pagefile and paged back on the next `AH=44h`. That is the
+cost curve — a slope for the cold set, zero for the hot one.
+
+**Advertises 1024 KB, and 0 with no pagefile**, for the same honesty reason
+§6b gives: with no store the pager cannot evict, so every page handed out would
+have to stay resident forever out of 160 frames. With no store, `EMMXXXX0` does
+not open and the `INT 67h` vector is left on the bare IRET.
+
+**The page frame is CHECKED, not assumed.** The upper megabyte here is one 4 KB
+`0xFF` page aliased everywhere except VRAM, the 13h aperture and the BIOS id
+page, so a free window is sixteen fold entries that are mapped and all resolve
+to the *same* host address. `x86_ems_set_backing()` tests exactly that and
+refuses (`x86_ems_frame_refused`) rather than quietly overlaying the display.
+
 ## 7. Where things live
 
 `src/main.c`'s `bonus_layout()`, computed at runtime:

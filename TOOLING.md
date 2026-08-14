@@ -1241,6 +1241,29 @@ python3 tests/test_xms.py                # XMS, driven by GUEST code doing the
                                          # over-allocation). The store is a
                                          # plain RAM buffer standing in for the
                                          # pagefile -- no card, no FatFs
+python3 tests/test_ems.py                # EMS, the MAPPED counterpart, driven
+                                         # by GUEST code: open EMMXXXX0 with
+                                         # INT 21h AH=3Dh -> INT 67h AH=41h for
+                                         # the page frame -> allocate -> AH=44h
+                                         # map a logical page -> WRITE 16 KB
+                                         # THROUGH THE WINDOW WITH ORDINARY
+                                         # STOSW -> remap -> map it back ->
+                                         # read it with ordinary loads. A
+                                         # logical page is FOUR granules, so
+                                         # every pass crosses three seams each
+                                         # way, and the arm asserts the frames
+                                         # really are shuffled. THE PINNING
+                                         # PROPERTY IS ASSERTED DIRECTLY: 12
+                                         # frames for 24 backing pages, so the
+                                         # squeeze must evict -- the MAPPED
+                                         # page must survive and the allocated
+                                         # but UNMAPPED one must not, which is
+                                         # the control. Two negative controls,
+                                         # both seen to fail: removing the pin
+                                         # makes the mapped page evict and the
+                                         # readback go wrong, and one flipped
+                                         # byte through the window is detected.
+                                         # RAM store, no card, no FatFs
 python3 tests/test_seam.py               # THE GRANULE SEAM. host = lin + k with
                                          # one k per 4 KB page, so two adjacent
                                          # GUEST granules are adjacent in HOST
