@@ -139,6 +139,12 @@ Why it matters: the pagefile costs **~25 ms per writeback**, XMS measured an
 the only SRAM DMA1/DMA2 can reach — "against the day SPI1's polled transfer
 becomes a DMA transfer". That day is this branch.
 
+**BLOCKED on upstream.** SylverB has a retro-go-sd side still to come — the
+driver file is in his FatFs repo but the plumbing is not: DMA stream/handle
+setup, the transfer buffer in **D2/AHB SRAM** (DMA1/DMA2 cannot reach DTCM),
+and cache maintenance around the transfer. `docs/12` already parks the `.dsk`
+cache in AHB for exactly this. Do not start half of it; wait for his part.
+
 **Both commits are READS.** The pagefile's cost is a write, so measure before
 assuming it helps writeback; it should help disk-heavy titles and XMS-backed
 asset loading either way.
