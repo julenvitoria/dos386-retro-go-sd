@@ -58,81 +58,76 @@ tier.
 
 ## Backlog
 
-### Queue A — Dark Forces and the memory tier: CLOSED
+### Queue A — memory tier: the groundwork is DONE
 
-Verdicts only; evidence in [`docs/12`](docs/12_memory_tiers.md) and
-[`docs/13`](docs/13_title_status.md).
+1. ~~MCB arena~~ — correct; DF's one refusal is real DOS semantics.
+2. ~~Pager eviction~~ — built: second-chance clock, comparison-based dirty
+   detection, both vetoes wired, six negative controls seen to fail.
+3. ~~Pagefile~~ — built. `x86page.swp` beside the `.dsk`, `slot` == guest page.
+   Measured: 39 writes, 5 reads, 0 errors, `_exhausted=0`.
+   **Cost: ~25 ms per writeback** — one and a half frames, paid at level load.
+   A write-behind queue is the fix if a title needs one.
+4. ~~Frame donation~~ — built and live: 34 frames / 139,264 B to Wolf3D.
+5. **Keen 4's levels** — now fundable by the same mechanism. Blocked on B3
+   freeing the 0Dh read shadow; see Queue B.
 
-1. Dark Forces exercises the MCB arena and **the arena is correct** — its one
-   refusal is real DOS semantics. DF dies in its first frame slice.
-2. **DPMI/VCPI/XMS — NOT out of scope. That verdict is RETRACTED.** The
-   measurement (zero read-only pages, 100% of residency via writes) kills
-   **NOR** backing, which needs a read-mostly set to XIP from flash. It says
-   nothing about a **pagefile**, whose whole purpose is pages that were
-   written — that is the FILE tier. `x86_pager.h` sizes the pager at
-   `X86_PG_PAGES = 2048` = **8 MB**, "sized for the space rather than for the
-   640 KB a real-mode DOS guest can address". Backing 8 MB is the design, not
-   a stretch. Prerequisite chain: pagefile → XMS/EMS → DPMI.
-3. Protected mode **sized, not started** (~1,225 lines; V86 not needed). The
-   old gate — "a title that needs it *and* fits in 640 KB; there is none" —
-   was circular: the 640 KB ceiling only exists because there is no pagefile.
-   Gated on item 2 instead.
-4. Pager exercised. **Eviction is not implemented** — now in progress.
-5. **Keen 4's levels are REACHABLE** — the "not fixable" verdict is retracted.
+### Queue B — rendering
 
-### Queue B — the planar store path first, then rendering
+0. ~~Planar store path~~ — write class decided at `OUT` time. **+55-73%** on
+   Wolf3D in Mode Y.
+1. ~~Golden-screenshot gate~~ — `scripts/golden_screens.py`. **Caveat proven in
+   practice: ALLEYCAT's golden was captured while the title was stuck on its
+   first frame, so it blessed a broken state. Attestation records what a golden
+   SHOWS, not whether the emulator was healthy. Re-bless against an
+   owner-verified run.**
+2. ~~Mode Y off-screen cache~~ — 8,192 → 15,616 offsets; `lost_cache` → 0.
+3. **Fold-trap the VGA aperture check** — in progress. Removes 4-5 instructions
+   from every memory access in every title, and may free the 65,536-byte 0Dh
+   read shadow, which is what Keen's intro needs.
+4. **Keen's half-height intro** — diagnosed: `crtc_start=15360`, pitch 64,
+   19,456 offsets fitted → exactly 64 rows. Needs 28,160 offsets. Blocked on 3.
+5. **DMA2D A/B** — in progress; chained 13h only, timing unprovable below tier 3.
+6. **Overlay legibility over 256-colour modes** — in progress.
+7. **Mode Y real pages** — done, 3 pages, `alias_hits=0`. Awaiting the owner's
+   verdict on the doubled-walls artefact.
+8. Alley Cat's other cats flicker in and out. New, unmeasured.
 
-0. **The planar store path halves the interpreter for graphics titles** (~1.4 M
-   ips in Mode Y against ~3.0 M in text). Four changes, each measured:
-   precompute a mode index at `OUT` time; fast-path the dominant single-plane
-   write-mode-0 case; keep the hot cases out of C; batch `REP STOS`/`MOVS`.
-   Baselines to beat and the counters to read are in
-   [`docs/09`](docs/09_frame_pacing_and_clocks.md) §7.
-1. A **golden-screenshot gate** with programmatic comparison. Two "runs fine,
-   renders garbage" regressions shipped in one session because nothing in the
-   suite can see a picture. A golden captured from a broken build blesses the
-   bug, so each must be eye-verified once and that verification recorded.
-2. Wolf3D's off-screen VRAM cache is too small — discards above `0xE300`.
-3. Fold-trap the VGA aperture check so non-planar titles pay nothing for it.
-4. Keen's watchdog reset and half-height intro.
-5. A/B the DMA2D blit on hardware — merged, off, unverified.
-6. Retro-go overlay legibility over 256-colour modes.
+### Queue C — Dark Forces, in dependency order
 
-### Queued — `x86_vga_planar_store`: exhaust C, then consider assembly
+The groundwork Queue A just landed is what makes this a road rather than a wall.
+**Nothing here starts before the step above it is measured.**
 
-**Gated on measurement, in this order. Do not start at step 3.**
+1. **XMS** (INT 2Fh AX=4300h, the HIMEM entry point, INT 15h AH=88h). The
+   pager already owns an 8 MB space (`X86_PG_PAGES = 2048`); XMS is the guest's
+   interface to it. Smallest real step, and it stands alone — titles use XMS
+   without any extender.
+2. **EMS** (`EMMXXXX0`, INT 67h, a page frame in the UMB region). Independent of
+   XMS and cheaper; several titles probe for it and we currently answer absent.
+3. **DPMI** (INT 2Fh AX=1687h, INT 31h) — needs 1 and the descriptor walk from
+   4. This is what DOS/4GW actually asks for; VCPI is the fallback it tries
+   first and may not be needed.
+4. **Protected mode** — ~1,225 lines sized against `references/tiny386`:
+   descriptor walk, far transfers and gates, `IRET` across privilege, paging.
+   **V86 is not needed** — INT 21h is HLE'd, which removes the TSS work too.
+5. **Dark Forces** — re-measure against 1-4. It dies in its first frame slice
+   today with "Not enough memory"; that message is the whole dependency list.
 
-1. **Re-profile it.** The case for converting rested on pre-optimisation data:
-   PC samples used to land in `x86_vga_planar_store`, and after the write-class
-   work they moved back into ITCM and `cls_general` went to 0. Establish what
-   share of frame time the planar path costs *now*, on hardware
-   (`profile_opcodes.py --retrogo --target hardware --settle 20 --window 25`),
-   with Wolf3D in Mode Y.
-2. **Exhaust the C.** More classes, cheaper `vga_cell()` (cache the page base
-   and recompute only when the offset leaves it), avoid re-deriving what the
-   class already implies. Measure each.
-3. **Only then assembly, and only for the ABI.** The win is not out-guessing
-   the compiler — GCC's Thumb-2 is good — it is escaping AAPCS. `R8`-`R11` are
-   reserved for CPU state and are callee-saved, so every call from the
-   interpreter forces a prologue/epilogue: ~8 instructions of stub plus the
-   callee's own, ~20-25 cycles of pure overhead against a fast-path body of
-   ~10-15. Hand assembly reads `R8` directly and returns without touching the
-   stack.
-
-**Cost to weigh against it:** once converted, the C is dead and every future
-change is hand-written. This function was modified ~6 times in one session,
-including the change that bought +55-73%. Freezing it early would have made
-that harder. **If step 1 says the path is a single-digit share of frame time,
-stop — the answer is no.**
-
-Keep the C as the oracle if it is converted: diff assembly against C on the
-same inputs, the way fast paths are already graded against the general path.
+**Measure at each step, not at the end.** The last time this chain was judged
+it was called out of scope on a 640 KB denominator that only existed because
+no pagefile was wired.
 
 ### Not scheduled, but live
 
-- Mode Y still paints mid-draw frames (`x86_modey_mid_draw`).
-- **VBE 320x240** (`DOS_MODE_VBE240` in the prior port) is the only mode that
-  fills the panel and reduces the blit to one `memcpy` — not ported. Note it is
-  a *custom* mode number: little period software will ask for it.
-- An adapter-advertisement Options entry (CGA / EGA+VGA / VGA-only), so a title
-  that cannot render what we claim becomes a switch, not a black screen.
+- **VBE 320x240** (`DOS_MODE_VBE240` in the prior port) — the only mode that
+  fills the panel and reduces the blit to one `memcpy`. Custom mode number, so
+  little period software asks for it.
+- An **adapter-advertisement Options entry** (CGA / EGA+VGA / VGA-only), so a
+  title that cannot render what we claim is a user-visible switch, not a black
+  screen.
+- **`x86_vga_planar_store` in assembly** — gated on re-profiling it first. The
+  case rested on pre-optimisation data; the write-class work moved PC samples
+  out of it. The win is escaping AAPCS (`R8`-`R11` are reserved *and*
+  callee-saved, so every call from the interpreter forces a prologue), ~20-25
+  cycles against a ~10-15 cycle body. **If the path is a single-digit share of
+  frame time, the answer is no.** Once converted the C is dead and every change
+  is hand-written — this function changed ~6 times in one session.
