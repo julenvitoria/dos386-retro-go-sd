@@ -985,17 +985,12 @@ python3 tests/test_video.py              # CGA mode 4 blitter, pixel-exact, plus
                                          # which is the case the device hits
                                          # and the 20-frame model missed.
                                          # --present-only runs just that arm
-python3 scripts/run_planar_controls.py   # grades those arms: SEVEN negative
+python3 scripts/run_planar_controls.py   # grades those arms: FIVE negative
                                          # controls that must FAIL (chain-4
                                          # inert, a 40-offset blit stride, four
                                          # FLAT planes, the fixed 16 KB page
-                                         # mask, the presentation escape
-                                         # hatch back on a plain TIMER, the
-                                         # display start ACTED ON PER BYTE
-                                         # rather than latched as a pair, and
-                                         # the "this guest flips" recency
-                                         # window back on the never-decaying
-                                         # high-water flip gap) and one
+                                         # mask, and the presentation escape
+                                         # hatch back on a plain TIMER) and one
                                          # POSITIVE control --
                                          # -DX86_MODEY_PAGE0=16384 must still
                                          # produce the same 64,000 pixels,

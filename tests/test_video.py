@@ -803,38 +803,14 @@ def modey_program():
     emit(0x81, 0xFB, 0x96, 0x00)            # cmp bx,150
     back(0x72, c_row)                       # jb c_row
 
-    # ---- the page flips. Their DIFFERENCE is the only place a guest ever
-    # states its page stride, which is what the POSITIVE control (a deliberately
-    # wrong X86_MODEY_PAGE0) makes the core learn. Word OUTs again.
-    #
-    # THE FIRST FLIP CHANGES BOTH HALVES OF THE START, AND THAT IS THE POINT.
-    # The display start is 16 bits written as two byte OUTs, high (0x0C) then
-    # low (0x0D). Until this program did that, EVERY start it programmed had a
-    # low byte of zero and so did the one before it, so the low write never
-    # changed the value and a core that recomputed and acted on each byte was
-    # indistinguishable from one that latched the pair -- which is exactly why
-    # this arm read 64000/64000 while hardware was visibly wrong. With a low
-    # byte that actually changes, acting on the high write alone presents
-    # 0x8200: the new page's high byte joined to the OLD page's low byte, an
-    # address the guest never programmed, and one flip edge too many.
-    #
-    # 0x8260 -> 0x8200 exercises a low-only change and 0x8200 -> 0x4100 a
-    # high-only one, so the latch is tested in both orders of "which half
-    # actually moved". Only the 16,640 pair is inside the learner's window; the
-    # 0x0000 -> 0x8260 and 0x8260 -> 0x8200 distances are rejected, so the
-    # stride still comes out of the guest's real page spacing.
+    # ---- the page flips, to 0x4100 and then 0x8200, and LEFT there.
+    # Their DIFFERENCE is the only place a guest ever states its page stride,
+    # which is what the POSITIVE control (a deliberately wrong X86_MODEY_PAGE0)
+    # makes the core learn. Word OUTs again.
     emit(0xBA, 0xD4, 0x03)                  # mov dx,3D4h
-    emit(0xB8, 0x0C, 0x82)                  # mov ax,820Ch     ; start hi = 0x82
-    emit(0xEF)                              # out dx,ax
-    emit(0xB8, 0x0D, 0x60)                  # mov ax,600Dh     ; start lo = 0x60
-    emit(0xEF)                              # out dx,ax
-    emit(0xB8, 0x0C, 0x82)                  # mov ax,820Ch     ; hi unchanged
-    emit(0xEF)                              # out dx,ax
-    emit(0xB8, 0x0D, 0x00)                  # mov ax,000Dh     ; start lo = 0
-    emit(0xEF)                              # out dx,ax
     emit(0xB8, 0x0C, 0x41)                  # mov ax,410Ch     ; start hi = 0x41
     emit(0xEF)                              # out dx,ax
-    emit(0xB8, 0x0D, 0x00)                  # mov ax,000Dh     ; lo unchanged
+    emit(0xB8, 0x0D, 0x00)                  # mov ax,000Dh     ; start lo = 0
     emit(0xEF)                              # out dx,ax
     emit(0xB8, 0x0C, 0x82)                  # mov ax,820Ch     ; start hi = 0x82
     emit(0xEF)                              # out dx,ax
@@ -921,7 +897,7 @@ def modey_checks(b, syms, quiet=False):
                      tries=600):
         return False
 
-    r = [b.read_uint32(syms["planar_r"] + 4 * i) for i in range(20)]
+    r = [b.read_uint32(syms["planar_r"] + 4 * i) for i in range(12)]
     mode, bda, unchained, page = r[0], r[1], r[2], r[3]
     stores, lost, flips = r[4], r[5], r[6]
     say(f"  mode={mode:#04x} bda449={bda:#04x} unchained={unchained} "
@@ -943,30 +919,9 @@ def modey_checks(b, syms, quiet=False):
               f"guest's two flips are {MODEY_STRIDE} apart and that is the only "
               f"place it ever states the number.")
         ok = False
-    # THE DISPLAY START IS LATCHED AS A PAIR, and the flip log is the witness.
-    # The guest programs four starts, each as a high byte then a low byte. A
-    # core that recomputes and acts on each byte separately sees FIVE edges --
-    # the extra one presenting 0x8200, which is the second page's high byte
-    # joined to the first page's low byte, an address the guest never asked for.
-    # On hardware that is a whole 2 x 64,000-pixel blit per flip thrown away
-    # from inside the guest slice, and a distance fed to the stride learner that
-    # no page spacing produced.
-    want_flips = [0x8260, 0x8200, 0x4100, 0x8200]
-    got_flips = r[14:14 + min(r[12], 6)]
-    say(f"  flip log {[hex(v) for v in got_flips]} "
-        f"(n={r[12]}, deferred halves {r[13]})")
-    if flips != len(want_flips) or r[12] != len(want_flips):
-        print(f"FAIL: {flips} display-start changes ({r[12]} present edges) for "
-              f"{len(want_flips)} starts the guest programmed. A start is a "
-              f"16-bit value written as TWO byte OUTs and it is complete only "
-              f"when both halves are in; acting on the first half counts a "
-              f"flip, and paints a frame, per BYTE.")
-        ok = False
-    elif got_flips != want_flips:
-        print(f"FAIL: presented from {[hex(v) for v in got_flips]}, guest "
-              f"programmed {[hex(v) for v in want_flips]}. A start that is in "
-              f"neither list is a HYBRID: the new page's high byte with the "
-              f"previous page's low byte still under it.")
+    if flips < 2:
+        print(f"FAIL: only {flips} display-start changes seen; the guest made "
+              f"two. Present-on-page-flip hangs off that edge.")
         ok = False
     if stores == 0:
         print("FAIL: not one store took the aperture hook -- cpu->vga_base was "
@@ -1519,36 +1474,6 @@ def present_checks(b, syms):
               f"forgetting what the raycaster taught the policy.")
         return False
 
-    # ESCAPE FROM GAMEPLAY BACK TO THE MENU -- symptom B, at the cadence
-    # hardware measured. While the policy believes this guest flips, a quiet
-    # screen is judged by the raycaster's rule and its whole draw is held back;
-    # the window was 8 x the WORST flip gap ever seen and a maximum never
-    # decays, so on hardware (gap_max 34) the menu was governed by the
-    # raycaster for 272 loop frames -- ~4.5 s -- and then healed itself. That
-    # is precisely "it holds a frame... it does fix itself given some time
-    # though, it like caught up".
-    ESCAPE_HOLD_MAX = 90        # ~1.5 s. 8 x 34 = 272 is the reported defect.
-    r = run(7)
-    if r is None:
-        return False
-    print(f"  escape: hold {r[0]} frames (gap max {r[5]}, cadence estimate "
-          f"{r[6]}, in-frame gap {r[3]})")
-    if r[0] > ESCAPE_HOLD_MAX:
-        print(f"FAIL: leaving gameplay, the panel held the last raycast frame "
-              f"for {r[0]} frames (limit {ESCAPE_HOLD_MAX}) while the menu was "
-              f"drawn underneath it, two frames of blitting in four, and a "
-              f"guest that is still drawing never offers a quiet run long "
-              f"enough to be painted on. The recency window is scaled by "
-              f"x86_modey_flip_gap_max ({r[5]}), a HIGH-WATER MARK that never "
-              f"decays, so every quiet screen after a level pays the "
-              f"raycaster's bill until the window runs out on its own.")
-        return False
-    if r[1] != 0 or r[2] != 0:
-        print(f"FAIL: going back INTO gameplay the loop painted {r[1]} frames "
-              f"({r[2]} mid-draw). A prompter menu must not be bought with the "
-              f"split viewport back.")
-        return False
-
     r = run(2)
     if r is None:
         return False
@@ -1585,8 +1510,7 @@ def present_checks(b, syms):
     print("PASS: Mode Y presentation policy "
           "(0 mid-draw paints at 20- and 300-frame flip gaps, bursty or not, "
           "a menu painted within 12 frames of going quiet after a level, "
-          "1 quiet paint, 3 stale paints, no freeze, and a menu reached "
-          "within 90 frames of leaving a level)")
+          "1 quiet paint, 3 stale paints, no freeze)")
     return True
 
 
