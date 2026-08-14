@@ -65,10 +65,18 @@ Verdicts only; evidence in [`docs/12`](docs/12_memory_tiers.md) and
 
 1. Dark Forces exercises the MCB arena and **the arena is correct** — its one
    refusal is real DOS semantics. DF dies in its first frame slice.
-2. **DPMI/VCPI/XMS OUT OF SCOPE.** ~8 MB wanted against 640 KB, and zero
-   read-only pages in any working set. Do not half-build DPMI.
-3. Protected mode **sized, not started** (~1,225 lines; V86 not needed). Gated
-   on a title that needs it *and* fits in 640 KB. There is none.
+2. **DPMI/VCPI/XMS — NOT out of scope. That verdict is RETRACTED.** The
+   measurement (zero read-only pages, 100% of residency via writes) kills
+   **NOR** backing, which needs a read-mostly set to XIP from flash. It says
+   nothing about a **pagefile**, whose whole purpose is pages that were
+   written — that is the FILE tier. `x86_pager.h` sizes the pager at
+   `X86_PG_PAGES = 2048` = **8 MB**, "sized for the space rather than for the
+   640 KB a real-mode DOS guest can address". Backing 8 MB is the design, not
+   a stretch. Prerequisite chain: pagefile → XMS/EMS → DPMI.
+3. Protected mode **sized, not started** (~1,225 lines; V86 not needed). The
+   old gate — "a title that needs it *and* fits in 640 KB; there is none" —
+   was circular: the 640 KB ceiling only exists because there is no pagefile.
+   Gated on item 2 instead.
 4. Pager exercised. **Eviction is not implemented** — now in progress.
 5. **Keen 4's levels are REACHABLE** — the "not fixable" verdict is retracted.
 

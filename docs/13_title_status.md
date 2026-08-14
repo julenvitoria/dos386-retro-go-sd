@@ -98,7 +98,21 @@ Two errors produced the wrong verdict, and both are the same shape:
 > hardware.** Re-measure before concluding anything is impossible. This cost a
 > wrong "impossible" once and a wrong "38% idle" the same day.
 
-## Star Wars: Dark Forces — OUT OF SCOPE, measured
+## Star Wars: Dark Forces — BLOCKED on the pagefile, not out of scope
+
+> **RETRACTED, 2026-08-14: the "out of scope" verdict below is wrong.** It reads
+> the zero-read-only-pages measurement as condemning *all* backing stores. It
+> condemns **NOR** — XIP from flash needs a read-mostly set — and says nothing
+> about a **pagefile**, whose entire purpose is pages that were written (the
+> FILE tier). `x86_pager.h` sizes the pager at `X86_PG_PAGES = 2048` = **8 MB**,
+> "sized for the space rather than for the 640 KB a real-mode DOS guest can
+> address". The 640 KB figure below is not a ceiling, it is the pool that exists
+> *because no pagefile is wired yet*. Prerequisite chain:
+> **pagefile → XMS/EMS → DPMI → protected mode → Dark Forces.**
+> Point 1 below (12.5x) is arithmetic against the wrong denominator; points 2
+> and 3 stand as written.
+
+## Star Wars: Dark Forces — the original, WRONG verdict (superseded above)
 
 Halts in its **first frame slice** at `CS:EIP 0393:005E`, executing DOS/4GW's own
 message strings (`"…$Not enough memory"`), `exit_reason=4`, opcode `ARPL`.
