@@ -205,7 +205,115 @@ def state_memory(path):
                      f"layout changed, do not guess a base")
 
 
-VGA_VRAM = 2 * 1024 * 1024
+# DOSBox-X's `Vga` component is `SerializeVga::getBytes()`
+# (references/dosbox-x/src/hardware/vga.cpp:2050). Two structures in it are
+# self-describing enough to be FOUND AND PROVEN rather than guessed at, and
+# those are the only two we need: `vga.dac` (vga_dac.cpp:481, one WRITE_POD of
+# the whole VGA_Dac) and, right after the VRAM blob, the `vgapages` struct and
+# `vga.mem.memsize` (vga_memory.cpp:3018 then vga.cpp:2131) which pin down
+# where the VRAM blob started.
+#
+# VGA_Dac (include/vga.h:573) on the 64-bit build:
+DAC_BITS = 0             # uint8_t bits -- 6 or 8
+DAC_PEL_MASK = 1         # uint8_t pel_mask -- 0xff in every DOS mode
+DAC_COMBINE = 16         # uint8_t combine[16], after the 8-aligned Bitu
+DAC_RGB = 32             # RGBEntry rgb[256]
+DAC_XLAT16 = 800         # uint16_t xlat16[256]
+DAC_XLAT32 = 1312        # uint32_t xlat32[256]
+DAC_SIZE = 2344          # + hidac_counter, reg02, tail padding
+
+
+def find_dac(v):
+    """(offset, palette) of the LIVE DAC in a `Vga` component, or raise.
+
+    THE DEFECT THIS REPLACES. The old reader scanned for the first 768-byte
+    window that was all 6-bit and varied, and called that the palette. That
+    does not identify the DAC -- it identifies anything DAC-SHAPED, and it
+    matched `vga.dac` + 6, i.e. the true table shifted by ten bytes of
+    `combine[]`. Ten bytes is 3 entries and one channel, so every index
+    rendered as its neighbour's colour with the channels rotated, and Wolf3D's
+    grey `BKGDCOLOR` menu background came out saturated blue. A rotation alone
+    leaves greys grey; the index shift is what made it visible, and nothing in
+    the old scan could tell the two apart -- it could not fail.
+
+    So the table is not merely FOUND, it is PROVEN: DOSBox-X keeps a host-pixel
+    cache `xlat32[]` next to `rgb[]` and rebuilds it from `rgb[]` on load
+    (vga_dac.cpp:501), so `xlat32[i] == pack(rgb[i] scaled to 8 bits)` holds
+    for all 256 entries of the real DAC and for no shifted copy of it, no
+    stale fade buffer and no second palette the game happens to keep in VRAM.
+    """
+    best = None
+    for d in range(0, len(v) - DAC_SIZE):
+        if v[d + DAC_BITS] not in (6, 8) or v[d + DAC_PEL_MASK] != 0xFF:
+            continue
+        bits = v[d + DAC_BITS]
+        rgb = v[d + DAC_RGB:d + DAC_XLAT16]
+        if bits == 6 and max(rgb) > 63:
+            continue
+        # 6->8 bits by REPLICATION, `(c<<2)|(c>>4)`, which is what DOSBox-X
+        # does (vga_dac.cpp) and is not the same as `c*255//63`: 59 becomes
+        # 0xef, not 0xee. The cross-check below only closes because this
+        # matches DOSBox-X exactly, which is the point -- it is proof the
+        # bytes are the DAC and not a lookalike.
+        scale = (lambda c: (c << 2) | (c >> 4)) if bits == 6 else (lambda c: c)
+        x32 = struct.unpack_from("<256I", v, d + DAC_XLAT32)
+        pal = []
+        ok = True
+        for i in range(256):
+            r, g, b = (scale(c) for c in rgb[3 * i:3 * i + 3])
+            pal += [r, g, b]
+            # RGB or BGR host order -- DOSBox-X packs whichever the host
+            # surface uses; both are checked so a byte order does not read as
+            # a missing DAC.
+            if x32[i] not in ((r << 16) | (g << 8) | b,
+                              (b << 16) | (g << 8) | r):
+                ok = False
+                break
+        if not ok or len(set(pal)) < 4:
+            continue
+        if best is not None:
+            raise SystemExit("ref_dos: two structures in the Vga component "
+                             f"validate as the DAC ({best[0]} and {d}) -- "
+                             "refusing to guess which is live")
+        best = (d, pal)
+    if best is None:
+        raise SystemExit(
+            "ref_dos: no VGA DAC in this save state. The rgb[]/xlat32[] "
+            "cross-check failed at every offset, which means DOSBox-X's "
+            "VGA_Dac layout changed (references/dosbox-x/include/vga.h) -- "
+            "fix the offsets, do NOT fall back to a palette-shaped run of "
+            "bytes, that is exactly the bug this check exists to catch")
+    return best
+
+
+def find_vram(v, after):
+    """Offset of the VRAM blob, from the `vgapages`/`memsize` pair after it.
+
+    `POD_Save_VGA_Memory` writes `memsize` bytes of VRAM and then `vgapages`
+    (two Bitu: base page and mask), and `SerializeVga` writes `vga.mem.memsize`
+    immediately after that. `vgapages.base` is the A000/B000 page number and
+    the size is a power of two, so the pair is identifiable and gives the VRAM
+    START as an ARITHMETIC result rather than an assumption.
+
+    The old reader assumed VRAM was simply the last 2 MB of the component. It
+    is not -- `vgapages`, `memsize`, `vga.lfb` and the Paradise/Tseng/XGA
+    blocks follow it (vga.cpp:2126-2168) -- so every frame was read 1296 bytes
+    late, i.e. rolled up by four scanlines.
+    """
+    for p in range(len(v) - 4, max(after, len(v) - 65536), -1):
+        size = struct.unpack_from("<I", v, p)[0]
+        if size & (size - 1) or not 0x10000 <= size <= 0x1000000:
+            continue
+        base, mask = struct.unpack_from("<QQ", v, p - 16)
+        if base not in (0xA0, 0xB0, 0xB8) or mask not in (0x7FFF, 0xFFFF,
+                                                          0x1FFFF, 0x3FFFF):
+            continue
+        start = p - 16 - size
+        if start >= after:
+            return start, size
+    raise SystemExit("ref_dos: no vgapages/memsize pair after the DAC in this "
+                     "save state -- the VRAM blob cannot be located, and "
+                     "guessing its base renders a rolled frame")
 
 
 def state_screen(path, png):
@@ -217,35 +325,25 @@ def state_screen(path, png):
     gives a picture that is a quarter as wide, repeated -- which looks like a
     rendering bug rather than a decoding one.
 
-    The DAC is found by scanning for a 768-byte run of 6-bit values; a
-    greyscale index image is written if that fails, because the INDEXES are the
-    part that carries the answer and a missing palette must not cost the shot.
+    Both the DAC and the VRAM base are read from where DOSBox-X actually puts
+    them and verified there; see `find_dac`/`find_vram`. Neither falls back to
+    something plausible, because a reference that renders the wrong colours
+    without complaining invalidates every colour judgement made against it.
     """
     import zipfile
     from PIL import Image
     v = zipfile.ZipFile(path).read("Vga")
-    if len(v) < VGA_VRAM:
-        raise SystemExit(f"ref_dos: {path} Vga component is too small")
-    vb = len(v) - VGA_VRAM
+    dac, pal = find_dac(v)
+    vb, size = find_vram(v, dac + DAC_SIZE)
+    if size < 320 * 200:
+        raise SystemExit(f"ref_dos: {path} VRAM blob is only {size} bytes")
     px = bytearray(320 * 200)
     for y in range(200):
         row = y * 80
         for x in range(320):
             px[y * 320 + x] = v[vb + (row + (x >> 2)) * 4 + (x & 3)]
     im = Image.frombytes("P", (320, 200), bytes(px))
-    # FORWARD, first match, and that is not arbitrary: any SHIFT of the real
-    # table is also all-6-bit, so scanning backwards lands on the last valid
-    # shift and renders a correct Wolf3D frame in rotated colours -- which
-    # reads as a palette defect in the thing being measured rather than in the
-    # reader. The first match is the table's true start.
-    pal = None
-    for i in range(0, vb - 768):
-        w = v[i:i + 768]
-        if max(w) < 64 and len(set(w)) > 20:
-            pal = [c * 255 // 63 for c in w]
-            break
-    im.putpalette(pal if pal else
-                  [c for i in range(256) for c in (i, i, i)])
+    im.putpalette(pal)
     os.makedirs(os.path.dirname(os.path.abspath(png)) or ".", exist_ok=True)
     im.convert("RGB").save(png)
     return len(set(px))
