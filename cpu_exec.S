@@ -325,7 +325,25 @@ x86_cpu_interp_asm:
     CMP R3, R2
     BLO.N 2f
 #endif
-#ifdef X86_TRACE_LOWSP
+#ifdef X86_TRACE_MEMEQ
+    /* "Something wrote THIS value to THIS guest address." A hardware
+       watchpoint cannot do this job here: the host address of a guest page is
+       only known once the fold entry is live, and this guest halts about a
+       second after it starts, so there is no window in which a host-side tool
+       can resolve and arm one. Checking the word at an instruction boundary
+       costs one fold lookup and fires on the instruction AFTER the store, with
+       the ring naming the writer -- which is the same answer. */
+    MOVW R1, #(X86_TRACE_MEMEQ & 0xFFFF)
+    MOVT R1, #(X86_TRACE_MEMEQ >> 16)
+    UBFX R2, R1, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R1
+    BMI.W 2f                         @ page not mapped yet
+    LDRH R1, [R2]
+    MOVW R2, #(X86_TRACE_MEMVAL & 0xFFFF)
+    CMP R1, R2
+    BNE.W 2f
+#elif defined(X86_TRACE_LOWSP)
     /* "The stack has leaked past a level it should never reach." Aimed at a
        push/pop imbalance repeated thousands of times, where the individual
        leak is invisible and only the drift is not. */
