@@ -1436,13 +1436,75 @@ Cost: `__CORE_BSS_END__` 0x2405a6c0 -> 0x2405a6d0, **+16 B**. Wolf3D unaffected
 (AH=1Ah still AX=0x1a1a/BX=0x0008, `x86_vga13_ok=1`, 1,536 DAC writes). Tier 1
 green, `test_opcodes` 273/273.
 
+## Keen 4 with planar 0Dh — adopted, detects everything, and still draws black
+
+Re-measured under gwemu at `b94b7d1` (the planar merge). **Mode 0Dh is ADOPTED,
+not refused** — `x86_video_mode_log` now ends `06 0d03` / `01 280d` / `03 000d`:
+requested, adopted at 40 columns, renderer following. `x86_vga_ega_armed=1`,
+**`x86_vga_ega_refused=0`** — the arena claim for the four planes succeeds
+(`ega_planes = 0x24040000`, 8,192 offsets = 32,768 B). The "Open defects" entry
+below is retired.
+
+**The startup banner is back AND everything is detected.** `screenshot.py --attr`
+at 2 s (`build/artifacts/keen4_planar_2s.png`): 11 distinct attributes,
+`0x5d`×1037 / `0x01`×533 / **`0x5f`×236** / `0x1f`×71 / `0x10`×64 / `0x56`×25 /
+`0x1d`×19 / `0x13`×10 / `0xdf`×2 / `0xdc`×2 / `0xfa`×1, 56,440 of 76,800 pixels
+non-zero. Unlike the 159-cell baseline, **the bright runs are VALUES**: `√CGA`,
+`√EGA/VGA`, `√Keyboard`, `√PC Speaker`, and the memory box reads
+**`√Standard 390 Kbytes` / Total 390 Kbytes** — the EXE's `xxxxx` placeholders
+are filled in. That is the "did anything get highlighted" question answered YES,
+for the first time. *Attribution honestly: this is downstream of `5de7e70`'s VGA
+answer and the sysinfo fixes, not of the planar work; nobody had captured Keen at
+2 s since. The planar work's own contribution is what happens next.*
+
+The banner is transient exactly as before (the second `06 0303`). At **5 s, 10 s
+and 20 s** the mode is 0x0D and the frame is **0 of 76,800 pixels non-zero** —
+`--attr` is meaningless there and says so, 0xB8000 holds pixels.
+
+**Keypresses work; Keen advances; the picture does not.**
+`timelines/keen4-keypress.tl` (new) presses B/A/TIME/SELECT at it. The `IN_Ack`
+loop at `0x15C70` releases: `x86_disk_reads` 618 → **734** (more `EGAGRAPH.CK4`),
+planar stores 157,304 → **254,813**, and the sampled PC lands in `ega_read_byte`,
+`ega_shadow_rebuild` and `blit_ega16` rather than the poll loop. Captures at
+18 s and 30 s after the presses are still **0 non-zero pixels**.
+
+**The discarded-store numbers, and they are the whole story:**
+
+| counter | after the clear (~3 s) | after the keypresses (~36 s) |
+|---|---:|---:|
+| `x86_vga_planar_stores` | 157,304 | 254,813 |
+| `x86_vga_planar_lost` | 243,444 | **385,049** |
+| `x86_vga_latch_loads` | 157,304 | 254,813 |
+| `x86_vga_latch_miss` | 71,163 | **168,672** |
+
+**60.2% of every store Keen makes is discarded** (385,049 of 639,862) and 66% of
+its latch loads come from a cell that is not fitted. Dumping the plane storage
+itself at t+35 s — `probe.py --bytes '*ega_planes+0:8192'` — returns **all
+zeros**: the visible window holds nothing, so the black frame is honest, not a
+blit defect. The geometry makes it unavoidable: Keen programs CRTC Offset
+**0x20** (`vga_regs.crtc[0x13]`, a 64-byte/512-pixel virtual row) with display
+start 0, so a 200-row window spans **12,800 plane offsets against 8,192 fitted**
+— the bottom 72 rows have no storage at any moment, and everything Keen caches
+off-screen is above the card entirely.
+
+This is the outcome `x86_video.c:869-876` and `docs/08_vga_mode13h.md:267-271`
+predicted from the reference's measurement (write high-water plane offset 65,536;
+97.2% of latch copies sourced from beyond 8 KB). **Measured, it is not "levels
+render badly" — it is that nothing renders at all past the text banner.** The
+prediction that a partial card buys a partial picture was wrong in our favour
+nowhere: we get zero picture, not a bad one.
+
+Not measured: whether Keen reaches its story screen / main menu logically (it
+loads art and runs, but there is no visible frame to confirm a menu), and how
+much of the 32,768-byte card is ever written (only the first 8,192 bytes were
+dumped; the frame's 0 non-zero pixels covers the rest indirectly).
+
 ## Open defects
 
-- **Keen 4 shows a BLANK screen since `5de7e70`** — AH=1Ah answering VGA lets it
-  past the video gate into mode 0Dh, which `x86_video` refuses, and it then waits
-  for a keypress it cannot show a prompt for. Measured, with the counterfactual
-  build; see "Keen 4 on HEAD" above. Do not revert (Wolf3D needs the VGA answer);
-  the fix is EGA planar 0Dh.
+- ~~**Keen 4 shows a BLANK screen since `5de7e70`**~~ — the REFUSAL is gone: 0Dh
+  is adopted and armed. Keen still draws a black frame, but for a different and
+  now-measured reason — 60% of its stores are past a 32 KB card. See "Keen 4
+  with planar 0Dh" above. Not fixable in this device's memory.
 - **A segment override in front of `REP` survives only the first element.**
   `rep_resume` is the address of the F2/F3 prefix, not of the whole prefix run,
   so `26 F3 A4` (`ES: REP MOVSB`) rewinds to the `F3` and every element after

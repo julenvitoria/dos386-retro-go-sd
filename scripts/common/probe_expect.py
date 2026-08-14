@@ -105,11 +105,13 @@ INT = {
     (0x10, 0x00, 0x04): _e("implemented", "CGA 320x200 4-colour, LUT8 blitter"),
     (0x10, 0x00, 0x05): _e("implemented", "CGA 320x200 4-colour, mono palette"),
     (0x10, 0x00, 0x06): _e("implemented", "CGA 640x200 2-colour"),
-    (0x10, 0x00, 0x0D): _e("absent-by-design",
-                           "REFUSED: EGA 320x200 planar is not implemented. "
-                           "The mode log records tag 5 value 0x0D",
-                           "an EGA programs 4 bit planes at A000:0000. This is "
-                           "the wall Commander Keen 4 hits"),
+    (0x10, 0x00, 0x0D): _e("partial",
+                           "ADOPTED: EGA 320x200 planar renders (mode log tag "
+                           "1, value 0x0D). The CARD is 8,192 plane offsets "
+                           "(32 KB); stores past that are discarded and "
+                           "counted in x86_vga_planar_lost",
+                           "a real EGA has 64 KB per plane. Keen 4's level "
+                           "art lives above our card and draws as black"),
     (0x10, 0x00, 0x0E): _e("absent-by-design", "REFUSED: EGA 640x200 planar"),
     (0x10, 0x00, 0x10): _e("absent-by-design", "REFUSED: EGA 640x350 planar"),
     (0x10, 0x00, 0x12): _e("absent-by-design", "REFUSED: VGA 640x480 planar"),
@@ -146,13 +148,16 @@ INT = {
     (0x10, 0x12): _e("absent-by-design",
                      "returns with BL UNCHANGED, which is exactly what a "
                      "machine with no EGA does",
-                     "an EGA returns BL=memory size. DO NOT 'fix' this: "
-                     "claiming EGA gets Keen 4 past the gate and then into an "
-                     "unrenderable mode 0Dh with no way to tell it failed"),
-    (0x10, 0x1A): _e("absent-by-design",
-                     "returns AL=0",
-                     "VGA returns AL=1Ah plus BL/BH display codes. AL=0 is the "
-                     "documented 'not supported' and is the honest answer here"),
+                     "an EGA returns BL=memory size. 0Dh renders now, so this "
+                     "is no longer a wall -- but the answer still describes "
+                     "this machine, which has 32 KB of plane storage and not "
+                     "the 256 KB the BL codes describe"),
+    (0x10, 0x1A): _e("implemented",
+                     "returns AL=1Ah, BX=0x0008 -- VGA with a colour analogue "
+                     "display, since 5de7e70. Measured, not assumed: the "
+                     "report prints AX=0x1a1a for Keen 4 and Wolf3D alike",
+                     "AL=0 was the old 'not supported' answer; it cost Wolf3D "
+                     "its VW_VideoID and is not what this BIOS says any more"),
     (0x10, 0x13): _e("unclassified", "write string -- not in the switch"),
 
     # ---- Hardware interrupts and INT 20h. AH carries nothing here, and

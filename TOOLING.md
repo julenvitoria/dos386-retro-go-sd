@@ -1111,6 +1111,13 @@ Verified with `screenshot.py --text` at each stage. This matters because
 profiling the unanswered prompt returns 56% `CMP Gv,Ev` + 44% `JZ Jb` -- an
 exact measurement of a game that never started, and one that looks like a
 result.
+`timelines/keen4-keypress.tl` presses keys AT the guest, on several different
+buttons, for a title whose startup ends in a "press any key" wait. Commander
+Keen 4 sits in `IN_Ack` at guest linear `0x15C70` forever under
+`start-preselected-game.tl`, which presses nothing after launching -- so every
+Keen measurement before this one stopped there by construction and could say
+nothing about what follows. It is proven by `x86_disk_reads` moving (618 -> 734)
+and the planar store counters resuming, not by the screen, which stays black.
 `timelines/run-to-completion.tl` is the same launch with a 58 s window, for a
 guest doing real work whose result only appears at the end -- the one case where
 the wait IS the result rather than a symptom to chase with `probe.py`.
