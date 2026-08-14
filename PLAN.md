@@ -108,9 +108,25 @@ tier.
 3. **Fold-trap the VGA aperture check** — in progress. Removes 4-5 instructions
    from every memory access in every title, and may free the 65,536-byte 0Dh
    read shadow, which is what Keen's intro needs.
+3b. **The aperture in DTCM — MEASURED, DOES NOT FIT, one route left.** The
+   65,536-byte aperture would be 0-wait-state there and would hand 65,536 B
+   back to the arena, which buys one extra Mode Y real page with **no donated
+   frames** (`x86_pg_frames_total` stays 160). `dtc_malloc()` refuses it: 63,268
+   free against 65,568 wanted, **short by 2,300**. The 87,844 this was planned
+   against was `core_dtcm_headroom_max` bounding against the end of the RAM
+   instead of the end of the POOL — a 24,576-byte over-report, now fixed, that
+   had stood for the whole project. The attempt and its witness
+   (`x86_vga_aperture_dtcm_fail`) are kept in tree. The ONE route left is
+   evicting the 8,192-byte pager page table, the only DTCM tenant not on a
+   per-access path; it fits with 5,892 to spare but costs two pager frames
+   (RAM_EMU) or an unknowable bite of the AHB heap. **Owner's call.** Note it
+   forecloses B5 — DMA2D cannot address DTCM.
+   [`docs/12`](docs/12_memory_tiers.md) §8.
 4. **Keen's half-height intro** — diagnosed: `crtc_start=15360`, pitch 64,
    19,456 offsets fitted → exactly 64 rows. Needs 28,160 offsets. Blocked on 3.
 5. **DMA2D A/B** — in progress; chained 13h only, timing unprovable below tier 3.
+   **Mutually exclusive with B3b**: DMA1/DMA2 and Chrom-ART cannot address
+   DTCM, so an aperture moved there has nothing the engine could read.
 6. **Overlay legibility over 256-colour modes** — in progress.
 7. **Mode Y real pages** — done, 3 pages, `alias_hits=0`. Awaiting the owner's
    verdict on the doubled-walls artefact.

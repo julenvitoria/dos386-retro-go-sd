@@ -222,6 +222,10 @@ static const uint32_t *clut256_pushed;
 static uint8_t *upper_filler;
 static uint8_t *bios_id_page;   /* 0xFF000: real storage, not an alias */
 static uint8_t *vga_aperture;   /* 0xA0000: the mode 13h linear framebuffer */
+/* The DTCM block dtcm_state_init() took for it, or NULL if the pool refused.
+   Aligned; see the block comment there. */
+static uint8_t *dtcm_aperture;
+#define X86_VGA_APERTURE_ALIGN 32u
 
 /* Host-readable so a failure to place either block is visible rather than a
    black screen. */
@@ -233,6 +237,20 @@ volatile uint32_t upper_filler_ok = 0;   /* 0xA0000-0xFFFFF backed at all */
    the AHB heap, which is shared with the firmware's own newlib allocations
    and so is the one whose free space cannot be read off a link map. */
 volatile uint32_t vga_aperture_ok = 0;
+/*
+ * WHERE the aperture landed, and the witness for a DTCM allocation that failed.
+ *
+ * The 64 KB aperture is taken from the DTCM bump pool rather than the AXI
+ * arena (see dtcm_aperture_init()). A NULL there is not fatal -- the arena
+ * claim is still there as a fallback -- but it MUST be visible, because the
+ * symptom of a silent failure is a black screen with no message, which is the
+ * exact shape STATUS.md records for RAM_EMU exhaustion.
+ *
+ *   x86_vga_aperture_dtcm       1 = DTCM (the intended path), 0 = arena
+ *   x86_vga_aperture_dtcm_fail  1 = DTCM was asked and said no
+ */
+volatile uint32_t x86_vga_aperture_dtcm = 0;
+volatile uint32_t x86_vga_aperture_dtcm_fail = 0;
 volatile uint32_t disk_cache_mem = 0;    /* the AHB pointer itself, or 0 */
 volatile uint32_t frames_rendered = 0;
 /*
@@ -666,7 +684,31 @@ volatile uint32_t run_benchmark_flag = 0;
 #define DWT_CYCCNT      (*(volatile uint32_t *)0xE0001004)
 #define CoreDebug_DEMCR (*(volatile uint32_t *)0xE000EDFC)
 
-#define DTCM_TOP 0x20020000u        /* 0x20000000 + 128 KB */
+/*
+ * THE TOP OF THE DTCM BUMP POOL -- WHICH IS NOT THE TOP OF DTCM.
+ *
+ * This read 0x20020000 (0x20000000 + 128 KB) and was WRONG BY 24,608 BYTES,
+ * and the error was not academic: it is the number a task was planned against.
+ * `core_dtcm_headroom_max` reported 87,844 free, the 65,536-byte VGA aperture
+ * was moved here on the strength of it, and dtc_malloc() returned NULL --
+ * because the firmware's pool ends at `__dtc_padding_end__`, not at the end of
+ * the RAM:
+ *
+ *   ._dtcm_free : __dtc_padding_end__ = ORIGIN(DTCMRAM) + 128K
+ *                                       - _Min_Stack_Size      (24K - 32)
+ *                                       - _Stack_Redzone_Size  (32)
+ *   references/game-and-watch-retro-go-sd/STM32H7B0VBTx_SDCARD.ld:462-471
+ *
+ * so the pool tops out at 0x2001A000, confirmed against the firmware ELF
+ * (`__dtc_padding_end__` = 2001a000). The 24 KB above it is the MAIN STACK and
+ * its redzone; handing it out would corrupt the machine rather than fail.
+ *
+ * The name still says `_max`, because it still is a bound and not an exact
+ * figure -- the ABI has no GW_MEM_OP_FREE_SIZE for DTCM ("RAM only today") --
+ * but it is now a bound that a caller can plan against instead of one that
+ * over-promises by a stack.
+ */
+#define DTCM_TOP 0x2001A000u        /* __dtc_padding_end__, NOT 0x20020000 */
 /* Where the DTCM bump pool had got to after the core's own allocations, and an
    UPPER BOUND on what is left above it. See dtcm_state_init(). */
 volatile uint32_t core_dtcm_next = 0;
@@ -726,6 +768,89 @@ static bool dtcm_state_init(void)
                                                   1, X86_PG_TABLE_BYTES),
                              X86_PG_TABLE_BYTES) != 0) {
         return false;
+    }
+
+    /*
+     * ---- THE VGA APERTURE, IN DTCM --------------------------------------
+     *
+     * 64 KB of real storage behind guest 0xA0000-0xAFFFF. It used to come out
+     * of the 143,360-byte AXI arena, and it was the single largest thing in
+     * there; moving it here does two things at once.
+     *
+     * 1. The planar path is the hottest data path a graphics title has. Every
+     *    guest store into a planar mode reads and writes this block, and the
+     *    blitter reads all 64,000 displayed bytes every frame. DTCM is
+     *    0-wait-state and, unlike AXI, is not shared with the LTDC's scanout
+     *    traffic. The CODE half of this landed at 486332a (planar_store and
+     *    vga_cell pinned to ITCM); this is the DATA half.
+     *
+     * 2. It hands 65,536 bytes back to the arena, which is what pays for a
+     *    second Mode Y real page WITHOUT donating any pager frames. See
+     *    planar_storage_follow() in x86_video.c.
+     *
+     * The FOLD SENTINEL IS UNAFFECTED, and that is a correctness precondition,
+     * not a hope: X86_FOLD_VGA_OK(host) is (host & 0xE0000000) == 0x20000000,
+     * which DTCM at 0x20000000 satisfies exactly as AXI at 0x24000000 does.
+     * Arming refuses the sentinel outright on any other region, so a mistake
+     * here would be loud rather than subtly wrong.
+     *
+     * IT DOES NOT FIT TODAY, AND THE ARITHMETIC IS WHY -- MEASURED, tier 2,
+     * with x86_vga_aperture_dtcm_fail reading 1 on every boot:
+     *
+     *   pool        0x20000000 .. 0x2001A000   106,496 B  (DTCM_TOP above)
+     *   core takes                              43,228 B  (core_dtcm_next)
+     *     X86CPUState             2,268
+     *     fold table             16,384   R9, every memory access
+     *     mode records           16,384   R2, every dispatch (8,192 + align)
+     *     pager page table        8,192   read on a FAULT, not on an access
+     *   left                                    63,268 B
+     *   wanted                                  65,568 B
+     *   SHORT BY                                 2,300 B
+     *
+     * The plan this was written to said 87,844 B were free "with ~22 KB to
+     * spare". That figure was core_dtcm_headroom_max measured against a
+     * DTCM_TOP of 0x20020000, which is the end of the RAM and not the end of
+     * the POOL -- see DTCM_TOP. The 24 KB it over-promised is the main stack.
+     *
+     * The only tenant here that is not on a per-access path is the 8,192-byte
+     * PAGER PAGE TABLE, and evicting it would leave 71,460 and fit this with
+     * 5,892 to spare. It is not done here because the memory it would move to
+     * is not free either: RAM_EMU costs two pager frames (x86_pg_frames_total
+     * 160 -> 158) and the AHB heap's free space is not knowable from a link
+     * map. That is a trade for the owner, not a side effect of this comment.
+     *
+     * THE COST IF IT EVER DOES FIT, STATED PLAINLY: the DTCM pool is a BUMP
+     * ALLOCATOR WITH NO FREE, so the 64 KB would be gone for the whole session
+     * -- taken even by a text-mode title that will never set a graphics mode.
+     * Making it lazy buys nothing: a bump pool cannot take the memory back
+     * when the guest leaves the mode either, so laziness only moves the
+     * failure somewhere harder to read.
+     *
+     * Over-allocated by 32 bytes so the block can be aligned up. Alignment is
+     * not required for correctness -- x86_map_fixed() builds each granule's k
+     * by arithmetic and DTCM has no cache lines to straddle -- but a 4-byte
+     * block already cost this project a pager frame once (STATUS.md), and 32
+     * bytes is not worth the doubt.
+     *
+     * THE ASK IS KEPT, not deleted. It costs one failed call at init, it is
+     * the thing that made the headroom bug visible at all, and it starts
+     * working by itself the day a tenant moves or the firmware's stack reserve
+     * shrinks. A NULL IS NOT FATAL: dtcm_aperture stays NULL, the caller falls
+     * back to the arena claim, and x86_vga_aperture_dtcm_fail says it
+     * happened.
+     */
+    {
+        uint8_t *ap = (uint8_t *)abi->mem_ctl(
+            GW_MEM_OP_ALLOC, GW_MEM_DTC, 1,
+            X86_VGA_APERTURE_BYTES + X86_VGA_APERTURE_ALIGN);
+        if (ap) {
+            dtcm_aperture = (uint8_t *)(uintptr_t)
+                (((uint32_t)(uintptr_t)ap + X86_VGA_APERTURE_ALIGN - 1u)
+                 & ~(uint32_t)(X86_VGA_APERTURE_ALIGN - 1u));
+        } else {
+            dtcm_aperture = NULL;
+            x86_vga_aperture_dtcm_fail = 1;
+        }
     }
 
     /*
@@ -1026,7 +1151,14 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
        at the top of the pool, so testing against BONUS_USED would refuse the
        aperture on any firmware whose bonus pool came back a byte short. Each
        block is placed if its own extent fits and reported if it does not. */
-    {
+    /* DTCM FIRST, arena as the fallback. dtcm_state_init() took the block; if
+       the pool refused it, x86_vga_aperture_dtcm_fail is already 1 and the
+       arena claim below is the old behaviour, unchanged -- a slower aperture
+       and one fewer Mode Y page, but a picture. */
+    if (dtcm_aperture) {
+        vga_aperture = dtcm_aperture;
+        x86_vga_aperture_dtcm = 1;
+    } else {
         void *blk = NULL;
         vga_aperture = (x86_arena_claim(X86_ARENA_ID_VGA13, 1,
                                         X86_VGA_APERTURE_BYTES, &blk) == 0)

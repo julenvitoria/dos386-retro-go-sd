@@ -305,3 +305,54 @@ so nothing is corrupted — but a caller that tolerates NULL loses a feature wit
 no message, which is what happened to the open-bus filler. Measure
 `__CORE_BSS_END__` before and after any core change; the core's TEXT is in this
 region too, so code growth counts.
+
+## 8. DTCM is a tier too, and its free space was over-reported by a stack
+
+DTCM is 128 KB at `0x20000000`, handed out by the firmware's `dtc_malloc()`
+bump pool. The core takes **43,228 B** of it, all of it on a per-access path
+bar one entry:
+
+| block | size | touched |
+|---|---:|---|
+| `X86CPUState` | 2,268 | every instruction |
+| fold table (`R9`) | 16,384 | every memory access |
+| mode records (`R2`) | 16,384 | every dispatch (8,192 + 8 KB align) |
+| pager page table | 8,192 | **on a FAULT, not on an access** |
+
+**The pool ends at `__dtc_padding_end__` = `0x2001A000`, not at `0x20020000`.**
+The 24 KB above it is `_Min_Stack_Size` + `_Stack_Redzone_Size` — the main
+stack (`STM32H7B0VBTx_SDCARD.ld`, `._dtcm_free`). `core_dtcm_headroom_max`
+computed its bound against the end of the RAM instead and therefore
+**over-reported free DTCM by 24,576 bytes on every reading this project has
+ever taken** — the "96,068 B free" in `TOOLING.md` and the 87,844 quoted into a
+task plan are both that error. Fixed in `src/main.c`; it now reads **63,268**.
+
+### The 13h aperture does not fit here, and that is measured
+
+Moving the 65,536-byte VGA aperture out of the arena and into DTCM was tried,
+on the strength of the wrong number. `dtc_malloc()` returns NULL:
+
+```
+left   63,268     wanted   65,568     SHORT BY 2,300
+```
+
+The attempt is kept, not deleted — it costs one failed call at init, it is what
+made the headroom bug visible, and `x86_vga_aperture_dtcm_fail` says on every
+boot that it is still failing. The fallback to `x86_arena_claim()` is the old
+path unchanged, so a picture is never at risk.
+
+**The only route left is to evict the pager page table**, the one DTCM tenant
+that is not on a per-access path. That leaves 71,460 and fits the aperture with
+5,892 to spare, and it would free 65,536 B of arena — enough for one extra Mode
+Y real page with **no donated frames**. It is not taken here because the memory
+it moves to is not free either: RAM_EMU costs two pager frames
+(`x86_pg_frames_total` 160 → 158) and the AHB heap's free space is not knowable
+from a link map. That is a trade to decide, not a refactor to slip in.
+
+### DMA2D can never reach the aperture if it moves here
+
+DMA1/DMA2 and Chrom-ART **cannot address DTCM** — it is CPU-private, off the
+AXI matrix. So an aperture in DTCM forecloses Queue B5's DMA2D A/B of the
+chained 13h blit entirely: the engine would have nothing it could read. This is
+recorded so it is not rediscovered as a bug in the DMA2D path. `X86_VIDEO_DMA2D`
+defaults to 0, so there is no conflict today.

@@ -110,12 +110,18 @@ X86_CS_LOG ?= 0
 # on dma2d_blit_hook(). Build with X86_VIDEO_DMA2D=1 to A/B it on hardware.
 X86_VIDEO_DMA2D ?= 0
 
-# How many EXTRA Mode Y display pages to fund out of donated pager frames, at
-# 65,536 B / 16 frames each. 2 is the hardware layout; 1 still removes the
-# draw-over-displayed hazard and hands 16 frames back to the guest; 0 keeps the
-# aliased fold. The trade is a RENDERING defect against a PAGING one -- see
-# x86_video.c at x86_pager_donate_upto(), and grade any rung on the WOLF3D
-# golden AND x86_vga_modey_alias_hits, never on frame rate alone.
+# How many EXTRA Mode Y display pages to fit, at 65,536 B each. 2 is the
+# hardware layout; 1 still removes the draw-over-displayed hazard; 0 keeps the
+# aliased fold. Grade any rung on the WOLF3D golden AND
+# x86_vga_modey_alias_hits, never on frame rate alone.
+#
+# RUNG 1 IS NOT FREE, AND THE ATTEMPT TO MAKE IT FREE IS RECORDED. The plan was
+# to move the 65,536-byte 13h aperture into DTCM, leaving the arena a run big
+# enough for one extra page with NO frames donated. The aperture does not fit
+# in DTCM -- short by 2,300 bytes, measured; see dtcm_state_init() in
+# src/main.c. So rung 1 still costs 16 donated frames (160 -> 142) and still
+# takes x86_vga_modey_alias_hits from 0 to ~13 M, which is the doubled-walls
+# defect. Rung 2 stays the default on the same grounds PLAN.md Queue A4 gives.
 X86_MODEY_EXTRA_PAGES ?= 2
 
 CORE_C_DEFS := \

@@ -1428,7 +1428,29 @@ static void planar_storage_follow(uint8_t kind)
 #ifndef X86_MODEY_EXTRA_PAGES
 #define X86_MODEY_EXTRA_PAGES 2u
 #endif
-    if (X86_MODEY_EXTRA_PAGES)
+    /*
+     * DONATE ONLY WHAT THE ARENA CANNOT ALREADY PLACE.
+     *
+     * x86_pager_donate_upto() is unconditional -- it takes the frames whether
+     * or not they were needed. That is invisible today, because the 13h
+     * aperture eats 65,536 of the arena's 143,360 bytes and there is never a
+     * run for an extra page, so the answer is always "donate". It stops being
+     * invisible the moment anything frees arena (the aperture moving to DTCM
+     * was tried and does not fit -- src/main.c -- but the EGA/cache fits move
+     * too), and donating on top of a run the arena already had would hand the
+     * guest's frames away for nothing.
+     *
+     * x86_arena_would_fit() is the right question and x86_arena_free is not:
+     * a claim needs a CONTIGUOUS run and releasing a claim leaves holes. That
+     * is the same trap aperture_compact() exists for, and the arithmetic
+     * working out has never been evidence that the run exists.
+     *
+     * MEASURED NO-OP TODAY: at the shipping rung the would_fit test is false
+     * and the donation happens exactly as before (x86_pg_frames_total 126).
+     */
+    if (X86_MODEY_EXTRA_PAGES
+        && !x86_arena_would_fit(X86_ARENA_ID_MODEYP, X86_MODEY_EXTRA_PAGES,
+                                X86_MODEY_PAGE_BYTES))
         x86_pager_donate_upto(X86_MODEY_EXTRA_PAGES * X86_MODEY_PAGE_BYTES,
                               X86_MODEY_PAGE_BYTES);
     void *pg[2] = { NULL, NULL };
