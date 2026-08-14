@@ -414,7 +414,10 @@ x86_cpu_interp_asm:
     MOVT R3, #(X86_TRACE_ATEIP >> 16)
     CMP R10, R3
     BNE.W 3f
-    LDR.W R3, [R8, #REG_ESP]
+#ifndef X86_TRACE_ATREG
+#define X86_TRACE_ATREG REG_ESP
+#endif
+    LDR.W R3, [R8, #X86_TRACE_ATREG]
 #else
     MOV.W R3, R10
 #endif

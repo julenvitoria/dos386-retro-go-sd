@@ -87,6 +87,42 @@ that looks exactly like a correct one. Both options walk `guest_page_table_ptr`
 `FOLD_INVALID` as `0xFF`, which is what the guest would fetch there, so a dump
 never silently invents zeros for memory that is not mapped.
 
+#### Driving the reference PC (`scripts/ref_dos.py`)
+
+```bash
+python3 scripts/ref_dos.py --dsk .../WOLF3D.dsk --no-hooks --launch WOLF3D.EXE \
+    --settle 30 --samples 5 --interval 8 --text \
+    --save build/artifacts/ref.bin --screen build/artifacts/ref.ppm
+```
+
+Four traps are handled in the script because each one produced a WRONG ANSWER
+rather than an error:
+
+1. **CHS geometry** comes from the volume's own BPB (1 head / 63 sectors here).
+   QEMU's default for a 3 MB disk is not that, and SeaBIOS then sits at 0x7C04
+   forever showing "Booting from Hard Disk...".
+2. **`--no-hooks`** rewrites CONFIG.SYS in a COPY: `XMSHOOK.SYS`/`EMSHOOK.SYS`
+   are written for our emulator and hang a reference machine before
+   AUTOEXEC.BAT runs, which reads exactly like the title crashing.
+3. **The monitor is read to its PROMPT, never slept on.** It echoes every
+   character, so a fixed sleep leaves part of one command's echo in the buffer
+   and the next command arrives with that garbage prepended.
+4. **Paths passed to `pmemsave`/`screendump` are QUOTED.** The monitor parses
+   the size argument as an arithmetic EXPRESSION and `/` is DIVISION, so
+   `pmemsave 0 0x100000 /home/...` becomes a division by `home` and dies with
+   `invalid char 'h' in expression` — having written nothing. Relative paths
+   happen to work, which is exactly what hid it.
+
+`--display` defaults to VNC and **must not be `none`**: QEMU derives the VGA
+status bits at port 0x3DA from its display refresh, so under `-display none` a
+title polling for vertical retrace spins forever. Measured — WOLF3D sat in
+`IN AL,0x3DA / TEST AL,1 / JNZ` indefinitely.
+
+**A reference that is RUNNING is not a reference that has reached the same
+place.** Check `--samples`, the mode byte and the screendump before trusting any
+comparison, or the two images are snapshots of different moments and every
+difference between them is noise.
+
 `scripts/watch_memory.py --addr guest:0xLIN` resolves the same way, for catching
 the write that corrupted a guest address rather than reading it after the fact.
 
@@ -104,7 +140,7 @@ the linear EIPs that led there**. Read the whole block with
 | `X86_TRACE_LOWEIP N` | first instruction with linear EIP below `N`. "The guest is running the IVT as code" — fires EARLIER in a derailment than any register predicate, so reach for it first |
 | `X86_TRACE_LOWSP N` | first boundary with SP below `N`, for a push/pop imbalance whose single leak is invisible and whose drift is not |
 | `X86_TRACE_MEMEQ A` + `X86_TRACE_MEMVAL V` | first boundary at which the guest 16-bit word at linear `A` equals `V` — a store watch. A hardware watchpoint cannot do this job here: the host address of a guest page is only known once its fold entry is live, and a guest that halts a second after it starts leaves no window in which a host-side tool can resolve and arm one (`watch_memory.py` armed on a stale entry and pointed at 0x02255706, which is not a host address at all). This fires on the instruction AFTER the store, and the ring names the writer |
-| `X86_TRACE_ATEIP A` | changes what the RING holds: SP sampled at exactly one guest EIP, one entry per pass. A slow stack leak cannot be found with a threshold — the drift is smaller than normal frame churn, so any bound low enough to miss a legitimate `sub sp,N` prologue is already past the start. Sampling the same instruction every iteration makes the per-iteration delta the reading |
+| `X86_TRACE_ATEIP A` (+ `X86_TRACE_ATREG R`) | changes what the RING holds: register `R` (default `REG_ESP`) sampled at exactly one guest EIP, one entry per pass. The ring INDEX at `[7]` is then a hit count, which answers "was this instruction ever executed at all" — a 0 there is how the only writer of a variable was shown never to run. A slow stack leak cannot be found with a threshold — the drift is smaller than normal frame churn, so any bound low enough to miss a legitimate `sub sp,N` prologue is already past the start. Sampling the same instruction every iteration makes the per-iteration delta the reading |
 | `X86_TRACE_SKIP N` | arms the trap only after `N` instructions. Not optional for a register predicate: BP is a general register during startup (the unpacker loads it with a segment value at instruction 28), so an ungated "first odd BP" fires on a non-defect and hides the real one. The ring keeps filling while disarmed |
 
 **Catch, do not bisect, when the event is rare.** A bisection needs the run to be

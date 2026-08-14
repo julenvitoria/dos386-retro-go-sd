@@ -125,6 +125,18 @@ def rewrite_boot_files(path, launch):
 
 
 class Monitor:
+    """QEMU's human monitor over a UNIX socket.
+
+    Commands are read to the PROMPT, not slept on. The monitor echoes every
+    character it receives, so a fixed sleep leaves part of one command's echo in
+    the buffer and the next command is delivered with that garbage prepended --
+    which QEMU then rejects with something as unhelpful as
+    `invalid char 'h' in expression`, having silently mangled a path. Measured:
+    that is why pmemsave produced no file while reporting nothing wrong.
+    """
+
+    PROMPT = b"(qemu) "
+
     def __init__(self, sock_path, timeout=20.0):
         deadline = time.time() + timeout
         while True:
@@ -136,24 +148,31 @@ class Monitor:
                 if time.time() > deadline:
                     raise
                 time.sleep(0.5)
-        time.sleep(0.5)
-        self._drain()
+        self._read_to_prompt(5.0)
 
-    def _drain(self):
+    def _read_to_prompt(self, timeout):
+        buf = b""
         self.s.settimeout(0.5)
-        try:
-            self.s.recv(1 << 20)
-        except OSError:
-            pass
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                chunk = self.s.recv(1 << 20)
+            except socket.timeout:
+                if buf.endswith(self.PROMPT):
+                    break
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            if buf.endswith(self.PROMPT):
+                break
+        return buf.decode("latin1")
 
-    def cmd(self, c, wait=2.5):
+    def cmd(self, c, wait=20.0):
         self.s.sendall((c + "\n").encode())
-        time.sleep(wait)
-        self.s.settimeout(1.0)
-        try:
-            return self.s.recv(1 << 20).decode("latin1")
-        except OSError:
-            return ""
+        return self._read_to_prompt(wait)
 
 
 def main():
@@ -170,6 +189,26 @@ def main():
     p.add_argument("--launch", default=None,
                    help="AUTOEXEC line to use with --no-hooks "
                         "(default: the image's own)")
+    p.add_argument("--samples", type=int, default=1,
+                   help="take this many snapshots, --interval apart. A "
+                        "reference that is merely RUNNING is not one that has "
+                        "reached the same place; the sequence is what shows "
+                        "whether it is progressing or spinning")
+    p.add_argument("--interval", type=float, default=5.0)
+    p.add_argument("--display", default="vnc=:99",
+                   help="QEMU -display/-vnc setting. NOT 'none' by default and "
+                        "that is load-bearing: QEMU derives the VGA status bits "
+                        "at port 0x3DA from its display refresh, so under "
+                        "-display none a title polling for vertical retrace "
+                        "spins forever. Measured: WOLF3D sat in "
+                        "`IN AL,0x3DA / TEST AL,1 / JNZ` indefinitely, which "
+                        "reads exactly like the title hanging")
+    p.add_argument("--text", action="store_true",
+                   help="also print the 80x25 text buffer at each sample")
+    p.add_argument("--keys", default="",
+                   help="comma-separated monitor sendkey names pressed before "
+                        "sampling, e.g. ret,spc -- a title waiting on a signon "
+                        "keypress is indistinguishable from one that has hung")
     p.add_argument("--mem", type=int, default=16)
     p.add_argument("--work", default="build/run/refdos")
     args = p.parse_args()
@@ -195,21 +234,66 @@ def main():
         ["qemu-system-i386",
          "-drive", f"file={img},format=raw,if=none,id=d0,snapshot=on",
          "-device", f"ide-hd,drive=d0,cyls={cyls},heads={heads},secs={secs}",
-         "-m", str(args.mem), "-display", "none",
+         "-m", str(args.mem)]
+        + (["-vnc", args.display[4:]] if args.display.startswith("vnc=")
+           else ["-display", args.display])
+        + [
          "-monitor", f"unix:{sock},server,nowait"],
         stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     try:
         print(f"letting the reference run {args.settle:.0f}s...")
         time.sleep(args.settle)
         mon = Monitor(sock)
-        regs = mon.cmd("info registers")
-        for line in regs.splitlines():
-            if line.startswith(("EIP", "CS ", "DS ", "SS ", "ESP")):
-                print("  " + line.strip())
+        for k in [x for x in args.keys.split(",") if x.strip()]:
+            print(f"  sendkey {k.strip()}")
+            mon.cmd(f"sendkey {k.strip()}")
+        for n in range(args.samples):
+            if n:
+                time.sleep(args.interval)
+            regs = mon.cmd("info registers")
+            bits = {}
+            for line in regs.splitlines():
+                for k in ("EIP", "CS ", "DS ", "SS ", "ESP"):
+                    if line.startswith(k):
+                        bits[k.strip()] = line.split("=")[1].split()[0]
+            probe = os.path.join(args.work, "probe.bin")
+            if os.path.exists(probe):
+                os.unlink(probe)
+            mon.cmd(f'pmemsave 0 0x100000 "{os.path.abspath(probe)}"')
+            for _ in range(20):          # the monitor acks before it finishes
+                if os.path.exists(probe) and os.path.getsize(probe) >= 0x100000:
+                    break
+                time.sleep(0.5)
+            mode = pixels = "?"
+            if os.path.exists(probe) and os.path.getsize(probe) >= 0x100000:
+                d = open(probe, "rb").read()
+                # 0040:0049 is the BIOS video mode, and A0000 having more than
+                # one distinct byte is the difference between "a graphics mode
+                # is set" and "a graphics mode is set and something drew".
+                mode = f"0x{d[0x449]:02x}"
+                pixels = len(set(d[0xA0000:0xA0000 + 64000]))
+                if args.text:
+                    t = d[0xB8000:0xB8000 + 80 * 25 * 2]
+                    for r in range(25):
+                        line = "".join(
+                            chr(t[(r * 80 + c) * 2])
+                            if 32 <= t[(r * 80 + c) * 2] < 127 else " "
+                            for c in range(80)).rstrip()
+                        if line:
+                            print(f"      |{line}")
+            print(f"  t+{n * args.interval:5.0f}s CS:IP={bits.get('CS')}:"
+                  f"{bits.get('EIP')} DS={bits.get('DS')} SS:SP="
+                  f"{bits.get('SS')}:{bits.get('ESP')} "
+                  f"mode={mode} A000-distinct={pixels}")
         # VERIFY the file appeared. The monitor acknowledges a command it has
         # not finished, so a terminate() straight after silently produces no
         # file at all and the caller diffs against a stale image -- which is
         # worse than an error, because the diff still "works".
+        # The path is QUOTED. QEMU's monitor parses the size argument as an
+        # arithmetic EXPRESSION and `/` is DIVISION, so an unquoted absolute
+        # path makes `0x100000 /home/...` a division by `home` and the command
+        # dies with `invalid char 'h' in expression` -- having written nothing.
+        # Relative paths happen to work, which is what hid this.
         for flag, cmd, want in ((args.save, "pmemsave 0 0x100000", 0x100000),
                                 (args.screen, "screendump", 0)):
             if not flag:
@@ -218,7 +302,7 @@ def main():
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
             if os.path.exists(path):
                 os.unlink(path)
-            mon.cmd(f"{cmd} {path}")
+            mon.cmd(f'{cmd} "{path}"')
             for _ in range(20):
                 if os.path.exists(path) and os.path.getsize(path) >= want:
                     break
