@@ -183,7 +183,67 @@ by `tests/test_video.py`'s Mode Y real-page arm — with the alias, a write to
 page 1 overwrites page 0, and that negative control is seen to fail in the same
 run.
 
-## 6. Where things live
+## 6. XMS — a tier with NO fast path at all
+
+`x86_xms.h` / the XMS block at the end of `x86_dos.c`. It is listed here because
+it is a place guest bytes live, but it is unlike every other row above it:
+
+**XMS is a BLOCK-COPY interface, not a mapped one.** A real-mode guest cannot
+address extended memory. It allocates a handle (`AH=09h`) and moves bytes in
+bulk with `AH=0Bh`, which we service. No instruction in the guest ever
+dereferences an XMS byte, so XMS memory is **never in the fold table, never
+resident in AXI, and never a page the victim picker can see**. There is no
+`FOLD_INVALID` check, no seam, no `MEM_TRAP`, no eviction pressure. The cost is
+paid inside `AH=0Bh`, at a moment the guest chose, and nowhere else.
+
+That is why XMS comes before EMS in `PLAN.md` Queue C. EMS's page frame *is*
+mapped and *is* read by ordinary instructions; XMS must not import that cost,
+and implementing it by handing out pager frames would do exactly that for
+nothing.
+
+### 6a. Where the bytes are, and why they cannot collide
+
+The same `x86page.swp`, at byte offset `X86_PG_PAGES * X86_PG_SIZE` (8 MB) and
+above. The pager's `slot` IS the guest page number and guest page numbers stop
+at `X86_PG_PAGES`, so the pager can never write past that offset. Collision-free
+by arithmetic, not by convention. The backing ABI is **byte-ranged**, not
+slot-ranged: a slot ABI would force a read-modify-write of a 4 KB slot for any
+unaligned move.
+
+### 6b. What `AH=08h` advertises, and the number that made it honest
+
+`X86_XMS_DEFAULT_KB` = **4,096 KB**, and **0 when there is no pagefile** — with
+no store there is nowhere to put a byte, so `INT 2Fh AX=4300h` answers "absent"
+and nothing is promised. The size is not bounded by the 160-frame AXI pool
+because no XMS byte is ever in a frame; it is bounded by the card and by
+transfer time.
+
+**MEASURED, WOLF3D driven into gameplay under gwemu, same timeline each way:**
+
+| | frames | guest insns |
+|---|---:|---:|
+| XMS absent (the tree before this) | 1,104 | 194.5 M |
+| XMS, `fopen`/`fclose` per move | 766 | 132.7 M |
+| XMS, the file handle held open | **1,057** | 171.9 M |
+
+Wolf3D takes the XMS path the moment it is offered — 278 moves, 430,636 bytes,
+0 I/O errors — and at ~25 ms per open (§1a) the per-move `fopen` alone cost a
+third of the title's frame rate. `src/main.c` therefore holds the handle open
+for the life of the title and closes it at guest reset, before `pgf_open_file()`
+truncates the file. `xms_opens` is **1** for a whole run and is the witness: if
+it ever tracks the move count, that decision has been reverted.
+
+### 6c. What is refused, and said out loud
+
+* **HMA** (`AH=01h`/`02h`): `BL=90h`, "HMA does not exist". The sixteen pages at
+  0x100000 are the A20 *wrap* window (§`x86_mem.c`); nothing owns them as memory
+  when the gate is open.
+* **Lock** (`AH=0Ch`): `BL=0ADh`, "lock failed". A lock's purpose is to yield a
+  32-bit linear address the caller then dereferences. Our bytes are in a file.
+* **A20** (`AH=03h`-`07h`) drives `x86_a20_set()` — the machine's own gate, the
+  one the 8042 path in `x86_io.c` moves. There is no second A20 model.
+
+## 7. Where things live
 
 `src/main.c`'s `bonus_layout()`, computed at runtime:
 

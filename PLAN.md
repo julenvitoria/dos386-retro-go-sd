@@ -99,10 +99,12 @@ tier.
 The groundwork Queue A just landed is what makes this a road rather than a wall.
 **Nothing here starts before the step above it is measured.**
 
-1. **XMS** (INT 2Fh AX=4300h, the HIMEM entry point, INT 15h AH=88h). The
-   pager already owns an 8 MB space (`X86_PG_PAGES = 2048`); XMS is the guest's
-   interface to it. Smallest real step, and it stands alone — titles use XMS
-   without any extender.
+1. ~~**XMS**~~ — built. A BLOCK-COPY interface, so its memory is never folded,
+   never AXI-resident and costs the interpreter nothing; it lives in
+   `x86page.swp` above every pager slot. Advertises 4 MB, **0 with no pagefile**.
+   MEASURED: WOLF3D uses it unprompted (278 moves, 430,636 B, 0 errors) at a 4%
+   frame cost — 31% until the file handle was held open.
+   [`docs/12`](docs/12_memory_tiers.md) §6.
 2. **EMS** (`EMMXXXX0`, INT 67h, a page frame in the UMB region). Independent of
    XMS and cheaper; several titles probe for it and we currently answer absent.
 3. **DPMI** (INT 2Fh AX=1687h, INT 31h) — needs 1 and the descriptor walk from

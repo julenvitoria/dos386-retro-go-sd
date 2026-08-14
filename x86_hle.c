@@ -19,6 +19,7 @@
 #include "cutils.h"
 #include "x86_cpu.h"
 #include "x86_probe.h"
+#include "x86_xms.h"
 #include "font8x8.h"
 
 /* Guest register accessors. The 8086 register file is 16-bit halves of the
@@ -99,6 +100,22 @@ void x86_hle_set_cf(int set)
 _Static_assert((STUB_SEG << 4) + IRET_OFF < (X86_DOS_ARENA_SEG << 4),
                "HLE stubs must sit below the DOS arena");
 
+/*
+ * The XMS control entry lives in the same block, and it is the one stub that is
+ * NOT reached by an interrupt: a guest gets its address from INT 2Fh AX=4310h
+ * and CALL FARs it, so it must end 0xCB (RETF) and not 0xCF (IRET). Returning
+ * with IRET there would pop the caller's own stack as a FLAGS word and leave
+ * SP two bytes light -- a corruption that surfaces nowhere near XMS.
+ *
+ * Both ends are compile-time constants, so both are asserted here rather than
+ * discovered by a guest: it must sit above every vector stub and below the bare
+ * IRET at IRET_OFF.
+ */
+_Static_assert(X86_XMS_ENTRY_SEG == STUB_SEG,
+               "the XMS entry point must be in the HLE stub block");
+_Static_assert(X86_XMS_ENTRY_OFF + 4u <= IRET_OFF,
+               "the XMS entry stub must sit below the bare IRET");
+
 /* Where a PC keeps its ROM identification. A system tool reads these directly
    rather than asking, so they have to exist as memory. */
 #define BIOS_ROM_LIN  0xFF000u
@@ -110,8 +127,8 @@ int x86_hle_install(const uint8_t *vectors, unsigned count)
 {
     uint32_t base = (uint32_t)STUB_SEG << 4;
     uint8_t *stubs;
-    if (count * STUB_BYTES > IRET_OFF)
-        return -1;                   /* would run into the bare IRET */
+    if (count * STUB_BYTES > X86_XMS_ENTRY_OFF)
+        return -1;                   /* would run into the XMS entry stub */
     stubs = (uint8_t *)x86_guest_ptr(base, STUB_LIMIT);
     uint8_t *ivt = (uint8_t *)x86_guest_ptr(0, 1024);
     if (!stubs || !ivt)
@@ -142,6 +159,18 @@ int x86_hle_install(const uint8_t *vectors, unsigned count)
         ivt[v * 4 + 1] = (uint8_t)(off >> 8);
         ivt[v * 4 + 2] = (uint8_t)STUB_SEG;
         ivt[v * 4 + 3] = (uint8_t)(STUB_SEG >> 8);
+    }
+
+    /* The XMS control entry. Planted unconditionally: INT 2Fh AX=4310h hands
+       out this address only when a backing store exists, but the four bytes
+       cost nothing and a guest that cached the address across a reset then
+       lands on a stub rather than on whatever is at 0060:00C0. */
+    {
+        uint8_t *x = stubs + X86_XMS_ENTRY_OFF;
+        x[0] = 0x0F;
+        x[1] = 0x0B;
+        x[2] = X86_HLE_SEL_XMS;
+        x[3] = 0xCB;                 /* RETF -- entered by CALL FAR */
     }
     cpu_state_ptr->hle_enabled = 1;
     return 0;
@@ -235,6 +264,17 @@ int x86_hle_dispatch(uint8_t vector)
         return x86_bios_kbd_irq();
     case 0x21:
         return x86_dos_int21(AH);
+    case 0x2F:
+        /* The multiplex interrupt. Only AX=43xx is answered; every other
+           subfunction comes back with the guest's registers untouched, which is
+           exactly what the bare IRET this replaces did. Do not widen this arm
+           without deciding what "absent" means for the subfunction you add. */
+        return x86_xms_int2f();
+    case X86_HLE_SEL_XMS:
+        /* Not a vector: the XMS control function, entered by CALL FAR through
+           the stub at 0060:00C0. Its stub ends RETF, so nothing here may touch
+           the stacked FLAGS -- there is none. */
+        return x86_xms_control();
     case 0x20:
         return x86_dos_terminate();
     default:

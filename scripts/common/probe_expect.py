@@ -262,6 +262,16 @@ INT = {
     (0x15, 0x88): _e("unanswered", "get extended memory size"),
     (0x15, 0x87): _e("unanswered", "move extended memory block"),
     (0x15, 0xC0): _e("unanswered", "get system configuration"),
+
+    # ---- INT 2Fh, the multiplex interrupt ------------------------------
+    # ONLY AX=4300h/4310h is answered; every other subfunction returns with
+    # the guest's registers untouched, which is what "no such driver" is
+    # defined to look like. AH=43h therefore covers both the detection
+    # (AL=80h) and the entry point (ES:BX = 0060:00C0, a RETF stub).
+    (0x2F, 0x43): _e("implemented",
+                     "XMS: detect (AL=80h) and hand out the control entry "
+                     "point. MEASURED: WOLF3D takes it and moves 430,636 B "
+                     "through AH=0Bh at level load"),
 }
 
 NOTE_INT15 = (

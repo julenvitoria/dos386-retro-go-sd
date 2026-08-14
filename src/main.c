@@ -42,6 +42,7 @@
 #include "x86_arena.h"
 #include "x86_video_planar.h"
 #include "x86_pager.h"
+#include "x86_xms.h"
 
 /* Chrom-ART offload for the chained 13h blit. DEFAULT OFF and UNVERIFIED --
    the whole rationale, the price and what tier 2 can and cannot prove are on
@@ -1152,6 +1153,7 @@ volatile uint32_t pgf_errors = 0;   /* I/O that did not land                   *
 #define PGF_NO_CREATE   3
 
 static char pgf_path[sizeof(dsk_path) + 16];
+static void xms_close_file(void);   /* XMS holds this file open; see below */
 
 static int pgf_open_file(void)
 {
@@ -1159,6 +1161,8 @@ static int pgf_open_file(void)
     size_t dir = 0;
 
     pgf_ready = 0;
+    /* Any XMS handle on the old file must go before this truncates it. */
+    xms_close_file();
     if (!dsk_path[0]) { pgf_result = PGF_NO_PATH; return -1; }
     for (size_t i = 0; dsk_path[i]; i++)
         if (dsk_path[i] == '/')
@@ -1218,6 +1222,135 @@ static int pgf_read(uint32_t slot, void *dst)
     X86_ZONE_EXIT();
     if (rc == 0) pgf_reads++; else pgf_errors++;
     return rc;
+}
+
+/* ===========================================================================
+ * THE XMS STORE -- the same file, a range the pager provably cannot reach.
+ *
+ * x86_xms.h explains why XMS memory is NOT a pager frame and costs the
+ * interpreter nothing. What is decided HERE is only where the bytes physically
+ * are, and the one property that has to hold is that a guest page and an XMS
+ * byte cannot land on the same byte of x86page.swp.
+ *
+ * They cannot, by arithmetic rather than by convention. The pager's `slot` IS
+ * the guest page number and guest page numbers stop at X86_PG_PAGES, so the
+ * pager can never write past X86_PG_PAGES * X86_PG_SIZE. XMS starts exactly
+ * there. Nothing has to be allocated, reserved or checked at run time.
+ *
+ * The file is sparse in practice: a slot that was never written is never read,
+ * and the same holds for the XMS range -- an unwritten region reads back as a
+ * short fread, which xms_read() turns into zeros (that IS what freshly
+ * allocated extended memory contains as far as any guest can tell) and counts.
+ *
+ * ONE OPEN PER MOVE, not per page-run: xms_open()/xms_close() bracket a whole
+ * AH=0Bh, unlike pgf_write() which must open per slot because the pager calls
+ * it one page at a time from inside eviction.
+ */
+#define XMS_FILE_BASE  ((uint32_t)X86_PG_PAGES * X86_PG_SIZE)   /* 8 MB */
+
+volatile uint32_t xms_bytes_read = 0;
+volatile uint32_t xms_bytes_written = 0;
+volatile uint32_t xms_holes = 0;        /* reads of a region never written */
+volatile uint32_t xms_file_errors = 0;
+volatile uint32_t xms_opens = 0;    /* file opens -- ONE per title, not per move */
+
+static FILE *xms_fp;
+
+/*
+ * THE HANDLE IS HELD OPEN ACROSS MOVES, and that is a MEASURED decision, not a
+ * preference. The pager opens per slot because it is called one page at a time
+ * from inside eviction and cannot know when the next call comes. XMS can:
+ * a title's moves arrive in bursts at level load.
+ *
+ * MEASURED, WOLF3D driven into gameplay under gwemu, same timeline both ways:
+ *
+ *   XMS absent (the tree before this)      1,104 frames / 194.5 M insns
+ *   XMS, fopen+fclose per move               766 frames / 132.7 M insns  -31%
+ *   XMS, this -- the handle held open      1,057 frames / 171.9 M insns   -4%
+ *
+ * Wolf3D takes the XMS path the moment it is offered and moves 430,636 bytes
+ * through it in 278 moves at level load; at ~25 ms per open (docs/12 §1a) the
+ * per-move open ALONE was a third of the title's frame rate. Nothing about the
+ * interpreter changed between those rows -- XMS costs nothing per access by
+ * construction -- the whole difference is fopen. `xms_opens` is 1 for the run,
+ * and it is the witness: if it ever climbs with the move count, this reverted.
+ *
+ * The price is one FatFs handle and its sector buffer held for the life of the
+ * title, which is exactly what pgf_write() refuses to pay for the pager. It is
+ * closed at guest reset, before pgf_open_file() truncates the file under it.
+ */
+static int xms_open(int write)
+{
+    const gw_firmware_abi_t *abi = gw_firmware_abi();
+    (void)write;
+    if (!pgf_ready)
+        return -1;
+    if (xms_fp)
+        return 0;
+    X86_ZONE_ENTER(X86_ZONE_DISK);
+    xms_fp = abi->fopen(pgf_path, "r+b");
+    X86_ZONE_EXIT();
+    if (!xms_fp) { xms_file_errors++; return -1; }
+    xms_opens++;
+    return 0;
+}
+
+/* End of one move. The handle stays; see above. */
+static void xms_close(void)
+{
+}
+
+/* The real close: at guest reset, and only there. */
+static void xms_close_file(void)
+{
+    const gw_firmware_abi_t *abi = gw_firmware_abi();
+    if (xms_fp) {
+        X86_ZONE_ENTER(X86_ZONE_DISK);
+        abi->fclose(xms_fp);
+        X86_ZONE_EXIT();
+        xms_fp = NULL;
+    }
+}
+
+static int xms_read(uint32_t off, void *dst, uint32_t bytes)
+{
+    const gw_firmware_abi_t *abi = gw_firmware_abi();
+    if (!xms_fp)
+        return -1;
+    X86_ZONE_ENTER(X86_ZONE_DISK);
+    size_t got = 0;
+    int rc = -1;
+    if (abi->fseek(xms_fp, (long)(XMS_FILE_BASE + off), SEEK_SET) == 0) {
+        got = abi->fread(dst, 1, bytes, xms_fp);
+        rc = 0;
+    }
+    X86_ZONE_EXIT();
+    if (rc != 0) { xms_file_errors++; return -1; }
+    if (got < bytes) {
+        /* Never written. Zero is the honest content of extended memory the
+           guest has not stored to, and it is COUNTED so that "the read was
+           short" is never mistaken for "the card failed". */
+        memset((uint8_t *)dst + got, 0, bytes - got);
+        xms_holes++;
+    }
+    xms_bytes_read += bytes;
+    return 0;
+}
+
+static int xms_write(uint32_t off, const void *src, uint32_t bytes)
+{
+    const gw_firmware_abi_t *abi = gw_firmware_abi();
+    if (!xms_fp)
+        return -1;
+    X86_ZONE_ENTER(X86_ZONE_DISK);
+    int rc = -1;
+    if (abi->fseek(xms_fp, (long)(XMS_FILE_BASE + off), SEEK_SET) == 0 &&
+        abi->fwrite(src, 1, bytes, xms_fp) == bytes)
+        rc = 0;
+    X86_ZONE_EXIT();
+    if (rc != 0) { xms_file_errors++; return -1; }
+    xms_bytes_written += bytes;
+    return 0;
 }
 
 /*
@@ -1413,10 +1546,22 @@ static void guest_reset(void)
      * is the SAME state the tree was in before -- donation refuses, nothing is
      * lost, and pgf_result says why.
      */
-    if (pgf_open_file() == 0)
+    if (pgf_open_file() == 0) {
         x86_pager_set_backing(pgf_read, pgf_write);
-    else
+        /* And XMS, out of the same file above every slot the pager owns.
+           X86_XMS_DEFAULT_KB is what AH=08h will advertise; it is bounded by
+           the card and by transfer time, NOT by the AXI pool -- no XMS byte is
+           ever in a frame. See x86_xms.h. */
+        x86_xms_set_backing(xms_open, xms_close, xms_read, xms_write,
+                            X86_XMS_DEFAULT_KB);
+    } else {
         x86_pager_set_backing(NULL, NULL);
+        /* No file, no extended memory, and INT 2Fh AX=4300h then answers
+           "absent". Advertising XMS with nowhere to put a byte is the failure
+           this project keeps hitting: the guest believes it, allocates, moves,
+           and dies somewhere unrelated. */
+        x86_xms_set_backing(NULL, NULL, NULL, NULL, 0);
+    }
     x86_video_map();
 
     /* What INT 12h and 0040:0013 will report, taken from the allocation that
@@ -1430,7 +1575,7 @@ static void guest_reset(void)
        bare IRET, which hands the guest back its own AX and reads as a
        successful answer -- see x86_bios.c and tests/test_sysinfo.py. */
     static const uint8_t hle_vectors[] = {
-        0x08, 0x09, 0x10, 0x11, 0x12, 0x15, 0x16, 0x1A, 0x20, 0x21,
+        0x08, 0x09, 0x10, 0x11, 0x12, 0x15, 0x16, 0x1A, 0x20, 0x21, 0x2F,
     };
     x86_hle_install(hle_vectors, sizeof(hle_vectors));
 
