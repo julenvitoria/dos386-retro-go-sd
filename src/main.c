@@ -292,6 +292,28 @@ volatile uint32_t frames_rendered = 0;
 #define KIPS_386SX_16      2500u   /* 386SX @ 16 MHz                  */
 #define KIPS_386_33        6000u   /* 386DX @ 33 MHz                  */
 /*
+ * The 486 rungs are STRESS TARGETS, not period-correct emulation, and the
+ * distinction matters when reading a score off them.
+ *
+ * Measured on silicon: ~5.54 MIPS, i.e. ~5500 kips. So KIPS_386_33 (6000) is
+ * ALREADY above what the machine delivers, and every rung at or above it is
+ * requesting more than exists. A paced profile only throttles when its target
+ * is BELOW the achievable rate; above it, the budget is never met, the guest
+ * runs flat out and the rung is indistinguishable from Max. That -- not a
+ * broken profile table -- is why 386SX 16 / 386DX 33 / Max were reported
+ * scoring the same, and guest_insn_deficit is the witness: it stays 0 in Max
+ * and climbs on any rung the silicon cannot satisfy.
+ *
+ * They earn their place anyway. A rung the CPU cannot satisfy still changes
+ * how the frame is SHAPED -- bigger per-frame budgets, longer slices, less
+ * idle handed back -- so a workload that keeps up at one rung and stutters at
+ * the next names the subsystem that could not follow (blit, audio refill,
+ * input poll), which is the thing a single "Max" cannot tell apart.
+ */
+#define KIPS_486SX_25      9000u   /* 486SX @ 25 MHz  -- above the ceiling */
+#define KIPS_486DX2_66    24000u   /* 486DX2 @ 66 MHz -- stress target     */
+#define KIPS_486DX4_100   40000u   /* 486DX4 @ 100 MHz -- stress target    */
+/*
  * DEFAULT: unthrottled. The emulated machine runs as fast as the silicon
  * delivers, and the number that describes it is guest_ips_achieved, not a
  * deficit -- with no target there is nothing to be short OF, so the deficit
@@ -386,7 +408,30 @@ static uint32_t   rate_window_frames;
    to it. Do NOT derive this from measured throughput: the slice limits
    throughput, so a cap computed from throughput ratchets both down to the
    floor (measured: 59,642 ips, pinned there). */
-#define MAX_SLICE_CEIL   50000u
+/*
+ * RAISED 50,000 -> 200,000. The old value was not a safety bound, it was the
+ * throughput limit: at ~5.5 M insn/s a 50,000-instruction slice finishes in
+ * ~9 ms of a 16.7 ms frame, so the machine sat ~54% busy with the regulator
+ * asking for more every single frame.
+ *
+ * The watchdog argument that produced 50,000 was about a slice running
+ * 4,000,000 instructions -- TWO SECONDS -- with no return to the frame loop.
+ * 200,000 is nowhere near that: at the measured ~50 cycles/insn it is ~10 M
+ * cycles, ~36 ms at 280 MHz, and one order of magnitude inside the watchdog
+ * window. It is a backstop for a guest that has gone pathological, not the
+ * thing that decides throughput -- GUEST_EXEC_PCT decides that, on measured
+ * time, and shrinks the slice by itself when instructions turn expensive.
+ */
+#define MAX_SLICE_CEIL  200000u
+/*
+ * Share of a display period the guest may execute in, percent. The rest is the
+ * render, the audio refill and the input poll. 90 leaves ~1.7 ms of a 16.7 ms
+ * frame; the blit is 200 memcpys of 320 B and the audio refill is bounded, so
+ * that is breathing room rather than a gamble -- and a frame that does overrun
+ * shows up as dropped frames, which is a number we already publish rather than
+ * a silent stutter.
+ */
+#define GUEST_EXEC_PCT       90u
 
 /*
  * The guest's clock, and the fact that it is REAL time.
@@ -1359,19 +1404,38 @@ static const uint8_t pad_scancode[10] = {
 #define CPU_OPTION_ID     100
 #define NOR_OPTION_ID     101
 
+/*
+ * The label carries the rung's OWN kips number, because the name alone cannot
+ * be compared against anything. "386DX 33" says nothing about whether the
+ * silicon can serve it; "386DX 33 (6000k)" sits next to a measured
+ * guest_ips_achieved of ~5500k and the answer is immediate. Max has no number
+ * because it has no target -- that is the whole meaning of unthrottled.
+ */
 static const uint16_t cpu_profile_kips[] = {
     KIPS_MAX, KIPS_8088_477, KIPS_286_8, KIPS_286_12, KIPS_386SX_16, KIPS_386_33,
+    KIPS_486SX_25, KIPS_486DX2_66, KIPS_486DX4_100,
 };
 static const char *const cpu_profile_name[] = {
-    "Max", "8088 4.77", "286 8MHz", "286 12MHz", "386SX 16", "386DX 33",
+    "Max", "8088 4.77 (330k)", "286 8MHz (800k)", "286 12MHz (1200k)",
+    "386SX 16 (2500k)", "386DX 33 (6000k)",
+    "486SX 25 (9000k)", "486DX2 66 (24000k)", "486DX4 100 (40000k)",
 };
 #define CPU_PROFILE_COUNT ((int)(sizeof(cpu_profile_kips) / sizeof(cpu_profile_kips[0])))
+/* The two arrays are indexed by the same variable; a mismatch reads off the
+   end of one of them and the menu shows a wild pointer. */
+_Static_assert(sizeof(cpu_profile_name) / sizeof(cpu_profile_name[0])
+               == (size_t)CPU_PROFILE_COUNT,
+               "cpu_profile_name and cpu_profile_kips must stay the same length");
 
 volatile uint32_t cpu_profile_persisted = 0xFF;  /* what the settings store kept */
 volatile uint32_t cpu_profile_events = 0;        /* dialog callbacks seen      */
 volatile uint32_t cpu_profile_last_event = 0xFF; /* last odroid_dialog_event_t */
 static int  cpu_profile_idx;
-static char cpu_profile_value[16];
+/* Sized for the LONGEST name plus its NUL, and asserted rather than eyeballed:
+   cpu_profile_apply() strcpy()s into this, so a name that outgrows it is a
+   silent stack smash in the menu path. "486DX4 100 (40000k)" is 19 + NUL. */
+#define CPU_PROFILE_VALUE_MAX 24
+static char cpu_profile_value[CPU_PROFILE_VALUE_MAX];
 
 /* Changing the emulated CPU's speed invalidates every number measured against
    the old one. Clearing them is what keeps "am I getting what I asked for?"
@@ -1384,7 +1448,11 @@ static void cpu_profile_apply(int idx)
     guest_kips = cpu_profile_kips[idx];
     guest_insn_debt = 0;
     guest_insn_deficit = 0;
-    strcpy(cpu_profile_value, cpu_profile_name[idx]);
+    /* Bounded: the buffer is sized and asserted above, but a truncating copy
+       is a wrong menu label rather than a smashed stack if a name ever grows
+       past it. */
+    snprintf(cpu_profile_value, sizeof(cpu_profile_value), "%s",
+             cpu_profile_name[idx]);
 }
 
 static bool cpu_profile_cb(odroid_dialog_choice_t *option,
@@ -2022,22 +2090,39 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
              * watching that has no gradient and hunts between its rails --
              * which it did, swinging the slice 20x frame to frame.
              *
-             * The target is three quarters of a display period, the remaining
-             * quarter being the render, the audio refill and the input poll.
+             * The target is GUEST_EXEC_PCT of a display period, the remainder
+             * being the render, the audio refill and the input poll.
              * panel_ms_min is the shortest iteration the hardware has ever let
              * us finish, i.e. the panel's own period -- learned, so an
              * overclocked or differently-timed display needs no constant here.
+             *
+             * IT WAS 75%, AND THAT WAS LEAVING A QUARTER OF THE MACHINE IDLE.
+             * Measured on silicon: ~54% busy, 0 dropped frames, 60 fps, with
+             * max_slice PINNED at the old 50,000 ceiling -- the controller's
+             * "under target" arm firing every frame against a clamp it could
+             * not pass. One iteration is one frame (the loop swaps
+             * unconditionally and the swap paces to the panel), so throughput
+             * was 50,000 x 60 = 3.0 M insn/s however fast the core really is.
+             * That is also why 386SX 16 / 386DX 33 / Max scored alike: an
+             * effective ~3000 cycles sits between the 2500 and 6000 rungs.
+             *
+             * The regulator is on TIME, not instruction count, which is what
+             * makes raising this safe: it settles wherever GUEST_EXEC_PCT of a
+             * frame actually lands, so a guest on a slow path (a planar store
+             * storm, a REP through the fold) shrinks the slice by itself. The
+             * instruction ceiling is the backstop for the pathological case
+             * only -- see MAX_SLICE_CEIL.
              */
             {
                 uint32_t panel = panel_ms_min ? panel_ms_min : 16u;
-                uint32_t target4 = panel * 3u;          /* 4 * (3/4 * panel) */
+                uint32_t target = panel * GUEST_EXEC_PCT;   /* x100 */
                 if (last_slice_halted) {
                     /* Idle is not headroom: leave max_slice alone. */
-                } else if (guest_exec_ms * 4u < target4) {
+                } else if (guest_exec_ms * 100u < target) {
                     max_slice += max_slice / 8u;
                     if (max_slice > MAX_SLICE_CEIL)
                         max_slice = MAX_SLICE_CEIL;
-                } else if (guest_exec_ms * 4u > target4) {
+                } else if (guest_exec_ms * 100u > target) {
                     max_slice -= max_slice / 8u;
                     if (max_slice < MAX_SLICE_FLOOR)
                         max_slice = MAX_SLICE_FLOOR;
