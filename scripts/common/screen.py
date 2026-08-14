@@ -73,6 +73,29 @@ def read_clut(backend, fw_syms, core_syms, entries=256):
     return [backend.read_uint32(sym + 4 * i) for i in range(entries)], src
 
 
+def read_active_clut(backend, fw_syms, core_syms, entries=32):
+    """The palette the LTDC is REALLY scanning with, 256-colour modes included.
+
+    `read_clut()` above reads `active_clut`, which is the darkened-twin cache
+    the 32-entry contract uses. A 256-colour mode does not go through it at
+    all: `lcd_set_clut_ext()` parks a caller-owned table in `ext_clut` and
+    `clut_push()` programs the controller from that. Reading `active_clut` for
+    a mode-13h frame therefore recovers the PREVIOUS mode's 32 CGA entries and
+    paints every pixel in the wrong colour -- a defect of the TOOL that is
+    indistinguishable from a palette defect in the core, which is why the
+    golden gate must not use the plain reader. Returns (clut, source).
+    """
+    ext_p = fw_syms.get("ext_clut")
+    ext_n = fw_syms.get("ext_clut_count")
+    if ext_p and ext_n:
+        addr = backend.read_uint32(ext_p)
+        count = backend.read_uint32(ext_n) & 0xFFFF
+        if addr and count:
+            return ([backend.read_uint32(addr + 4 * i) for i in range(count)],
+                    f"ext_clut ({count} entries)")
+    return read_clut(backend, fw_syms, core_syms, entries)
+
+
 def capture(backend, fw_syms, core_syms):
     """Return (info, indices, clut, rgb) for the currently scanned frame.
 

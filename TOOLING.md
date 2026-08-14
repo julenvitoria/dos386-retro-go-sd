@@ -627,6 +627,66 @@ frame. It also prints a coarse text map of the result, so a black or garbage
 capture is obvious without opening the file. `tests/test_screen.py` does this
 for one expected image; this is the general form.
 
+### `golden_screens.py` — the golden-screenshot GATE
+
+```bash
+python3 scripts/golden_screens.py list                       # what is covered
+python3 scripts/golden_screens.py check                      # THE GATE
+python3 scripts/golden_screens.py check --title WOLF3D
+python3 scripts/golden_screens.py repeat --title ALLEYCAT --runs 3
+python3 scripts/golden_screens.py capture --title KEEN4      # candidate only
+python3 scripts/golden_screens.py capture --title KEEN4 --bless \
+    --verified-by doug --shows "Keen 4 intro, EGA 0Dh, full height"
+```
+
+`screenshot.py` captures a picture; this **compares** it. Two "the guest runs
+happily and the screen is garbage" regressions shipped in one session and every
+tier-1 test passed through both, because nothing in the suite could see a
+picture. Each title is booted from its own freshly-built SD image, run to a
+fixed `guest_insns_total`, captured from the LTDC, and diffed against
+`tests/goldens/<TITLE>.png` pixel by pixel. Failures print **where**: a
+bounding box, a 16x12 block map and the worst pixel with both colours. A count
+alone cannot tell a palette off by one level from six thumbnails of noise.
+
+Four rules it is built around, each closing a way this gate could be worthless:
+
+1. **A golden captured from a BROKEN build blesses the bug.** So an image is
+   never a golden on its own: it needs a `<TITLE>.json` sidecar naming who
+   verified it by eye, when, and what they saw. `check` refuses a golden whose
+   sidecar is missing, incomplete, `unverified` or `known_bad`. The sha256 in
+   the sidecar is checked on load, so an image swapped underneath its
+   attestation is an error rather than a new baseline.
+2. **Re-blessing is visible.** `--bless` over an existing golden requires
+   `--because`, prints the pixel difference against the image it replaces, and
+   pushes the old attestation onto a `history` list. There is no silent
+   overwrite.
+3. **`known_bad` is a defect WITH A PICTURE.** It fails the gate — an
+   outstanding defect is not a pass — but it is summarised separately from a
+   regression, so a real regression cannot hide behind a bug someone already
+   knew about. `KEEN4.png` is one: the half-height EGA 0Dh intro.
+4. **The capture point is an instruction count, not a sleep.** `guest_insns_total`
+   is polled with adaptive sleeps so the overshoot is a fraction of a guest
+   frame; a flat 0.2 s poll overshoots by a MILLION instructions and lands on a
+   different frame every run. Prove a new capture point with `repeat` before
+   blessing it — "it looked the same" is not the proof, two identical frames are.
+
+**A mask is the last resort and never a wider tolerance.** Some elements are
+driven by guest TIME, not by the instruction stream — Alley Cat's cat walks off
+the PIT tick and its copyright line alternates between two equally correct
+strings — and no instruction-count capture point can freeze those. The manifest
+may declare `mask` rectangles, but only with a written `mask_reason` (enforced),
+and masked pixels are still counted and printed (`m` in the block map). A
+tolerance wide enough to absorb a moving sprite is wide enough to absorb the
+corruption the gate exists to catch.
+
+`tests/test_goldens.py` is the tier-1 half: it drives the comparator and the
+attestation rules against synthetic images with **negative controls for every
+failure this project has actually shipped** — a one-pixel shift, a rectangle of
+noise in an otherwise perfect screen, a uniform level shift, a half-height
+render, a defect one pixel outside a mask, and a golden with no attestation. It
+needs no target and runs in under a second, and it also re-checks the shipped
+goldens' hashes.
+
 ### `profile_opcodes.py` — which x86 opcodes burn the cycles
 
 ```bash
@@ -1082,6 +1142,12 @@ python3 tests/test_screen.py             # what the LTDC actually scans out,
                                          # reconstructed to build/artifacts/screen.png
                                          # (checks whichever mode the core is
                                          # in -- text if a guest is running)
+python3 tests/test_goldens.py            # the golden gate's COMPARATOR and its
+                                         # attestation rules, against synthetic
+                                         # images with a negative control for
+                                         # each shipped failure mode. No target,
+                                         # under a second. The gate itself is
+                                         # scripts/golden_screens.py check
 python3 tests/test_disk_cache.py         # .dsk sector cache + read-ahead:
 python3 tests/test_disk_cache.py --sweep # backend calls + hit rate across
                                          # several cache geometries. The stream
@@ -1450,6 +1516,7 @@ Importable support only — no CLIs.
 | `refx86.py` | Unicorn run of that image, sampled like the target's own sampler |
 | `refdos.py` | A minimal DOS/BIOS for the reference, so it can run PAST the first INT 21h and say what the program should do. Deliberately not modelled on our x86_dos.c -- mirroring it would make the two agree on the same mistake. It has no port I/O, so it cannot follow a program that times against the CGA retrace |
 | `textmode.py` | Host-side model of the CGA text renderer: CP437 font load (4x8 by default, the table the renderer uses), the 80x25 -> palette-index render at 4x8 cells, AH=06 scrolling, and a readable CP437 dump. Shared by `test_text.py` (seeded pattern) and `test_screen.py` (the live guest) |
+| `golden.py` | The golden gate's comparator and its attestation object: an 8-bit-truecolour PNG reader (deliberately strict -- a decoder that coped with other shapes would let a differently-quantised golden in), a masked pixel comparison that reports WHERE it differs, and `Golden`, which refuses to be a golden at all without a record of who verified it and what they saw. Kept separate from `golden_screens.py` because it is the part that has to be right and the only part testable without a target |
 | `verify.py` | Symbol-region checks and ELF-vs-target section comparison |
 | `builder.py`, `runner.py` | Tier-1 build convenience |
 
