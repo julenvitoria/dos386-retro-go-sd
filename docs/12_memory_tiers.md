@@ -28,25 +28,47 @@ Backing store is abstracted behind `x86_pg_read_fn`/`x86_pg_write_fn`, set by
 be driven at tier 1 against a plain RAM buffer with no card, no FatFs and no
 firmware.
 
-## 2. EVICTION IS NOT IMPLEMENTED — read this before trusting the header
+### 1a. The pagefile — `src/main.c`, and it is wired
 
-`x86_pager.h:117-162` documents eviction-time dirty detection by comparison
-against the tier's authoritative copy, and declares `x86_pg_evictions`,
+`pgf_read()` / `pgf_write()` in `src/main.c`, handed to `x86_pager_set_backing()`
+from `guest_reset()`. `slot` IS the guest page number, so a slot is `slot*4096`
+into one file and there is no allocator. The file is `x86page.swp` next to the
+`.dsk` — the one directory this core has demonstrated it can write — and it is
+truncated at every guest reset.
+
+**Open-per-call**, exactly like `sd_sector_write()`: there is no ranged SD write
+in the ABI, and `x86_pg_wb_opens` counts these because the counter's name *is*
+this design. `pgf_ready` / `pgf_result` / `pgf_writes` / `pgf_reads` /
+`pgf_errors` are the host-visible witnesses.
+
+**MEASURED, WOLF3D gameplay under gwemu: `x86_pg_wb_us_worst` = 24,593 µs.**
+One writeback is ~25 ms — one and a half frames, and `docs/09` explains why
+overrunning a frame costs a whole frame rather than the overrun. It is paid 39
+times at level load and then never again in a 42 s run, so it reads as a
+one-off hitch and not a per-frame cost; a title with a working set that does not
+settle would be a different story, and a write-behind queue is the answer if one
+appears. gwemu timing is not to be trusted (`docs/04`) — carry the number to
+silicon, do not bank it.
+
+## 2. Eviction — built, and the header is now a description
+
+*(Historical note: this section used to read "EVICTION IS NOT IMPLEMENTED".
+It is implemented; `tests/test_paging.py` drives all of it at tier 1 against a
+RAM buffer standing in for the pagefile.)*
+
+The design, for reference: `x86_pager.h` documents eviction-time dirty
+detection by comparison against the tier's authoritative copy, and declares `x86_pg_evictions`,
 `_drop_clean`, `_wb_zero`, `_wb_file`, `_wb_bytes`, `_wb_opens`, `_wb_us_worst`
 and `_donated`.
 
-**Nothing in the tree increments any of them.** `x86_pager.c:287-293` is the
-whole of victim selection: if the free list is empty it returns `NO_FRAME` and
-the guest takes `X86_EXIT_MEM_FAULT`. `--gc-sections` drops all eight symbols
-from `dos_core.elf`, which is how it was found — `probe.py` could not resolve
-them. `x86_livemap_holds()` (`x86_arena.c`) is likewise uncalled: the eviction
-veto ring is armed and never consulted, because nothing evicts.
+All of them are live. MEASURED, WOLF3D gameplay under gwemu with 34 frames
+donated: `_evictions`=39, `_drop_clean`=0, `_wb_file`=39, `_wb_zero`=0,
+`_io_errors`=0, `_exhausted`=0 — and the invariant
+`drop_clean + wb_file + io_errors == evictions` holds. `x86_livemap_holds()`
+and the pin bitmap are both consulted by the victim picker.
 
-*(Being implemented. Until it lands, treat the header as a specification, not a
-description.)*
-
-The design it specifies, when built, is worth preserving verbatim: **decide at
-EVICTION by comparing against the tier's authoritative copy** — scan a ZERO page
+The design, verbatim, because it is the reason the figures look like that:
+**decide at EVICTION by comparing against the tier's authoritative copy** — scan a ZERO page
 for a non-zero byte, compare a NOR page against its snapshot — so the answer is
 EXACT rather than conservative, and a page that matches is DROPPED with no SD
 I/O. The alternative (treat every resident page as dirty) is what produced the
@@ -68,6 +90,13 @@ gwemu tier 2, whole runs:
 
 `_frames_total=160` (the full 640 KB, no frame lost to alignment),
 `_exhausted=0`, `_unmapped=0`, `_io_errors=0`.
+
+**Those two rows are TITLE SCREENS, and they undersell the pressure.** Measured
+since, on WOLF3D driven into GAMEPLAY (`timelines/wolf3d-ingame.tl`): resident
+reaches **160/160** — the pool is full. The 104 figure is the credits screen and
+quoting it as the working set is how "56 idle frames" was arrived at. Donation
+still fits, because 126 frames is enough for the gameplay set; but size any
+future donation against a title that is PLAYING, not one that is booting.
 
 Two conclusions:
 
@@ -92,6 +121,7 @@ and a probe can name what holds it.
 | `X86_ARENA_ID_VGA13` | 0xA0000, 64 KB linear |
 | `X86_ARENA_ID_EGA` | 0xA0000, 4 planes |
 | `X86_ARENA_ID_SPARE` | Mode Y's off-screen cache |
+| `X86_ARENA_ID_MODEYP` | Mode Y's REAL display pages 1 and 2, 64 KB each |
 
 **Modes are mutually exclusive, so peak demand is the LARGEST mode, not the
 sum.** CGA VRAM and the 13h aperture used to be permanent allocations — 96 KB
@@ -127,7 +157,31 @@ This is what makes Keen 4's levels reachable, and the arithmetic is in
 
 **Donation without eviction turns a later shortfall into a hard
 `X86_EXIT_MEM_FAULT` instead of a page-out**, which is why the two are one piece
-of work.
+of work — and why donation stayed gated on a backing store existing until the
+pagefile above landed.
+
+### 5a. What donation is actually spent on: Mode Y's real pages
+
+Wolf3D triple-buffers across display starts `0x0000`, `0x4100`, `0x8200`
+(stride 16,640, learned). With one page's storage all three fold onto the same
+bytes and the raycaster draws the next page over the one being shown. `vga_cell()`
+in `x86_video_planar.c` is the one place that says where a plane byte lives; it
+now takes page 1 and 2 from `X86_ARENA_ID_MODEYP` when they exist and falls back
+to the alias when they do not, counting every fallback in
+`x86_vga_modey_alias_hits`. `x86_vga_modey_pages` is 1 (aliased), 2 or 3.
+
+MEASURED, WOLF3D gameplay under gwemu: `_donated`=34 frames / 139,264 B,
+`_donate_refused`=0, `x86_vga_modey_pages`=**3**, `alias_hits`=0. Guest RAM
+falls from 160 to 126 frames, which costs 39 one-off page-outs at level load
+and nothing after that — the gameplay working set fits in 126.
+
+**A single captured frame cannot see any of this, in either direction.** In
+gameplay the panel is painted AT THE GUEST'S FLIP, synchronously, from a page it
+has just finished; a before/after gwemu screenshot of the same moment is a clean
+Wolf3D frame both ways. The property is asserted structurally instead, at tier 1,
+by `tests/test_video.py`'s Mode Y real-page arm — with the alias, a write to
+page 1 overwrites page 0, and that negative control is seen to fail in the same
+run.
 
 ## 6. Where things live
 

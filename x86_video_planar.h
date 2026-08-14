@@ -83,6 +83,12 @@ int  x86_vga_planar_active(void);
 
 void x86_vga_ega_set_planes(void *planes, uint32_t plane_offsets);
 void x86_vga_modey_set_cache(void *cache, uint32_t offsets);
+/* REAL storage for Mode Y display pages 1 and 2, each X86_MODEY_PAGE_BYTES.
+   NULL leaves that page ALIASED onto page 0 -- the old behaviour, and the cause
+   of Wolf3D's corrupted gameplay picture: the raycaster draws the next page
+   into the bytes the panel is showing. Page 2 is ignored without page 1. */
+#define X86_MODEY_PAGE_BYTES (4u * X86_MODEY_PLANE_OFFSETS)   /* 65,536 */
+void x86_vga_modey_set_pages(void *p1, void *p2);
 
 const uint8_t *x86_vga_ega_planes(void);
 const uint8_t *x86_vga_modey_cache_ptr(void);
@@ -95,6 +101,13 @@ uint32_t       x86_vga_ega_plane_offsets(void);
  * THROUGH the same cell lookup the store path uses, so the two cannot drift.
  */
 uint32_t x86_vga_modey_row(uint32_t a);
+
+/* The same answer in POINTER form, which is what a real multi-page card needs:
+   pages 1 and 2 have their own storage and are not aperture offsets any more.
+   Fills *base with the page's storage and *off with the plane offset inside it
+   (always < X86_MODEY_PLANE_OFFSETS); returns 0 when the row has no storage,
+   which the blit must paint black. */
+int x86_vga_modey_row_at(uint32_t a, const uint8_t **base, uint32_t *off);
 
 /* "The page you were displaying is finished; show it." Called from the CRTC
    display-start write, which is the only instant an aliased Mode Y page is
@@ -163,6 +176,12 @@ extern volatile uint32_t x86_vga_modey_lost_nocache; /* arena refused the cache*
    covers 0xC300 .. 0xC300 + this - 1, and a store past that is counted in
    x86_vga_modey_lost_cache and lost. */
 extern volatile uint32_t x86_vga_modey_cache_offs;
+/* Display pages with storage of their OWN: 1 = the aliased fold (the defect),
+   2 = the draw-over-displayed hazard removed, 3 = the hardware layout. */
+extern volatile uint32_t x86_vga_modey_pages;
+/* Cells that had to fall back onto page 0. THE LOUD ONE: donation refused is
+   otherwise indistinguishable from this bug coming back. */
+extern volatile uint32_t x86_vga_modey_alias_hits;
 /* Highest and lowest window offset a cache store was discarded at. A count
    cannot say how much bigger the cache needs to be; these can. */
 extern volatile uint32_t x86_vga_modey_lost_hi;

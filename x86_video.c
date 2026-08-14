@@ -853,9 +853,13 @@ static void vga13_blit(uint8_t *dst, uint32_t stride)
            is whatever the guest programmed, and WOLF3D's is 16,640. This is the
            same lookup the store path uses, so the blit and the writes cannot
            disagree about where a row is. */
-        const uint32_t a = x86_vga_modey_row(start + y * pitch);
+        /* POINTER, not an aperture offset. Pages 1 and 2 have storage of their
+           own now when the donation was funded, and they are not in the
+           aperture -- x86_vga_modey_row() can only answer for page 0. */
+        const uint8_t *pb;
+        uint32_t a;
 
-        if (a == ~0u) {
+        if (!x86_vga_modey_row_at(start + y * pitch, &pb, &a)) {
             /* No aperture storage for this row: off-screen, or a page tail.
                BLACK rather than whatever the previous frame left, so a
                mis-learned layout is VISIBLE instead of merely plausible. */
@@ -865,17 +869,17 @@ static void vga13_blit(uint8_t *dst, uint32_t stride)
 #if X86_MODEY_BLIT_NEGCTL
         /* Four FLAT planes instead of four interleaved ones. */
         for (unsigned x = 0; x < X86_VGA13_WIDTH; x++)
-            dst[x] = src[(x & 3u) * X86_MODEY_PLANE_OFFSETS + a + (x >> 2)];
+            dst[x] = pb[(x & 3u) * X86_MODEY_PLANE_OFFSETS + a + (x >> 2)];
 #else
         /* A row is contiguous in the interleaved store unless it runs off the
            end of the aliased page, which only a non-zero start can do. Split
            rather than read past the aperture. */
         if (a + VGA13_ROW_OFFSETS <= X86_MODEY_PLANE_OFFSETS) {
-            memcpy(dst, src + 4u * a, X86_VGA13_WIDTH);
+            memcpy(dst, pb + 4u * a, X86_VGA13_WIDTH);
         } else {
             const unsigned head = (X86_MODEY_PLANE_OFFSETS - a) * 4u;
-            memcpy(dst, src + 4u * a, head);
-            memcpy(dst + head, src, X86_VGA13_WIDTH - head);
+            memcpy(dst, pb + 4u * a, head);
+            memcpy(dst + head, pb, X86_VGA13_WIDTH - head);
         }
 #endif
     }
@@ -1272,6 +1276,8 @@ static void planar_storage_follow(uint8_t kind)
     if (kind == VM_EGA4) {
         x86_arena_release(X86_ARENA_ID_SPARE);
         x86_vga_modey_set_cache(NULL, 0);
+        x86_arena_release(X86_ARENA_ID_MODEYP);
+        x86_vga_modey_set_pages(NULL, NULL);
         /* Release BEFORE measuring: x86_arena_largest cannot know that a
            re-claim would free the card we are replacing. */
         x86_arena_release(X86_ARENA_ID_EGA);
@@ -1311,6 +1317,12 @@ static void planar_storage_follow(uint8_t kind)
     x86_arena_release(X86_ARENA_ID_EGA);
     x86_vga_ega_set_planes(NULL, 0);
     x86_vga_ega_card_offsets = 0;
+    /* Mode Y's real pages live in the DONATED extent, so they must go back
+       before the reclaim below -- a reclaim is refused while the arena still
+       holds a page inside it, and the frames would stay lent for the rest of
+       the session (x86_pg_reclaim_busy says so when this is got wrong). */
+    x86_arena_release(X86_ARENA_ID_MODEYP);
+    x86_vga_modey_set_pages(NULL, NULL);
     /* Give the borrowed frames back BEFORE anything else claims: a reclaim is
        refused while the arena still holds a page in the donated extent, and
        every claim below is exactly such a claim. The CGA reclaim itself moved
@@ -1365,6 +1377,40 @@ static void planar_storage_follow(uint8_t kind)
         x86_vga_modey_set_cache(blk, offs);
     else
         x86_vga_modey_set_cache(NULL, 0);
+
+    /*
+     * REAL PAGE STORAGE FOR MODE Y -- the last unfixed cause of Wolf3D's
+     * corrupted gameplay picture, and the reason donation and eviction were
+     * built.
+     *
+     * Three display starts (0x0000, 0x4100, 0x8200) fold onto ONE page's bytes
+     * without this, so the panel shows page N while the raycaster draws page
+     * N+1 over it. It is not tearing and no presentation policy fixes it; it
+     * needs 64 KB per extra page. The arena has ~15 KB free here with the cache
+     * fitted, so every byte comes from the pager's idle frames.
+     *
+     * TWO EXTRA PAGES, ASKED FOR AS A LADDER. Two (131,072 B, three real pages)
+     * is the hardware layout; one (65,536 B, two real pages) already removes
+     * the draw-over-displayed hazard, which IS the defect -- WOLF3D never draws
+     * into the page it is displaying, only into the next one. Below that the
+     * aliased fold stays, and x86_vga_modey_alias_hits is what says so.
+     *
+     * Measured on this tree: WOLF3D peaks at 104 of 160 frames resident, so
+     * 32 donated frames leave 128 -- above the working set, no thrash. The
+     * pager's own reserve refuses anything that would go further.
+     */
+    x86_pager_donate_upto(2u * X86_MODEY_PAGE_BYTES, X86_MODEY_PAGE_BYTES);
+    void *pg[2] = { NULL, NULL };
+    if (x86_arena_claim(X86_ARENA_ID_MODEYP, 2, X86_MODEY_PAGE_BYTES, pg) == 0)
+        x86_vga_modey_set_pages(pg[0], pg[1]);
+    else if (x86_arena_claim(X86_ARENA_ID_MODEYP, 1, X86_MODEY_PAGE_BYTES,
+                             pg) == 0)
+        x86_vga_modey_set_pages(pg[0], NULL);
+    else
+        /* Loud by construction: x86_arena_deficit holds what the last refusal
+           wanted and x86_vga_modey_pages stays 1. */
+        x86_vga_modey_set_pages(NULL, NULL);
+    x86_video_log_event(9, x86_vga_modey_pages, 0);
 }
 
 static int mode_select(uint8_t mode)

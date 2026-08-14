@@ -1111,6 +1111,115 @@ static int sd_sector_write(void *ctx, const void *src, uint32_t offset,
     return rc;
 }
 
+/* ===========================================================================
+ * THE PAGEFILE -- the pager's FILE tier, and the last missing link.
+ *
+ * x86_pager.h is explicit that this belongs HERE and not in the pager: the ABI
+ * lives in src/main.c so the whole eviction mechanism can be driven at tier 1
+ * against a plain RAM buffer (tests/main.c's pgf_read/pgf_write), with no card,
+ * no FatFs and no firmware. This is the same two functions over real storage.
+ *
+ * `slot` IS the guest page number -- the mapping is direct, so there is no
+ * allocator and no free list, and a slot is simply `slot * 4096` bytes into the
+ * file. 640 KB of guest space is a 640 KB file at most, and it is sparse in
+ * practice because only pages that were genuinely modified and then evicted are
+ * ever written.
+ *
+ * OPEN-PER-CALL, deliberately, exactly like sd_sector_write() above. There is
+ * no ranged SD write in the ABI, the firmware's stdio is the only write path,
+ * and holding a FILE* across a guest frame would pin a FatFs handle and its
+ * sector buffer for the life of the title. x86_pg_wb_opens counts these -- the
+ * counter's name IS this design -- and x86_pg_wb_us_worst says what one costs.
+ * If that number ever blows the frame budget the answer is a write-behind
+ * queue, and the counter is what would justify building one.
+ *
+ * The file lives next to the .dsk, the one directory this core has demonstrated
+ * it can write (the disk write-back path opens the image there "r+b" and the
+ * NOR snapshot places its placeholder there). It is TRUNCATED at every guest
+ * reset: slots are guest page numbers, so a previous title's page 37 would sit
+ * exactly where this title's page 37 goes. Nothing can read it -- a page is
+ * only fetched from FILE tier after this run wrote it -- but a stale 640 KB of
+ * another game's memory on the card is not a thing to leave lying around.
+ */
+volatile uint32_t pgf_ready  = 0;   /* 1 once the file exists and is writable  */
+volatile uint32_t pgf_result = 0;   /* why not, if not; see PGF_* below        */
+volatile uint32_t pgf_reads  = 0;   /* slots read back                         */
+volatile uint32_t pgf_writes = 0;   /* slots written                           */
+volatile uint32_t pgf_errors = 0;   /* I/O that did not land                   */
+
+#define PGF_OK          1
+#define PGF_NO_PATH     2
+#define PGF_NO_CREATE   3
+
+static char pgf_path[sizeof(dsk_path) + 16];
+
+static int pgf_open_file(void)
+{
+    const gw_firmware_abi_t *abi = gw_firmware_abi();
+    size_t dir = 0;
+
+    pgf_ready = 0;
+    if (!dsk_path[0]) { pgf_result = PGF_NO_PATH; return -1; }
+    for (size_t i = 0; dsk_path[i]; i++)
+        if (dsk_path[i] == '/')
+            dir = i + 1;
+    if (dir + 13 >= sizeof(pgf_path)) { pgf_result = PGF_NO_PATH; return -1; }
+    memcpy(pgf_path, dsk_path, dir);
+    strcpy(pgf_path + dir, "x86page.swp");
+
+    /* "wb" creates it and truncates whatever was there. Zero length is the
+       right starting state: a slot that has never been written is never read,
+       so the file only has to grow as far as the highest evicted page. */
+    FILE *f = abi->fopen(pgf_path, "wb");
+    if (!f) { pgf_result = PGF_NO_CREATE; return -1; }
+    abi->fclose(f);
+
+    pgf_reads = pgf_writes = pgf_errors = 0;
+    pgf_result = PGF_OK;
+    pgf_ready = 1;
+    return 0;
+}
+
+static int pgf_write(uint32_t slot, const void *src)
+{
+    const gw_firmware_abi_t *abi = gw_firmware_abi();
+    int rc = -1;
+
+    if (!pgf_ready)
+        return -1;
+    X86_ZONE_ENTER(X86_ZONE_DISK);          /* ZONES: see sd_sector_read */
+    FILE *f = abi->fopen(pgf_path, "r+b");
+    if (f) {
+        if (abi->fseek(f, (long)(slot * X86_PG_SIZE), SEEK_SET) == 0 &&
+            abi->fwrite(src, 1, X86_PG_SIZE, f) == X86_PG_SIZE)
+            rc = 0;
+        abi->fclose(f);
+    }
+    X86_ZONE_EXIT();
+    if (rc == 0) pgf_writes++; else pgf_errors++;
+    return rc;
+}
+
+static int pgf_read(uint32_t slot, void *dst)
+{
+    const gw_firmware_abi_t *abi = gw_firmware_abi();
+    int rc = -1;
+
+    if (!pgf_ready)
+        return -1;
+    X86_ZONE_ENTER(X86_ZONE_DISK);
+    FILE *f = abi->fopen(pgf_path, "rb");
+    if (f) {
+        if (abi->fseek(f, (long)(slot * X86_PG_SIZE), SEEK_SET) == 0 &&
+            abi->fread(dst, 1, X86_PG_SIZE, f) == X86_PG_SIZE)
+            rc = 0;
+        abi->fclose(f);
+    }
+    X86_ZONE_EXIT();
+    if (rc == 0) pgf_reads++; else pgf_errors++;
+    return rc;
+}
+
 /*
  * Work out what to run. The disk images are built to boot FreeDOS, so the
  * program to launch is named in AUTOEXEC.BAT rather than being guessable from
@@ -1293,6 +1402,21 @@ static void guest_reset(void)
            turn a pool that cannot evict into one that must. */
         x86_pager_add_frames(guest_ram,
                              X86_PG_POOL_BYTES(GUEST_RAM_SIZE / 4096u));
+    /*
+     * The FILE tier. Without this call there is no backing store at all: the
+     * victim picker may then only ever evict a page it can DROP, donation is
+     * refused outright (x86_pager.h: "SAFE ONLY BECAUSE EVICTION EXISTS"), and
+     * a pool smaller than the working set is a hard X86_EXIT_MEM_FAULT. This is
+     * the one call the whole mechanism was waiting on.
+     *
+     * If the file cannot be made the pager is left with no backing store, which
+     * is the SAME state the tree was in before -- donation refuses, nothing is
+     * lost, and pgf_result says why.
+     */
+    if (pgf_open_file() == 0)
+        x86_pager_set_backing(pgf_read, pgf_write);
+    else
+        x86_pager_set_backing(NULL, NULL);
     x86_video_map();
 
     /* What INT 12h and 0040:0013 will report, taken from the allocation that

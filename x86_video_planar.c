@@ -226,6 +226,14 @@ volatile uint32_t x86_vga_modey_cache_offs;
  * guessing is what left Wolf3D's pictures as noise through two attempts. These
  * two say exactly where to put the top of the cache: it must reach _hi + 1.
  */
+/* How many of the three Mode Y display pages have storage of their OWN: 1 is
+   the aliased fold (all three on top of each other), 3 is the real card. */
+volatile uint32_t x86_vga_modey_pages = 1;
+/* Cells resolved to page 1 or 2 that had to fall back onto page 0's storage.
+   THE LOUD COUNTER: a run with x86_vga_modey_pages < 3 and this climbing is the
+   guest drawing over the frame it is displaying, which is exactly the corrupted
+   Wolf3D gameplay picture. Zero when the donation was funded. */
+volatile uint32_t x86_vga_modey_alias_hits;
 volatile uint32_t x86_vga_modey_lost_hi;
 volatile uint32_t x86_vga_modey_lost_lo = 0xFFFFFFFFu;
 volatile uint32_t x86_vga_latch_miss;
@@ -234,6 +242,10 @@ static uint8_t  *ega_planes;        /* 0Dh interleaved plane storage (arena) */
 static uint32_t  ega_plane_size;    /* plane OFFSETS the card has fitted     */
 static uint8_t  *modey_cache;       /* Mode Y off-screen store (arena)       */
 static uint32_t  modey_cache_offs;  /* plane offsets it holds                */
+/* Real storage for Mode Y display pages 1 and 2. Page 0 is always the aperture.
+   NULL means that page is still ALIASED onto page 0 -- the old behaviour, and
+   the defect this whole path exists to remove. */
+static uint8_t  *modey_pgstore[2];
 
 static uint32_t  modey_prev_start;
 static int       modey_learned;
@@ -338,6 +350,41 @@ void x86_vga_modey_set_cache(void *p, uint32_t offsets)
     x86_vga_modey_cache_offs = modey_cache_offs;
 }
 
+/*
+ * REAL PAGE STORAGE FOR PAGES 1 AND 2 -- what the alias never was.
+ *
+ * With one page's worth of storage, all three of WOLF3D's display starts fold
+ * onto the same bytes: while the panel shows page N the raycaster is drawing
+ * page N+1 over it, and the owner sees each wall rendered twice -- once in
+ * perspective and once unstretched -- with the doors split and out of order.
+ * The prior port measured the same thing against a real 256 KB card and wrote
+ * the conclusion down: "the frame boundary composites a finished frame with a
+ * half-drawn one. That is not tearing, and it is not fixed by getting the fold
+ * right." Four rounds of presentation policy since have confirmed it from the
+ * other side. It is not a presentation bug. It needs MEMORY, and the memory
+ * comes from the pager's idle frames by way of x86_pager_donate_to_arena().
+ *
+ * Either or both may be NULL. A page with no storage keeps the old aliased
+ * fold, which is a picture rather than a black screen -- but it is counted, in
+ * x86_vga_modey_alias_hits, because "the guest silently got the alias again" is
+ * indistinguishable from this defect returning.
+ */
+void x86_vga_modey_set_pages(void *p1, void *p2)
+{
+    /* Page 2 without page 1 would give a layout whose middle page is the alias
+       and whose last is real -- more surprising than the plain alias and no
+       cheaper. Take them in order or not at all. */
+    modey_pgstore[0] = (uint8_t *)p1;
+    modey_pgstore[1] = p1 ? (uint8_t *)p2 : NULL;
+    /* Arena memory carries whatever the last claim left in it, and these are
+       displayed storage: a page that is never fully drawn would show it. */
+    if (modey_pgstore[0]) memset(modey_pgstore[0], 0, 4u * X86_MODEY_PLANE);
+    if (modey_pgstore[1]) memset(modey_pgstore[1], 0, 4u * X86_MODEY_PLANE);
+    x86_vga_modey_pages = 1u + (modey_pgstore[0] != NULL)
+                             + (modey_pgstore[1] != NULL);
+    x86_vga_modey_alias_hits = 0;
+}
+
 /* ---------------------------------------------------------------------------
  * THE ONE PLACE THAT SAYS WHERE A PLANE BYTE LIVES.
  *
@@ -350,9 +397,42 @@ void x86_vga_modey_set_cache(void *p, uint32_t offsets)
  * this card has no memory there. NULL is not an error: a missing off-screen
  * tile must draw nothing, where an aliased one corrupts the picture.
  */
+/*
+ * THE PAGE REDUCTION, factored out so the store path and the BLIT share it.
+ *
+ * Which of the three display pages window offset `a` is in, and where in that
+ * page. Returns 0 when `a` has no page storage at all -- the off-screen cache,
+ * or a page's tail rows 205+. Page-relative against the LEARNED stride, not an
+ * AND mask: WOLF3D's is 16,640 and a mask puts every page 256 offsets off its
+ * neighbour (see the stride block above).
+ */
+static int modey_split(uint32_t a, uint32_t *pg, uint32_t *off)
+{
+    uint32_t p = x86_vga_modey_page, n = 0;
+
+    if (a >= X86_MODEY_CACHE)
+        return 0;
+    if (a >= 2u * p)      { a -= 2u * p; n = 2; }
+    else if (a >= p)      { a -= p;      n = 1; }
+    if (a >= X86_MODEY_PLANE)
+        return 0;                       /* page tail, rows 205+: never shown */
+    *pg = n;
+    *off = a;
+    return 1;
+}
+
+/* Where page `pg` actually lives. Page 0 is the aperture; 1 and 2 are their own
+   storage when it was funded and page 0 again when it was not. */
+static uint8_t *modey_page_base(uint32_t pg)
+{
+    if (pg && modey_pgstore[pg - 1u])
+        return modey_pgstore[pg - 1u];
+    return x86_vga_planar_aperture;
+}
+
 static uint8_t *vga_cell(uint32_t a)
 {
-    uint32_t p;
+    uint32_t pg, off;
 
     if (!x86_vga_modey_armed) {
         if (a < ega_plane_size)
@@ -369,16 +449,14 @@ static uint8_t *vga_cell(uint32_t a)
             return 0;                   /* no storage: draws nothing */
         return modey_cache + 4u * a;
     }
-    /* Page-relative against the LEARNED stride, not an AND mask. Three pages,
-       because that is what a Galaxy-engine layout uses; a title that spaces
-       them differently loses its cache to the discard path above rather than
-       corrupting a page, which is the direction to fail in. */
-    p = x86_vga_modey_page;
-    if (a >= 2u * p)      a -= 2u * p;
-    else if (a >= p)      a -= p;
-    if (a >= X86_MODEY_PLANE)
-        return 0;                       /* page tail, rows 205+: never shown */
-    return x86_vga_planar_aperture + 4u * a;
+    /* Three pages, because that is what a Galaxy-engine layout uses; a title
+       that spaces them differently loses its cache to the discard path above
+       rather than corrupting a page, which is the direction to fail in. */
+    if (!modey_split(a, &pg, &off))
+        return 0;
+    if (pg && !modey_pgstore[pg - 1u])
+        x86_vga_modey_alias_hits++;     /* LOUD: drawing over the shown page */
+    return modey_page_base(pg) + 4u * off;
 #endif
 }
 
@@ -393,6 +471,41 @@ uint32_t x86_vga_modey_row(uint32_t a)
     if (!c || c < base || c >= base + X86_VGA_APERTURE_BYTES)
         return ~0u;
     return (uint32_t)(c - base) / 4u;
+}
+
+/*
+ * The blit's half of the address model, in POINTER form.
+ *
+ * x86_vga_modey_row() cannot serve a real page-1 or page-2 row: it answers in
+ * offsets from the aperture, and those pages are not in the aperture any more.
+ * This is the same reduction -- modey_split(), shared with vga_cell() -- so the
+ * blit and the store path still cannot disagree about where a row is, which is
+ * the whole reason the reference deleted its two rival helpers.
+ *
+ * Returns 0 when the row has no page storage (off-screen cache, or a page tail
+ * that is never displayed), which the blit paints BLACK so a mis-learned layout
+ * is visible rather than merely plausible.
+ */
+int x86_vga_modey_row_at(uint32_t a, const uint8_t **base, uint32_t *off)
+{
+    uint32_t pg, o;
+
+    if (!x86_vga_planar_aperture || !x86_vga_modey_armed)
+        return 0;
+#if X86_MODEY_PAGE_NEGCTL
+    /* The fixed-mask negative control has to reach the BLIT too, or the arm
+       that requires it to fail is testing only the store path. */
+    (void)pg; (void)o;
+    *base = x86_vga_planar_aperture;
+    *off  = a & X86_MODEY_MASK;
+    return 1;
+#else
+    if (!modey_split(a, &pg, &o))
+        return 0;
+    *base = modey_page_base(pg);
+    *off  = o;
+    return 1;
+#endif
 }
 
 /* ---------------------------------------------------------------------------

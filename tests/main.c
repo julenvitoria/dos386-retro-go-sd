@@ -948,6 +948,139 @@ static void modeyfit_test_run(void)
     x86_video_map();
 }
 
+/* ===========================================================================
+ * MODE Y REAL PAGE STORAGE -- the property a pixel test cannot see.
+ *
+ * Every pixel arm in this suite renders ONE frame from ONE page, and passes
+ * 64000/64000 with all three of Wolf3D's pages folded onto the same bytes. The
+ * defect is invisible to it by construction: it only shows when the guest DRAWS
+ * page N+1 while the panel is showing page N, which is what the raycaster does
+ * every frame and what the owner sees as walls rendered twice, once in
+ * perspective and once unstretched.
+ *
+ * So the arm asserts the property directly and in both directions:
+ *   with real pages   a write at page 1 leaves page 0's bytes alone;
+ *   with the alias    the SAME write lands on top of page 0.
+ * The second half is the negative control, and it is the half that makes the
+ * first half a check rather than a tautology -- it is seen to fail here, in
+ * the same run, rather than being reasoned about.
+ *
+ * Storage is carved out of test_ram (256 KB..384 KB) for the same reason the
+ * arena region is: 128 KB of new .bss does not fit in any region of this
+ * harness, and this arm runs no guest code above 64 KB.
+ */
+static void planar_test_unmap(void);
+
+#define MODEYPG_OFF   (256u * 1024u)
+volatile uint32_t run_modeypage_flag = 0;
+volatile uint32_t modeypage_r[24];
+
+/* One plane offset of page `pg`, read back through the SAME cell lookup the
+   store used -- x86_vga_modey_row_at(), which is modey_split() and therefore
+   the store path's own answer. Reading page 0 out of the aperture by hand
+   would be a second opinion about where a row lives, which is the exact drift
+   the reference deleted two helpers to stop. */
+static uint32_t modeypg_peek(uint32_t win_off)
+{
+    const uint8_t *base;
+    uint32_t off;
+    if (!x86_vga_modey_row_at(win_off, &base, &off))
+        return 0xFFFFFFFFu;
+    return base[4u * off];      /* plane 0 of that cell */
+}
+
+static void modeypage_test_run(void)
+{
+    uint8_t *p1 = test_ram + MODEYPG_OFF;
+    uint8_t *p2 = p1 + X86_MODEY_PAGE_BYTES;
+    const uint32_t stride = 16640u;     /* WOLF3D's, and the shipping default */
+    unsigned i;
+
+    for (i = 0; i < 24; i++)
+        modeypage_r[i] = 0;
+
+    planar_test_init();
+    /* Mode Y with no guest: the register file the arm needs is exactly what
+       x86_vga_modey_arm() plants (write mode 0, bit mask 0xFF, map mask 0x0F),
+       so a plain store is one byte into all four planes. */
+    x86_vga_modey_arm(0);
+    x86_vga_modey_set_pages(NULL, NULL);
+    x86_vga_modey_arm(1);
+    modeypage_r[0] = x86_vga_modey_page;         /* 16,640 */
+    modeypage_r[1] = x86_vga_modey_pages;        /* 1: aliased */
+
+    /* ---- NEGATIVE CONTROL FIRST, so a broken positive cannot be read as a
+       pass on stale state. Page 0 gets 0x11, then page 1 gets 0x22 at the same
+       offset within its page -- and page 0 must come back 0x22. */
+    x86_vga_planar_store(0u, 0x11u, 1);
+    x86_vga_planar_store(stride, 0x22u, 1);
+    modeypage_r[2] = modeypg_peek(0u);           /* 0x22: CLOBBERED */
+    modeypage_r[3] = modeypg_peek(stride);       /* 0x22 */
+    modeypage_r[4] = x86_vga_modey_alias_hits;   /* > 0: the loud counter */
+
+    /* ---- the positive: the same sequence with real storage. */
+    x86_vga_modey_set_pages(p1, p2);
+    modeypage_r[5] = x86_vga_modey_pages;        /* 3 */
+    modeypage_r[6] = x86_vga_modey_alias_hits;   /* 0, reset by set_pages */
+
+    x86_vga_planar_store(0u, 0x11u, 1);
+    x86_vga_planar_store(stride, 0x22u, 1);
+    x86_vga_planar_store(2u * stride, 0x33u, 1);
+    modeypage_r[7]  = modeypg_peek(0u);          /* 0x11: UNDISTURBED */
+    modeypage_r[8]  = modeypg_peek(stride);      /* 0x22 */
+    modeypage_r[9]  = modeypg_peek(2u * stride); /* 0x33 */
+    modeypage_r[10] = x86_vga_modey_alias_hits;  /* still 0 */
+
+    /* The three pages must be three DIFFERENT places, not three names for one.
+       Comparing the returned bases is the structural statement behind the byte
+       checks above. */
+    {
+        const uint8_t *b0, *b1, *b2;
+        uint32_t o;
+        x86_vga_modey_row_at(0u, &b0, &o);
+        x86_vga_modey_row_at(stride, &b1, &o);
+        x86_vga_modey_row_at(2u * stride, &b2, &o);
+        modeypage_r[11] = (b0 != b1) && (b1 != b2) && (b0 != b2);
+        modeypage_r[12] = (b0 == x86_vga_planar_aperture);   /* page 0 is it */
+    }
+
+    /* A whole page of stores, the way a raycaster fills one: page 1 covered end
+       to end must not touch one byte of page 0. A single-offset check passes
+       against an off-by-a-few fold; this does not. */
+    for (i = 0; i < X86_MODEY_PLANE_OFFSETS; i++)
+        x86_vga_planar_store(stride + i, 0xA5u, 1);
+    {
+        uint32_t bad = 0;
+        for (i = 0; i < X86_MODEY_PLANE_OFFSETS; i++)
+            if (x86_vga_planar_aperture[4u * i] == 0xA5u)
+                bad++;
+        modeypage_r[13] = bad;                   /* 0 */
+    }
+    modeypage_r[14] = modeypg_peek(0u);          /* still 0x11 */
+    modeypage_r[15] = x86_vga_modey_alias_hits;  /* still 0 */
+
+    /* ---- HALF FUNDING. One real page is the rung that still removes the
+       hazard WOLF3D actually hits: it never draws into the page it displays,
+       only into the next one. Page 2 must then be the one that aliases, and it
+       must SAY SO. */
+    x86_vga_modey_set_pages(p1, NULL);
+    modeypage_r[16] = x86_vga_modey_pages;       /* 2 */
+    x86_vga_planar_store(0u, 0x44u, 1);
+    x86_vga_planar_store(stride, 0x55u, 1);
+    modeypage_r[17] = modeypg_peek(0u);          /* 0x44: undisturbed */
+    modeypage_r[18] = x86_vga_modey_alias_hits;  /* 0 so far */
+    x86_vga_planar_store(2u * stride, 0x66u, 1);
+    modeypage_r[19] = modeypg_peek(0u);          /* 0x66: page 2 aliases */
+    modeypage_r[20] = (x86_vga_modey_alias_hits > 0);   /* loud */
+    /* Page 2 without page 1 is refused rather than half-adopted. */
+    x86_vga_modey_set_pages(NULL, p2);
+    modeypage_r[21] = x86_vga_modey_pages;       /* 1 */
+
+    x86_vga_modey_set_pages(NULL, NULL);
+    x86_vga_modey_arm(0);
+    planar_test_unmap();
+}
+
 /* Put guest 0xA0000/0xB8000 back on test_ram, so an arm that runs after this
    one sees the identity map the harness set up at reset. */
 static void planar_test_unmap(void)
@@ -3296,6 +3429,10 @@ void Reset_Handler(void) {
         if (run_modeyfit_flag == 1) {
             modeyfit_test_run();
             run_modeyfit_flag = 0;
+        }
+        if (run_modeypage_flag == 1) {
+            modeypage_test_run();
+            run_modeypage_flag = 0;
         }
         if (run_planar_flag == 3) {
             planar_test_unmap();
