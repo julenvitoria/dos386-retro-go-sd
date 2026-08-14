@@ -785,8 +785,9 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
        160, one whole frame lost to a partial page at each end. The spare page
        comes out of RAM_EMU headroom, which had 24,672 bytes doing nothing. */
     {
-        uint8_t *raw = (uint8_t *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM,
-                                               1, GUEST_RAM_SIZE + 4096u);
+        uint8_t *raw = (uint8_t *)abi->mem_ctl(
+            GW_MEM_OP_ALLOC, GW_MEM_RAM, 1,
+            X86_PG_POOL_BYTES(GUEST_RAM_SIZE / 4096u) + 4096u);
         guest_ram = raw ? (uint8_t *)(((uint32_t)(uintptr_t)raw + 4095u)
                                       & ~4095u) : NULL;
     }
@@ -1171,7 +1172,12 @@ static void guest_reset(void)
     x86_pager_reset();
     x86_pager_own(0, GUEST_RAM_SIZE / 4096u);
     if (guest_ram)
-        x86_pager_add_frames(guest_ram, GUEST_RAM_SIZE);
+        /* POOL BYTES, not guest bytes. A frame is 4,104 bytes now -- 4,096 of
+           guest space plus the eight the seam writes into (x86_pager.h). Handing
+           this GUEST_RAM_SIZE would yield 159 frames for 160 pages and quietly
+           turn a pool that cannot evict into one that must. */
+        x86_pager_add_frames(guest_ram,
+                             X86_PG_POOL_BYTES(GUEST_RAM_SIZE / 4096u));
     x86_video_map();
 
     /* What INT 12h and 0040:0013 will report, taken from the allocation that

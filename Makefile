@@ -41,6 +41,22 @@ CFLAGS += -DX86_TEXT_AA=1
 X86_VIDEO_NEGCTL ?=
 CFLAGS += $(X86_VIDEO_NEGCTL)
 
+# THE GRANULE SEAM (x86_seam.c). 0 is the NEGATIVE CONTROL: no seam prologue is
+# emitted at the fold sites and no flush runs at the instruction boundary, so a
+# straddling 16/32-bit access reads and writes the slack past the low granule
+# instead of its neighbour -- the defect itself. tests/test_seam.py --negative
+# builds this and asserts the wrong answers, because a test that cannot be made
+# to fail is not a test. Never ship 0.
+# PSP SHIFT, in paragraphs, for the granule-seam acceptance test only. 0 is the
+# shipping path. 15 puts the PSP 256 bytes off a 4 KB boundary, which is the
+# placement that silently corrupted Wolfenstein 3-D before the seam was fixed.
+# See x86_dos.c and tests/test_seam.py.
+X86_DOS_PSP_SHIFT ?= 0
+CFLAGS += -DX86_DOS_PSP_SHIFT=$(X86_DOS_PSP_SHIFT)
+
+X86_SEAM_FIX ?= 1
+CFLAGS += -DX86_SEAM_FIX=$(X86_SEAM_FIX)
+
 X86_PROFILE ?= 0
 CFLAGS += -DX86_PROFILE=$(X86_PROFILE)
 
@@ -62,7 +78,7 @@ LDFLAGS = -mcpu=cortex-m7 -mthumb -T STM32H7B0VBTx_SDCARD.ld -Wl,--gc-sections -
 
 PROGS = test_core.elf
 
-TEST_OBJS = x86_cpu.o x86_nor.o x86_profile.o x86_probe.o x86_io.o x86_mem.o x86_arena.o x86_pager.o x86_video.o x86_video_planar.o x86_osk.o x86_hle.o x86_bios.o x86_dos.o cga_blit.o cpu_exec.o tests/main.o hw_accel.o x86_disk.o lib/FatFs/ff.o lib/FatFs/ffunicode.o
+TEST_OBJS = x86_cpu.o x86_nor.o x86_profile.o x86_probe.o x86_io.o x86_mem.o x86_arena.o x86_pager.o x86_seam.o x86_video.o x86_video_planar.o x86_osk.o x86_hle.o x86_bios.o x86_dos.o cga_blit.o cpu_exec.o tests/main.o hw_accel.o x86_disk.o lib/FatFs/ff.o lib/FatFs/ffunicode.o
 
 all: $(PROGS)
 

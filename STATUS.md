@@ -1655,6 +1655,9 @@ paths only; `INT 21h AH=47h` answering with it. All three titles pixel-identical
 after each. Dark Forces goes from "MZ-load a batch file, fail, execute the IVT"
 to `dsk_exec_rc=0` with DOS/4GW's stub running its handle probes.
 
+**FOUND AND FIXED: it was THE GRANULE SEAM.** See the section below. What
+follows is the bisection that named it, kept because it is the evidence.
+
 **NOT landed: the environment block.** It is what breaks WOLF3D, and bisecting
 it says the cause is not DOS semantics at all:
 
@@ -1673,7 +1676,8 @@ granules**. The env block is a red herring -- it is simply the first thing that
 ever shifted the arena. Master's PSP is linear 0x710; 0x1710 works, 0x810 and
 0x820 do not.
 
-**That is a guest-memory bug of ours, not a DOS one, and it is unfound.** The
+**That is a guest-memory bug of ours, not a DOS one.** It has now been found:
+it is THE GRANULE SEAM, and the section below is the fix. The
 DOS loader itself is granule-aware (`x86_guest_copy_in` walks pages;
 `psp_build` copies granule-aware; WOLF3D.EXE has zero relocations). Something
 downstream is sensitive to a load's offset within a 4 KB page. Until it is
@@ -1687,3 +1691,59 @@ and `probe.py --dos-log` shows WOLF3D doing one `findfirst *.WL1` and then
 **184,293** identical 14-byte `AH=40h` writes to stderr -- an error message on
 a loop. `tests/test_dos.py`'s new MZ-load arm cannot see this class: tier 1
 maps guest memory flat.
+
+
+## The granule seam — found, fixed, and proven by picture
+
+`host = lin + k` with **one k per 4 KB granule**, so two adjacent GUEST granules
+are adjacent in HOST memory only by luck. The pager hands frames out in **fault
+order** over a single pool (`x86_pager.c`, `take_free_frame()`), copy-on-write
+moves a granule into a pool page, and a fixed mapping's neighbour is a different
+device entirely. A guest 16- or 32-bit access whose bytes span the boundary
+resolves ONE pointer from the LOW granule's `k` and then reads or writes
+straight past the top of that host frame -- into an unrelated guest page.
+
+Silently. Nothing faults and nothing was counted. This is exactly the defect the
+prior DOS port named "the seam" (`references/dos_port_prior/CLAUDE.md`,
+"The memory map"; `references/8086tiny/8086tiny.c:7176-7183`), where a
+straddling 16-bit **data** read is what made KEEN4 and TOPBENCH diverge.
+
+It explains the bisection above completely. Move a program by a whole granule
+and every structure keeps its offset within its page, so the same accesses
+straddle and the same luck holds; move it by 256 bytes and a different set of
+accesses lands on a boundary.
+
+**The mechanism, ported from the prior port: pull, then push.** Every pager
+frame now carries **8 bytes of slack** past its top that belong to nobody
+(stride 4,104 for 4,096 of guest space). Before a straddling access the
+neighbour's leading bytes are pulled into that slack, so the READ is correct;
+at the next instruction boundary any slack byte that CHANGED is pushed into the
+neighbour, so the WRITE lands. A bounce buffer cannot serve this and the prior
+port proved it -- folded operand pointers have arithmetic done on them, they
+tried a gather buffer for data and it turned their suite red
+(`8086tiny.c:11360-11366`, "Do not re-try it").
+
+**The acceptance test, by picture.** `X86_DOS_PSP_SHIFT=15` puts the PSP 256
+bytes off a 4 KB boundary -- the placement that used to corrupt the guest:
+
+| build | WOLF3D |
+|---|---|
+| PSP shift 0, seam fix ON (shipping) | title screen, **57,874** px |
+| PSP shift **256 B**, seam fix ON | title screen, **57,874** px |
+| PSP shift **256 B**, seam fix **OFF** | shredded, streaked garbage, 57,457 px |
+
+The third row is the negative control and it is the proof: same tree, same
+shift, one flag.
+
+**The seam is rare and that is why it survived.** WOLF3D over 25 s:
+`x86_seam_syncs=52,216`, `x86_seam_writes=1`, `x86_seam_overflow=2`. One wrong
+byte in 52,000 straddles is precisely the shape of a defect that lives for
+months.
+
+**Cost.** `tests/test_benchmark.py` on a pure `DEC/JNZ` loop -- the most
+flush-check-dominated workload that exists, with no memory operand at all --
+9,962,750 -> 11,364,021 cycles per 1 M instructions, **cpi 9.96 -> 11.36
+(+14.1%)**. On a real title it is not measurable: WOLF3D's `guest_ips_achieved`
+is 2,982,107 with the fix and 2,982,107 without, because the title is
+frame-paced rather than interpreter-bound. ITCM `+8,394 B` (58,120 of 65,536),
+`__CORE_BSS_END__` `0x2405bbc0 -> 0x2405bdf0` (+560 B).

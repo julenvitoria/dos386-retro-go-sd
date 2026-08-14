@@ -392,6 +392,7 @@ OP .op_mov_r32_imm32
     AND.W R2, R0, #7
     MOV.W R2, R2, LSL #2
     ADD.W R2, R2, #8
+    SEAM_CHECK R3, R10
     UBFX R3, R10, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R10
@@ -477,6 +478,7 @@ L(ALU_EV_GV_MEM):
     MOV.W R4, R4, LSL #2
     ADD.W R4, R4, #8
     LDREG_V R5, R4
+    SEAM_CHECK R2, R7
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
@@ -563,6 +565,7 @@ OP .op_alu_gv_ev
 L(ALU_GV_EV_MEM):
     LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
     BLX R12
+    SEAM_CHECK R2, R7
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
@@ -598,6 +601,7 @@ L(ALU_TABLE_AL):
     ALU_TABLE_M L(ALU_TABLE_AL), L(ALU_DISPATCH_8_AL), 8
 
 OP .op_alu_eax_imm32
+    SEAM_CHECK R5, R10
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -672,6 +676,7 @@ OP .op_alu_ev_imm32_81
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
     CMP R3, #192
     BNE.N L(ALU_EV_IMM32_81_MEM)
+    SEAM_CHECK R5, R10
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -687,12 +692,14 @@ OP .op_alu_ev_imm32_81
 L(ALU_EV_IMM32_81_MEM):
     LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
     BLX R12
+    SEAM_CHECK R5, R10
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
     MEM_TRAP_R R5
     LD_V R5, R5
     EIP_ADV_V
+    SEAM_CHECK R2, R7
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
@@ -738,6 +745,7 @@ L(ALU_EV_IMM8_83_MEM):
     MEM_TRAP_R R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
+    SEAM_CHECK R2, R7
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
@@ -993,6 +1001,7 @@ L(MOV_EV_GV_MEM):
     MOV.W R4, R4, LSL #2
     ADD.W R4, R4, #8
     LDREG_V R5, R4
+    SEAM_CHECK R2, R7
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
@@ -1103,6 +1112,7 @@ L(MOV_GV_EV_MEM):
     /* MOV Gv, Ev -- memory form. */
     LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
     BLX R12
+    SEAM_CHECK R2, R7
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
@@ -1242,6 +1252,7 @@ OP_AGNOSTIC .op_test_al_imm8_A8
     B.W .fetch_decode_loop
 
 OP .op_test_eax_imm32_A9
+    SEAM_CHECK R5, R10
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -1498,6 +1509,7 @@ OP .op_ret_C3
     B.W .fetch_decode_loop
 
 OP .op_ret_imm16_C2
+    SEAM_CHECK R5, R10
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -1570,6 +1582,7 @@ OP .op_mov_ev_imm32_C7
     AND.W R3, R1, #192             @ R2 stays live: it is the mode record
     CMP R3, #192
     BNE.N L(MOV_EV_IMM_C7_MEM)
+    SEAM_CHECK R5, R10
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -1584,6 +1597,7 @@ OP .op_mov_ev_imm32_C7
 L(MOV_EV_IMM_C7_MEM):
     LDR.W R12, [R2, #REC_MODRM_FN]
     BLX R12
+    SEAM_CHECK R5, R10
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -1626,6 +1640,7 @@ OP .op_shift_ev_imm8_C1
 L(SHIFT_EV_IMM8_C1_MEM):
     LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
     BLX R12
+    SEAM_CHECK R2, R7
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
@@ -1675,6 +1690,7 @@ L(SHIFT_EV_MEM):
     LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
     BLX R12
     POP {R5}
+    SEAM_CHECK R2, R7
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
@@ -2343,6 +2359,7 @@ L(DECODE_MODRM_32):
     CMP R4, #28                    @ rm==5 -> [(E)BP+disp], default SS
     IT EQ
     MOVEQ R12, #SEG_SS_SEL
+    SEAM_CHECK R5, R10
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -2367,6 +2384,7 @@ L(MODRM_MOD0):
     AND.W R4, R1, #7
     CMP R4, #5
     BNE.N L(MODRM_DONE_MOD0)
+    SEAM_CHECK R7, R10
     UBFX R7, R10, #12, #12
     LDR.W R7, [R9, R7, LSL #2]
     ADDS R7, R7, R10
@@ -2398,6 +2416,7 @@ L(SIB_HAS_BASE):
     LDR.W R7, [R8, R4]
     B.N L(SIB_DO_INDEX)
 L(SIB_BASE_DISP32):
+    SEAM_CHECK R7, R10
     UBFX R7, R10, #12, #12
     LDR.W R7, [R9, R7, LSL #2]
     ADDS R7, R7, R10
@@ -2430,6 +2449,7 @@ L(SIB_DISP8):
     ADD R7, R5
     B.N L(MODRM_SEG)
 L(SIB_DISP32):
+    SEAM_CHECK R5, R10
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -2467,6 +2487,7 @@ L(DECODE_MODRM_32):
     CMP R2, #0
     BNE.N L(M16_RM6_BP)
     /* mod=00 rm=110: disp16, no base register at all, segment stays DS. */
+    SEAM_CHECK R7, R10
     UBFX R7, R10, #12, #12
     LDR.W R7, [R9, R7, LSL #2]
     ADDS R7, R7, R10
@@ -2525,6 +2546,7 @@ L(M16_DISP):
     ADD R7, R7, R5
     B.N L(M16_WRAP)
 L(M16_DISP16):
+    SEAM_CHECK R5, R10
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -2548,6 +2570,7 @@ L(MODRM_SEG):
     BX LR
 
 OP .op_call_rel32_E8
+    SEAM_CHECK R5, R10
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -2565,6 +2588,7 @@ OP .op_call_rel32_E8
     B.W .fetch_decode_loop
 
 OP .op_jmp_rel32_E9
+    SEAM_CHECK R5, R10
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -2676,6 +2700,7 @@ OP .op_grp5_FF
 L(GRP5_MEM):
     LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
     BLX R12
+    SEAM_CHECK R2, R7
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
@@ -2902,6 +2927,7 @@ OP .op_popa_61
     B.W .fetch_decode_loop
 
 OP .op_push_imm32_68
+    SEAM_CHECK R5, R10
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -2930,6 +2956,7 @@ OP .op_imul_imm32_69
 L(IMUL69_MEM):
     LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
     BLX R12
+    SEAM_CHECK R2, R7
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
@@ -2937,6 +2964,7 @@ L(IMUL69_MEM):
     VGA_LATCH R2, R12
     LD_V R3, R2
 L(IMUL69_DO):
+    SEAM_CHECK R5, R10
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -2979,6 +3007,7 @@ OP .op_imul_imm8_6B
 L(IMUL6B_MEM):
     LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
     BLX R12
+    SEAM_CHECK R2, R7
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
@@ -3000,6 +3029,7 @@ L(IMUL6B_DO):
     B.W .fetch_decode_loop
 
 OP .op_enter_C8
+    SEAM_CHECK R5, R10
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -3044,6 +3074,7 @@ OP .op_retf_imm16_CA
        and used raw ESP as a linear address with a 4-byte slot. Pop IP then CS,
        install CS so the base is recomputed, rebuild the linear EIP from it,
        and only then drop the caller's arguments. */
+    SEAM_CHECK R5, R10
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -3507,6 +3538,7 @@ OP .op_grp3_ev_F7
 L(GRP3_F7_MEM):
     LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
     BLX R12
+    SEAM_CHECK R2, R7
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
@@ -3531,6 +3563,7 @@ L(GRP3_F7_DISPATCH):
     BEQ.W L(GRP3_F7_IDIV)
     B.W .exit_loop
 L(GRP3_F7_TEST):
+    SEAM_CHECK R5, R10
     UBFX R5, R10, #12, #12
     LDR.W R5, [R9, R5, LSL #2]
     ADDS R5, R5, R10
@@ -3780,6 +3813,7 @@ OP_AGNOSTIC .op_mov_seg_Ew_8E
 L(MOV_SREG_MEM):
     LDR.W R12, [R2, #REC_MODRM_FN]
     BLX R12
+    SEAM_CHECK R3, R7
     UBFX R3, R7, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R7
@@ -3847,6 +3881,7 @@ L(LOAD_FAR_PTR):
     LDR.W R12, [R2, #REC_MODRM_FN]
     BLX R12
     PUSH {R0, R1}
+    SEAM_CHECK R3, R7
     UBFX R3, R7, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R7
@@ -3854,6 +3889,7 @@ L(LOAD_FAR_PTR):
     VGA_LATCH R3, R12
     LD_V R4, R3                    @ offset, operand-size wide
     ADD.W R7, R7, #OPSZ
+    SEAM_CHECK R3, R7
     UBFX R3, R7, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R7
@@ -3918,12 +3954,14 @@ OP .op_jmp_far_EA
 OP .op_call_far_9A
     MOV.W R0, #1
 L(FAR_IMM):
+    SEAM_CHECK R3, R10
     UBFX R3, R10, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R10
     MEM_TRAP_R R3
     LD_V R4, R3                    @ new offset
     EIP_ADV_V
+    SEAM_CHECK R3, R10
     UBFX R3, R10, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R10
@@ -4196,6 +4234,7 @@ L(HYPERCALL_UD):
  * selector -- an arbitrary CS built out of the target address. LES/LDS
  * (L(LOAD_FAR_PTR)) already reads the pair this way; this now matches it. */
 L(GRP5_FAR_ENTRY):
+    SEAM_CHECK R3, R7
     UBFX R3, R7, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R7
@@ -4203,6 +4242,7 @@ L(GRP5_FAR_ENTRY):
     VGA_LATCH R3, R12
     LD_V R4, R3                    @ new IP/EIP, operand-size wide
     ADD.W R7, R7, #OPSZ
+    SEAM_CHECK R3, R7
     UBFX R3, R7, #12, #12
     LDR.W R3, [R9, R3, LSL #2]
     ADDS R3, R3, R7

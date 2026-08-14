@@ -110,7 +110,7 @@ static uint8_t *frame_addr(uint32_t f)
 {
     for (uint32_t e = 0; e < extent_count; e++) {
         if (f >= extents[e].first && f < extents[e].first + extents[e].count)
-            return extents[e].base + (f - extents[e].first) * X86_PG_SIZE;
+            return extents[e].base + (f - extents[e].first) * X86_PG_STRIDE;
     }
     return NULL;
 }
@@ -135,10 +135,15 @@ int x86_pager_add_frames(void *base, uint32_t bytes)
         return -1;
     uint32_t start = ((uint32_t)(uintptr_t)base + X86_PG_SIZE - 1u)
                      & ~(X86_PG_SIZE - 1u);
-    uint32_t end = ((uint32_t)(uintptr_t)base + bytes) & ~(X86_PG_SIZE - 1u);
+    uint32_t end = (uint32_t)(uintptr_t)base + bytes;
     if (end <= start)
         return -1;
-    uint32_t n = (end - start) / X86_PG_SIZE;
+    /* STRIDE, not SIZE. Each frame owns X86_PG_SLACK bytes past its top so a
+       straddling guest access has somewhere to land that belongs to nobody --
+       see the seam block in x86_pager.h. A pool sized in whole pages therefore
+       yields one fewer frame than it used to, which is why every caller was
+       moved to X86_PG_POOL_BYTES() rather than left to lose a frame silently. */
+    uint32_t n = (end - start) / X86_PG_STRIDE;
     if (frame_count + n > MAX_FRAMES)
         n = MAX_FRAMES - frame_count;
     if (!n)
@@ -288,6 +293,14 @@ static uint32_t take_free_frame(void)
     return f;
 }
 
+uint8_t *x86_pager_slack(uint32_t page)
+{
+    if (!pg_flags || page >= X86_PG_PAGES || !(pg_flags[page] & PG_RESIDENT))
+        return NULL;
+    uint8_t *host = frame_addr(pg_frame[page]);
+    return host ? host + X86_PG_SIZE : NULL;
+}
+
 uint32_t x86_pager_fault(uint32_t lin, int write)
 {
     uint32_t page = lin >> X86_PG_SHIFT;
@@ -333,6 +346,22 @@ uint32_t x86_pager_fault(uint32_t lin, int write)
         return 0;
     }
     fill_frame(page, host);
+    /* Prime the slack from the neighbour AS IT STANDS NOW. A page becoming
+       resident takes a fresh snapshot; storing and restoring an old one is the
+       stale-neighbour bug the prior port traced
+       (references/8086tiny/8086tiny.c:10182-10190). A straddling access still
+       goes through x86_seam_sync(), which pulls live bytes -- this only means
+       the eight bytes are never uninitialised. */
+    {
+        uint32_t nk = (page + 1u < FOLD_ENTRIES)
+                      ? guest_page_table_ptr[page + 1u] : FOLD_INVALID;
+        if (nk != FOLD_INVALID)
+            memcpy(host + X86_PG_SIZE,
+                   (const void *)(uintptr_t)(((page + 1u) << X86_PG_SHIFT) + nk),
+                   X86_PG_SLACK);
+        else
+            memset(host + X86_PG_SIZE, 0, X86_PG_SLACK);
+    }
 
     frame_page[f] = (uint16_t)page;
     pg_frame[page] = (uint16_t)f;

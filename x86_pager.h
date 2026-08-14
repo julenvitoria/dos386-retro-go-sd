@@ -72,6 +72,29 @@ typedef int (*x86_pg_write_fn)(uint32_t slot, const void *src);
    8 KB, and it belongs in DTCM -- it is read on every fault. Supplied by the
    caller because a core gets its DTCM from mem_ctl() at runtime, and because
    8 KB of static .bss overflows RAM_EMU in the tier-1 harness. */
+/*
+ * THE SEAM SLACK. host = lin + k and k is per granule, so two adjacent guest
+ * pages are only adjacent in HOST memory by luck: frames are handed out in
+ * FAULT order. A guest 16- or 32-bit access whose bytes span the boundary
+ * resolves one pointer from the LOW page's k and then runs off the top of that
+ * frame -- into the next frame, which belongs to an unrelated guest page.
+ *
+ * Every frame therefore carries X86_PG_SLACK bytes past its top that belong to
+ * nobody, and x86_seam.c pulls the neighbour's leading bytes into them before a
+ * straddling access and pushes back whatever the instruction wrote. This is the
+ * prior DOS port's mechanism (references/8086tiny/8086tiny.c:7176-7188,
+ * DOS_COW_SLACK = 8) and the size is the same 8: the widest thing a handler
+ * reads through one folded pointer is a 6-byte far pointer (LDS/LES), and 8
+ * keeps the stride 8-aligned.
+ *
+ * THE PRICE IS THE STRIDE, NOT A SECOND TABLE: a frame costs 4,104 bytes to
+ * cover 4,096 of guest space, so a pool sized for N pages must be N * 4,104.
+ */
+#define X86_PG_SLACK   8u
+#define X86_PG_STRIDE  (X86_PG_SIZE + X86_PG_SLACK)
+/* What a caller must hand x86_pager_add_frames() to get `pages` frames. */
+#define X86_PG_POOL_BYTES(pages) ((pages) * X86_PG_STRIDE)
+
 #define X86_PG_TABLE_BYTES (4u * X86_PG_PAGES)
 int  x86_pager_set_tables(void *block, uint32_t bytes);
 
@@ -95,6 +118,16 @@ void x86_pager_own(uint32_t first_page, uint32_t count);
  * from x86_guest_ptr() on the host side.
  */
 uint32_t x86_pager_fault(uint32_t lin, int write);
+
+/*
+ * The seam's hook into the pager. Returns the address of `page`'s eight slack
+ * bytes -- the memory immediately past the top of its frame -- or NULL if the
+ * page is not resident in a frame this pager owns. NULL is the honest answer
+ * for a FIXED mapping (VRAM, the 13h aperture, the open-bus filler) and for a
+ * NOR-backed page: those have no slack, their neighbour is not ours to write,
+ * and x86_seam.c counts the refusal rather than guessing.
+ */
+uint8_t *x86_pager_slack(uint32_t page);
 
 /* Where the NOR snapshot is, so a fill can read from it. Mirrored from
    x86_nor.c rather than reached into: the two files own different halves of

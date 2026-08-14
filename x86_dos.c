@@ -728,6 +728,30 @@ int x86_dos_exec(const char *path, const char *cmdline)
     if (want < need)
         want = need;
 
+    /*
+     * THE ACCEPTANCE TEST FOR THE GRANULE SEAM, and nothing else.
+     *
+     * A program's load address may only move by whole 4 KB granules while the
+     * seam is broken: shift it by a granule and every structure keeps its
+     * offset within its page, so the same accesses straddle and the same luck
+     * holds; shift it by 256 bytes and a DIFFERENT set of accesses lands on a
+     * boundary and the guest is silently corrupted. That is exactly how this
+     * bug was found -- WOLF3D rendered at PSP 0x710 and at 0x1710, and broke at
+     * 0x810 -- so a fix that cannot survive a non-granule-aligned PSP has not
+     * been demonstrated.
+     *
+     * X86_DOS_PSP_SHIFT is paragraphs of dead block allocated ahead of the
+     * program, plus the one paragraph of MCB header: 15 gives exactly 256
+     * bytes. Default 0, so the shipping path is byte for byte what it was.
+     * See tests/test_seam.py and the seam block in x86_seam.c.
+     */
+#if X86_DOS_PSP_SHIFT
+    {
+        uint16_t pad_largest = 0;
+        (void)mcb_alloc(X86_DOS_PSP_SHIFT, MCB_OWNER_DOS, &pad_largest);
+    }
+#endif
+
     uint16_t largest = 0;
     uint16_t block = mcb_alloc(want, MCB_OWNER_DOS, &largest);
     uint16_t granted = want;

@@ -118,6 +118,14 @@ struct X86CPUState {
        nor_ptr so each is one LDR off R8 in DTCM. */
     uint32_t vga_base;
     uint32_t vga_latch;
+    /* THE SEAM. How many granule boundaries the instruction in flight has
+       synced -- see x86_seam.c. It lives here, not in x86_seam.c's .bss, for
+       one reason: the interpreter tests it at EVERY loop head, and one LDR off
+       R8 into DTCM costs a load, where a global would cost a literal pool
+       inside the ITCM hot section and a second cache line. Zero is the resting
+       state and the flush is behind a CBZ, so a guest that never straddles
+       pays a load and a not-taken branch and nothing else. */
+    uint32_t seam_n;
 };
 typedef struct X86CPUState X86CPUState;
 
@@ -544,6 +552,15 @@ extern uint8_t *mode_records_ptr;
 #define FOLD_SHIFT       12                 /* 4 KB granules */
 #define FOLD_ENTRIES     4096               /* 16 MB direct window */
 #define FOLD_INVALID     0x80000000u        /* forces bit 31 of the result */
+/* ---- the granule seam (x86_seam.c) -------------------------------------- */
+void x86_seam_sync(uint32_t lin);
+void x86_seam_flush(void);
+void x86_seam_reset(void);
+extern volatile uint32_t x86_seam_syncs;    /* straddles SERVED             */
+extern volatile uint32_t x86_seam_writes;   /* bytes a straddling store put back */
+extern volatile uint32_t x86_seam_overflow; /* straddles NOT served -- LOUD */
+extern volatile uint32_t x86_seam_flushes;
+
 #define FOLD_K(host, idx)  ((uint32_t)(host) - ((uint32_t)(idx) << FOLD_SHIFT))
 
 /* get_reg/set_reg additional constants */
