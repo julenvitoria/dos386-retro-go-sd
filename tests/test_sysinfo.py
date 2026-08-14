@@ -75,9 +75,9 @@ def main(args):
             print("FAIL: the sysinfo arm never completed")
             return False
 
-        r = [b.read_uint32(syms["sys_r"] + 4 * i) for i in range(14)]
-        (equip, conv, ext_ax, ext_fl, cfg_ax, cfg_fl, spk, _u7, exit_reason,
-         bda_equip, bda_conv, bda_crtc, bda_kb_lo, bda_kb_hi) = r
+        r = [b.read_uint32(syms["sys_r"] + 4 * i) for i in range(15)]
+        (equip, conv, ext_ax, ext_fl, cfg_ax, cfg_fl, spk, dcc_ax, exit_reason,
+         bda_equip, bda_conv, bda_crtc, bda_kb_lo, bda_kb_hi, dcc_bx) = r
 
         def check(label, got, want, fmt="0x{:04x}"):
             nonlocal ok
@@ -104,6 +104,18 @@ def main(args):
         check("INT 15h AH=88h CF (IRET frame)", ext_fl & CF, 0, "{}")
         check("INT 15h AH=C0h CF (IRET frame)", cfg_fl & CF, CF, "{}")
         check("INT 15h AH=C0h AH", (cfg_ax >> 8) & 0xFF, 0x86)
+
+        # INT 10h AH=1Ah, the display combination code. This is not a nicety:
+        # it is the FIRST of the four probes in Wolf3D's VW_VideoID, and a
+        # BIOS that answers AL=0 here sends the whole cascade down to the CGA
+        # arm. Measured under gwemu on the pre-fix core: videocard came out 2
+        # (CGAcard), VW_Startup called Quit("Improper video card!") before
+        # CA_Startup ever ran, and every symptom after that -- no page file,
+        # seeks on handle 0, SoundMode stuck at 0 -- was that one byte.
+        print("INT 10h AH=1Ah display combination code:")
+        check("  AL (1Ah = this BIOS has the call)", dcc_ax & 0xFF, 0x1A)
+        check("  BL (active display, 08 = VGA colour)", dcc_bx & 0xFF, 0x08)
+        check("  BH (alternate display, 00 = none)", (dcc_bx >> 8) & 0xFF, 0x00)
 
         # BL = OR of 1024 samples of port 0x61, BH = AND of the same. A bit
         # that ever went high is set in BL; a bit that ever went low is CLEAR

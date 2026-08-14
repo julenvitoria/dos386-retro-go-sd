@@ -553,6 +553,19 @@ static const uint8_t sys_guest_code[] = {
     0x89, 0x1E, 0x0C, 0x4C,             /* MOV [4C0C],BX                    */
     0xE4, 0x61, 0x24, 0xFC, 0xE6, 0x61, /* gate the speaker back off        */
 
+    /* INT 10h AH=1Ah -- the display combination code, which is how a VGA
+       program asks WHICH adapter it is talking to. AL=1Ah back means "this
+       BIOS has the call"; BL is the active display's code and BH the
+       alternate's. BX is poisoned FFFF, because a BIOS that answers AL=1Ah
+       and leaves BX alone has told the caller it has a display type of
+       0xFF -- and the table lookup that follows is off the end of the
+       caller's own array. Both halves have to be checked. */
+    0xB8, 0x00, 0x1A,                   /* MOV AX,1A00                     */
+    0xBB, 0xFF, 0xFF,                   /* MOV BX,FFFF                     */
+    0xCD, 0x10,                         /* INT 10h                         */
+    0xA3, 0x0E, 0x4C,                   /* MOV [4C0E],AX                   */
+    0x89, 0x1E, 0x10, 0x4C,             /* MOV [4C10],BX                   */
+
     0xF4,                               /* HLT                             */
 };
 
@@ -561,7 +574,7 @@ static void sysinfo_test_run(void)
     static const uint8_t hle_vectors[] = {
         0x08, 0x09, 0x10, 0x11, 0x12, 0x15, 0x16, 0x1A, 0x20, 0x21,
     };
-    memset(&test_ram[SYS_RES_BASE], 0, 16);
+    memset(&test_ram[SYS_RES_BASE], 0, 20);
     x86_video_init(cga_test_vram, cga_test_palette);
     x86_video_set_aperture(vga_test_aperture, vga_test_pal);
     x86_bios_init();
@@ -571,9 +584,12 @@ static void sysinfo_test_run(void)
     kbd_test_reset_cpu(SYS_CODE_BASE);
     sys_r[8] = kbd_test_run_to_halt();
 
-    for (unsigned i = 0; i < 7; i++)
+    for (unsigned i = 0; i < 8; i++)
         sys_r[i] = (uint16_t)(test_ram[SYS_RES_BASE + i * 2] |
                               (test_ram[SYS_RES_BASE + i * 2 + 1] << 8));
+    /* sys_r[8] is the exit reason, so the AH=1Ah BX lands at the top. */
+    sys_r[14] = (uint16_t)(test_ram[SYS_RES_BASE + 16] |
+                           (test_ram[SYS_RES_BASE + 17] << 8));
 
     /* The same facts as MEMORY, which is the other half of the contract: a
        program is free to peek the BDA instead of calling, and the two must not

@@ -670,6 +670,85 @@ planar→linear byte copy of ~64,000 pixels at ~9 instructions each, i.e. the
 signon screen drawn once; then 0x1D41D, 0x1620F, 0x188xx; then the derail in the
 last 1,532. So we get **past** the signon screen before failing.
 
+### It was never a CPU, memory or DOS defect: the guest was executing `Quit()`
+
+**`INT 10h AH=1Ah` answered AL=0, so `VW_VideoID` classified us as a CGA and
+`VW_Startup` called `Quit("Improper video card!")`.** Everything above this
+line that was read as a defect is that one byte, seen from downstream.
+
+The chain, measured, not reasoned:
+
+1. `X86_TRACE_EIP` with `SHIFT 11/12` and `SKIP` set into the gap turned the
+   phase map from four addresses into a sequence. It named the far call at
+   `0x1D41D` as `0x0081:0x43BF`, and **segment 0x0081 is not "the C runtime" —
+   it is the program's own first code segment** (PSP 0x0071, DGROUP 0x3804).
+   0x0081:0x43BF is a plain far `memcpy`.
+2. **Every `[0xD8F3]`-style address in the rounds above is a DS-RELATIVE
+   OFFSET, not a linear address.** DGROUP is at linear **0x38040** (found by
+   searching the image for `"WL1"` and subtracting the offset 0x9691 the code
+   itself uses), so `grhandle` is at linear 0x45933, `SoundMode` at 0x412A5,
+   `mapon` at 0x41920. They read zero at the true addresses too, so the
+   conclusions survived — but nothing was checking that they would.
+3. A static scan of the whole low megabyte for `E8`/`9A`/`EA` reaching
+   `CA_Startup` found **exactly one caller, at linear 0x05F50**, which is
+   `InitGame`. Disassembling around it gives the whole startup order:
+   `MM_Startup` 0x18680, `SignonScreen` 0x5B9B, `VW_Startup` **0x1CC0B**,
+   `IN_Startup` 0x17E26, `PM_Startup` 0x1A2C2, `PM_SetMainMemPurge` 0x194DA,
+   `SD_Startup` 0x1B4EE, `CA_Startup` 0x16E86, `US_Startup` 0x1C12B.
+4. `X86_TRACE_EIPREG` with **`REGMASK 0` / `MEMVAL 0`** turns the register test
+   into a tautology, so the trap becomes "freeze the ring on the FIRST arrival
+   at this EIP" and the ring names the caller. Pointed at `CA_CacheGrChunk`
+   (0x170CB) it fired at instruction **2,523,378** with CS=0x1620 and the ring
+   ending `... MM_SortMem ... 0x61C3, 0x61DF, 0x61E2` — and 0x61AD is
+   **`Quit()`**, whose two `CA_CacheGrChunk` call sites are the ORDERSCREEN and
+   ERRORSCREEN arms. The stack at `[BP+6]` held 0x3EF1, and `DS:0x3EF1` reads
+   **`"Improper video card!  If you really have a VGA card that I am no..."`**
+   The return address one frame up is `0x1CC0:0x005E`, inside `VW_Startup`.
+5. `VW_VideoID` is at `0x1E01:0x0136`. It runs four detectors in order —
+   `AX=1A00`, `AH=12h/BL=10h`, a CRTC write/read-back on 0x3D4, the same on
+   0x3B4 — and stores a card code at `cs:0x0106`. **Read out of our own guest
+   image, that word is 0x0202: card 2, CGAcard.** Wolf3D requires 5.
+
+So `CA_Startup` never ran because `VW_Startup`, which precedes it, never
+returned; the graphics-cache code that ran "from outside" was `Quit()` trying
+to display an error screen out of a file no one had opened yet. The 81 seeks on
+handle 0, `SoundMode` stuck at 0, the unhooked INT 08h/09h and the final wild
+far transfer are all inside that error path.
+
+**The fix is `x86_bios.c` AH=1Ah answering AL=1Ah, BL=08h, BH=00h.** The old
+comment there refused on the grounds that VGA implies planar 0Dh/0Eh/10h/12h,
+which `x86_video` refuses — and rested on a claim, "Wolf3D never calls AH=1Ah at
+all", that is simply false. The planar risk is unchanged and real, but a refused
+mode is logged (`x86_video_mode_log` tag 5) and leaves the previous mode up,
+whereas AL=0 is a hard stop for every VGA title on a machine that has a
+pixel-exact mode 13h and a real 256-entry DAC. **AH=12h/BL=10h is deliberately
+left answering "no EGA"** — that is the gate Keen 4 stops at, and it is
+untouched.
+
+Tier 1: `tests/test_sysinfo.py` drives AH=1Ah from GUEST code with **BX poisoned
+to 0xFFFF**, because a BIOS that sets AL=1Ah and leaves BX alone has handed the
+caller a display type of 0xFF to index a 16-entry table with. Measured on the
+pre-fix core: AL=0x00, BL=0xFF, BH=0xFF — all three arms fail, and pass after.
+
+**Measured after, tier 2 under gwemu:** `guest_halted` **1 → 0**,
+`guest_exit_reason` **4 → 3**, `guest_insns_total` **2,723,483 → 57 M and
+climbing** at ~3.0 M insn/s, 1,162 frames at ~60 fps, no fault. The DOS file log
+now shows **MAPHEAD, GAMEMAPS, VGADICT, VGAHEAD, VGAGRAPH and AUDIOHED all
+opened** — `CA_Startup` runs in full — against 275 file calls where there were
+4. Mode 13h is adopted (`0040:0049` = 0x13, `0040:004A` = 40, `x86_vga13_ok=1`,
+`vga_aperture_ok=1`) and the DAC has taken both 768-byte palettes.
+
+**The next wall is the one already scoped above and NOT built: unchained
+Mode Y.** `build/artifacts/wolf3d_after_1ah.png` is the title drawing real
+glyphs into the 13h aperture, repeated four times across the frame — the exact
+signature of planar writes with no Sequencer map mask, read back linearly. That
+is three separate subsystems (a store-side hook on VRAM writes, a Sequencer +
+CRTC register file, and page storage that does not exist), not a follow-up
+patch. Also visible and not yet judged: ~500 k reads of **port 0x201**, the game
+adapter, which is unmodelled and returns the 0xFF no-device default —
+`INL_StartJoy` should conclude "no joystick" from that, and whether it does has
+not been measured.
+
 ## TOPBENCH — running, scoring, screenshotted
 
 The 4 px cell is an **Everex Micro Enhancer 5x8** face squeezed to 4, not a

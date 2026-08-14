@@ -505,28 +505,49 @@ int x86_bios_video(uint8_t func)
     }
     case 0x1A:
         /*
-         * AH=1Ah is VGA's display-combination call. It reports support by
-         * returning AL=1Ah, so AL=0 is the documented "not supported" -- which
-         * is what a pre-VGA BIOS is, and what this one deliberately stays.
+         * AH=1Ah is VGA's display-combination call: AL=1Ah back means "this
+         * BIOS has the call", BL is the active display's code and BH the
+         * alternate's. 08h is "VGA with an analogue colour monitor".
          *
-         * This looks like the obvious thing to "fix", because we DO have a
-         * working 256-entry DAC on 0x3C6-0x3C9 and a pixel-exact mode 13h. It
-         * is not. AH=1Ah does not have a return code for "VGA, except the
-         * planar modes": a program told AL=1Ah/BL=08h has been told VGA, and
-         * VGA is a strict SUPERSET of EGA, so it is free to ask for 0Dh, 0Eh,
-         * 10h or 12h -- every one of which x86_video refuses. That converts a
-         * clean stop into a program running forever against a black screen,
-         * which is the exact failure the AH=12h comment above records having
-         * been measured and reverted.
+         * This used to answer AL=0 ("no such call"), on the argument that VGA
+         * is a strict superset of EGA and a program told VGA is free to ask
+         * for planar 0Dh/0Eh/10h/12h, which x86_video refuses. **That argument
+         * was written against a claim -- "Wolf3D never calls AH=1Ah at all" --
+         * that the measurement does not support, and the silence cost the
+         * whole title.** Wolf3D's VW_VideoID (linear 0x1E146) runs four
+         * detectors in order: AX=1A00 first, then AH=12h/BL=10h for EGA, then
+         * a CRTC write/read-back on 0x3D4 for CGA, then 0x3B4 for MDA. With
+         * AL=0 the first two fall through, the third succeeds, videocard comes
+         * out 2 (CGAcard), and VW_Startup calls
+         * Quit("Improper video card!  If you really have a VGA card...").
          *
-         * The honest description of this machine is the CGA-class colour
-         * adapter the equipment word at 0040:0010 reports (bits 4-5 = 10b) and
-         * the CRTC base port at 0040:0063 confirms, with mode 13h available to
-         * a program that simply ASKS for it -- which is how Wolf3D reaches it,
-         * measured: it never calls AH=1Ah at all. Nothing is lost by staying
-         * silent here that answering could safely give back.
+         * Quit() then tries to display its error screen through
+         * CA_CacheGrChunk on a grhandle that CA_Startup -- which runs AFTER
+         * VW_Startup and therefore never ran at all -- had not opened, so the
+         * seeks land on handle 0 and the guest eventually derails. Every
+         * downstream symptom recorded in STATUS.md (page file never opened,
+         * SoundMode stuck at 0, INT 08h/09h never hooked, the 81 identical
+         * AH=42h seeks) is that one byte, and none of them is a defect where
+         * it was looked for.
+         *
+         * The planar risk is real and is NOT closed by this: a VGA-only title
+         * that asks for mode 10h still gets refused. But a refusal is logged
+         * (x86_video_mode_log tag 5) and leaves the previous mode up, whereas
+         * "improper video card" is a hard stop for every 256-colour title on
+         * a machine that has a pixel-exact mode 13h and a real 256-entry DAC.
+         * Answering is strictly the better trade, and it is also the truthful
+         * one: we DO have the DAC and 13h that AL=1Ah/BL=08h describes.
+         *
+         * AH=12h/BL=10h is deliberately left alone -- see the comment above.
+         * Commander Keen 4 is EGA-only and still stops at that gate, which is
+         * the failure this call's old comment was really protecting.
          */
-        x86_set_al(0);
+        x86_set_al(0x1A);
+        /* BX must be written, both halves. A BIOS that answers AL=1Ah and
+           leaves BX alone has just told the caller its display type is
+           whatever junk was in BX, and VW_VideoID indexes a 16-entry table
+           with it. */
+        cpu_state_ptr->regs[3] = (cpu_state_ptr->regs[3] & 0xFFFF0000u) | 0x0008u;
         return 1;
     default:
         x86_hle_unhandled_vector = 0x10;
