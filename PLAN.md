@@ -66,10 +66,32 @@ tier.
 2. ~~Pager eviction~~ — built: second-chance clock, comparison-based dirty
    detection, both vetoes wired, six negative controls seen to fail.
 3. ~~Pagefile~~ — built. `x86page.swp` beside the `.dsk`, `slot` == guest page.
-   Measured: 39 writes, 5 reads, 0 errors, `_exhausted=0`.
-   **Cost: ~25 ms per writeback** — one and a half frames, paid at level load.
-   A write-behind queue is the fix if a title needs one.
-4. ~~Frame donation~~ — built and live: 34 frames / 139,264 B to Wolf3D.
+   **MEASURED ON SILICON, 3 min of WOLF3D play: `x86_pg_wb_us_worst` = 433,509
+   us for ONE 4 KB write**, against 23,531 us for an ordinary sector read, and
+   growing over the session. The write path is pathological, not merely slow.
+   First cause found and fixed: the file was opened, seeked, written and
+   `fclose`d PER PAGE while XMS held a second handle on it — `FF_FS_TINY 1`
+   means a held FIL costs no sector buffer and `FF_FS_LOCK 0` means the
+   duplicate open was unsound as well as slow. One shared held handle now.
+   `pgf_us_open/_seek/_write` split the rest; **`FF_USE_FASTSEEK 0` makes
+   `f_lseek` walk the chain from byte zero on every call**, which is the only
+   suspect that grows with offset. A write-behind queue hides latency but does
+   not reduce the churn, so it comes after this, not instead of it.
+4. ~~Frame donation~~ — built and live: 34 frames / 139,264 B to Wolf3D, and
+   **it is the two extra Mode Y display pages, not the off-screen cache.**
+   Costed properly at last, `X86_MODEY_EXTRA_PAGES`: dropping to one page hands
+   16 frames back (126 → 142) and halves evictions, and takes
+   `x86_vga_modey_alias_hits` from 0 to **13,119,029** — the doubled-walls
+   defect, straight back. **The WOLF3D golden passes on BOTH arms** (it captures
+   the credits screen), so it cannot gate this; `alias_hits` is the gate.
+   Full ladder, tier 2, same timeline (`alias_hits` at t+40 s):
+   **2** → 126 frames, pages=3, **0** hits, 40 evictions ·
+   **1** → 142, pages=2, 13,119,029, 18 · **0** → **160, pages=1, 27,011,108,
+   and WOLF3D PAGES ZERO TIMES** (evictions 0, `fill_file` 0).
+   So the whole stall is buyable, at 27 M aliased folds. **The golden reads
+   0.000% on ALL THREE arms**, so it cannot decide this; gwemu cannot reach
+   gameplay inside the 60 s cap either. DEFAULT STAYS AT 2 — the picture is the
+   gate and only tier 3 plus the owner's eye can read it.
 5. **Keen 4's levels** — now fundable by the same mechanism. Blocked on B3
    freeing the 0Dh read shadow; see Queue B.
 
@@ -133,10 +155,17 @@ no pagefile was wired.
 the FIRMWARE, not FatFs core.** Our `lib/FatFs` already matches that tree bar
 `ffconf.h` and one function we added, so this is firmware work we consume.
 
-- `fd1ff62` — bulk `HAL_SPI_TransmitReceive` for 512-byte blocks, **CMD18
-  multi-block reads** with a capability probe, ACMD23 pre-count, CMD17
-  fallback. **Needs no DMA**, and replaces per-sector round trips — plausibly
-  the larger win for our access pattern.
+- `fd1ff62` — bulk `HAL_SPI_TransmitReceive`, **CMD18 multi-block reads**,
+  ACMD23 pre-count, CMD17 fallback. **ALREADY IN THE FIRMWARE WE BUILD AND
+  FLASH, together with the DMA commit** — `gw_retro_go.elf` defines
+  `SPI_RxBuffer`, `probe_multiblock`, `read_sectors_cmd17`, `sd_io_on_ram_init`
+  and `s_spi_tx_ff`/`s_spi_rx` in D2 SRAM. It is the BASELINE, not a pending
+  win, and there is nothing to take upstream.
+- **And it would not have helped.** On silicon `x86_disk_reads` reaches 3,168
+  then FREEZES at t+36 s for the remaining 145 s, with it `x86_disk_us_total`
+  and `x86_disk_cache_misses` (100): WOLF3D loads its assets once. Both commits
+  are READS and neither touches `CMD24`/`CMD25`; the pagefile's cost is a WRITE.
+  The 64 KB sector cache is cleared for the same reason.
 - `6d6f6fb` — DMA for SD reads, +125 lines.
 
 Why it matters: the pagefile costs **~25 ms per writeback**, XMS measured an

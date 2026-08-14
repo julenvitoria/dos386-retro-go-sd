@@ -254,7 +254,8 @@ extern volatile uint32_t x86_pg_wb_zero;        /* dirty, but became all-zero */
 extern volatile uint32_t x86_pg_wb_file;        /* written to the pagefile    */
 extern volatile uint32_t x86_pg_wb_bytes;
 extern volatile uint32_t x86_pg_wb_opens;       /* fopen/fseek/fwrite/fclose  */
-extern volatile uint32_t x86_pg_wb_us_worst;    /* worst single writeback     */
+extern volatile uint32_t x86_pg_wb_us_worst;
+extern volatile uint32_t x86_pg_wb_us_total;    /* TOTAL time in writeback    */
 extern volatile uint32_t x86_pg_io_errors;
 extern volatile uint32_t x86_pg_exhausted;      /* no victim could be found   */
 extern volatile uint32_t x86_pg_unmapped;       /* faults outside our window  */

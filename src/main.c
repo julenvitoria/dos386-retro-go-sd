@@ -1145,13 +1145,52 @@ static int sd_sector_write(void *ctx, const void *src, uint32_t offset,
  * practice because only pages that were genuinely modified and then evicted are
  * ever written.
  *
- * OPEN-PER-CALL, deliberately, exactly like sd_sector_write() above. There is
- * no ranged SD write in the ABI, the firmware's stdio is the only write path,
- * and holding a FILE* across a guest frame would pin a FatFs handle and its
- * sector buffer for the life of the title. x86_pg_wb_opens counts these -- the
- * counter's name IS this design -- and x86_pg_wb_us_worst says what one costs.
- * If that number ever blows the frame budget the answer is a write-behind
- * queue, and the counter is what would justify building one.
+ * ONE HANDLE, HELD OPEN, SHARED WITH XMS -- and that is a correction, not a
+ * preference. This used to be OPEN-PER-CALL, on the stated grounds that
+ * "holding a FILE* across a guest frame would pin a FatFs handle and its
+ * sector buffer for the life of the title". Both halves of that were false on
+ * this build:
+ *
+ *   - The sector buffer is not pinned. The firmware builds FatFs with
+ *     FF_FS_TINY 1 (references/.../porting/lib/FatFs/ffconf.h:227), so a FIL
+ *     carries NO private window -- it shares FATFS.win. A held handle costs
+ *     the FIL struct and nothing else.
+ *   - The handle was already held ANYWAY. xms_open() below has held a second
+ *     FILE* on THIS EXACT FILE since the XMS work landed, and WOLF3D takes the
+ *     XMS path unprompted. So the cost was being paid AND the per-slot fopen
+ *     was being paid on top of it.
+ *
+ * That second point was also a live CORRECTNESS bug, not just a cost. The
+ * firmware builds with FF_FS_LOCK 0 (ffconf.h:266), so nothing refuses a
+ * duplicated open, and FatFs prohibits opening a file twice when either handle
+ * writes. Every WOLF3D level load had the pager writing x86page.swp through
+ * one handle while XMS held another open on it.
+ *
+ * What the open actually cost, and why it dominated a level load: fopen ->
+ * f_open is a directory walk with LFN on; fseek -> f_lseek with
+ * FF_USE_FASTSEEK 0 (ffconf.h:37) walks the cluster chain from byte zero,
+ * reading FAT sectors as it goes; and fclose -> f_sync writes the FAT back and
+ * updates the directory entry, which is two SD WRITES before the 4 KB of page
+ * data is even counted. The 4 KB was never the expensive part.
+ *
+ * The same A/B was already run on the XMS side of this file and is recorded
+ * below: fopen per operation cost WOLF3D 31% of its frame rate, and holding
+ * the handle cut that to 4%. The pager was paying the identical toll 36 times
+ * at a level load. x86_pg_wb_opens still counts writebacks and
+ * x86_pg_wb_us_worst still says what one costs; `xms_opens` is now the witness
+ * for the WHOLE file -- it is 1 for a run, and if it ever climbs with the
+ * writeback count, this reverted.
+ *
+ * Ordering is unchanged and there is no queue: every writeback is still
+ * synchronous and still completes before the frame it came from is reused, so
+ * a page can never be read back before its write has landed. Reads and writes
+ * share one handle, which is what makes that true through the buffering as
+ * well -- a page written and immediately refilled is served from the same
+ * FatFs window rather than from a stale sector under a second handle.
+ *
+ * Nothing needs an f_sync. The file is truncated at every guest reset and no
+ * slot is ever read before this run wrote it, so what reaches the card after a
+ * crash is not a property anything depends on.
  *
  * The file lives next to the .dsk, the one directory this core has demonstrated
  * it can write (the disk write-back path opens the image there "r+b" and the
@@ -1172,7 +1211,79 @@ volatile uint32_t pgf_errors = 0;   /* I/O that did not land                   *
 #define PGF_NO_CREATE   3
 
 static char pgf_path[sizeof(dsk_path) + 16];
-static void xms_close_file(void);   /* XMS holds this file open; see below */
+
+/*
+ * THE one handle on x86page.swp. The pager and XMS share it; see the header
+ * above for why there is exactly one and not two, and why it is held.
+ * `xms_opens` counts the fopen and is the witness that it stayed at one.
+ */
+static FILE *pgf_fp;
+extern volatile uint32_t xms_opens;
+extern volatile uint32_t xms_file_errors;
+static void pgf_close_file(void);
+
+/*
+ * WHERE A PAGEFILE WRITE ACTUALLY SPENDS ITS TIME.
+ *
+ * x86_pg_wb_us_worst measured 433,509 us for ONE 4 KB write on silicon, against
+ * 23,531 us for an ordinary sector read -- 20-80x, and GROWING over a session.
+ * A single number cannot say which of fopen / fseek / fwrite that is, and the
+ * three have completely different fixes (a held handle, the cluster-chain walk,
+ * the card itself). These split it, so the next run localises it instead of
+ * arguing about it.
+ *
+ * fseek is the one to read first: the firmware builds FF_USE_FASTSEEK 0, so
+ * f_lseek walks the cluster chain from byte zero on EVERY call, and a seek past
+ * EOF in write mode ALLOCATES the intervening clusters -- which is the only
+ * candidate on the list that grows with offset and with session length.
+ *
+ * _total is what attribution needs (a worst-case cannot be divided into a frame
+ * budget); _worst is what says whether the cost is a tail or a constant.
+ */
+volatile uint32_t pgf_us_open  = 0;
+volatile uint32_t pgf_us_seek  = 0;
+volatile uint32_t pgf_us_write = 0;
+volatile uint32_t pgf_us_read  = 0;
+volatile uint32_t pgf_seek_us_worst  = 0;
+volatile uint32_t pgf_write_us_worst = 0;
+
+extern volatile uint32_t x86_disk_cycles_per_us;
+
+/* Cycles -> us against the SAME calibration x86_pg_wb_us_worst uses, so the
+   split adds up to the total the pager reports rather than to a second scale. */
+static uint32_t pgf_us(uint32_t cycles)
+{
+    uint32_t per_us = x86_disk_cycles_per_us;
+    return per_us ? (cycles / per_us) : 0u;
+}
+
+static void pgf_acc(volatile uint32_t *total, volatile uint32_t *worst,
+                    uint32_t cycles)
+{
+    uint32_t us = pgf_us(cycles);
+    *total += us;
+    if (worst && us > *worst)
+        *worst = us;
+}
+
+/* The shared handle, opened on first use. NULL means the file is not usable;
+   every caller must check, exactly as they checked the per-call fopen. */
+static FILE *pgf_file(void)
+{
+    const gw_firmware_abi_t *abi = gw_firmware_abi();
+    if (!pgf_ready)
+        return NULL;
+    if (pgf_fp)
+        return pgf_fp;
+    X86_ZONE_ENTER(X86_ZONE_DISK);
+    uint32_t t0 = DWT_CYCCNT;
+    pgf_fp = abi->fopen(pgf_path, "r+b");
+    pgf_acc(&pgf_us_open, NULL, DWT_CYCCNT - t0);
+    X86_ZONE_EXIT();
+    if (!pgf_fp) { xms_file_errors++; return NULL; }
+    xms_opens++;
+    return pgf_fp;
+}
 
 static int pgf_open_file(void)
 {
@@ -1180,8 +1291,8 @@ static int pgf_open_file(void)
     size_t dir = 0;
 
     pgf_ready = 0;
-    /* Any XMS handle on the old file must go before this truncates it. */
-    xms_close_file();
+    /* The shared handle must go before this truncates the file under it. */
+    pgf_close_file();
     if (!dsk_path[0]) { pgf_result = PGF_NO_PATH; return -1; }
     for (size_t i = 0; dsk_path[i]; i++)
         if (dsk_path[i] == '/')
@@ -1198,26 +1309,35 @@ static int pgf_open_file(void)
     abi->fclose(f);
 
     pgf_reads = pgf_writes = pgf_errors = 0;
+    pgf_us_open = pgf_us_seek = pgf_us_write = pgf_us_read = 0;
+    pgf_seek_us_worst = pgf_write_us_worst = 0;
     pgf_result = PGF_OK;
     pgf_ready = 1;
     return 0;
 }
 
+/*
+ * Both of these do an ABSOLUTE fseek before every access, which is not
+ * decoration: one handle is shared by the pager and by XMS, so the file
+ * position on entry belongs to whoever ran last. It is also what C requires
+ * between a read and a write on the same update-mode stream.
+ */
 static int pgf_write(uint32_t slot, const void *src)
 {
     const gw_firmware_abi_t *abi = gw_firmware_abi();
     int rc = -1;
+    FILE *f = pgf_file();
 
-    if (!pgf_ready)
+    if (!f)
         return -1;
     X86_ZONE_ENTER(X86_ZONE_DISK);          /* ZONES: see sd_sector_read */
-    FILE *f = abi->fopen(pgf_path, "r+b");
-    if (f) {
-        if (abi->fseek(f, (long)(slot * X86_PG_SIZE), SEEK_SET) == 0 &&
-            abi->fwrite(src, 1, X86_PG_SIZE, f) == X86_PG_SIZE)
-            rc = 0;
-        abi->fclose(f);
-    }
+    uint32_t t0 = DWT_CYCCNT;
+    int sought = abi->fseek(f, (long)(slot * X86_PG_SIZE), SEEK_SET);
+    uint32_t t1 = DWT_CYCCNT;
+    pgf_acc(&pgf_us_seek, &pgf_seek_us_worst, t1 - t0);
+    if (sought == 0 && abi->fwrite(src, 1, X86_PG_SIZE, f) == X86_PG_SIZE)
+        rc = 0;
+    pgf_acc(&pgf_us_write, &pgf_write_us_worst, DWT_CYCCNT - t1);
     X86_ZONE_EXIT();
     if (rc == 0) pgf_writes++; else pgf_errors++;
     return rc;
@@ -1227,17 +1347,18 @@ static int pgf_read(uint32_t slot, void *dst)
 {
     const gw_firmware_abi_t *abi = gw_firmware_abi();
     int rc = -1;
+    FILE *f = pgf_file();
 
-    if (!pgf_ready)
+    if (!f)
         return -1;
     X86_ZONE_ENTER(X86_ZONE_DISK);
-    FILE *f = abi->fopen(pgf_path, "rb");
-    if (f) {
-        if (abi->fseek(f, (long)(slot * X86_PG_SIZE), SEEK_SET) == 0 &&
-            abi->fread(dst, 1, X86_PG_SIZE, f) == X86_PG_SIZE)
-            rc = 0;
-        abi->fclose(f);
-    }
+    uint32_t t0 = DWT_CYCCNT;
+    int sought = abi->fseek(f, (long)(slot * X86_PG_SIZE), SEEK_SET);
+    uint32_t t1 = DWT_CYCCNT;
+    pgf_acc(&pgf_us_seek, &pgf_seek_us_worst, t1 - t0);
+    if (sought == 0 && abi->fread(dst, 1, X86_PG_SIZE, f) == X86_PG_SIZE)
+        rc = 0;
+    pgf_acc(&pgf_us_read, NULL, DWT_CYCCNT - t1);
     X86_ZONE_EXIT();
     if (rc == 0) pgf_reads++; else pgf_errors++;
     return rc;
@@ -1261,9 +1382,10 @@ static int pgf_read(uint32_t slot, void *dst)
  * short fread, which xms_read() turns into zeros (that IS what freshly
  * allocated extended memory contains as far as any guest can tell) and counts.
  *
- * ONE OPEN PER MOVE, not per page-run: xms_open()/xms_close() bracket a whole
- * AH=0Bh, unlike pgf_write() which must open per slot because the pager calls
- * it one page at a time from inside eviction.
+ * ONE OPEN PER TITLE, and it is the SAME open the pager uses -- pgf_file()
+ * above. There used to be a second handle here, on this same file, while the
+ * pager opened and closed a third per evicted page; see the pagefile header for
+ * why that was both slow and, with FF_FS_LOCK 0, unsound.
  */
 #define XMS_FILE_BASE  ((uint32_t)X86_PG_PAGES * X86_PG_SIZE)   /* 8 MB */
 
@@ -1273,13 +1395,9 @@ volatile uint32_t xms_holes = 0;        /* reads of a region never written */
 volatile uint32_t xms_file_errors = 0;
 volatile uint32_t xms_opens = 0;    /* file opens -- ONE per title, not per move */
 
-static FILE *xms_fp;
-
 /*
  * THE HANDLE IS HELD OPEN ACROSS MOVES, and that is a MEASURED decision, not a
- * preference. The pager opens per slot because it is called one page at a time
- * from inside eviction and cannot know when the next call comes. XMS can:
- * a title's moves arrive in bursts at level load.
+ * preference. A title's moves arrive in bursts at level load.
  *
  * MEASURED, WOLF3D driven into gameplay under gwemu, same timeline both ways:
  *
@@ -1294,24 +1412,14 @@ static FILE *xms_fp;
  * construction -- the whole difference is fopen. `xms_opens` is 1 for the run,
  * and it is the witness: if it ever climbs with the move count, this reverted.
  *
- * The price is one FatFs handle and its sector buffer held for the life of the
- * title, which is exactly what pgf_write() refuses to pay for the pager. It is
- * closed at guest reset, before pgf_open_file() truncates the file under it.
+ * The price is one FIL for the life of the title -- and NOT a sector buffer:
+ * the firmware builds FatFs with FF_FS_TINY 1, so a FIL has no private window.
+ * It is closed at guest reset, before pgf_open_file() truncates the file.
  */
 static int xms_open(int write)
 {
-    const gw_firmware_abi_t *abi = gw_firmware_abi();
     (void)write;
-    if (!pgf_ready)
-        return -1;
-    if (xms_fp)
-        return 0;
-    X86_ZONE_ENTER(X86_ZONE_DISK);
-    xms_fp = abi->fopen(pgf_path, "r+b");
-    X86_ZONE_EXIT();
-    if (!xms_fp) { xms_file_errors++; return -1; }
-    xms_opens++;
-    return 0;
+    return pgf_file() ? 0 : -1;
 }
 
 /* End of one move. The handle stays; see above. */
@@ -1320,27 +1428,27 @@ static void xms_close(void)
 }
 
 /* The real close: at guest reset, and only there. */
-static void xms_close_file(void)
+static void pgf_close_file(void)
 {
     const gw_firmware_abi_t *abi = gw_firmware_abi();
-    if (xms_fp) {
+    if (pgf_fp) {
         X86_ZONE_ENTER(X86_ZONE_DISK);
-        abi->fclose(xms_fp);
+        abi->fclose(pgf_fp);
         X86_ZONE_EXIT();
-        xms_fp = NULL;
+        pgf_fp = NULL;
     }
 }
 
 static int xms_read(uint32_t off, void *dst, uint32_t bytes)
 {
     const gw_firmware_abi_t *abi = gw_firmware_abi();
-    if (!xms_fp)
+    if (!pgf_fp)
         return -1;
     X86_ZONE_ENTER(X86_ZONE_DISK);
     size_t got = 0;
     int rc = -1;
-    if (abi->fseek(xms_fp, (long)(XMS_FILE_BASE + off), SEEK_SET) == 0) {
-        got = abi->fread(dst, 1, bytes, xms_fp);
+    if (abi->fseek(pgf_fp, (long)(XMS_FILE_BASE + off), SEEK_SET) == 0) {
+        got = abi->fread(dst, 1, bytes, pgf_fp);
         rc = 0;
     }
     X86_ZONE_EXIT();
@@ -1359,12 +1467,12 @@ static int xms_read(uint32_t off, void *dst, uint32_t bytes)
 static int xms_write(uint32_t off, const void *src, uint32_t bytes)
 {
     const gw_firmware_abi_t *abi = gw_firmware_abi();
-    if (!xms_fp)
+    if (!pgf_fp)
         return -1;
     X86_ZONE_ENTER(X86_ZONE_DISK);
     int rc = -1;
-    if (abi->fseek(xms_fp, (long)(XMS_FILE_BASE + off), SEEK_SET) == 0 &&
-        abi->fwrite(src, 1, bytes, xms_fp) == bytes)
+    if (abi->fseek(pgf_fp, (long)(XMS_FILE_BASE + off), SEEK_SET) == 0 &&
+        abi->fwrite(src, 1, bytes, pgf_fp) == bytes)
         rc = 0;
     X86_ZONE_EXIT();
     if (rc != 0) { xms_file_errors++; return -1; }

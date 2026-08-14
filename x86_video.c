@@ -1395,16 +1395,49 @@ static void planar_storage_follow(uint8_t kind)
      * into the page it is displaying, only into the next one. Below that the
      * aliased fold stays, and x86_vga_modey_alias_hits is what says so.
      *
-     * Measured on this tree: WOLF3D peaks at 104 of 160 frames resident, so
-     * 32 donated frames leave 128 -- above the working set, no thrash. The
-     * pager's own reserve refuses anything that would go further.
+     * HOW MANY EXTRA PAGES TO ASK FOR IS A KNOB, AND IT HAD TO BECOME ONE.
+     *
+     * This used to ask for two unconditionally, on a measurement that silicon
+     * has since falsified. The old note read "WOLF3D peaks at 104 of 160
+     * frames resident, so 32 donated frames leave 128 -- above the working
+     * set, no thrash". MEASURED ON HARDWARE, 3 minutes of real play:
+     *
+     *   x86_pg_frames_total  126        (160 less the 34 donated)
+     *   x86_pg_evictions     368        monotonic, never settling
+     *   x86_pg_fill_file     334        pages read straight back IN
+     *   x86_pg_exhausted     0          allocation never fails
+     *
+     * 368 out against 334 back in is not a working set paged out once. It is
+     * clock replacement cycling on a pool slightly too small, and every
+     * guest_fps_achieved collapse in that run lines up with an eviction burst.
+     * The 104-frame peak was measured before the working set this title
+     * actually has.
+     *
+     * So the ladder's rung is now X86_MODEY_EXTRA_PAGES, because the trade is
+     * between a RENDERING defect and a PAGING one and the only honest way to
+     * settle it is to build both arms and grade them against the WOLF3D
+     * golden. Two pages (131,072 B, 32 frames) is the hardware layout; ONE
+     * (65,536 B, 16 frames) already removes the draw-over-displayed hazard,
+     * which IS the defect -- WOLF3D never draws into the page it is
+     * displaying, only into the next one -- and hands 16 frames back to the
+     * guest. Zero keeps the aliased fold and x86_vga_modey_alias_hits says so.
+     *
+     * The gate on any rung is the golden at 0.000% plus alias_hits at 0. Do
+     * not lower it on a frame-rate argument alone.
      */
-    x86_pager_donate_upto(2u * X86_MODEY_PAGE_BYTES, X86_MODEY_PAGE_BYTES);
+#ifndef X86_MODEY_EXTRA_PAGES
+#define X86_MODEY_EXTRA_PAGES 2u
+#endif
+    if (X86_MODEY_EXTRA_PAGES)
+        x86_pager_donate_upto(X86_MODEY_EXTRA_PAGES * X86_MODEY_PAGE_BYTES,
+                              X86_MODEY_PAGE_BYTES);
     void *pg[2] = { NULL, NULL };
-    if (x86_arena_claim(X86_ARENA_ID_MODEYP, 2, X86_MODEY_PAGE_BYTES, pg) == 0)
+    if (X86_MODEY_EXTRA_PAGES >= 2u
+        && x86_arena_claim(X86_ARENA_ID_MODEYP, 2, X86_MODEY_PAGE_BYTES, pg) == 0)
         x86_vga_modey_set_pages(pg[0], pg[1]);
-    else if (x86_arena_claim(X86_ARENA_ID_MODEYP, 1, X86_MODEY_PAGE_BYTES,
-                             pg) == 0)
+    else if (X86_MODEY_EXTRA_PAGES >= 1u
+             && x86_arena_claim(X86_ARENA_ID_MODEYP, 1, X86_MODEY_PAGE_BYTES,
+                                pg) == 0)
         x86_vga_modey_set_pages(pg[0], NULL);
     else
         /* Loud by construction: x86_arena_deficit holds what the last refusal
