@@ -595,6 +595,30 @@ cluster chain at least as long as its directory size, `VSWAP.WL1` exactly
 742,912 B. **The disk exonerates itself, DOSBox-X exonerates the game, and the
 defect that keeps Wolf3D inside `SD_Startup()` is ours.**
 
+#### Three things the oracle then settled
+
+**Our port 0x3DA is NOT QEMU's defect, and that lead is closed by measurement.**
+QEMU stalls because `vga_dumb_retrace()` flips `ST01_V_RETRACE` and
+`ST01_DISP_ENABLE` *together*, so its 0x3DA alternates 0x00/0x09 and never
+presents 0x01 or 0x08 alone. Ours derives both from the PIT slice position and
+returns 0x00, 0x01 or 0x09 — and `X86_TRACE_ATEIP 0x1E066` counts **21 passes
+through `VL_SetScreen`'s retrace wait, every one of which EXITS.** A hit count,
+not a reading of the code.
+
+**Our unpacked code image matches DOSBox's BYTE FOR BYTE** — 0x18Dxx, 0x1BAxx,
+0x1BBxx, 0x1D9xx, 0x1D4xx, 0x1E0xx, 0x188xx, 0x162xx — apart from segment
+relocations of exactly +0xF2D, the same delta QEMU gave, so the alignment is
+corroborated by two independent references. **The code is right; a VALUE we
+supply is wrong.** At the two machines' respective stopping points:
+`SoundMode` 0 vs **2**, `TimeCount` 0 vs 0x39, INT 08h/09h our stubs vs the
+game's own.
+
+**Phase map of our 2.65 M instructions**, from the now-deterministic sampler:
+the LZEXE unpacker to 1.70 M; then ONE loop at 0x1D9DB for 585 k — a
+planar→linear byte copy of ~64,000 pixels at ~9 instructions each, i.e. the
+signon screen drawn once; then 0x1D41D, 0x1620F, 0x188xx; then the derail in the
+last 1,532. So we get **past** the signon screen before failing.
+
 ## TOPBENCH — running, scoring, screenshotted
 
 The 4 px cell is an **Everex Micro Enhancer 5x8** face squeezed to 4, not a
