@@ -83,7 +83,13 @@ WITNESS = ("x86_video_mode_byte", "frames_rendered", "guest_insns_total",
            "x86_vga_latch_miss", "x86_vga_planar_lost",
            "x86_vga_modey_cache_offs", "x86_vga_modey_lost_hi",
            "x86_vga_modey_lost_lo",
-           "x86_vga_ega_card_offsets", "x86_arena_largest")
+           "x86_vga_ega_card_offsets", "x86_arena_largest",
+           # The DMA2D offload's witnesses. Absent from a control build, which
+           # _read_u32 answers with None rather than a missing key -- that is
+           # the difference between "the engine did nothing" and "this build
+           # has no engine in it", and scripts/dma2d_ab.py grades both.
+           "x86_dma2d_blits", "x86_dma2d_fallback", "x86_dma2d_waits",
+           "x86_dma2d_selftest")
 
 
 def load_manifest():

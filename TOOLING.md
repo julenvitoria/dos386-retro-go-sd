@@ -629,6 +629,30 @@ frame. It also prints a coarse text map of the result, so a black or garbage
 capture is obvious without opening the file. `tests/test_screen.py` does this
 for one expected image; this is the general form.
 
+### `dma2d_ab.py` — A/B the Chrom-ART offload of the chained 13h blit
+
+```bash
+python3 scripts/dma2d_ab.py                     # both arms, tier 2
+python3 scripts/dma2d_ab.py --keep-dsk          # keep build/CHAIN13.dsk
+python3 scripts/dma2d_ab.py --insns 3000000     # earlier capture point
+```
+
+Builds the core twice (`X86_VIDEO_DMA2D=0` and `=1`), boots each under gwemu
+against a **synthetic guest it generates itself** — a 27-byte MZ .EXE on a
+FAT12 floppy that sets mode 13h, fills the aperture with `i & 0xFF` and
+repaints forever — captures a frame from each and requires: the two arms
+identical, the picture obeying the pattern's own `(x,y) == (x-64,y+1)`
+identity (palette-independent, so it pins the row pitch without knowing the
+DAC), and `x86_dma2d_blits > 0` with `x86_dma2d_fallback == 0`, so an A/B
+cannot silently compare the fallback with itself.
+
+It exists because nothing else can reach this code: the offload covers
+**chained 13h only** and no title in the tree holds such a screen. **It does
+not pass yet** — the guest halts at `guest_exit_reason=4` before the mode set
+takes; the script's docstring records the measured state and the next
+question. Timing is not settleable below tier 3 either (gwemu runs the
+transfer synchronously), and the script prints the hardware recipe.
+
 ### `golden_screens.py` — the golden-screenshot GATE
 
 ```bash
