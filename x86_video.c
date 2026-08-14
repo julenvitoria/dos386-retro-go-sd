@@ -18,6 +18,7 @@
 #include "cutils.h"
 #include "x86_cpu.h"
 #include "x86_arena.h"
+#include "x86_pager.h"
 #include "x86_video_planar.h"
 /* The 8x8 table is still the BIOS INT 1Fh/43h font (x86_hle.c hands it to the
    guest); the renderer draws from the narrow tables. */
@@ -1221,6 +1222,20 @@ static void planar_storage_follow(uint8_t kind)
         x86_vga_ega_set_planes(NULL, 0);
         cga_storage_lend();
         aperture_compact();
+        /* BORROW FROM GUEST RAM. The arena is 143,360 B and 100% used in 0Dh
+           while the guest's frame pool has idle frames; PLAN.md Phase 3 always
+           meant the extra plane storage to come from there. The floor is one
+           page past the best run the arena already has -- donating to build a
+           card no bigger than the one that already fits would shrink the guest
+           for nothing. See x86_pager.h for what a donation may and may not
+           take (with no pagefile wired, only FREE frames). */
+        {
+            uint32_t floor = x86_arena_largest + X86_ARENA_PAGE;
+            if (floor < 4u * X86_EGA_PLANE_OFFSETS)
+                floor = 4u * X86_EGA_PLANE_OFFSETS;
+            if (floor <= 4u * X86_EGA_PLANE_MAX)
+                x86_pager_donate_upto(4u * X86_EGA_PLANE_MAX, floor);
+        }
         uint32_t offs = ega_fit_offsets();
         if (offs && x86_arena_claim(X86_ARENA_ID_EGA, 1, 4u * offs, &blk) == 0) {
             x86_vga_ega_set_planes(blk, offs);
@@ -1240,6 +1255,10 @@ static void planar_storage_follow(uint8_t kind)
     x86_arena_release(X86_ARENA_ID_EGA);
     x86_vga_ega_set_planes(NULL, 0);
     x86_vga_ega_card_offsets = 0;
+    /* Give the borrowed frames back BEFORE anything else claims: a reclaim is
+       refused while the arena still holds a page in the donated extent, and
+       cga_storage_reclaim() below is exactly such a claim. */
+    x86_pager_reclaim_from_arena();
     cga_storage_reclaim();
     if (cga_lent)
         return;                 /* the loan is outstanding: claim nothing */

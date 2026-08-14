@@ -54,7 +54,7 @@ def main(args):
             print("FAIL: target never ran the NOR test")
             return False
 
-        r = [b.read_uint32(syms["nor_r"] + 4 * i) for i in range(24)]
+        r = [b.read_uint32(syms["nor_r"] + 4 * i) for i in range(40)]
 
         checks = [
             # A snapshot whose readback disagrees must be refused OUTRIGHT --
@@ -91,6 +91,31 @@ def main(args):
             ("NOR copy unmodified at +0x5001",     r[21], pat(0x5001)),
             # Which is only meaningful if the page really moved to AXI.
             ("page 5 now on the fast path",        r[23], 0),
+
+            # ---- NOR-TIER EVICTION: the compare against the snapshot -------
+            # The pager's half of a NOR page's life. Nothing else in the tree
+            # exercises it, and it is the branch that decides whether a cold
+            # code page costs an SD write every time it is evicted.
+            ("two pages filled from NOR",          r[24], 2),
+            ("  ... byte-exact with the snapshot", r[25], 1),
+            ("  ... and so is the second",         r[26], 1),
+            ("unmodified victim: one eviction",    r[27], 1),
+            ("  ... DROPPED, it still matches",    r[28], 1),
+            ("  ... no pagefile write at all",     r[29], 0),
+
+            # The negative control. One byte differs from the snapshot, so
+            # neither page can be dropped -- and no pagefile is wired, so there
+            # is nowhere to put it. A MEM_FAULT the guest can see beats a page
+            # it cannot: MEASURED on KEEN4 before this rule, 38 evictions and
+            # 38 io_errors, i.e. 38 pages of guest memory gone.
+            ("modified victim: fault refused",     r[30], 1),
+            ("  ... nothing was evicted",          r[31], 0),
+            ("  ... nothing was dropped",          r[32], 0),
+            ("  ... nothing was LOST",             r[33], 0),
+            ("  ... exhaustion counted instead",   r[34], 1),
+            ("  ... and the bytes are still there", r[35], 1),
+
+            ("frames handed back",                 r[36], 0),
         ]
 
         # r[11] counts writes; the SECOND store went to the same page and must

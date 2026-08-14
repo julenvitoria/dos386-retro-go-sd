@@ -155,7 +155,7 @@ def main(args):
         ]
 
         # ---- demand paging, driven by guest instructions -------------------
-        p = run_arm(b, syms, "run_pager_flag", "pager_r", 24)
+        p = run_arm(b, syms, "run_pager_flag", "pager_r", 72)
         if p is None:
             print("FAIL: target never ran the pager test")
             return False
@@ -175,21 +175,93 @@ def main(args):
             ("one frame taken",                     p[9], 3),
             ("the page is on the FAST path now",    p[10], 1),
 
-            # Four pages against three frames. Exhaustion must be loud.
-            ("the 5th page takes a clean fault",    p[11], MEM_FAULT),
-            ("four resident, not five",             p[12], 4),
+            # Five pages against four frames. This used to be the exhaustion
+            # arm; with a victim picker it is an EVICTION, and the page that
+            # leaves held a byte the guest wrote, so it must be WRITTEN.
+            ("the 5th page pages in, no fault",     p[11], HALT),
+            ("four resident: the pool size",        p[12], 4),
             ("no frames left",                      p[13], 0),
-            ("exhaustion counted",                  p[14], 1),
+            ("nothing was exhausted",               p[14], 0),
+            ("exactly one eviction",                p[15], 1),
+            ("  ... written back: it was dirty",    p[16], 1),
+            ("  ... NOT dropped",                   p[17], 0),
+            ("  ... 4096 bytes",                    p[18], 4096),
+            ("  ... one backing-store write",       p[19], 1),
+            ("  ... no I/O errors",                 p[20], 0),
+            ("the victim is off the fast path",     p[21], 1),
+
+            # The round trip. Everything above can pass with a writeback that
+            # wrote the wrong slot; this cannot.
+            ("read the evicted page back",          p[22], HALT),
+            ("  ... the guest's byte survived",     p[23], 0x5A),
+            ("  ... filled from the FILE tier",     p[24], 1),
+            ("  ... one backing-store read",        p[25], 1),
+
+            # THE RULE THE WHOLE DESIGN IS FOR: a ZERO page that is still zero
+            # is dropped with no SD I/O at all.
+            ("still-zero page: one eviction",       p[26], 1),
+            ("  ... DROPPED clean",                 p[27], 1),
+            ("  ... no writeback",                  p[28], 0),
+            ("  ... the pagefile was not touched",  p[29], 0),
+
+            # The negative control for it. One non-zero byte, at the far END of
+            # the page, and the same eviction must write.
+            ("dirtied page: one eviction",          p[30], 1),
+            ("  ... NOT dropped",                   p[31], 0),
+            ("  ... written back",                  p[32], 1),
+            ("  ... the pagefile WAS touched",      p[33], 1),
+
+            # The two vetoes. 5 evictions of a live-mapped page produced 26,329
+            # wrong bytes in the prior port with its own counters green.
+            ("no legal victim: refused",            p[34], 1),
+            ("  ... exhaustion counted",            p[35], 1),
+            ("  ... the ring vetoed one",           p[36], 1),
+            ("  ... nothing was evicted",           p[37], 2),
+            ("lift the pin and it succeeds",        p[38], 1),
+            ("  ... and does not re-count",         p[39], 1),
 
             # The host path carries every DOS program load.
-            ("host fault reports exhaustion",       p[15], 1),
-            ("  ... and counts it",                 p[16], 2),
+            ("host fault now pages in",             p[40], 1),
 
             # An address outside the window is not a page fault at all.
-            ("outside the window is unmapped",      p[17], 1),
-            ("  ... counted separately",            p[18], 1),
+            ("outside the window is unmapped",      p[41], 1),
+            ("  ... counted separately",            p[42], 1),
 
-            ("frames handed back",                  p[19], 0),
+            ("frames handed back",                  p[43], 0),
+            ("no stray pagefile slot",              p[44], 0),
+
+            # ---- donation: spare guest frames become an EGA card -----------
+            ("a pinned run refuses donation",       p[45], 1),
+            ("  ... loudly",                        p[46], 1),
+            ("  ... and nothing moved",             p[47], 5),
+            ("past the reserve is refused",         p[48], 1),
+            ("  ... loudly",                        p[49], 2),
+            # No pagefile means eviction is data loss, so only FREE frames may
+            # go. src/main.c wires no backing store, so this is the rule that
+            # governs on the target.
+            ("no backing store: resident refused",  p[50], 1),
+            ("  ... loudly",                        p[51], 3),
+            ("donated bytes",                       p[52], 16384),
+            ("  ... four frames",                   p[53], 4),
+            ("  ... one eviction: cheapest run",    p[54], 1),
+            ("  ... guest RAM shrank to 1",         p[55], 1),
+            ("  ... the arena grew",                p[56], 16384),
+            ("the guest still pages on what is left", p[57], 1),
+            ("the arena can claim it",              p[58], 1),
+            ("  ... in the donated extent",         p[59], 1),
+            ("reclaim refused while claimed",       p[60], 1),
+            ("  ... counted",                       p[61], 1),
+            ("  ... frames stay lent",              p[62], 1),
+            ("released: reclaim succeeds",          p[63], 1),
+            ("  ... guest RAM whole again",         p[64], 5),
+            ("  ... arena empty",                   p[65], 0),
+            ("  ... nothing donated",               p[66], 0),
+            # A mode change donates and reclaims every time 0Dh comes and goes.
+            ("donate/reclaim round 2",              p[67], 1),
+            ("  ... reclaimed",                     p[68], 1),
+            ("donate/reclaim round 3",              p[69], 1),
+            ("  ... reclaimed",                     p[70], 1),
+            ("  ... the pool did not fragment",     p[71], 5),
         ]
 
         bad = 0
