@@ -103,6 +103,7 @@ the linear EIPs that led there**. Read the whole block with
 | `X86_TRACE_ODDREG R` | first boundary where guest register `R` is ODD; default `REG_ESP`. A 16-bit DOS guest moves SP by two for its whole life, so an odd SP is a defect at the instant it happens |
 | `X86_TRACE_LOWEIP N` | first instruction with linear EIP below `N`. "The guest is running the IVT as code" — fires EARLIER in a derailment than any register predicate, so reach for it first |
 | `X86_TRACE_LOWSP N` | first boundary with SP below `N`, for a push/pop imbalance whose single leak is invisible and whose drift is not |
+| `X86_TRACE_ATEIP A` | changes what the RING holds: SP sampled at exactly one guest EIP, one entry per pass. A slow stack leak cannot be found with a threshold — the drift is smaller than normal frame churn, so any bound low enough to miss a legitimate `sub sp,N` prologue is already past the start. Sampling the same instruction every iteration makes the per-iteration delta the reading |
 | `X86_TRACE_SKIP N` | arms the trap only after `N` instructions. Not optional for a register predicate: BP is a general register during startup (the unpacker loads it with a segment value at instruction 28), so an ungated "first odd BP" fires on a non-defect and hides the real one. The ring keeps filling while disarmed |
 
 **Catch, do not bisect, when the event is rare.** A bisection needs the run to be
@@ -114,6 +115,13 @@ a batch got cut moved with the wall-clock-driven slice and the index differed by
 is bit-reproducible (measured: 2,647,648 on three consecutive WOLF3D runs, from
 2,453,372/2,454,873 before). **The guest itself was never the problem** —
 `guest_insns_total` was 2,723,483 on every run throughout.
+
+**A zero in `x86_eip_log` means NO SAMPLE, not a value of zero.** The index is
+bumped for a batched `REP` element (that is what makes it deterministic) but the
+sampler only stores from `.resume_fetch`, so a sample whose index falls inside a
+batch leaves its slot at 0. Reading those zeros as data is how a healthy stack
+sitting at 0xFFB8 was misread as collapsing to 0, and it cost a bisection step.
+Filter empty slots out before interpreting a sweep.
 
 **The old `*guest_ram+OFF` spelling now FAILS with a message** in `--dump`,
 `--deref` and `watch_memory.py --addr`, rather than serving a wrong page. It is

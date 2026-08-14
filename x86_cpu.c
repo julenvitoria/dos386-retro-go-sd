@@ -302,5 +302,9 @@ uint32_t x86_eip_log_idx;
      [0] caught flag  [1] instruction count at the catch  [2] EIP now
      [3] watched reg  [4] SS base  [5] ESP  [6] EBP
      [7] ring write index at the catch    [72] instruction count now
-     [8..71] the frozen ring, oldest at (idx & 63)  */
-uint32_t x86_oddsp_log[73];
+     [8..71] the frozen ring, oldest at (idx & 63)
+     [73] CS base   [74..81] eight guest stack words from SS:(SP-8)
+   The stack words are captured AT THE CATCH and not read afterwards on purpose:
+   between a wild transfer and the halt the guest runs a few hundred thousand
+   more instructions and writes straight over the frame that explains it.  */
+uint32_t x86_oddsp_log[82];

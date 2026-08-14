@@ -312,7 +312,8 @@ x86_cpu_interp_asm:
     ADD.W R3, R3, #1
     STR R3, [R0, #288]
     LDR R2, [R0, #0]                 @ caught already? the ring is frozen
-    CBNZ R2, 3f
+    CMP R2, #0                       @ not CBNZ: 3f is out of its +126 reach
+    BNE.W 3f
     /* X86_TRACE_SKIP arms the trap late. A register that is legitimately odd
        during startup -- BP is a general register until a frame is set up, and
        the unpacker loads it with a segment value at instruction 28 -- makes an
@@ -343,11 +344,11 @@ x86_cpu_interp_asm:
     MOVW R2, #(X86_TRACE_LOWEIP & 0xFFFF)
     MOVT R2, #(X86_TRACE_LOWEIP >> 16)
     CMP R1, R2
-    BHS.N 2f
+    BHS.W 2f
 #else
     LDR.W R1, [R8, #X86_TRACE_ODDREG]
     LSLS R2, R1, #31                 @ bit 0 into C/Z: Z set == even
-    BEQ.N 2f
+    BEQ.W 2f
 #endif
     MOV.W R2, #1
     STR R2, [R0, #0]
@@ -360,11 +361,49 @@ x86_cpu_interp_asm:
     STR R2, [R0, #20]
     LDR.W R2, [R8, #REG_EBP]
     STR R2, [R0, #24]
-    B.N 3f                           @ freeze the ring where it stands
-2:  LDR R1, [R0, #28]                @ [7] ring write index
+    LDR.W R2, [R8, #SEG_CS_BASE]
+    STR R2, [R0, #292]               @ [73]
+    /* Eight stack words from SS:(SP-8). A far RETF has already popped by the
+       time this fires, so the frame it used sits just BELOW the live SP -- and
+       nowhere else will it still be readable. One fold lookup per word: the
+       span can cross a 4 KB granule. */
+    LDR.W R1, [R8, #REG_ESP]
+    LDR.W R2, [R8, #SEG_SS_BASE]
+    ADD.W R1, R1, R2
+    SUB.W R1, R1, #8
+    ADD.W R2, R0, #296               @ [74]
+4:  UBFX R3, R1, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R1
+    BMI.N 5f                         @ unmapped: leave the slot zero
+    LDRH R3, [R3]
+    STR R3, [R2]
+5:  ADD.W R1, R1, #2
+    ADD.W R2, R2, #4
+    SUB.W R3, R2, R0
+    CMP R3, #328                     @ [82] -- eight words done
+    BLO.N 4b
+    B.W 3f                           @ freeze the ring where it stands
+2:
+#ifdef X86_TRACE_ATEIP
+    /* Record SP at ONE fixed point in the guest's loop instead of the EIP of
+       every instruction. A slow stack leak cannot be found with a threshold --
+       the drift is smaller than the normal frame churn, so any bound low enough
+       to miss a legitimate `sub sp,N` prologue is already past the start. One
+       sample per iteration, at the same instruction every time, makes the
+       per-iteration delta the reading. */
+    MOVW R3, #(X86_TRACE_ATEIP & 0xFFFF)
+    MOVT R3, #(X86_TRACE_ATEIP >> 16)
+    CMP R10, R3
+    BNE.W 3f
+    LDR.W R3, [R8, #REG_ESP]
+#else
+    MOV.W R3, R10
+#endif
+    LDR R1, [R0, #28]                @ [7] ring write index
     AND.W R1, R1, #63
     ADD.W R2, R0, #32                @ [8..71] the ring itself
-    STR.W R10, [R2, R1, LSL #2]
+    STR.W R3, [R2, R1, LSL #2]
     ADD.W R1, R1, #1
     STR R1, [R0, #28]
 3:  POP {R0, R1, R2, R3}

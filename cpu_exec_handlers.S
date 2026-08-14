@@ -3960,10 +3960,10 @@ L(FAR_SET):
 #ifndef USE_16_BIT
 .str_exit:
     LDR.W R3, [R8, #CPU_REP_ACTIVE]
-#ifdef X86_TRACE_EIP
-    /* CBZ reaches +126 bytes and the sampler's counter bump below does not fit
-       inside that. Widened ONLY in a tracing build, so a shipping core keeps
-       the two-byte encoding on this hot path. */
+#if defined(X86_TRACE_EIP) || defined(X86_TRACE_ODDSP)
+    /* CBZ reaches +126 bytes and the counter bumps below do not fit inside
+       that. Widened ONLY in a tracing build, so a shipping core keeps the
+       two-byte encoding on this hot path. */
     CMP R3, #0
     BEQ.W 1f
 #else
@@ -3996,6 +3996,18 @@ L(FAR_SET):
     IT EQ
     UXTHEQ R5, R5
     STR.W R5, [R8, #REG_ECX]
+#ifdef X86_TRACE_ODDSP
+    /* The predicate trap's own counter needs the same correction, or its
+       X86_TRACE_SKIP arming point is measured on a different (and, before the
+       fix below, non-reproducible) scale from the sampler's. */
+    PUSH {R0, R3}
+    MOVW R0, #:lower16:x86_oddsp_log
+    MOVT R0, #:upper16:x86_oddsp_log
+    LDR R3, [R0, #288]
+    ADD.W R3, R3, #1
+    STR R3, [R0, #288]
+    POP {R0, R3}
+#endif
 #ifdef X86_TRACE_EIP
     /* A batched element bypasses .resume_fetch, so without this the sampler's
        index counts DISPATCHES, not guest instructions -- and where a batch gets
