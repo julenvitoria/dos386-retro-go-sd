@@ -459,12 +459,41 @@ static void guest_str(uint32_t lin, char *out, unsigned max)
  * f_open rejects outright with FR_INVALID_DRIVE. We have exactly one volume
  * (the mounted .dsk), so every drive letter means the same disk: strip it.
  *
- * FF_FS_RPATH is 0 too, so there is no current directory to be relative to and
- * a leading separator is meaningless -- but harmless -- to strip as well; what
- * matters is that "A:FOO.INI" and "\FOO.INI" and "FOO.INI" all reach the same
- * root-directory entry, which is where a single-floppy DOS title keeps its
- * files.
+ * FF_FS_RPATH is 0 too, so FatFs has no current directory of its own. That is
+ * fine for a single-floppy title whose files all sit in the root, and WRONG for
+ * a title AUTOEXEC.BAT reaches with `CD \DF`: every relative name it then opens
+ * ("DARK.GOB") has to resolve against that directory, and with no CWD anywhere
+ * in the stack it resolved against the root and missed. So the current
+ * directory is kept HERE, as a plain prefix string, and applied to exactly the
+ * paths DOS applies it to -- the relative ones. "\DF\TEXT.MSG" and "C:\FOO"
+ * still mean the root, as they do under DOS.
+ *
+ * "C:FOO" is DRIVE-RELATIVE, not absolute: DOS resolves it against that
+ * drive's current directory. We have one volume and one CWD, so it gets the
+ * prefix too. (The reverted version of this change read "C:FOO" as rooted;
+ * that is the wrong reading and it is the one a title in a subdirectory would
+ * trip over.)
  */
+static char dos_cwd[48];                        /* "" = root; no trailing '/' */
+
+void x86_dos_set_cwd(const char *dir)
+{
+    unsigned i = 0;
+    if (dir) {
+        while (*dir == '\\' || *dir == '/')
+            dir++;
+        while (dir[i] && i < sizeof(dos_cwd) - 1) {
+            dos_cwd[i] = (dir[i] == '\\') ? '/' : dir[i];
+            i++;
+        }
+        while (i && dos_cwd[i - 1] == '/')
+            i--;
+    }
+    dos_cwd[i] = 0;
+}
+
+const char *x86_dos_get_cwd(void) { return dos_cwd; }
+
 static void dos_path_from_guest(uint32_t lin, char *out, unsigned max)
 {
     char raw[64];
@@ -473,13 +502,24 @@ static void dos_path_from_guest(uint32_t lin, char *out, unsigned max)
     const char *s = raw;
     if (s[0] && s[1] == ':')                    /* drop any "X:" */
         s += 2;
+    int absolute = (*s == '\\' || *s == '/');
     while (*s == '\\' || *s == '/')             /* and any leading separator */
         s++;
 
     unsigned i = 0;
-    while (s[i] && i < max - 1) {
-        out[i] = s[i];
+    if (!absolute && dos_cwd[0]) {
+        while (dos_cwd[i] && i < max - 2) {
+            out[i] = dos_cwd[i];
+            i++;
+        }
+        if (i < max - 1)
+            out[i++] = '/';
+    }
+    unsigned j = 0;
+    while (s[j] && i < max - 1) {
+        out[i] = (s[j] == '\\') ? '/' : s[j];
         i++;
+        j++;
     }
     out[i] = 0;
 }
@@ -1310,11 +1350,25 @@ static int dos_int21_dispatch(uint8_t func)
         x86_set_al(1);                          /* one drive in the system */
         return 1;
     case 0x47: {                                /* get current directory */
-        /* Root, always: FF_FS_RPATH is 0, so there is no other answer to give
-           and an empty string IS the correct encoding of "\". */
+        /*
+         * The CWD, in DOS notation and WITHOUT a leading backslash -- which is
+         * what the DOS API specifies and what a caller re-joins with one.
+         *
+         * "Root, always" was not a free answer. DOS/4GW's stub asks here and
+         * then opens `<cwd>\DOS4GW.EXE` as an ABSOLUTE path; told the root it
+         * opened `\DOS4GW.EXE`, got file-not-found for a file that is in \DF,
+         * printed three lines and exited with errorlevel 1.
+         */
         uint32_t lin = cpu_state_ptr->segs[3].base + (uint16_t)r[6];
-        uint8_t z = 0;
-        x86_guest_copy_in(lin, &z, 1);
+        const char *c = x86_dos_get_cwd();
+        char buf[64];
+        unsigned i = 0;
+        while (c[i] && i < sizeof(buf) - 1) {
+            buf[i] = (c[i] == '/') ? '\\' : c[i];
+            i++;
+        }
+        buf[i] = 0;
+        x86_guest_copy_in(lin, buf, i + 1);
         x86_set_ax(0x0100);
         ok_clear_cf();
         return 1;
