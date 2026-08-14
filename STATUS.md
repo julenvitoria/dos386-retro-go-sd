@@ -1563,3 +1563,71 @@ dumped; the frame's 0 non-zero pixels covers the rest indirectly).
   rebuilds the scanned-out image. A black timeline screenshot is not a bug.
 - No hardware probe this session, so `50.50 cyc/insn` predates the interrupt,
   speaker and video work.
+
+## "Input is not responsive" was the CLOCK, and input was clean
+
+A device report on Wolfenstein 3D: *"keyboard input is not very responsive or
+something. rotating left/right in game is noticeably slow and moving to different
+items in menu isn't as quick as it should be"* — two symptoms that read as one
+input defect and one speed defect. **They are one defect, and it is neither.**
+
+**The measurement.** `probe_report.py --title wolf3d` recorded the guest issuing
+`OUT 0x43,0x36` (channel 0, lo/hi, mode 3) followed by two writes to port
+`0x40`, last byte `0x21` — divisor `0x214B` = 8523 = **140.0 Hz**. Both writes
+were dropped: `pit_write_control()` returned early for every channel but 2, and
+port 0x40 was **not in the write switch at all**. So the guest asked for 140 Hz
+and got the 18.2065 Hz boot rate — its tic counter, which is what paces turning,
+animation *and* menu key-repeat, ran at **18.2/140 = 13% of real time**, i.e.
+7.7x slow. That is exactly both symptoms, from one cause.
+
+**Input was measured clean and is unchanged.** `poll_input()` (`src/main.c:1737`)
+queues every button edge into the 16-deep controller queue, and the slice loop
+re-raises IRQ 1 on every iteration (`src/main.c:2031`), so there is **no
+one-key-per-frame ceiling** — several codes drain inside a single frame. There is
+no typematic auto-repeat, deliberately, exactly as the owner's prior port decided
+(`dos_input.c:304`: *"One event per edge, never per frame… Repeat, if a program
+wants it, is the guest's business"*), and it is irrelevant to Wolf3D anyway: it
+installs its own INT 09h and reads `Keyboard[]`/`LastScan`, so one make and one
+break per press is the whole contract.
+
+**The fix.** PIT channel 0 is modelled (`x86_io.c`, `pit_write_ch0()` +
+`x86_pit0_divisor()`), and the frame loop derives IRQ 0 from *that* divisor
+rather than from a constant. Two things had to move with it:
+
+* **The BDA 0x46C count stays on 18.2065 Hz** (its own accumulator, `bda_acc`).
+  It is DOS's time of day and must not accelerate because a game retimed the
+  chip for itself.
+* **One IRQ 0 per frame was a ceiling on the guest's clock**, invisible at 18.2 Hz
+  against a 60 Hz panel and fatal at 140 Hz. The frame's budget is now cut into
+  up to `TICK_IRQ_MAX` (8) sub-slices with one interrupt armed before each; the
+  `hard_int_pending` slot is one deep, so nothing else could deliver more than
+  one. A HLT that lands with a tick still owed now gets it immediately instead of
+  idling to the next frame.
+
+**Gates.** `test_opcodes` **273/273**; `test_video` green including Mode Y and
+EGA 0Dh at 64000/64000; `test_keyboard`, `test_osk` green. `test_screen` fails
+its text-mode CLUT assertion — **verified identical on unmodified master**, so it
+is pre-existing and not this change. New: `tests/test_pit.py`, which runs the
+real Wolf3D OUT sequence as GUEST code and whose `--negative` rebuilds with the
+`case 0x40:` arm deleted and requires a FAIL (measured: divisor 65536 / 18.207 Hz
+where the guest asked 8523 / 140 Hz, five assertions fire, source restored in a
+`finally`).
+
+**No measurable cost.** Tier 2, Alley Cat: 508 ticks / 28.005 s = **18.14 Hz**,
+`x86_pit0_writes` 0 — a guest that never programs the timer is bit-for-bit on the
+old path. Wolf3D run against master and against this branch: `guest_ticks` 469
+and `guest_uptime_ms` 25,789 on **both**, `guest_ips_achieved` 2,975,117 vs
+2,974,339 (0.03%, noise). Core cost `__CORE_BSS_END__` **0x2405b808 →
+0x2405b960, +344 B**.
+
+**What is NOT fixed, and is the next obvious thing.** Port 0x40's **READ** still
+floats 0xFF — a latched counter that never moves. Alley Cat reads it **2,014,994
+times in 28 s** as a fine clock or an entropy source. The divisor is now modelled,
+so the counter has something to count from; nothing else does.
+
+**Wolf3D does not currently reach its title screen on master**, and that blocked
+end-to-end confirmation of the 140 Hz rate at tier 2. It loops on `INT 21h` AH=25h
+/ 40h / 4Ch (1,029,769 / 512,365 / **257,440 terminations** in 26 s, writing an
+error and exiting over and over), with `x86_vga_dac_writes` 0. **Measured
+identically on unmodified master**, so it is not this change — but it is a live
+regression somebody owns.

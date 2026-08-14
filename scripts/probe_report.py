@@ -208,7 +208,14 @@ CONTEXT = ["core_ready", "core_dtcm_ok", "hle_calls_seen", "x86_hle_calls",
            "hle_bad_vector", "hle_bad_func", "guest_ips_achieved",
            "guest_insns_total", "frames_rendered", "x86_disk_reads",
            "x86_vga13_ok", "vga_aperture_ok", "x86_vga_dac_writes",
-           "guest_exit_reason", "guest_halted", "x86_dos_file_calls"]
+           "guest_exit_reason", "guest_halted", "x86_dos_file_calls",
+           # The guest's CLOCK, which is a different question from its speed
+           # and has its own failure mode: a title that programs PIT channel 0
+           # and does not get that rate has every timed thing it does slowed by
+           # the ratio. guest_ticks/guest_uptime_ms must read back as
+           # 1193182/guest_tick_divisor.
+           "guest_tick_divisor", "x86_pit0_writes", "guest_ticks",
+           "guest_ticks_dropped", "guest_tick_irq_lost", "guest_uptime_ms"]
 
 
 def collect(args, title):

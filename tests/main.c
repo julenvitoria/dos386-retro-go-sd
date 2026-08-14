@@ -873,6 +873,111 @@ static void sysinfo_test_run(void)
     sys_r[13] = kbd_bda_r16(0x82);     /* keyboard ring end         */
 }
 
+/* ---------------------------------------------------------------------------
+ * PIT channel 0 -- the SYSTEM TIMER's divisor, programmed by GUEST code.
+ *
+ * Channel 0 decides how fast the guest's clock runs, and until it was modelled
+ * every write to it was dropped: a title that programmed 140 Hz got 18.2 Hz and
+ * its whole sense of time -- movement, animation, menu key-repeat -- ran at 13%
+ * of real. Wolfenstein 3D is exactly that title (OUT 43h,36h then 4Bh/21h).
+ *
+ * The arm executes the guest's own OUTs rather than calling the port handler
+ * from the host, because the question is what a program's instruction stream
+ * does to the machine. Four phases, each ending in HLT:
+ *
+ *   A  36h + lo/hi   -> 0x214B, the real Wolf3D program
+ *   B  14h + one lo  -> lo-byte-only access must leave the HIGH byte alone
+ *   C  a channel 2   -> programming the SPEAKER must not touch the timer
+ *   D  36h + 00/00   -> a reload of 0 is 65536, not a divide by zero
+ */
+#define PIT_CODE_A      0x2A00u
+#define PIT_CODE_B      0x2A20u
+#define PIT_CODE_C      0x2A40u
+#define PIT_CODE_D      0x2A60u
+
+volatile uint32_t run_pit_flag = 0;
+volatile uint32_t pit_r[10];
+
+static const uint8_t pit_code_a[] = {
+    0xB0, 0x36,                   /* MOV AL,36h  ch0, lo/hi, mode 3         */
+    0xE6, 0x43,                   /* OUT 43h,AL                             */
+    0xB0, 0x4B,                   /* MOV AL,4Bh  divisor low                */
+    0xE6, 0x40,                   /* OUT 40h,AL                             */
+    0xB0, 0x21,                   /* MOV AL,21h  divisor high -> 0x214B     */
+    0xE6, 0x40,                   /* OUT 40h,AL                             */
+    0xF4,                         /* HLT                                    */
+};
+static const uint8_t pit_code_b[] = {
+    0xB0, 0x14,                   /* MOV AL,14h  ch0, LO BYTE ONLY, mode 2  */
+    0xE6, 0x43,                   /* OUT 43h,AL                             */
+    0xB0, 0xFF,                   /* MOV AL,FFh                             */
+    0xE6, 0x40,                   /* OUT 40h,AL  -> 0x21FF, high byte kept  */
+    0xF4,                         /* HLT                                    */
+};
+static const uint8_t pit_code_c[] = {
+    0xB0, 0xB6,                   /* MOV AL,B6h  ch2, lo/hi, mode 3         */
+    0xE6, 0x43,                   /* OUT 43h,AL                             */
+    0xB0, 0x34,                   /* MOV AL,34h                             */
+    0xE6, 0x42,                   /* OUT 42h,AL                             */
+    0xB0, 0x12,                   /* MOV AL,12h                             */
+    0xE6, 0x42,                   /* OUT 42h,AL  -> speaker 0x1234          */
+    0xF4,                         /* HLT                                    */
+};
+static const uint8_t pit_code_d[] = {
+    0xB0, 0x36,                   /* MOV AL,36h                             */
+    0xE6, 0x43,                   /* OUT 43h,AL                             */
+    0xB0, 0x00,                   /* MOV AL,00                              */
+    0xE6, 0x40,                   /* OUT 40h,AL                             */
+    0xE6, 0x40,                   /* OUT 40h,AL  -> reload 0 == 65536       */
+    0xF4,                         /* HLT                                    */
+};
+
+static void pit_test_run(void)
+{
+    static const uint8_t hle_vectors[] = { 0x08, 0x09, 0x10, 0x16, 0x1A, 0x20, 0x21 };
+
+    /* x86_bios_init() puts the renderer into mode 3, which needs a VRAM
+       pointer -- the real core calls x86_video_init() first and so must this.
+       Omitting it is a fault inside the arm, which reads as "never completed". */
+    x86_video_init(cga_test_vram, cga_test_palette);
+    x86_video_set_aperture(vga_test_aperture, vga_test_pal);
+    x86_bios_init();
+    x86_hle_install(hle_vectors, sizeof(hle_vectors));
+    memcpy(&test_ram[PIT_CODE_A], pit_code_a, sizeof(pit_code_a));
+    memcpy(&test_ram[PIT_CODE_B], pit_code_b, sizeof(pit_code_b));
+    memcpy(&test_ram[PIT_CODE_C], pit_code_c, sizeof(pit_code_c));
+    memcpy(&test_ram[PIT_CODE_D], pit_code_d, sizeof(pit_code_d));
+
+    /* A cold machine: the boot divisor, which is 0 stored and 65536 meant. */
+    x86_io.pit0_reload = 0;
+    x86_io.pit0_access = 0;
+    x86_io.pit0_latched = 0;
+    x86_pit0_writes = 0;
+    pit_r[0] = x86_pit0_divisor();          /* expect 65536 before anything */
+
+    kbd_test_reset_cpu(PIT_CODE_A);
+    pit_r[8] = kbd_test_run_to_halt();
+    pit_r[1] = x86_pit0_divisor();          /* expect 0x214B = 8523         */
+    pit_r[2] = x86_pit0_writes;             /* expect 2                     */
+
+    kbd_test_reset_cpu(PIT_CODE_B);
+    pit_r[9] = kbd_test_run_to_halt();
+    pit_r[3] = x86_pit0_divisor();          /* expect 0x21FF = 8703         */
+
+    kbd_test_reset_cpu(PIT_CODE_C);
+    (void)kbd_test_run_to_halt();
+    pit_r[4] = x86_pit0_divisor();          /* UNCHANGED: still 0x21FF      */
+    /* The RELOAD, not x86_speaker_divisor(): that answers 0 while the gate at
+       port 0x61 is shut, which it is here -- this arm programs a tone, it does
+       not sound one. The question is only whether channel 2 still latched. */
+    pit_r[5] = x86_io.pit2_reload;          /* expect 0x1234 = 4660         */
+
+    kbd_test_reset_cpu(PIT_CODE_D);
+    (void)kbd_test_run_to_halt();
+    pit_r[6] = x86_pit0_divisor();          /* expect 65536, never 0        */
+    pit_r[7] = x86_pit0_writes;             /* expect 5 across the run      */
+}
+
 static void kbd_test_run(void)
 {
     static const uint8_t hle_vectors[] = {
@@ -2010,6 +2115,11 @@ void Reset_Handler(void) {
         if (run_kbd_flag == 1) {
             kbd_test_run();
             run_kbd_flag = 0;
+        }
+
+        if (run_pit_flag == 1) {
+            pit_test_run();
+            run_pit_flag = 0;
         }
 
         if (run_sysinfo_flag == 1) {

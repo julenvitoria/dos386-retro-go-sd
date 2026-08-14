@@ -224,8 +224,8 @@ static int vga_in_mode13(void)
 static void pit_write_control(uint8_t v)
 {
     unsigned ch = v >> 6;
-    if (ch != 2)
-        return;                     /* channels 0/1 are the tick, not sound */
+    if (ch != 0 && ch != 2)
+        return;                     /* channel 1 is DRAM refresh: nothing here */
     unsigned access = (v >> 4) & 3;
     /* Access field 0 is the COUNTER LATCH command, not an access mode: it
        freezes the count for reading and leaves the programmed mode alone.
@@ -234,8 +234,50 @@ static void pit_write_control(uint8_t v)
        or more off. */
     if (access == 0)
         return;
+    if (ch == 0) {
+        x86_io.pit0_access = (uint8_t)access;
+        x86_io.pit0_latched = 0;
+        return;
+    }
     x86_io.pit2_access = (uint8_t)access;
     x86_io.pit2_latched = 0;        /* a control word resets the pair phase */
+}
+
+/* Channel 0's data port. Same three access modes as channel 2 and for the same
+   reasons; the divisor it leaves behind is read by the frame loop, which is
+   where the guest's tick rate actually comes from. */
+static void pit_write_ch0(uint8_t v)
+{
+    switch (x86_io.pit0_access) {
+    case 1:                          /* lo byte only: the HIGH byte STAYS */
+        x86_io.pit0_reload = (uint16_t)((x86_io.pit0_reload & 0xFF00) | v);
+        break;
+    case 2:                          /* hi byte only: the LOW byte STAYS  */
+        x86_io.pit0_reload = (uint16_t)((v << 8) | (x86_io.pit0_reload & 0xFF));
+        break;
+    default:                         /* lo then hi */
+        if (!x86_io.pit0_latched) {
+            x86_io.pit0_reload = (uint16_t)((x86_io.pit0_reload & 0xFF00) | v);
+            x86_io.pit0_latched = 1;
+        } else {
+            x86_io.pit0_reload = (uint16_t)((v << 8) | (x86_io.pit0_reload & 0xFF));
+            x86_io.pit0_latched = 0;
+        }
+        break;
+    }
+    x86_pit0_writes++;
+}
+
+/*
+ * The system timer's divisor right now. A reload of 0 means the full 16-bit
+ * period, i.e. 65536 -- which is also the boot value, so a guest that never
+ * touches channel 0 gets exactly the 18.2065 Hz it always got.
+ */
+volatile uint32_t x86_pit0_writes = 0;
+
+uint32_t x86_pit0_divisor(void)
+{
+    return x86_io.pit0_reload ? x86_io.pit0_reload : 65536u;
 }
 
 static void pit_write_ch2(uint8_t v)
@@ -709,6 +751,9 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
     unsigned unmodelled = 0;
 #endif
     switch (port) {
+    case 0x40:
+        pit_write_ch0((uint8_t)value);
+        break;
     case 0x42:
         pit_write_ch2((uint8_t)value);
         spk_event(port, value);

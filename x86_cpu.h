@@ -145,6 +145,10 @@ typedef struct X86CPUState X86CPUState;
 /* Guest I/O device state. Lives outside X86CPUState: the interpreter never
    touches it, only the C port handlers do. */
 typedef struct {
+    /* THE FIRST FIVE BYTES OF THIS STRUCT ARE A PUBLISHED LAYOUT. They are
+       mirrored by read_io_state() in tests/test_opcodes.py, which reads them
+       by OFFSET -- inserting a field here silently breaks five speaker tests
+       and nothing says why. Append to the end of the struct instead. */
     uint16_t pit2_reload;     /* channel 2 divisor -> speaker frequency */
     uint8_t  pit2_access;     /* latched access mode from port 0x43 */
     uint8_t  pit2_latched;    /* half-way through a lo/hi pair */
@@ -206,6 +210,18 @@ typedef struct {
     uint8_t  kbd_cmd;         /* 8042 command byte awaiting its 0x60 argument */
     uint8_t  kbd_outport;     /* 8042 output port latch; bit 1 IS A20 */
     uint8_t  port92;          /* System Control Port A latch */
+    /* Channel 0 IS the system timer, and its divisor is the guest's whole
+       sense of elapsed time. The boot value is 65536 (18.2065 Hz); a title
+       that wants finer time programs its own -- Wolfenstein 3D writes 0x214B,
+       i.e. 140 Hz, and drives its tic counter from the resulting ISR. Dropping
+       that write (which is what happened until this was modelled) does not
+       make the guest run slowly, it makes the guest's CLOCK run at 18.2/140 of
+       real time, and everything the guest paces by it slows to match: turning,
+       animation, menu key-repeat. See the clock-2 block in src/main.c.
+       At the END of the struct deliberately -- see the note at the top. */
+    uint16_t pit0_reload;     /* channel 0 divisor -> the system timer rate */
+    uint8_t  pit0_access;     /* latched access mode from port 0x43 */
+    uint8_t  pit0_latched;    /* half-way through a lo/hi pair */
 } X86IOState;
 
 extern X86IOState x86_io;
@@ -477,6 +493,11 @@ extern uint32_t x86_hle_unhandled_vector, x86_hle_unhandled_func;
 
 uint32_t x86_port_read(uint32_t port, uint32_t size);
 void x86_port_write(uint32_t port, uint32_t value, uint32_t size);
+/* PIT channel 0: the SYSTEM TIMER's divisor, 65536 until a guest programs it.
+   The frame loop divides the PIT input by this to decide how many IRQ 0s a
+   millisecond of host time owes -- see the three-clock block in src/main.c. */
+uint32_t x86_pit0_divisor(void);
+extern volatile uint32_t x86_pit0_writes;
 uint32_t x86_speaker_divisor(void);   /* the signal path's pitch source */
 uint32_t x86_speaker_hz(void);        /* reporting only */
 void x86_speaker_render(int16_t *dst, unsigned frames, unsigned sample_rate,
