@@ -23,6 +23,7 @@ x86_arena.c \
 x86_pager.c \
 x86_nor.c \
 x86_video.c \
+x86_video_planar.c \
 x86_osk.c \
 x86_hle.c \
 x86_bios.c \

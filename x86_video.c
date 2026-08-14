@@ -586,6 +586,10 @@ volatile uint32_t x86_vga_dac_writes;   /* DAC bytes the guest has streamed  */
 void x86_video_set_aperture(void *aperture, void *palette_block)
 {
     vga_aperture = (uint8_t *)aperture;
+    /* The store hook resolves its window offsets against the same base. One
+       assignment, one owner -- the hook must never learn the aperture from a
+       second source. */
+    x86_vga_planar_aperture = vga_aperture;
     vga_dac      = (uint8_t *)palette_block;
     vga_clut256  = palette_block
                  ? (uint32_t *)((uint8_t *)palette_block + 768) : 0;

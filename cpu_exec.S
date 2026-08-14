@@ -128,6 +128,96 @@
         MEM_GET_PTR_W \dest_ptr, \vaddr
     .endm
 
+    /* ---------------------------------------------------------------- *
+     * The VGA aperture hook.
+     *
+     * A planar VGA mode (EGA 0Dh, and the unchained "Mode Y" Wolfenstein 3D
+     * runs in) is not memory. A store to 0xA0000-0xAFFFF goes through the map
+     * mask, four latches and one of four write modes, so what the guest
+     * presents is not what any plane receives -- and a byte store and a dword
+     * store are different operations, not the same one repeated.
+     *
+     * The fold trap cannot serve this and that is settled: MEM_TRAP fires at
+     * pointer RESOLUTION and hands back a host pointer; the store then happens
+     * inline at the site, so the trap never sees the VALUE or the SIZE and
+     * there is no post-store hook. Hence a check AT the store, per site, with
+     * the size baked in at assembly time.
+     *
+     * cpu->vga_base is the host base of the aperture while a planar mode is
+     * armed and 0 otherwise. Host pointers are 0x24xxxxxx, so with a zero base
+     * `ptr - 0` is never unsigned-below 0x10000 and the check cannot fire:
+     * disarmed is the reset state with no special case anywhere.
+     *
+     * Cost when disarmed: LDR + SUBS + CMP + a not-taken BLO at a store, and
+     * LDR + SUBS + CMP + a not-executed IT/STR at a load.
+     *
+     * THE STORE STUB REPLACES THE STORE and must not fall through to it. In
+     * Mode Y the raw byte would land on top of a pixel written four stores ago.
+     *
+     * The stub is out of line but stays in ITCM, for MEM_TRAP's reason: a
+     * conditional branch reaches +/-1 MB and .text is in RAM_EMU ~600 MB away.
+     * (The BL to the C helper is fine -- the linker plants a veneer in ITCM,
+     * exactly as it already does for x86_nor_slow_r/w.)
+     *
+     * BOTH macros CLOBBER THE PSR. x86 flags live in R11, so that is normally
+     * free; a site that consumes host flags across the access must not use
+     * them, and none does.
+     *
+     * The STACK is deliberately NOT hooked (PUSH_V/POP_V in
+     * cpu_exec_handlers.S). SS pointing into the A segment is not something a
+     * DOS guest can legally do, and skipping it saves four instructions on
+     * every PUSH, POP, CALL and RET.
+     * ---------------------------------------------------------------- */
+
+    /* Store: \src is the value, \ptr the host pointer, \op the store opcode
+       that would have been used, \sz its size in bytes, and \t a register that
+       is DEAD at this site. \t and \src must be different registers. */
+    .macro VGA_ST op, sz, src, ptr, t
+        LDR \t, [R8, #CPU_VGA_BASE]
+        SUBS \t, \ptr, \t
+        CMP \t, #0x10000
+        BLO 99f
+        \op \src, [\ptr]
+98:
+        .pushsection .itcram_hot.norslow, "ax", %progbits
+99:     PUSH {R0-R3, R12, LR}
+        /* PUSH stores, it does not clobber, so \src and \t are still live.
+           Marshalling order is the only subtlety: R3 is the staging register,
+           so a site whose dead scratch IS R3 takes the other order. */
+    .ifc \t, R3
+        MOV R1, \src
+        MOV R0, R3
+    .else
+        MOV R3, \src
+        MOV R0, \t                @ window offset, 0..0xFFFF
+        MOV R1, R3                @ value
+    .endif
+        MOV R2, #\sz
+        BL x86_vga_planar_store
+        POP {R0-R3, R12, LR}
+        B 98b
+        .popsection
+    .endm
+
+    .macro VGA_ST_B src, ptr, t
+        VGA_ST STRB, 1, \src, \ptr, \t
+    .endm
+    .macro VGA_ST_H src, ptr, t
+        VGA_ST STRH, 2, \src, \ptr, \t
+    .endm
+
+    /* Load: record the window offset of a guest read that lands in the
+       aperture, then let the site's own load run unchanged. Width-agnostic --
+       the latch is an OFFSET, so there is nothing per-size about it, and the
+       caller keeps its own LDRB/LDRH/LD_V. */
+    .macro VGA_LATCH ptr, t
+        LDR \t, [R8, #CPU_VGA_BASE]
+        SUBS \t, \ptr, \t
+        CMP \t, #0x10000
+        IT LO
+        STRLO \t, [R8, #CPU_VGA_LATCH]
+    .endm
+
 /* ------------------------------------------------------------------ *
  * Per-opcode DWT cycle profiling. OFF unless built with X86_PROFILE=1.
  *
@@ -537,6 +627,11 @@ x86_cpu_interp_asm:
     .macro ST_V src, ptr
         STR \src, [\ptr]
     .endm
+    /* ST_V through the VGA aperture hook. Per-pass because the SIZE handed to
+       the hook must be this pass's operand size, not a runtime value. */
+    .macro VGA_ST_V src, ptr, t
+        VGA_ST STR, 4, \src, \ptr, \t
+    .endm
     /* Register file access. A 16-bit write must leave the high half alone --
      * that is architectural (AX writes do not clear the top of EAX) and STRH
      * gives it for free. */
@@ -600,6 +695,7 @@ x86_cpu_interp_asm:
 #undef OP_SUFFIX
     .purgem LD_V
     .purgem ST_V
+    .purgem VGA_ST_V
     .purgem LDREG_V
     .purgem STREG_V
     .purgem EIP_ADV_V
@@ -621,6 +717,9 @@ x86_cpu_interp_asm:
     .endm
     .macro ST_V src, ptr
         STRH \src, [\ptr]
+    .endm
+    .macro VGA_ST_V src, ptr, t
+        VGA_ST STRH, 2, \src, \ptr, \t
     .endm
     .macro LDREG_V dest, off
         LDRH.W \dest, [R8, \off]
