@@ -391,6 +391,28 @@ static void frame_hist_add(uint32_t ms, uint32_t panel)
    the slice on that reading is how the controller inflated to its ceiling and
    then ran a multi-second slice that tripped the watchdog. */
 static uint32_t   last_slice_halted = 0;
+/*
+ * THE PACING CONTROLLER'S OWN STATE, published because it is otherwise
+ * invisible and it is what decides throughput.
+ *
+ * "Busy 55.8% against a 90% target" has three candidate explanations that look
+ * identical from outside: the slice is still ramping, the slice has settled
+ * somewhere below the ceiling, or the guest keeps HALTING so the regulator
+ * refuses to grow (idle is not headroom). These separate them:
+ *
+ *   guest_max_slice     where the regulator has actually settled
+ *   guest_slice_halted  slices that ended on a guest HLT
+ *   guest_grow_blocked  frames the halted arm suppressed a grow
+ *
+ * A ramp that keeps climbing for seconds is guest_max_slice still moving; a
+ * ceiling that is not the ceiling is guest_max_slice parked below
+ * MAX_SLICE_CEIL; and a guest that idles is guest_grow_blocked climbing while
+ * guest_max_slice sits still.
+ */
+volatile uint32_t guest_max_slice    = 20000u;
+volatile uint32_t guest_panel_ms_used = 0;  /* the period the budget is 90% OF */
+volatile uint32_t guest_slice_halted = 0;
+volatile uint32_t guest_grow_blocked = 0;
 static uint32_t   max_slice = 20000u;    /* unthrottled mode's working slice  */
 static uint32_t   rate_window_ms;        /* start of the achieved-rate window */
 static uint32_t   rate_window_insns;
@@ -432,6 +454,12 @@ static uint32_t   rate_window_frames;
  * a silent stutter.
  */
 #define GUEST_EXEC_PCT       90u
+/* Bounds on the display period the budget is a percentage OF. 16 ms is 60 Hz;
+   the window is deliberately narrow because anything outside it means the
+   measurement is wrong rather than the panel is unusual, and a budget derived
+   from a wrong period is exactly the bug this replaced. */
+#define PANEL_MS_MIN_SANE    14u
+#define PANEL_MS_MAX_SANE    20u
 
 /*
  * The guest's clock, and the fact that it is REAL time.
@@ -2114,10 +2142,40 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
              * only -- see MAX_SLICE_CEIL.
              */
             {
-                uint32_t panel = panel_ms_min ? panel_ms_min : 16u;
+                /*
+                 * THE REFERENCE IS THE DISPLAY PERIOD, AND panel_ms_min IS NOT
+                 * IT. Measured on silicon during TOPBENCH: panel_ms_min read
+                 * 6 ms and leaked up to 11 over 42 s, while guest_fps_achieved
+                 * sat at 59 -- a real period of ~16.9 ms. It is a MINIMUM with
+                 * a decay (`panel_ms_min++` every 512 frames), so it latches
+                 * on the shortest iteration ever completed -- which happens
+                 * during boot, in menus, and any frame the guest spent halted
+                 * -- and then crawls back at 1 ms per ~8.5 s.
+                 *
+                 * The consequence was invisible because the controller was
+                 * working perfectly: it drove guest_exec_ms to 10 ms against a
+                 * 10 ms target and held it there. The target was simply 40%
+                 * short, so the machine sat ~56% busy with zero dropped frames
+                 * and the score crept upward as the leak raised the budget.
+                 * That crawl is what looked "uncanny" from outside.
+                 *
+                 * The loop swaps every iteration and the swap paces to the
+                 * panel, so whenever we are keeping up the ITERATION period IS
+                 * the display period -- and guest_fps_achieved measures it
+                 * directly. Clamped at both ends: a fps reading below 50 means
+                 * we are already dropping frames, and letting the target grow
+                 * on that reading is a runaway (slower -> bigger budget ->
+                 * slower). panel_ms_min stays as the published witness.
+                 */
+                uint32_t fps = guest_fps_achieved;
+                uint32_t panel = fps ? (1000u / fps) : 16u;
+                if (panel < PANEL_MS_MIN_SANE) panel = PANEL_MS_MIN_SANE;
+                if (panel > PANEL_MS_MAX_SANE) panel = PANEL_MS_MAX_SANE;
                 uint32_t target = panel * GUEST_EXEC_PCT;   /* x100 */
+                guest_panel_ms_used = panel;
                 if (last_slice_halted) {
                     /* Idle is not headroom: leave max_slice alone. */
+                    guest_grow_blocked++;
                 } else if (guest_exec_ms * 100u < target) {
                     max_slice += max_slice / 8u;
                     if (max_slice > MAX_SLICE_CEIL)
@@ -2127,6 +2185,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                     if (max_slice < MAX_SLICE_FLOOR)
                         max_slice = MAX_SLICE_FLOOR;
                 }
+                guest_max_slice = max_slice;
             }
 
             if (kips == 0u) {
@@ -2267,6 +2326,8 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
             X86_ZONE_EXIT();                        /* ZONES */
             uint32_t reason = cpu_state_ptr->exit_reason;
             last_slice_halted = (reason == X86_EXIT_HALT);
+            if (last_slice_halted)
+                guest_slice_halted++;
             guest_exit_reason = reason;
             if (reason == X86_EXIT_TIMER) {
                 cpu_state_ptr->exit_reason = 0;
