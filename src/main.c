@@ -993,24 +993,11 @@ static int sd_sector_write(void *ctx, const void *src, uint32_t offset,
  * the .dsk name -- ALLEYCAT.dsk runs CAT.EXE. Reading it keeps this working
  * for the other images too instead of hardcoding one game.
  */
-/* "DF" + "DF.EXE" -> "DF/DF.EXE". snprintf pulls in ~600 B of newlib for this. */
-static void path_join(char *dst, unsigned max, const char *dir, const char *name)
-{
-    unsigned i = 0;
-    if (dir && dir[0]) {
-        while (dir[i] && i < max - 2) { dst[i] = dir[i]; i++; }
-        dst[i++] = '/';
-    }
-    unsigned j = 0;
-    while (name[j] && i < max - 1) dst[i++] = name[j++];
-    dst[i] = 0;
-}
-
-static int parse_batch(const char *batpath, char *out, unsigned max,
-                       char *tail, unsigned tail_max, int depth)
+static int find_startup_program(char *out, unsigned max,
+                                char *tail, unsigned tail_max)
 {
     FIL f;
-    if (f_open(&f, batpath, FA_READ) != FR_OK)
+    if (f_open(&f, "AUTOEXEC.BAT", FA_READ) != FR_OK)
         return -1;
 
     /* Read it whole and split by hand: f_gets needs FF_USE_STRFUNC, which this
@@ -1032,31 +1019,12 @@ static int parse_batch(const char *batpath, char *out, unsigned max,
         char *q = line;
         while (*q == ' ' || *q == '\t') q++;
         if (*q == '@') q++;
-        while (*q == ' ' || *q == '\t') q++;
         if (!*q || *q == ';' || *q == ':')
             continue;
-        /*
-         * `CD` is not scaffolding. STAR_WARS_DARKFORCES.dsk's AUTOEXEC.BAT is
-         * `CD \DF` then `DFDEMO.BAT`, and skipping the CD left us opening
-         * "DFDEMO.BAT" in the ROOT -- which does not exist. x86_dos_exec then
-         * returned -1, main() fell through to the demo, and the guest ran the
-         * IVT as code for half a million instructions. Record the directory
-         * instead: it is both where the next name is looked up and the CWD the
-         * program's own relative opens must resolve against.
-         */
-        if (!strncasecmp(q, "CD", 2) &&
-            (q[2] == ' ' || q[2] == '\t' || q[2] == '\\')) {
-            const char *d = q + 2;
-            while (*d == ' ' || *d == '\t') d++;
-            if (*d && strcmp(d, "\\") != 0 && strcmp(d, "/") != 0)
-                x86_dos_set_cwd(d);
-            continue;
-        }
-        /* Skip the rest of the scaffolding; the first real command is it. */
+        /* Skip the scaffolding; the first real command is the program. */
         if (!strncasecmp(q, "REM", 3) || !strncasecmp(q, "ECHO", 4) ||
             !strncasecmp(q, "PROMPT", 6) || !strncasecmp(q, "SET", 3) ||
-            !strncasecmp(q, "PATH", 4) || !strncasecmp(q, "CD", 2) ||
-            !strncasecmp(q, "CLS", 3) || !strncasecmp(q, "VERIFY", 6))
+            !strncasecmp(q, "PATH", 4) || !strncasecmp(q, "CD", 2))
             continue;
 
         unsigned i = 0;
@@ -1078,37 +1046,9 @@ static int parse_batch(const char *batpath, char *out, unsigned max,
             j++;
         }
         tail[j] = 0;
-        if (!i)
-            return -1;
-
-        /*
-         * A .BAT is not a program. DFDEMO.BAT is a two-line wrapper around
-         * `df.exe %1 %2 ...`; handed to the MZ loader it fails the signature
-         * check. Follow it ONCE -- one level is what these generated disks
-         * use, and unbounded recursion on a guest-authored file is not
-         * something a loader should offer. The %n placeholders expand to
-         * nothing, which is what COMMAND.COM does with no arguments.
-         */
-        unsigned n = 0;
-        while (out[n]) n++;
-        if (depth < 1 && n > 4 && !strncasecmp(out + n - 4, ".BAT", 4)) {
-            char sub[96];
-            path_join(sub, sizeof(sub), x86_dos_get_cwd(), out);
-            return parse_batch(sub, out, max, tail, tail_max, depth + 1);
-        }
-        /* Strip the unexpanded %n placeholders a wrapper .BAT passes on. */
-        for (unsigned k = 0; tail[k]; k++)
-            if (tail[k] == '%') { tail[k] = 0; break; }
-        return 0;
+        return i ? 0 : -1;
     }
     return -1;
-}
-
-static int find_startup_program(char *out, unsigned max,
-                                char *tail, unsigned tail_max)
-{
-    x86_dos_set_cwd("");
-    return parse_batch("AUTOEXEC.BAT", out, max, tail, tail_max, 0);
 }
 
 static FATFS dsk_fs;
@@ -1217,28 +1157,11 @@ static void guest_reset(void)
            TOPBENCH.dsk asks for "-l", its continuous scoring loop. Clear
            guest_use_cmdtail (over the debug backend, or here) to launch the
            program bare, which for TOPBENCH is its interactive menu UI. */
-        /* The program lives in the CWD the batch file changed to, and
-           x86_dos_exec takes a FatFs path rather than a guest one, so the
-           prefix is applied here rather than in dos_path_from_guest(). */
-        char full[96];
-        int rooted = 0;
-        for (const char *c = startup; *c; c++)
-            if (*c == '/' || *c == '\\') { rooted = 1; break; }
-        path_join(full, sizeof(full), rooted ? "" : x86_dos_get_cwd(), startup);
-        dsk_exec_rc = (uint32_t)x86_dos_exec(full,
+        dsk_exec_rc = (uint32_t)x86_dos_exec(startup,
                                              guest_use_cmdtail ? cmdtail : "");
     }
     if (dsk_exec_rc != 0) {
-        /*
-         * guest_ram is a page POOL, not a flat image of the low megabyte, so
-         * `guest_ram + 0x100` was the pool's first frame and NOT guest linear
-         * 0x100. The demo was written somewhere the guest never executes, and
-         * the guest instead started at 0000:0100 -- inside the IVT -- and ran
-         * table bytes as code. Write it through the pager like everything else.
-         */
-        x86_guest_copy_in(0x100, demo_guest, sizeof(demo_guest));
-        cpu_state_ptr->segs[1].sel = 0;
-        cpu_state_ptr->segs[1].base = 0;
+        memcpy(guest_ram + 0x100, demo_guest, sizeof(demo_guest));
         cpu_state_ptr->eip = 0x100;
         cpu_state_ptr->regs[4] = 0xFFFE;
     }

@@ -447,11 +447,6 @@ extern volatile uint32_t x86_disk_cache_evictions;
 extern volatile uint32_t x86_disk_cache_bypass;
 extern volatile uint32_t x86_disk_cache_invalidates;
 int x86_dos_exec(const char *path, const char *cmdline);
-/* The guest's current directory, as a FatFs-shaped prefix ("DF", no trailing
-   separator). FF_FS_RPATH is 0, so FatFs cannot hold this for us; every
-   relative path the guest opens is resolved against it in x86_dos.c. */
-void x86_dos_set_cwd(const char *dir);
-const char *x86_dos_get_cwd(void);
 uint16_t x86_dos_psp(void);
 extern uint32_t x86_dos_last_error;
 /* Last path the guest opened or created. Diagnostic only: an unserviced file
