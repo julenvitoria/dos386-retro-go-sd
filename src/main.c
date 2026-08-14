@@ -1392,7 +1392,7 @@ static void guest_reset(void)
        slice is also the emulated machine's notion of a display frame. */
     x86_osk_reset();
     cpu_state_ptr->pit_reload = guest_slice_now ? guest_slice_now : 20000u;
-    cpu_state_ptr->pit_counter = cpu_state_ptr->pit_reload;
+    x86_pit_counter_forced(cpu_state_ptr->pit_reload);
 }
 
 /*
@@ -2199,7 +2199,7 @@ static void arm_tick_irq(void)
         return;
     }
     cpu_state_ptr->hard_int_pending = 0x08;
-    cpu_state_ptr->pit_counter = 1;
+    x86_pit_counter_forced(1);       /* NOT a raw store: see x86_pit_sync() */
     tick_irqs_owed--;
     guest_ticks++;
 }
@@ -2336,6 +2336,10 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
             uint32_t kips = guest_kips;
             if (kips > 100000u)
                 kips = 100000u;                /* keeps dt*kips in 32 bits */
+            /* The PIT counters convert instructions into 1.193182 MHz
+               ticks at exactly this rate, so the machine's clock and the
+               speed it claims to run at are one number. */
+            x86_pit_kips = kips;
 
             /*
              * How many instructions FIT in one display period, regulated from
@@ -2534,6 +2538,10 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         uint32_t sub_slice = slice / subs;
         if (sub_slice == 0)
             sub_slice = slice;
+        /* The PIT clock is charged for everything run under the OLD reload
+           before the new one lands, and the emulated CPU's declared speed is
+           what converts instructions into 1.193182 MHz ticks. */
+        x86_pit_sync();
         cpu_state_ptr->pit_reload = sub_slice;
         arm_tick_irq();
 
@@ -2561,6 +2569,10 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
             X86_ZONE_ENTER(X86_ZONE_GUEST);         /* ZONES */
             x86_cpu_interp_asm();
             X86_ZONE_EXIT();                        /* ZONES */
+            /* Bank the slice's guest time while pit_counter still holds what
+               the guest left it at -- every host store to it below is a
+               forced one and would otherwise be charged as elapsed time. */
+            x86_pit_sync();
             uint32_t reason = cpu_state_ptr->exit_reason;
             last_slice_halted = (reason == X86_EXIT_HALT);
             if (last_slice_halted)
@@ -2617,7 +2629,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                     /* Something is genuinely waiting. Pull the boundary in so
                        it lands now; EIP is already past the HLT, which is
                        where the handler's IRET belongs. */
-                    cpu_state_ptr->pit_counter = 1;
+                    x86_pit_counter_forced(1);
                     continue;
                 }
                 /* Nothing is due YET. This used to fabricate an INT 08h on

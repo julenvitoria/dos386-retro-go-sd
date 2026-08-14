@@ -912,7 +912,18 @@ static const uint8_t sys_guest_code[] = {
     0xB0, 0x11, 0xE6, 0x42,             /* MOV AL,11 / OUT 42,AL (hi)       */
     0xE4, 0x61, 0x0C, 0x03, 0xE6, 0x61, /* IN 61 / OR AL,3 / OUT 61 (ungate)*/
     0xBB, 0x00, 0xFF,                   /* MOV BX,FF00  BL=OR 0, BH=AND FF  */
-    0xB9, 0x00, 0x04,                   /* MOV CX,0400                      */
+    /*
+     * THE SAMPLE COUNT IS A TIME, and it was 1024 while bit 5 was a SHAPE
+     * fitted to the instruction budget rather than a counter. It is a counter
+     * now (x86_io.c), so the loop has to be long enough to cover a full period
+     * of the divisor it just programmed: 0x11FB = 4603 PIT ticks, and a PIT
+     * tick is worth ~4.6 guest instructions at the emulated CPU's nominal
+     * speed. 8192 iterations x 4 instructions is ~7100 ticks -- more than one
+     * whole period, so the bit is seen both high and low whatever phase the
+     * loop starts in. This is the emulated machine being FAST, not the probe
+     * being wrong: real detection code loops until the bit flips.
+     */
+    0xB9, 0x00, 0x20,                   /* MOV CX,2000h (8192)              */
     0xE4, 0x61,                         /* .loop: IN AL,61                  */
     0x08, 0xC3,                         /*        OR BL,AL                  */
     0x20, 0xC7,                         /*        AND BH,AL                 */
@@ -992,6 +1003,9 @@ static void sysinfo_test_run(void)
 
 volatile uint32_t run_pit_flag = 0;
 volatile uint32_t pit_r[10];
+/* Phase E's results, read back out of GUEST memory. A separate array so the
+   published pit_r[10] layout tests/test_pit.py already reads stays untouched. */
+volatile uint32_t ztimer_r[8];
 
 static const uint8_t pit_code_a[] = {
     0xB0, 0x36,                   /* MOV AL,36h  ch0, lo/hi, mode 3         */
@@ -1026,6 +1040,99 @@ static const uint8_t pit_code_d[] = {
     0xE6, 0x40,                   /* OUT 40h,AL  -> reload 0 == 65536       */
     0xF4,                         /* HLT                                    */
 };
+
+/*
+ * PHASE E -- THE PRECISION ZEN TIMER'S ACTUAL SEQUENCE.
+ *
+ * This is not a paraphrase of what a timing library might do: it is what
+ * references/TOPBENCH/ZTIMER11/PZTIMER.ASM does, in the order it does it, and
+ * it is what TOPBENCH runs five times per benchmark. Reading it wrong is what
+ * put 65535 microseconds in every sub-timing on the panel.
+ *
+ *   ch2  program mode 2 / count 0 (= 65536), ungate at port 0x61 bit 0, then
+ *        LATCH (OUT 43h,80h) and read the pair back off 0x42 -- three times,
+ *        with work in between. The counter must MOVE, and move DOWN.
+ *   ch0  PZTimerOn: OUT 43h,34h then a 0/0 count (PZTIMER.ASM:186-224).
+ *        PZTimerOff: latch with OUT 43h,00h, read lo/hi off 0x40 and NEG AX to
+ *        turn "counts remaining" into "counts elapsed" (PZTIMER.ASM:246-266).
+ *   PIC  PZTimerOff's OVERFLOW test: OCW3 0x0A to port 0x20 selects the IRR,
+ *        and IN AL,20h reads it. Bit 0 set means IRQ 0 is pending, which
+ *        PZTimerCount() reports as 0xFFFFFFFF (PZTIMER.ASM:488-493) -- 65535
+ *        once TOPBENCH truncates it to a word (TOPB_DAT.PAS:31-35). An
+ *        unmodelled port floats to 0xFF and declares overflow every time.
+ */
+#define PIT_CODE_E      0x2A80u
+#define ZT_RES          0x2B00u
+
+static const uint8_t pit_code_e[] = {
+    /* -- channel 2: mode 2, count 65536, gate on ------------------------- */
+    0xB0, 0xB4,                   /* MOV AL,B4h   ch2, lo/hi, mode 2        */
+    0xE6, 0x43,                   /* OUT 43h,AL                             */
+    0xB0, 0x00,                   /* MOV AL,0                               */
+    0xE6, 0x42,                   /* OUT 42h,AL   count lo                  */
+    0xE6, 0x42,                   /* OUT 42h,AL   count hi -> 65536         */
+    0xB0, 0x01,                   /* MOV AL,1     gate on, speaker data off */
+    0xE6, 0x61,                   /* OUT 61h,AL                             */
+    /* -- latch + read pair #1 -------------------------------------------- */
+    0xB0, 0x80,                   /* MOV AL,80h   latch ch2                 */
+    0xE6, 0x43,                   /* OUT 43h,AL                             */
+    0xE4, 0x42,                   /* IN  AL,42h   lsb                       */
+    0x8A, 0xE0,                   /* MOV AH,AL                              */
+    0xE4, 0x42,                   /* IN  AL,42h   msb                       */
+    0x86, 0xE0,                   /* XCHG AH,AL   -> AX = count             */
+    0xA3, 0x00, 0x2B,             /* MOV [2B00h],AX                         */
+    /* -- work ------------------------------------------------------------ */
+    0xB9, 0xA0, 0x0F,             /* MOV CX,4000                            */
+    0xE2, 0xFE,                   /* LOOP $                                 */
+    /* -- latch + read pair #2 -------------------------------------------- */
+    0xB0, 0x80,                   /* MOV AL,80h                             */
+    0xE6, 0x43,                   /* OUT 43h,AL                             */
+    0xE4, 0x42,                   /* IN  AL,42h                             */
+    0x8A, 0xE0,                   /* MOV AH,AL                              */
+    0xE4, 0x42,                   /* IN  AL,42h                             */
+    0x86, 0xE0,                   /* XCHG AH,AL                             */
+    0xA3, 0x02, 0x2B,             /* MOV [2B02h],AX                         */
+    /* -- PZTimerOn, on channel 0 ----------------------------------------- */
+    0xB0, 0x34,                   /* MOV AL,34h   ch0, lo/hi, mode 2        */
+    0xE6, 0x43,                   /* OUT 43h,AL                             */
+    0xB0, 0x00,                   /* MOV AL,0                               */
+    0xE6, 0x40,                   /* OUT 40h,AL                             */
+    0xE6, 0x40,                   /* OUT 40h,AL   -> 65536                  */
+    0xB9, 0x40, 0x1F,             /* MOV CX,8000                            */
+    0xE2, 0xFE,                   /* LOOP $       the "timed" code          */
+    /* -- PZTimerOff ------------------------------------------------------ */
+    0xB0, 0x00,                   /* MOV AL,0     latch ch0                 */
+    0xE6, 0x43,                   /* OUT 43h,AL                             */
+    0xE4, 0x40,                   /* IN  AL,40h   lsb                       */
+    0x8A, 0xE0,                   /* MOV AH,AL                              */
+    0xE4, 0x40,                   /* IN  AL,40h   msb                       */
+    0x86, 0xE0,                   /* XCHG AH,AL                             */
+    0xF7, 0xD8,                   /* NEG AX       remaining -> elapsed      */
+    0xA3, 0x04, 0x2B,             /* MOV [2B04h],AX                         */
+    /* -- the overflow test ----------------------------------------------- */
+    0xB0, 0x0A,                   /* MOV AL,0Ah   OCW3: read the IRR        */
+    0xE6, 0x20,                   /* OUT 20h,AL                             */
+    0xE4, 0x20,                   /* IN  AL,20h                             */
+    0x30, 0xE4,                   /* XOR AH,AH                              */
+    0xA3, 0x06, 0x2B,             /* MOV [2B06h],AX                         */
+    /* -- a third ch2 read: the clock must still be running ---------------- */
+    0xB9, 0xA0, 0x0F,             /* MOV CX,4000                            */
+    0xE2, 0xFE,                   /* LOOP $                                 */
+    0xB0, 0x80,                   /* MOV AL,80h                             */
+    0xE6, 0x43,                   /* OUT 43h,AL                             */
+    0xE4, 0x42,                   /* IN  AL,42h                             */
+    0x8A, 0xE0,                   /* MOV AH,AL                              */
+    0xE4, 0x42,                   /* IN  AL,42h                             */
+    0x86, 0xE0,                   /* XCHG AH,AL                             */
+    0xA3, 0x08, 0x2B,             /* MOV [2B08h],AX                         */
+    0xF4,                         /* HLT                                    */
+};
+
+static uint32_t zt_r16(uint32_t off)
+{
+    return (uint32_t)(test_ram[ZT_RES + off] |
+                      ((uint32_t)test_ram[ZT_RES + off + 1] << 8));
+}
 
 static void pit_test_run(void)
 {
@@ -1071,6 +1178,19 @@ static void pit_test_run(void)
     (void)kbd_test_run_to_halt();
     pit_r[6] = x86_pit0_divisor();          /* expect 65536, never 0        */
     pit_r[7] = x86_pit0_writes;             /* expect 5 across the run      */
+
+    /* ---- phase E: the Zen Timer's own sequence ------------------------- */
+    memcpy(&test_ram[PIT_CODE_E], pit_code_e, sizeof(pit_code_e));
+    memset(&test_ram[ZT_RES], 0, 16);
+    x86_io.port61 = 0;
+    kbd_test_reset_cpu(PIT_CODE_E);
+    ztimer_r[5] = kbd_test_run_to_halt();
+    ztimer_r[0] = zt_r16(0);                /* ch2 count, read 1            */
+    ztimer_r[1] = zt_r16(2);                /* ch2 count, read 2            */
+    ztimer_r[2] = zt_r16(4);                /* ch0 elapsed counts (NEG AX)  */
+    ztimer_r[3] = zt_r16(6);                /* the 8259 IRR                 */
+    ztimer_r[4] = zt_r16(8);                /* ch2 count, read 3            */
+    ztimer_r[6] = x86_pit_ticks();
 }
 
 static void kbd_test_run(void)

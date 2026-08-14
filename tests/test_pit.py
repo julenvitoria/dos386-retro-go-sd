@@ -27,6 +27,20 @@ Covered:
     versa. One control-word decoder serves both and a channel mix-up here retunes
     the timer every time a game beeps.
   * A reload of 0 means 65536, not 0. The frame loop divides by this value.
+  * THE COUNTERS COUNT, AND CAN BE READ BACK (phase E). The guest runs Michael
+    Abrash's Precision Zen Timer sequence verbatim -- the one TOPBENCH times
+    all five of its suites with: program channel 2 mode 2 / count 65536, ungate
+    it at port 0x61 bit 0, LATCH with OUT 43h,80h and read the lo/hi pair off
+    0x42; then PZTimerOn/PZTimerOff on channel 0 (OUT 43h,34h, a 0/0 count,
+    work, OUT 43h,00h, two reads of 0x40, NEG AX); then the OVERFLOW test,
+    OCW3 0x0A to port 0x20 followed by IN AL,20h for the 8259's IRR.
+    Asserted: the channel 2 count MOVES and moves DOWN across three reads, the
+    channel 0 elapsed count is non-zero and plausible, and the IRR does NOT
+    report IRQ 0 pending. That last one is the whole 65535 bug: port 0x20 was
+    not in the read switch, floated to 0xFF, and PZTimerCount() therefore took
+    its overflow path and returned 0xFFFFFFFF, which TOPBENCH truncates to a
+    word and prints as 65535 (references/TOPBENCH/ZTIMER11/PZTIMER.ASM:488-493,
+    TOPB_DAT.PAS:31-35).
 
 NEGATIVE CONTROL (`--negative`): rebuilds the core with the `case 0x40:` arm
 deleted from `x86_port_write()` -- the exact state of the tree before this fix --
@@ -36,6 +50,11 @@ because a check that cannot fail proves nothing, and this area's bug was a
 silently dropped write: the exact shape a green-by-construction test hides.
 Measured: the mutated build reports divisor 65536 / 18.207 Hz where the guest
 asked for 8523 / 140 Hz, and five assertions fire.
+
+`--negative-clock` is phase E's own control: it deletes the port 0x40 / 0x42 /
+0x20 READ arms, restoring the tree exactly as it was -- a channel 2 counter that
+answered with a static reload byte, a channel 0 counter that was not answered at
+all, and a PIC that floated 0xFF and so declared overflow on every measurement.
 """
 import argparse
 import sys
@@ -62,7 +81,7 @@ def main(args):
         runner.start()
         b = runner.backend
         syms = get_symbols("test_core.elf")
-        for n in ("run_pit_flag", "pit_r"):
+        for n in ("run_pit_flag", "pit_r", "ztimer_r"):
             if n not in syms:
                 print(f"missing symbol {n} -- rebuild tests/main.c")
                 return False
@@ -134,6 +153,58 @@ def main(args):
                 fail(f"phase {name} exited with reason {val}, not 6 (HLT) -- "
                      f"the guest did not reach the end of its code")
 
+        # ---- phase E: the Zen Timer's own sequence ------------------------
+        z = [b.read_uint32(syms["ztimer_r"] + 4 * i) for i in range(8)]
+        ch2_a, ch2_b, ch0_elapsed, irr, ch2_c, exit_e, ticks = z[:7]
+
+        print(f"\nphase E -- the Precision Zen Timer's sequence")
+        print(f"  ch2 latched reads   {ch2_a:5d} -> {ch2_b:5d} -> {ch2_c:5d}"
+              f"   (a 65536 count, so it counts DOWN)")
+        print(f"  ch0 elapsed counts  {ch0_elapsed}"
+              f"  = {ch0_elapsed / PIT_HZ * 1e6:.1f} usec of guest time")
+        print(f"  8259 IRR            0x{irr:02X}   "
+              f"(bit 0 = IRQ 0 pending = 'the timer overflowed')")
+        print(f"  free-running ticks  {ticks}")
+        print(f"  exit reason         {exit_e}   (6 = HLT)")
+
+        if exit_e != 6:
+            fail(f"phase E exited with reason {exit_e}, not 6 (HLT)")
+        if ch2_a == ch2_b or ch2_b == ch2_c:
+            fail(f"the channel 2 counter did not MOVE between latched reads "
+                 f"({ch2_a} / {ch2_b} / {ch2_c}). A counter that stands still "
+                 f"is what made every Zen Timer measurement nonsense")
+        # A 65536-count mode 2 channel counts DOWN, and 4000 LOOP iterations
+        # are nowhere near a wrap, so both steps must be strictly decreasing.
+        if not (ch2_a > ch2_b > ch2_c):
+            fail(f"the channel 2 counter is not counting DOWN monotonically: "
+                 f"{ch2_a} -> {ch2_b} -> {ch2_c}. A timer that reads a counter "
+                 f"going backwards computes garbage either way")
+        if ch0_elapsed == 0:
+            fail("the channel 0 elapsed count is 0 -- PZTimerOff's NEG AX saw "
+                 "a counter that had not moved since PZTimerOn loaded it")
+        if ch0_elapsed >= 65536 // 2:
+            fail(f"the channel 0 elapsed count is {ch0_elapsed}, over half the "
+                 f"period -- 8000 LOOP iterations cannot be that long, so the "
+                 f"lo/hi read pair is out of order or unlatched")
+        # 8000 LOOP iterations is ~8000 instructions; PIT ticks are instructions
+        # converted at the emulated CPU speed (x86_io.c). The bare-metal harness
+        # never publishes guest_kips, so the 5500 kips nominal applies:
+        # ~8000 * 1193182 / 5.5e6 ~= 1700 ticks. An order of magnitude either
+        # way is fine -- what is NOT fine is 0, a sentinel, or a constant.
+        if not (100 <= ch0_elapsed <= 20000):
+            fail(f"the channel 0 elapsed count is {ch0_elapsed}; ~1700 ticks is "
+                 f"what 8000 guest instructions are worth at the nominal rate")
+        if irr & 1:
+            fail(f"the 8259 IRR reads 0x{irr:02X}: bit 0 says IRQ 0 is PENDING, "
+                 f"so PZTimerCount() reports overflow and returns 0xFFFFFFFF -- "
+                 f"which is the 65535 usec TOPBENCH prints for every suite")
+        if irr == 0xFF:
+            fail("the IRR read 0xFF, which is an unmodelled port floating high, "
+                 "not an answer from a PIC")
+        if ticks == 0:
+            fail("the free-running PIT tick count is 0 after a whole phase of "
+                 "guest execution -- guest time is not advancing at all")
+
         print("\nPASS" if ok else "\nFAIL")
         return ok
     finally:
@@ -144,6 +215,56 @@ def main(args):
 # the control word still latches an access mode, and the divisor bytes go
 # nowhere.
 MUTATE_OUT = "    case 0x40:\n        pit_write_ch0((uint8_t)value);\n        break;\n"
+
+
+# Phase E's own mutation: the three READ arms. Deleting them is exactly the
+# tree before this fix -- 0x42 answered with a static reload byte, 0x40 and 0x20
+# were not answered at all and floated to 0xFF.
+MUTATE_READ = """    /* The counters. Not the reload value: see the PIT clock block above. */
+    case 0x40:
+        return pit_read_data(0);
+    case 0x42:
+        return pit_read_data(2);
+    case 0x20:
+        return (pic_ocw3_read == 3) ? 0u : pic_read_irr();
+    case 0x21:
+        return pic_imr;
+"""
+MUTATE_READ_WITH = """    case 0x42:
+        return x86_io.pit2_reload & 0xFF;
+"""
+
+
+def _mutate_and_require_failure(args, target, replacement, what):
+    import pathlib
+    src = pathlib.Path("x86_io.c")
+    original = src.read_text()
+    if target not in original:
+        print(f"FAIL: the mutation target ({what}) is not in x86_io.c -- this "
+              f"control would pass without testing anything")
+        return False
+    try:
+        src.write_text(original.replace(target, replacement, 1))
+        print(f"-- negative control: rebuilt with {what} --")
+        args.negative = False
+        args.negative_clock = False
+        failed = not main(args)
+    finally:
+        src.write_text(original)
+        print("-- x86_io.c restored --")
+    if failed:
+        print("\nPASS (negative control): the test rejects the defective core")
+        return True
+    print("\nFAIL (negative control): the test PASSED without the fix, so it "
+          "is not measuring anything")
+    return False
+
+
+def negative_control_clock(args):
+    """Rebuild with the PIT/PIC READ arms deleted and require a FAIL."""
+    return _mutate_and_require_failure(
+        args, MUTATE_READ, MUTATE_READ_WITH,
+        "the port 0x40 / 0x42 / 0x20 READ arms DELETED")
 
 
 def negative_control(args):
@@ -175,8 +296,12 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
     add_runner_args(p)
     p.add_argument("--negative", action="store_true",
-                   help="rebuild with the fix mutated out and require a FAIL")
+                   help="rebuild with the 0x40 WRITE arm deleted, require FAIL")
+    p.add_argument("--negative-clock", action="store_true",
+                   help="rebuild with the PIT/PIC READ arms deleted, require FAIL")
     args = p.parse_args()
     if args.negative:
         sys.exit(0 if negative_control(args) else 1)
+    if args.negative_clock:
+        sys.exit(0 if negative_control_clock(args) else 1)
     sys.exit(0 if main(args) else 1)

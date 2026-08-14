@@ -1295,6 +1295,25 @@ and the planar store counters resuming, not by the screen, which stays black.
 guest doing real work whose result only appears at the end -- the one case where
 the wait IS the result rather than a symptom to chase with `probe.py`.
 
+`timelines/topbench-benchmark.tl` walks TOPBENCH's main menu to **Benchmarking**
+(one DOWN, then START -- see the note below about GAME) and lets the suites run.
+It is the timeline for the PIT question: the five Zen-Timer sub-timings are what
+`IN 0x40` and the 8259's IRR at `0x20` decide. **It does not finish inside the
+58 s cap** -- the guest is still in the CGA mode-4 VidMem suite when the window
+closes, so the results screen is not reachable under gwemu and the evidence has
+to come from the port table instead:
+
+```bash
+python3 scripts/probe_report.py --title topbench \
+    --timeline timelines/topbench-benchmark.tl --settle 50 --skip-cost
+```
+
+Read three rows. `0x0020 OUT` last=0x0a is PZTimerOff selecting the IRR;
+`0x0020 IN` must answer **0**, because a set bit 0 is "the timer overflowed" and
+sends every sub-timing to 65535; `0x0040 IN` must show several distinct values,
+because one value is a counter that is not counting. Measured: 1,640 IRR reads,
+all 0, and 55,760 counter reads over 11 distinct low-5-bit values.
+
 **GAME NO LONGER SENDS RETURN**, and a timeline written against that is testing
 something that was deliberately removed. It is the on-screen keyboard's only
 door (`docs/input/02-button-mapping.md`), so `pad_scancode[6]` is 0 and Return
