@@ -33,6 +33,14 @@ CFLAGS += -DX86_TEXT_AA=1
 # the fetch/dispatch tail, the hottest code in the project, and perturbs every
 # timing-dependent thing in the emulator. Flags are not dependencies -- rebuild
 # from clean when this changes. See x86_profile.h and scripts/profile_opcodes.py.
+# Negative and positive controls for the planar VGA arms of tests/test_video.py.
+# Set in the ENVIRONMENT by scripts/run_planar_controls.py, one build each, e.g.
+#   X86_VIDEO_NEGCTL=-DX86_MODEY_CORE_NEGCTL=1 make clean test_core.elf
+# Flags are not dependencies, so every arm builds from CLEAN -- same caveat as
+# X86_PROFILE below.
+X86_VIDEO_NEGCTL ?=
+CFLAGS += $(X86_VIDEO_NEGCTL)
+
 X86_PROFILE ?= 0
 CFLAGS += -DX86_PROFILE=$(X86_PROFILE)
 

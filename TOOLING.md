@@ -921,7 +921,29 @@ python3 tests/test_video.py              # CGA mode 4 blitter, pixel-exact, plus
                                          # Cat defect); mode 6 at 640x200x1;
                                          # mode 0 at 40 columns and the 8x8
                                          # cell; and a mode nothing renders
-                                         # being REFUSED, not adopted
+                                         # being REFUSED, not adopted.
+                                         # It also runs the two PLANAR arms LAST
+                                         # (they remap guest 0xA0000/0xB8000
+                                         # onto the real aperture, which the
+                                         # other arms do not expect): unchained
+                                         # 13h "Mode Y" and EGA 0Dh, each 64,000
+                                         # pixels exact against a host-computed
+                                         # pattern, driven by GUEST code so the
+                                         # store hook and the word `out dx,ax`
+                                         # register writes are on the path.
+                                         # --modey-only runs just the Mode Y arm
+python3 scripts/run_planar_controls.py   # grades that Mode Y arm: four negative
+                                         # controls that must FAIL (chain-4
+                                         # inert, a 40-offset blit stride, four
+                                         # FLAT planes, the fixed 16 KB page
+                                         # mask) and one POSITIVE control --
+                                         # -DX86_MODEY_PAGE0=16384 must still
+                                         # produce the same 64,000 pixels,
+                                         # because the shipped default equals
+                                         # the right answer and without it
+                                         # nothing tests the stride learning.
+                                         # One CLEAN build per arm (flags are
+                                         # not dependencies), so it is slow
 python3 tests/test_nor.py                # NOR cold-page backing and COW, driven
                                          # by GUEST code. The fake NOR is the
                                          # extflash window ITSELF, written with

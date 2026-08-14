@@ -638,12 +638,621 @@ def expected_text40(cells, font):
     return bytes(img)
 
 
+# ===========================================================================
+# UNCHAINED VGA ("Mode Y") -- mode 13h with the Sequencer's chain-4 bit clear.
+#
+# This is what Wolfenstein 3-D runs in, and reading it as a chained mode is what
+# put four horizontally-squashed copies side by side. Pixel (x,y) lives in PLANE
+# x&3 at PLANE OFFSET y*80 + (x>>2), so each plane holds 80 bytes per scanline
+# rather than 320.
+#
+# Ported from references/8086tiny/test286/{tmodey.asm,runmodey.sh,modeycheck.py}.
+# Read references/8086tiny/docs/video/15-mode-y.md section 6 before changing the
+# pattern -- several of its choices look arbitrary and are each the residue of a
+# mutation that survived.
+#
+# THE FOUR BANDS. Each has a different geometric signature, chosen so that no
+# single wrong stride, wrong plane order or wrong start address can satisfy more
+# than one of them:
+#
+#   rows   0..49   x & 0xFF        VERTICAL bars. Written PLANE AT A TIME (four
+#                                  Map Mask writes, each painting every fourth
+#                                  column), so a wrong plane-to-column mapping
+#                                  reorders the bars and a stride error slants
+#                                  them.
+#   rows  50..99   (x+y) & 0xFF    DIAGONALS. A stride error changes the SLOPE
+#                                  rather than destroying it, so it disagrees
+#                                  with band A in a DIFFERENT direction.
+#   rows 100..149  y & 0xFF        HORIZONTAL bars -- the exact transpose of
+#                                  band A. Written with the Map Mask at 0x0F, so
+#                                  one store paints four pixels: this is the
+#                                  band that proves the Map Mask is not ignored.
+#   rows 150..199  (y-50) & 0xFF   A LATCH COPY of band C through write mode 1.
+#                                  Latch copies are how unchained software
+#                                  actually moves video memory, and they are the
+#                                  one read path that must stay EXACT in Mode Y,
+#                                  where a data read returns the wrong plane by
+#                                  design.
+#
+# THE PAGE FLIPS. Between bands C and D the display start moves to 0x4100 and
+# then 0x8200 and is LEFT there, and band D is addressed THROUGH PAGE 2. Without
+# that last part the write-side fold is never exercised -- the reference's
+# mutation that deletes it SURVIVED until band D was moved up there.
+#
+# THE STRIDE IS 16,640 AND THE NUMBER IS LOAD-BEARING. At 16,384 an AND mask is
+# the correct fold BY ACCIDENT, so the page-fold control cannot fail and the
+# shipped bug is invisible to the test written to catch it. 80 x 208 is what
+# real Mode Y software uses.
+#
+# Rows 175..199 are staged through the OFF-SCREEN CACHE at 0xC300 and blitted
+# back down, because that region has separate storage and an untested path is
+# not a path.
+# ===========================================================================
+PLANAR_CODE_BASE = 0x3000
+MODEY_STRIDE = 16640            # 80 x 208, the id Galaxy engine's SCREENSIZE
+MODEY_PAGE2 = 2 * MODEY_STRIDE  # 33280
+MODEY_CACHE = 0xC300            # 3 x 16,640: FREESTART
+
+
+def modey_program():
+    """The guest program, assembled here so it sits next to its expectation.
+
+    Hand-encoded rather than run through an assembler because the harness has no
+    assembler in the loop; every instruction carries its mnemonic. Only backward
+    jumps are used, so a label is always known by the time it is referenced.
+    """
+    c = bytearray()
+
+    def emit(*b):
+        c.extend(b)
+
+    def back(op, target):
+        """A backward rel8 branch. Fails loudly rather than silently wrapping if
+        a body ever grows past the reach of a short jump."""
+        emit(op)
+        d = target - (len(c) + 1)
+        assert -128 <= d <= -1, f"rel8 out of range: {d}"
+        emit(d & 0xFF)
+
+    # ---- mode 13h through the BIOS. INT 10h and not a host call because the
+    # chain-4 arm is GATED on BDA 0040:0049 being 0x13, and only the BIOS mode
+    # set publishes that -- a blind Sequencer probe must not be able to
+    # reinterpret some other mode as planar.
+    emit(0xB8, 0x13, 0x00)                  # mov ax,0013h
+    emit(0xCD, 0x10)                        # int 10h
+
+    # ---- unchain. Sequencer index 4 = 0x06 clears Chain-4 and leaves Extended
+    # Memory and Odd/Even set as a real Mode Y setup does -- byte for byte what
+    # Wolfenstein 3-D writes. A WORD `out dx,ax`, which is how real software
+    # programs these registers and is where a byte-only port path loses AH.
+    emit(0xBA, 0xC4, 0x03)                  # mov dx,3C4h
+    emit(0xB8, 0x04, 0x06)                  # mov ax,0604h
+    emit(0xEF)                              # out dx,ax
+    emit(0xB8, 0x00, 0xA0)                  # mov ax,0A000h
+    emit(0x8E, 0xC0)                        # mov es,ax
+    emit(0xFC)                              # cld
+
+    # ---- band A: rows 0..49, pixel = x & 0xFF, one plane at a time.
+    emit(0x31, 0xF6)                        # xor si,si        ; plane 0..3
+    emit(0xB3, 0x01)                        # mov bl,1         ; Map Mask
+    a_plane = len(c)
+    emit(0xBA, 0xC4, 0x03)                  # mov dx,3C4h
+    emit(0xB0, 0x02)                        # mov al,2
+    emit(0xEE)                              # out dx,al
+    emit(0x42)                              # inc dx
+    emit(0x88, 0xD8)                        # mov al,bl
+    emit(0xEE)                              # out dx,al
+    emit(0x31, 0xFF)                        # xor di,di        ; plane offset 0
+    emit(0xBD, 0x32, 0x00)                  # mov bp,50        ; rows to go
+    a_row = len(c)
+    emit(0x89, 0xF0)                        # mov ax,si        ; column 0's value
+    emit(0xB9, 0x50, 0x00)                  # mov cx,80        ; offsets per row
+    a_col = len(c)
+    emit(0xAA)                              # stosb
+    emit(0x04, 0x04)                        # add al,4         ; four pixels on
+    back(0xE2, a_col)                       # loop a_col
+    emit(0x4D)                              # dec bp
+    back(0x75, a_row)                       # jnz a_row
+    emit(0x46)                              # inc si
+    emit(0xD0, 0xE3)                        # shl bl,1
+    emit(0x83, 0xFE, 0x04)                  # cmp si,4
+    back(0x72, a_plane)                     # jb a_plane
+
+    # ---- band B: rows 50..99, pixel = (x + y) & 0xFF.
+    emit(0x31, 0xF6)                        # xor si,si
+    emit(0xB3, 0x01)                        # mov bl,1
+    b_plane = len(c)
+    emit(0xBA, 0xC4, 0x03)                  # mov dx,3C4h
+    emit(0xB0, 0x02)                        # mov al,2
+    emit(0xEE)                              # out dx,al
+    emit(0x42)                              # inc dx
+    emit(0x88, 0xD8)                        # mov al,bl
+    emit(0xEE)                              # out dx,al
+    emit(0xBF, 0xA0, 0x0F)                  # mov di,4000      ; row 50
+    emit(0xBD, 0x32, 0x00)                  # mov bp,50        ; bp doubles as y
+    b_row = len(c)
+    emit(0x89, 0xF0)                        # mov ax,si
+    emit(0x01, 0xE8)                        # add ax,bp        ; plane + y
+    emit(0xB9, 0x50, 0x00)                  # mov cx,80
+    b_col = len(c)
+    emit(0xAA)                              # stosb
+    emit(0x04, 0x04)                        # add al,4
+    back(0xE2, b_col)                       # loop b_col
+    emit(0x45)                              # inc bp
+    emit(0x83, 0xFD, 0x64)                  # cmp bp,100
+    back(0x72, b_row)                       # jb b_row
+    emit(0x46)                              # inc si
+    emit(0xD0, 0xE3)                        # shl bl,1
+    emit(0x83, 0xFE, 0x04)                  # cmp si,4
+    back(0x72, b_plane)                     # jb b_plane
+
+    # ---- band C: rows 100..149, pixel = y & 0xFF, Map Mask 0x0F.
+    # Every store paints all four planes, i.e. four pixels of the same value.
+    # Constant ALONG a row, so this band is the transpose of band A and no
+    # single wrong stride satisfies both.
+    emit(0xBA, 0xC4, 0x03)                  # mov dx,3C4h
+    emit(0xB8, 0x02, 0x0F)                  # mov ax,0F02h
+    emit(0xEF)                              # out dx,ax
+    emit(0xBF, 0x40, 0x1F)                  # mov di,8000      ; row 100
+    emit(0xBB, 0x64, 0x00)                  # mov bx,100       ; y
+    c_row = len(c)
+    emit(0x88, 0xD8)                        # mov al,bl
+    emit(0xB9, 0x50, 0x00)                  # mov cx,80
+    emit(0xF3, 0xAA)                        # rep stosb
+    emit(0x43)                              # inc bx
+    emit(0x81, 0xFB, 0x96, 0x00)            # cmp bx,150
+    back(0x72, c_row)                       # jb c_row
+
+    # ---- the page flips, to 0x4100 and then 0x8200, and LEFT there.
+    # Their DIFFERENCE is the only place a guest ever states its page stride,
+    # which is what the POSITIVE control (a deliberately wrong X86_MODEY_PAGE0)
+    # makes the core learn. Word OUTs again.
+    emit(0xBA, 0xD4, 0x03)                  # mov dx,3D4h
+    emit(0xB8, 0x0C, 0x41)                  # mov ax,410Ch     ; start hi = 0x41
+    emit(0xEF)                              # out dx,ax
+    emit(0xB8, 0x0D, 0x00)                  # mov ax,000Dh     ; start lo = 0
+    emit(0xEF)                              # out dx,ax
+    emit(0xB8, 0x0C, 0x82)                  # mov ax,820Ch     ; start hi = 0x82
+    emit(0xEF)                              # out dx,ax
+    emit(0xB8, 0x0D, 0x00)                  # mov ax,000Dh
+    emit(0xEF)                              # out dx,ax
+
+    # ---- band D: rows 150..199, a LATCH COPY of band C through write mode 1.
+    # The READ is what loads the latches, and in Mode Y that read is the only
+    # exact one there is -- the byte it returns in AL deliberately is not.
+    emit(0xBA, 0xCE, 0x03)                  # mov dx,3CEh
+    emit(0xB8, 0x05, 0x01)                  # mov ax,0105h     ; write mode 1
+    emit(0xEF)                              # out dx,ax
+
+    def latch_copy(src, dst, count):
+        emit(0xBE, src & 0xFF, src >> 8)      # mov si,src
+        emit(0xBF, dst & 0xFF, dst >> 8)      # mov di,dst
+        emit(0xB9, count & 0xFF, count >> 8)  # mov cx,count
+        top = len(c)
+        emit(0x26, 0x8A, 0x04)              # mov al,[es:si]  ; loads the latches
+        emit(0x26, 0x88, 0x05)              # mov [es:di],al  ; latches go back
+        emit(0x46)                          # inc si
+        emit(0x47)                          # inc di
+        back(0xE2, top)                     # loop
+
+    # Rows 100..124 -> rows 150..174, both addressed THROUGH PAGE 2,
+    # deliberately: every plane offset folds into one page of storage, so page 2
+    # + k must reach the same bytes as k -- on the READ and on the WRITE alike.
+    # Addressing band D at its unaliased offset instead leaves the write-side
+    # fold untested, and in the reference it did: the mutation that deletes the
+    # fold SURVIVED until this copy was moved up here.
+    latch_copy(MODEY_PAGE2 + 8000, MODEY_PAGE2 + 12000, 2000)
+    # Rows 125..149 -> the OFF-SCREEN CACHE -> rows 175..199 of page 2. That
+    # region has its own storage; folding it into the visible page is what
+    # painted a band of garbage across Wolfenstein's setup screen.
+    latch_copy(10000, MODEY_CACHE, 2000)
+    latch_copy(MODEY_CACHE, MODEY_PAGE2 + 14000, 2000)
+
+    emit(0xBA, 0xCE, 0x03)                  # mov dx,3CEh
+    emit(0xB8, 0x05, 0x00)                  # mov ax,0005h     ; write mode 0
+    emit(0xEF)                              # out dx,ax
+    emit(0xF4)                              # hlt
+    return bytes(c)
+
+
+def modey_want_index(x, y):
+    if y < 50:
+        return x & 0xFF                     # A vertical bars, plane at a time
+    if y < 100:
+        return (x + y) & 0xFF               # B diagonals
+    if y < 150:
+        return y & 0xFF                     # C horizontal bars, Map Mask 0x0F
+    return (y - 50) & 0xFF                  # D latch copy of band C
+
+
+def expected_modey():
+    """Computed from the PATTERN, never from a second copy of the emulator's
+    decode -- two copies of one mistake agree with each other."""
+    img = bytearray(FB_STRIDE * 240)
+    for y in range(200):
+        row = FB_TOP + y * FB_STRIDE
+        for x in range(320):
+            img[row + x] = modey_want_index(x, y)
+    return bytes(img)
+
+
+def modey_checks(b, syms, quiet=False):
+    """Run the Mode Y program on the target and compare all 64,000 pixels."""
+    def say(*a):
+        if not quiet:
+            print(*a)
+
+    for n in ("run_planar_flag", "planar_r", "test_ram"):
+        if n not in syms:
+            print(f"FAIL: harness has no {n} -- rebuild tests/main.c")
+            return False
+
+    b.write_uint32(syms["run_planar_flag"], 1)
+    if not wait_flag(b, syms["run_planar_flag"], 0, "planar init hung"):
+        return False
+
+    b.write_memory(syms["test_ram"] + PLANAR_CODE_BASE, modey_program())
+    b.write_uint32(syms["run_planar_flag"], 2)
+    if not wait_flag(b, syms["run_planar_flag"], 0, "Mode Y program hung",
+                     tries=600):
+        return False
+
+    r = [b.read_uint32(syms["planar_r"] + 4 * i) for i in range(12)]
+    mode, bda, unchained, page = r[0], r[1], r[2], r[3]
+    stores, lost, flips = r[4], r[5], r[6]
+    say(f"  mode={mode:#04x} bda449={bda:#04x} unchained={unchained} "
+        f"page={page} stores={stores} lost={lost} flips={flips} "
+        f"latch={r[8]}/{r[9]} exit={r[7]:#x}")
+
+    ok = True
+    if mode != 0x13 or bda != 0x13:
+        print(f"FAIL: mode 13h was never adopted (mode {mode:#x}, BDA {bda:#x})")
+        ok = False
+    if not unchained:
+        print("FAIL: the guest cleared Chain-4 and the adapter is still CHAINED."
+              " Either the Sequencer write never reached "
+              "x86_vga_planar_seq_write() or the BDA gate rejected it. This is "
+              "the four-copies bug.")
+        ok = False
+    if page != MODEY_STRIDE:
+        print(f"FAIL: page stride learned as {page}, want {MODEY_STRIDE}. The "
+              f"guest's two flips are {MODEY_STRIDE} apart and that is the only "
+              f"place it ever states the number.")
+        ok = False
+    if flips < 2:
+        print(f"FAIL: only {flips} display-start changes seen; the guest made "
+              f"two. Present-on-page-flip hangs off that edge.")
+        ok = False
+    if stores == 0:
+        print("FAIL: not one store took the aperture hook -- cpu->vga_base was "
+              "never armed, so every planar write landed raw in the aperture.")
+        ok = False
+    if not ok:
+        return False
+
+    b.write_uint32(syms["run_video_flag"], 3)
+    if not wait_flag(b, syms["run_video_flag"], 0, "Mode Y blit did not finish"):
+        return False
+    got = bytes(b.read_memory(syms["cga_test_out"], FB_STRIDE * 240))
+    want = expected_modey()
+
+    bad = [i for i in range(FB_TOP, FB_TOP + 200 * FB_STRIDE)
+           if got[i] != want[i]]
+    if bad:
+        i = bad[0]
+        y, x = divmod(i - FB_TOP, FB_STRIDE)
+        band = ["A vertical-bars/map-mask", "B diagonals", "C horizontal-bars",
+                "D latch-copy"][min(y // 50, 3)]
+        print(f"FAIL: Mode Y {len(bad)}/64000 pixels wrong; first ({x},{y}) "
+              f"got {got[i]} want {want[i]}  [band {band}]")
+        return False
+
+    say("PASS: Mode Y 64000/64000 pixels exact (chain-4 off + map mask + "
+        "interleave + CRTC start/stride + page fold + latch copy + off-screen "
+        "cache)")
+
+    # Put the fold back the way the harness set it up, so any arm that runs
+    # after this one is not looking at the aperture through 0xA0000.
+    b.write_uint32(syms["run_planar_flag"], 3)
+    wait_flag(b, syms["run_planar_flag"], 0, "planar unmap hung")
+    return True
+
+
+# ===========================================================================
+# EGA mode 0Dh -- 320x200, 16 colours, four bitplanes at 0xA0000.
+#
+# Ported from references/8086tiny/test286/tega.asm AND tega2.asm, MERGED,
+# because the pair exists for a reason that is recorded and general
+# (11-ega-planar.md, "Why the first test passed while a real game rendered
+# garbage"). tega.asm compared all 64,000 pixels, was mutation-tested when it
+# was written, and passed unchanged through ALL FIVE of the bugs that made
+# Commander Keen 4 render as horizontal streaks of coloured dashes -- because it
+# drove the adapter the way a TEST does:
+#
+#   tega.asm did                  real software does            bug it hid
+#   byte OUT for index then data  word `out dx,ax`, one insn    word OUT drops AH
+#   ATC index 0x01                ATC index 0x21 (bit 5 set)    index masked 0x3F
+#   start 0, stride 40, no pan    reprograms all three a frame  blit ignores CRTC
+#   stayed inside the first 16 KB uses the whole 64 KB window   writes land raw
+#   never probed unknown ports    FreeDOS walks 0x3C0-0x3CF     the probe armed it
+#
+# So this program does the right-hand column: EVERY register write is a word
+# OUT, the ATC index carries bit 5, the CRTC Offset is 22 (a 352-pixel virtual
+# screen, not the default 40 bytes), the display start is 0x0100, there are
+# three pixels of pel panning, there is a write above the 16 KB window whose
+# read-back must be ZERO, and there is a blind 0xFF to port 0x3C2.
+#
+# The virtual screen is also deliberately WIDER THAN THE CARD CAN HOLD: at 8,192
+# plane offsets the bottom right of the display runs past fitted plane memory and
+# must come back BLACK. The card-size boundary is then visible in the picture
+# instead of being an internal detail.
+#
+# FOUR BANDS, each isolating one mechanism so a wrong answer in one cannot be
+# produced by a bug in another. u is the SOURCE pixel index within the virtual
+# row, i.e. displayed x plus the pel pan:
+#
+#   rows   0..49   Map Mask     each plane filled separately    colour = u & 15
+#   rows  50..99   Bit Mask +   repaint under mask 0x18, six    15 where u%8 is
+#                  latches      bits coming from the latches    3 or 4, else 1
+#   rows 100..149  Set/Reset    CPU byte is 0xAA and must be    colour = y & 15
+#                               ignored entirely
+#   rows 150..199  Write mode 1 a pure latch copy of rows 0-49  colour = u & 15
+#
+# The bands are chosen so a plausible-looking wrong answer is still a detectable
+# one: if write mode 1 were unimplemented the bottom band would mirror AL --
+# a pattern, not a blank -- which is why the comparison is pixel-exact rather
+# than "does something appear".
+# ===========================================================================
+EGA_START = 0x0100      # non-zero display start, in plane offsets
+EGA_OFFSET = 22         # CRTC 0x13, in WORDS -> 44 bytes per row
+EGA_PITCH = 2 * EGA_OFFSET
+EGA_PAN = 3             # ATC 0x13, horizontal pel pan
+EGA_PLANE = 0x2000      # X86_EGA_PLANE_OFFSETS: 8,192 -> a 32 KB card
+EGA_BAND = EGA_PITCH * 50
+EGA_PROBE = 0x5000      # a window offset above the 16 KB CPU-visible shadow
+EGA_PROBE_SLOT = 0x2F00  # guest DS:offset the read-back is parked in
+
+
+def ega_program():
+    """The guest program. Same hand-encoding as modey_program(); see there."""
+    c = bytearray()
+
+    def emit(*b):
+        c.extend(b)
+
+    def back(op, target):
+        emit(op)
+        d = target - (len(c) + 1)
+        assert -128 <= d <= -1, f"rel8 out of range: {d}"
+        emit(d & 0xFF)
+
+    def wout(port, index, data):
+        """`mov dx,port / mov ax,(data<<8)|index / out dx,ax` -- the word form,
+        which is the only form real software uses and the one that loses AH if
+        the port layer treats a 16-bit OUT as a byte."""
+        emit(0xBA, port & 0xFF, port >> 8)          # mov dx,port
+        emit(0xB8, index, data)                     # mov ax,(data<<8)|index
+        emit(0xEF)                                  # out dx,ax
+
+    emit(0xB8, 0x0D, 0x00)                  # mov ax,000Dh
+    emit(0xCD, 0x10)                        # int 10h
+    emit(0xB8, 0x00, 0xA0)                  # mov ax,0A000h
+    emit(0x8E, 0xC0)                        # mov es,ax
+    emit(0xFC)                              # cld
+
+    # ---- CRTC: a non-default Offset and a non-zero display start.
+    wout(0x3D4, 0x13, EGA_OFFSET)           # Offset = 22 words = 44 bytes
+    wout(0x3D4, 0x0C, EGA_START >> 8)       # start high
+    wout(0x3D4, 0x0D, EGA_START & 0xFF)     # start low
+
+    # ---- ATC pel panning, through the real sequence: read 0x3DA to clear the
+    # flip-flop, then index and data on the SAME port, with bit 5 of the index
+    # set (Palette Address Source) exactly as real software leaves it.
+    emit(0xBA, 0xDA, 0x03)                  # mov dx,3DAh
+    emit(0xEC)                              # in al,dx
+    emit(0xBA, 0xC0, 0x03)                  # mov dx,3C0h
+    emit(0xB0, 0x13 | 0x20)                 # mov al,33h
+    emit(0xEE)                              # out dx,al
+    emit(0xB0, EGA_PAN)                     # mov al,3
+    emit(0xEE)                              # out dx,al
+
+    # ---- a blind 0xFF to Miscellaneous Output, which is what FreeDOS's boot
+    # probe does and what armed planar and wiped VRAM on the reference port.
+    emit(0xBA, 0xC2, 0x03)                  # mov dx,3C2h
+    emit(0xB0, 0xFF)                        # mov al,0FFh
+    emit(0xEE)                              # out dx,al
+
+    def fill(mapmask, base, count, value):
+        wout(0x3C4, 0x02, mapmask)          # Sequencer Map Mask
+        emit(0xBF, base & 0xFF, base >> 8)  # mov di,base
+        emit(0xB9, count & 0xFF, count >> 8)  # mov cx,count
+        emit(0xB0, value)                   # mov al,value
+        emit(0xF3, 0xAA)                    # rep stosb
+
+    # ---- band A: colour = u & 15, one plane at a time.
+    # Bit p of (u & 15) over eight consecutive u is a CONSTANT byte for planes
+    # 0-2 (0x55, 0x33, 0x0F) and alternates 0x00/0xFF per group for plane 3.
+    # Filling each plane separately is what makes this the Map Mask band: a Map
+    # Mask that is ignored puts every constant into every plane.
+    fill(0x01, EGA_START, EGA_BAND, 0x55)
+    fill(0x02, EGA_START, EGA_BAND, 0x33)
+    fill(0x04, EGA_START, EGA_BAND, 0x0F)
+    wout(0x3C4, 0x02, 0x08)                 # Map Mask = plane 3 only
+    emit(0xBF, EGA_START & 0xFF, EGA_START >> 8)    # mov di,start
+    emit(0xB9, EGA_BAND & 0xFF, EGA_BAND >> 8)      # mov cx,2200
+    emit(0xB0, 0x00)                        # mov al,0
+    a_alt = len(c)
+    emit(0xAA)                              # stosb
+    emit(0x34, 0xFF)                        # xor al,0FFh
+    back(0xE2, a_alt)                       # loop a_alt
+
+    # ---- band B: colour 1 everywhere, then repaint under Bit Mask 0x18.
+    # The six bits the mask does NOT cover have to come back from the LATCHES,
+    # so this band fails if a read-modify-write does not load them.
+    b_base = EGA_START + EGA_BAND
+    fill(0x01, b_base, EGA_BAND, 0xFF)      # plane 0 only -> colour 1
+    wout(0x3C4, 0x02, 0x0F)                 # every plane enabled
+    wout(0x3CE, 0x08, 0x18)                 # Bit Mask = 0x18
+    emit(0xBE, b_base & 0xFF, b_base >> 8)  # mov si,b_base
+    emit(0xB9, EGA_BAND & 0xFF, EGA_BAND >> 8)      # mov cx,2200
+    b_loop = len(c)
+    emit(0x26, 0x8A, 0x1C)                  # mov bl,[es:si]  ; loads the latches
+    emit(0xB0, 0xFF)                        # mov al,0FFh
+    emit(0x26, 0x88, 0x04)                  # mov [es:si],al
+    emit(0x46)                              # inc si
+    back(0xE2, b_loop)                      # loop b_loop
+    wout(0x3CE, 0x08, 0xFF)                 # Bit Mask back to 0xFF
+
+    # ---- band C: Set/Reset supplies the colour and the CPU byte is 0xAA,
+    # which must be ignored ENTIRELY. A path that quietly ORs the CPU byte in
+    # renders 0xAA's bit pattern through it and this band says so.
+    c_base = EGA_START + 2 * EGA_BAND
+    wout(0x3CE, 0x01, 0x0F)                 # Enable Set/Reset, all four planes
+    emit(0xBF, c_base & 0xFF, c_base >> 8)  # mov di,c_base
+    emit(0xB3, 100)                         # mov bl,100      ; y
+    c_row = len(c)
+    emit(0xBA, 0xCE, 0x03)                  # mov dx,3CEh
+    emit(0xB0, 0x00)                        # mov al,0        ; Set/Reset index
+    emit(0x88, 0xDC)                        # mov ah,bl
+    emit(0x80, 0xE4, 0x0F)                  # and ah,0Fh      ; colour = y & 15
+    emit(0xEF)                              # out dx,ax
+    emit(0xB0, 0xAA)                        # mov al,0AAh     ; must be ignored
+    emit(0xB9, EGA_PITCH & 0xFF, EGA_PITCH >> 8)    # mov cx,44
+    emit(0xF3, 0xAA)                        # rep stosb
+    emit(0xFE, 0xC3)                        # inc bl
+    emit(0x80, 0xFB, 150)                   # cmp bl,150
+    back(0x72, c_row)                       # jb c_row
+    wout(0x3CE, 0x01, 0x00)                 # Enable Set/Reset off
+
+    # ---- band D: a PURE LATCH COPY of band A through write mode 1.
+    d_base = EGA_START + 3 * EGA_BAND
+    wout(0x3CE, 0x05, 0x01)                 # Mode register = write mode 1
+    emit(0xBE, EGA_START & 0xFF, EGA_START >> 8)    # mov si,start
+    emit(0xBF, d_base & 0xFF, d_base >> 8)          # mov di,d_base
+    emit(0xB9, EGA_BAND & 0xFF, EGA_BAND >> 8)      # mov cx,2200
+    d_loop = len(c)
+    emit(0x26, 0x8A, 0x04)                  # mov al,[es:si]
+    emit(0x26, 0x88, 0x05)                  # mov [es:di],al
+    emit(0x46)                              # inc si
+    emit(0x47)                              # inc di
+    back(0xE2, d_loop)                      # loop d_loop
+    wout(0x3CE, 0x05, 0x00)                 # back to write mode 0
+
+    # ---- a write ABOVE the 16 KB CPU-visible window, then a read-back of it.
+    # It must return ZERO. A non-zero answer means the access was treated as
+    # plain memory: the raw guest byte landed somewhere the blit will render,
+    # which is precisely the "horizontal streaks of coloured dashes" defect.
+    emit(0xBF, EGA_PROBE & 0xFF, EGA_PROBE >> 8)    # mov di,5000h
+    emit(0xB0, 0x5A)                        # mov al,5Ah
+    emit(0x26, 0x88, 0x05)                  # mov [es:di],al
+    emit(0x26, 0x8A, 0x05)                  # mov al,[es:di]
+    emit(0xA2, EGA_PROBE_SLOT & 0xFF, EGA_PROBE_SLOT >> 8)   # mov [imm16],al
+    emit(0xF4)                              # hlt
+    return bytes(c)
+
+
+def ega_want(x, y):
+    """The colour index displayed at (x, y), from the PATTERN. u is the source
+    pixel: the pel pan shifts the whole picture left by three, so displayed x
+    reads source pixel x + 3."""
+    u = x + EGA_PAN
+    a = EGA_START + y * EGA_PITCH + (u >> 3)
+    if a >= EGA_PLANE:
+        # Past the plane memory this card has fitted. Reads as zero, exactly as
+        # the store path discarded the writes there, so the card-size boundary
+        # is a visible edge in the picture rather than an internal detail.
+        return 0
+    if y < 50 or y >= 150:
+        return u & 15                       # A map mask; D is a latch copy of A
+    if y < 100:
+        return 15 if (u & 7) in (3, 4) else 1   # B bit mask + latches
+    return y & 15                           # C set/reset
+
+
+def expected_ega():
+    img = bytearray(FB_STRIDE * 240)
+    for y in range(200):
+        row = FB_TOP + y * FB_STRIDE
+        for x in range(320):
+            img[row + x] = ega_want(x, y)
+    return bytes(img)
+
+
+def ega_checks(b, syms):
+    """EGA 0Dh: the four write mechanisms, the CRTC window, and the card bound."""
+    b.write_uint32(syms["run_planar_flag"], 1)
+    if not wait_flag(b, syms["run_planar_flag"], 0, "planar init hung"):
+        return False
+
+    b.write_memory(syms["test_ram"] + PLANAR_CODE_BASE, ega_program())
+    b.write_uint32(syms["run_planar_flag"], 2)
+    if not wait_flag(b, syms["run_planar_flag"], 0, "EGA program hung",
+                     tries=600):
+        return False
+
+    r = [b.read_uint32(syms["planar_r"] + 4 * i) for i in range(12)]
+    print(f"  mode={r[0]:#04x} bda449={r[1]:#04x} ega_armed={r[10]} "
+          f"stores={r[4]} lost={r[5]} arena_free={r[11]} exit={r[7]:#x}")
+    if r[0] != 0x0D or r[1] != 0x0D:
+        print(f"FAIL: mode 0Dh was not adopted (mode {r[0]:#x}, BDA {r[1]:#x}). "
+              f"If the arena could not place 32,768 bytes the mode is REFUSED, "
+              f"which is the intended behaviour but not a passing test.")
+        return False
+    if not r[10]:
+        print("FAIL: mode 0Dh adopted but the planar adapter is not armed, so "
+              "every store landed raw in the aperture.")
+        return False
+    if r[5] == 0:
+        print("FAIL: no store was discarded, yet the program deliberately writes "
+              "past the fitted card (offset 0x5000 and the bottom of band D). "
+              "Nothing is enforcing the card bound.")
+        return False
+
+    probe = b.read_memory(syms["test_ram"] + EGA_PROBE_SLOT, 1)[0]
+    if probe != 0:
+        print(f"FAIL: a write at window offset {EGA_PROBE:#x} -- above the 16 KB "
+              f"CPU-visible shadow -- read back as {probe:#04x}, not 0. The "
+              f"access was treated as plain memory, so the raw guest byte is "
+              f"sitting where the blit will render it.")
+        return False
+    print(f"PASS: a write above the 16 KB window is discarded and reads back 0")
+
+    b.write_uint32(syms["run_video_flag"], 3)
+    if not wait_flag(b, syms["run_video_flag"], 0, "EGA blit did not finish"):
+        return False
+    got = bytes(b.read_memory(syms["cga_test_out"], FB_STRIDE * 240))
+    want = expected_ega()
+    bad = [i for i in range(FB_TOP, FB_TOP + 200 * FB_STRIDE)
+           if got[i] != want[i]]
+    if bad:
+        i = bad[0]
+        y, x = divmod(i - FB_TOP, FB_STRIDE)
+        band = ["A map-mask", "B bit-mask/latches", "C set/reset",
+                "D write-mode-1"][min(y // 50, 3)]
+        print(f"FAIL: EGA 0Dh {len(bad)}/64000 pixels wrong; first ({x},{y}) "
+              f"got {got[i]} want {want[i]}  [band {band}]")
+        return False
+    print("PASS: EGA 0Dh 64000/64000 pixels exact (map mask + bit mask/latches "
+          "+ set/reset + write mode 1 + word OUTs + CRTC Offset/start + pel pan "
+          "+ the card bound)")
+
+    b.write_uint32(syms["run_planar_flag"], 3)
+    wait_flag(b, syms["run_planar_flag"], 0, "planar unmap hung")
+    return True
+
+
 def main(args):
     runner = build_and_create_runner(args)
     try:
         runner.start()
         b = runner.backend
         syms = get_symbols(getattr(args, "elf", None) or "test_core.elf")
+        if getattr(args, "modey_only", False):
+            # The single arm scripts/run_planar_controls.py builds and re-runs
+            # once per control. Nothing else runs, so a control's verdict is
+            # about the Mode Y pipeline and not about some other arm.
+            time.sleep(0.5)
+            return modey_checks(b, syms, quiet=getattr(args, "quiet", False))
         for n in ("run_video_flag", "cga_test_vram", "cga_test_out",
                   "video_blit_cycles"):
             if n not in syms:
@@ -695,7 +1304,14 @@ def main(args):
         print(f"PASS: {px} pixels exact")
         print(f"  blit: {cycles} cycles, {cycles / px:.2f} cyc/pixel")
 
-        return mode_switch_checks(b, syms)
+        if not mode_switch_checks(b, syms):
+            return False
+        # LAST, deliberately: the planar arms remap guest 0xA0000/0xB8000 onto
+        # the real aperture and VRAM for the duration, which is what the core
+        # does and what the other arms do not expect.
+        if not modey_checks(b, syms):
+            return False
+        return ega_checks(b, syms)
     finally:
         runner.stop()
 
@@ -704,5 +1320,9 @@ if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser(description=__doc__)
     add_runner_args(p)
+    p.add_argument("--modey-only", action="store_true",
+                   help="run only the Mode Y arm (the controls driver uses this)")
+    p.add_argument("--quiet", action="store_true",
+                   help="suppress the PASS chatter; the exit code is the verdict")
     args = p.parse_args()
     sys.exit(0 if main(args) else 1)

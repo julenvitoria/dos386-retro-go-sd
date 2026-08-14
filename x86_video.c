@@ -18,6 +18,7 @@
 #include "cutils.h"
 #include "x86_cpu.h"
 #include "x86_arena.h"
+#include "x86_video_planar.h"
 /* The 8x8 table is still the BIOS INT 1Fh/43h font (x86_hle.c hands it to the
    guest); the renderer draws from the narrow tables. */
 /*
@@ -88,6 +89,7 @@
 #define VM_CGA2   1     /* 320x200 2 bpp, two-bank interleave              */
 #define VM_CGA1   2     /* 640x200 1 bpp, same interleave, decimated 2:1   */
 #define VM_VGA8   3     /* 320x200 8 bpp LINEAR at 0xA0000 -- mode 13h     */
+#define VM_EGA4   4     /* 320x200 4 bpp PLANAR at 0xA0000 -- mode 0Dh     */
 
 typedef struct {
     uint8_t mode;       /* the BDA 0x449 value                             */
@@ -105,6 +107,13 @@ static const x86_vmode vmodes[] = {
     { 0x04, VM_CGA2, 40 },
     { 0x05, VM_CGA2, 40 },
     { 0x06, VM_CGA1, 80 },
+    /* EGA 0Dh. Its plane storage is an arena claim, so vmode_find() gates it on
+       the claim being satisfiable the same way 13h is gated on its aperture.
+       Modes 0Eh and 10h are deliberately absent: they need 16,000 and 28,000
+       bytes per plane against the 8,192 offsets this partition holds, and a
+       mode set that is accepted and cannot be rendered leaves the guest drawing
+       into memory nothing reads. See 11-ega-planar.md, "Out of scope". */
+    { 0x0D, VM_EGA4, 40 },
     { 0x13, VM_VGA8, 40 },
 };
 
@@ -126,6 +135,19 @@ static const x86_vmode *vmode_find(uint8_t mode)
        difference is that this one depends on an allocation. */
     if (mode == 0x13 && !x86_vga13_ok)
         return 0;
+    /* EGA 0Dh needs plane storage out of the arena, and a REFUSAL MUST BE LOUD:
+       "EGA needs N more bytes than exist" is actionable, "the screen is blank"
+       is not. x86_arena_would_fit() runs the real placement without committing,
+       so this cannot pass here and fail at the claim below. If the claim is
+       already held (we are re-entering 0Dh) the dry run accounts for that --
+       re-claiming an id releases the old claim first. */
+    if (mode == 0x0D
+        && (!x86_vga13_ok
+            || !x86_arena_would_fit(X86_ARENA_ID_EGA, 1,
+                                    4u * X86_EGA_PLANE_OFFSETS))) {
+        x86_vga_ega_refused++;
+        return 0;
+    }
     for (unsigned i = 0; i < sizeof vmodes / sizeof vmodes[0]; i++)
         if (vmodes[i].mode == mode)
             return &vmodes[i];
@@ -150,10 +172,16 @@ static uint8_t *cga_vram;
    section below for why none of it is .bss. */
 static uint8_t  *vga_aperture;      /* 64 KB at guest 0xA0000, or NULL       */
 static uint8_t  *vga_dac;           /* 768 B: 256 x (r,g,b), 6 bits each     */
+/* EGA 0Dh palette staging. Last (attribute palette, DAC) pair pushed, so the
+   32-entry CLUT is rebuilt only when the guest actually changes one of them. */
+static uint8_t  ega_attr_shadow[16];
+static uint8_t  ega_dac_shadow[16 * 3];
+static uint8_t  ega_clut_valid;
 static uint32_t *vga_clut256;       /* 1 KB: ARGB8888, what the LTDC scans   */
 static void text_render(uint8_t *dst, uint32_t stride);
 static void cga_mode6_blit(uint8_t *dst, uint32_t stride);
 static void vga13_blit(uint8_t *dst, uint32_t stride);
+static void blit_ega16(uint8_t *dst, uint32_t stride);
 static void text_render_wide(uint8_t *dst, uint32_t stride);
 #if X86_TEXT_AA
 static void text_alloc_palette(void);
@@ -291,6 +319,16 @@ void x86_video_refresh_palette(void)
 {
     if (!cga_clut)
         return;
+    /* EGA 0Dh owns the whole 32-entry table -- sixteen colours through the
+       Attribute Controller and their mirrors -- and ega_sync_palette() is the
+       only writer while it is up. Falling through here would paint the CGA
+       four-colour block over it, and because that path leaves ega_clut_valid
+       set the EGA palette would never be recomputed to correct it. */
+    if (cur_desc->kind == VM_EGA4) {
+        ega_clut_valid = 0;             /* recompute at the next blit */
+        return;
+    }
+    ega_clut_valid = 0;                 /* any other mode invalidates it too */
 
     unsigned sel = x86_io.cga_color_select;
     unsigned background = sel & 0x0F;
@@ -513,6 +551,9 @@ void x86_video_render(uint8_t *dst, uint32_t stride)
     case VM_VGA8:
         vga13_blit(top, stride);
         break;
+    case VM_EGA4:
+        blit_ega16(top, stride);
+        break;
     default:
         cga_mode4_blit(top, cga_vram, cga_vram + CGA_PLANE_ODD,
                        cga_expand, stride - CGA_WIDTH);
@@ -727,6 +768,29 @@ void x86_vga_dac_set_block(unsigned first, unsigned count, const uint8_t *rgb)
  * here so the two happen to be equal, but the stride is the caller's and a
  * single copy would silently break the moment it is not.
  */
+/*
+ * NEGATIVE CONTROLS for the Mode Y blit. Each is REQUIRED to fail the Mode Y
+ * arm of tests/test_video.py; see the header there for the whole set.
+ *
+ * NOT AMONG THEM: "read the unchained aperture linearly". That was the obvious
+ * first choice and the reference measured it SURVIVING, because at a display
+ * start of 0 and an Offset of 40 the correct de-interleave IS the linear read
+ * (the identity in the module header). A mutation that is a no-op at the
+ * geometry under test cannot be the control -- 15-mode-y.md records it so it is
+ * not proposed again.
+ */
+#ifndef X86_MODEY_STRIDE_NEGCTL
+#define X86_MODEY_STRIDE_NEGCTL 0   /* blit at 40 plane offsets/row, not 80  */
+#endif
+#ifndef X86_MODEY_BLIT_NEGCTL
+#define X86_MODEY_BLIT_NEGCTL 0     /* decode four FLAT planes, not interleaved */
+#endif
+
+/* 320 pixels is 80 plane offsets, and one plane offset is four interleaved
+   bytes, so a displayed row is 80 plane offsets wide however far apart rows
+   are. */
+#define VGA13_ROW_OFFSETS  (X86_VGA13_WIDTH / 4u)
+
 static void vga13_blit(uint8_t *dst, uint32_t stride)
 {
     const uint8_t *src = vga_aperture;
@@ -735,8 +799,174 @@ static void vga13_blit(uint8_t *dst, uint32_t stride)
             memset(dst + y * stride, 0, X86_VGA13_WIDTH);
         return;
     }
-    for (unsigned y = 0; y < X86_VGA13_HEIGHT; y++)
-        memcpy(dst + y * stride, src + y * X86_VGA13_WIDTH, X86_VGA13_WIDTH);
+    if (!x86_vga_is_unchained()) {
+        /* CHAINED 13h, BYTE FOR BYTE WHAT IT ALWAYS WAS. The unchained work
+           below must not cost this path a single instruction: it is the mode
+           most titles use and the reason 13h was buildable here at all. */
+        for (unsigned y = 0; y < X86_VGA13_HEIGHT; y++)
+            memcpy(dst + y * stride, src + y * X86_VGA13_WIDTH, X86_VGA13_WIDTH);
+        return;
+    }
+
+    /*
+     * UNCHAINED ("Mode Y"). The de-interleave is the identity at the standard
+     * geometry -- 4*(y*80 + (x>>2)) + (x&3) == 320*y + x -- so all this loop
+     * adds over the chained one is a per-row SOURCE OFFSET, which is what makes
+     * a non-zero CRTC display start and a non-standard Offset render correctly.
+     * At start 0 and Offset 40 it reduces to the loop above exactly.
+     */
+    const unsigned pitch = X86_MODEY_STRIDE_NEGCTL ? x86_vga_row_pitch() / 2u
+                                                   : x86_vga_row_pitch();
+    const unsigned start = x86_vga_crtc_start();
+
+    for (unsigned y = 0; y < X86_VGA13_HEIGHT; y++, dst += stride) {
+        /* The CORE owns the page fold, and it is NOT a mask -- the page stride
+           is whatever the guest programmed, and WOLF3D's is 16,640. This is the
+           same lookup the store path uses, so the blit and the writes cannot
+           disagree about where a row is. */
+        const uint32_t a = x86_vga_modey_row(start + y * pitch);
+
+        if (a == ~0u) {
+            /* No aperture storage for this row: off-screen, or a page tail.
+               BLACK rather than whatever the previous frame left, so a
+               mis-learned layout is VISIBLE instead of merely plausible. */
+            memset(dst, 0, X86_VGA13_WIDTH);
+            continue;
+        }
+#if X86_MODEY_BLIT_NEGCTL
+        /* Four FLAT planes instead of four interleaved ones. */
+        for (unsigned x = 0; x < X86_VGA13_WIDTH; x++)
+            dst[x] = src[(x & 3u) * X86_MODEY_PLANE_OFFSETS + a + (x >> 2)];
+#else
+        /* A row is contiguous in the interleaved store unless it runs off the
+           end of the aliased page, which only a non-zero start can do. Split
+           rather than read past the aperture. */
+        if (a + VGA13_ROW_OFFSETS <= X86_MODEY_PLANE_OFFSETS) {
+            memcpy(dst, src + 4u * a, X86_VGA13_WIDTH);
+        } else {
+            const unsigned head = (X86_MODEY_PLANE_OFFSETS - a) * 4u;
+            memcpy(dst, src + 4u * a, head);
+            memcpy(dst + head, src, X86_VGA13_WIDTH - head);
+        }
+#endif
+    }
+}
+
+/* ===========================================================================
+ * EGA mode 0Dh -- 320x200, 16 colours, four bitplanes at 0xA0000.
+ *
+ * The planes are NOT the aperture. While 0Dh is armed the adapter partitions
+ * things so that the bottom 16 KB of the aperture is the CPU-visible READ
+ * SHADOW -- which is what guest 0xA0000 folds onto, so reads cost nothing --
+ * and the planes are a separate interleaved block out of the arena.
+ * x86_vga_ega_planes() is the only correct source here.
+ *
+ * "Interleaved" means plane p at offset a lives at planes[4*a + p], so all four
+ * planes of one 8-pixel group are a single aligned 32-bit load. That layout is
+ * tiny386's / QEMU's; the idea is theirs.
+ *
+ * KEEN 4'S LEVEL BACKGROUNDS ARE NOT REACHABLE HERE AND THAT IS ARITHMETIC, NOT
+ * A MISSING FEATURE. The Galaxy engine caches its tile art in off-screen video
+ * memory and blits it out with latch copies; measured on the reference, 97.2%
+ * of those copies source from beyond an 8 KB plane, its write high-water is
+ * plane offset 65,536, and nothing between 8 KB and 64 KB per plane buys a
+ * partial picture -- at 16 KB the frame is WORSE than at 8 KB, not better. That
+ * is a 256 KB card against a device with ~25 KB spare. 0Dh gets Keen's banner
+ * and its menus; it does not get its levels.
+ */
+#define EGA_WIDTH     320u
+#define EGA_ROWS      200u
+#define EGA_ROWBYTES  (EGA_WIDTH / 8u)   /* 40 bytes per plane per row */
+
+/* (ega_attr_shadow / ega_dac_shadow / ega_clut_valid are declared up with the
+   other mode statics: x86_video_refresh_palette() invalidates the flag, and it
+   runs long before this section.) */
+
+/*
+ * Pixel value -> Attribute Controller palette register -> DAC entry -> RGB.
+ * BOTH indirections are real and a game can repaint by writing either.
+ *
+ * DECLARE EXACTLY 32 ENTRIES, NEVER 16. lcd_set_clut(clut, count) stores a
+ * darkened twin of entry i at count+i, while retro-go's overlay dims a pixel by
+ * ORing LCD_DARKEN_BIT, which is a fixed +32. The two agree only at count == 32,
+ * so a 16-entry push would leave the menu dimming reading colours 16..31 --
+ * which is why 16-31 are MIRRORED here rather than left stale: unreachable from
+ * a 4-bit pixel, but lcd_pack_color() searches the whole table.
+ */
+static void ega_sync_palette(void)
+{
+    const uint8_t *attr = x86_vga_attr_palette();
+
+    if (!cga_clut || !vga_dac)
+        return;
+    if (ega_clut_valid
+        && memcmp(ega_attr_shadow, attr, sizeof ega_attr_shadow) == 0
+        && memcmp(ega_dac_shadow, vga_dac, sizeof ega_dac_shadow) == 0)
+        return;
+
+    memcpy(ega_attr_shadow, attr, sizeof ega_attr_shadow);
+    memcpy(ega_dac_shadow, vga_dac, sizeof ega_dac_shadow);
+
+    for (unsigned i = 0; i < 16; i++) {
+        const uint8_t *e = vga_dac + (attr[i] & 0x3Fu) * 3u;
+        cga_clut[i] = dac_expand(e[0], e[1], e[2]);
+    }
+    for (unsigned i = 16; i < X86_TEXT_CLUT_ENTRIES; i++)
+        cga_clut[i] = cga_clut[i - 16];
+
+    ega_clut_valid = 1;
+    cga_clut_dirty = 1;
+}
+
+static void blit_ega16(uint8_t *dst, uint32_t stride)
+{
+    const uint8_t *planes = x86_vga_ega_planes();
+    const uint32_t vram   = x86_vga_ega_plane_offsets();
+    /* The display is a WINDOW onto plane memory, not the bottom of it. A game
+       that scrolls moves the CRTC start address and widens the row pitch; both
+       have to be honoured or the picture is a sheared crop. */
+    const unsigned pitch = x86_vga_row_pitch();
+    const unsigned pan   = x86_vga_pel_panning();
+    unsigned addr = x86_vga_crtc_start();
+
+    ega_sync_palette();
+    if (!planes) {
+        for (unsigned y = 0; y < EGA_ROWS; y++)
+            memset(dst + y * stride, 0, EGA_WIDTH);
+        return;
+    }
+
+    /* One extra group per row so the pel-panning shift has 8 more pixels to
+       pull from. */
+    for (unsigned y = 0; y < EGA_ROWS; y++, dst += stride, addr += pitch) {
+        uint8_t line[EGA_WIDTH + 8];
+        unsigned a = addr;
+        uint8_t *out = line;
+
+        for (unsigned g = 0; g < EGA_ROWBYTES + 1u; g++, a++) {
+            uint32_t p0, p1, p2, p3;
+
+            if (a < vram) {
+                /* One 32-bit load, four planes. Bit 7 is the leftmost pixel. */
+                uint32_t q;
+                memcpy(&q, planes + 4u * a, 4);
+                p0 = q & 0xFFu;         p1 = (q >> 8) & 0xFFu;
+                p2 = (q >> 16) & 0xFFu; p3 = (q >> 24) & 0xFFu;
+            } else {
+                /* Past the memory this card has fitted: reads as ZERO, exactly
+                   as the store path discards writes there. The card-size
+                   boundary is then visible in the picture rather than being an
+                   internal detail. */
+                p0 = p1 = p2 = p3 = 0;
+            }
+            for (int bit = 7; bit >= 0; bit--)
+                *out++ = (uint8_t)(((p0 >> bit) & 1u)
+                                 | (((p1 >> bit) & 1u) << 1)
+                                 | (((p2 >> bit) & 1u) << 2)
+                                 | (((p3 >> bit) & 1u) << 3));
+        }
+        memcpy(dst, line + pan, EGA_WIDTH);
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -797,6 +1027,56 @@ volatile int32_t x86_video_pan = -1;
  * per-frame BDA re-read calls, and clearing VRAM there would wipe the screen of
  * a guest that set the mode by writing the BDA itself.
  */
+/*
+ * Give the planar adapter the storage the mode being adopted needs, and take
+ * back what it does not.
+ *
+ * PEAK DEMAND, NOT SUM. The modes are mutually exclusive -- a guest is in 13h
+ * or 0Dh, never both -- so one 32,768-byte arena block serves whichever is up,
+ * under two different claim ids so a probe can name the holder. With CGA
+ * (32,768) and the 13h aperture (65,536) held out of a 143,360-byte arena there
+ * are 45,056 bytes free, and this is 32,768 of them: 12,288 to spare either way.
+ *
+ *   Mode Y   the 64 KB aperture IS the plane storage (one aliased page), and
+ *            the block is the OFF-SCREEN cache at 0xC300 upward. Losing it is a
+ *            DEGRADATION, not a refusal: offsets with no storage draw nothing,
+ *            which is what an unfitted card does.
+ *   0Dh      the aperture is the CPU read shadow and the block is the planes.
+ *            Losing it IS a refusal -- there is nowhere for a pixel to go.
+ */
+static void planar_storage_follow(uint8_t kind)
+{
+    void *blk = NULL;
+
+    if (kind == VM_EGA4) {
+        x86_arena_release(X86_ARENA_ID_SPARE);
+        x86_vga_modey_set_cache(NULL, 0);
+        if (x86_arena_claim(X86_ARENA_ID_EGA, 1, 4u * X86_EGA_PLANE_OFFSETS,
+                            &blk) == 0)
+            x86_vga_ega_set_planes(blk, X86_EGA_PLANE_OFFSETS);
+        else
+            x86_vga_ega_set_planes(NULL, 0);
+        return;
+    }
+
+    x86_arena_release(X86_ARENA_ID_EGA);
+    x86_vga_ega_set_planes(NULL, 0);
+    if (kind != VM_VGA8) {
+        x86_arena_release(X86_ARENA_ID_SPARE);
+        x86_vga_modey_set_cache(NULL, 0);
+        return;
+    }
+    /* The cache is claimed when 13h is ADOPTED, not when the guest unchains:
+       unchaining happens inside an OUT to 0x3C4 and an arena claim there would
+       put a placement walk on an I/O path, for storage that is only ever needed
+       by a mode already up. */
+    if (x86_arena_claim(X86_ARENA_ID_SPARE, 1, 4u * X86_MODEY_CACHE_OFFSETS,
+                        &blk) == 0)
+        x86_vga_modey_set_cache(blk, X86_MODEY_CACHE_OFFSETS);
+    else
+        x86_vga_modey_set_cache(NULL, 0);
+}
+
 static int mode_select(uint8_t mode)
 {
     const x86_vmode *d = vmode_find(mode);
@@ -806,9 +1086,29 @@ static int mode_select(uint8_t mode)
     }
     if (d == cur_desc && mode == video_mode)
         return 1;
+
+    planar_storage_follow(d->kind);
+    /* Disarm FIRST, unconditionally: leaving Mode Y armed into a text mode set
+       would put every 0xB8000-adjacent store through the adapter. Then arm 0Dh
+       -- and if the adapter cannot take it even now, refuse rather than adopt a
+       mode whose stores have nowhere to land. */
+    x86_vga_modey_arm(0);
+    if (d->kind == VM_EGA4) {
+        if (!x86_vga_planar_arm(1)) {
+            x86_video_log_event(5, mode, video_mode);
+            planar_storage_follow(cur_desc->kind);   /* put the old mode back */
+            return 0;
+        }
+    } else {
+        x86_vga_planar_arm(0);
+    }
+
     x86_video_log_event(1, d->cols, mode);
     cur_desc = d;
     video_mode = mode;
+    /* A real VGA BIOS programs the CRTC on every mode set. Chained 13h does not
+       need it; a title that unchains without setting the Offset itself does. */
+    x86_vga_crtc_preset(mode);
     x86_video_refresh_palette();
     return 1;
 }

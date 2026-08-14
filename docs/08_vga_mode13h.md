@@ -178,57 +178,144 @@ pool took it to **+30,728 bytes**.
 Measure it after any change to the core:
 `arm-none-eabi-nm build/core/dos_core.elf | grep __CORE_BSS_END__`.
 
-## 4. Mode Y (unchained 13h) — scoped, NOT built, and why
+## 4. Mode Y (unchained 13h) and EGA 0Dh — BUILT
 
 Wolfenstein 3-D runs in Mode Y, not chained 13h: Sequencer index 4 bit 3
 (Chain-4) cleared, four planes at 80 bytes per scanline, page flips through the
-CRTC start address at `0x0C`/`0x0D`.
+CRTC start address at `0x0C`/`0x0D`. It is now implemented, together with the
+0Dh planar path it shares a write pipeline with.
 
-The de-interleaving blit would be nearly free — `4*(y*80 + (x>>2)) + (x&3)`
-is exactly `320*y + x`, so at the standard geometry the correct de-interleave
-*is* the linear read this commit already does. **The blit is not the problem.**
+This section previously listed three missing subsystems. All three exist:
 
-What Mode Y actually needs, and what this core does not have:
+| was missing | is now |
+|---|---|
+| a store-side hook | `VGA_ST`/`VGA_LATCH` in `cpu_exec.S` (landed separately) driving `x86_vga_planar_store()` |
+| a Sequencer/CRTC register file with effects | `x86_io.c`'s register file, which was already a faithful store, now feeds `x86_video_planar.c` through `x86_video_planar.h`. Nothing is duplicated |
+| page storage that does not exist | it still does not exist. Pages are FOLDED. See "what that costs" below |
 
-1. **A store-side hook.** Every guest write to `A000:*` must run through the
-   Map Mask, the latches and the write mode. Our VRAM is deliberately plain
-   mapped RAM with **no MMIO path at all** — that is the design property that
-   makes the interpreter fast. There is now a mechanism that could serve
-   (the NOR COW fold traps: an entry with bit 31 set traps to a slow path), but
-   arming it over the aperture puts ~20 instructions of adapter logic on every
-   VRAM store, and the NOR work measured that shape at **6-8x slower** for
-   code pages.
-2. **A Sequencer and CRTC register file.** We model `cga_mode`, `cga_color_select`
-   and a synthetic beam, and nothing else. CRTC `0x0C`/`0x0D` in particular is
-   listed in `STATUS.md` as an open gap: without it a Mode Y title renders a
-   static page 0.
-3. **Page storage that does not exist.** A Mode Y page is still 64,000 bytes;
-   unchaining does not shrink a page, it makes three more addressable. Two real
-   pages are 195,072 B and a full card is 262,144 B, against 45,056 B free in
-   the bonus pool. The reference port folds every plane offset into one page's
-   worth of storage and accepts that a page flip is a no-op — and needed a
-   *learned* page stride (WOLF3D's is 16,640, not 16,384) plus separate
-   off-screen storage at `0xC300` to make even that look right.
+The de-interleaving blit is nearly free, as this section always said:
+`4*(y*80 + (x>>2)) + (x&3)` is exactly `320*y + x`, so at the standard geometry
+the correct de-interleave *is* the linear read. `vga13_blit()` gained only a
+per-row source offset; the chained path is byte-identical and
+`tests/test_video.py` asserts that.
 
-That is three subsystems, not a small addition, and item 3 has no answer here
-at all. **It is correctly a separate piece of work.**
+### Where the code is
+
+| what | where |
+|---|---|
+| the adapter: cell lookup, latches, four write modes, the page fold | `x86_video_planar.c` |
+| the interface, and the rule that no state is held twice | `x86_video_planar.h` |
+| register writes with an effect; the word-`OUT` split | `x86_io.c` |
+| the blits, the arena claims, the mode table | `x86_video.c` |
+| present-on-page-flip | `src/main.c`, `x86_video_page_flip()` |
+| the tier-1 evidence | `tests/test_video.py`, `scripts/run_planar_controls.py` |
+
+### The arena arithmetic that actually held
+
+Modes are mutually exclusive, so the peak demand is the largest mode and not the
+sum. Against a 143,360-byte arena with CGA (32,768) and the 13h aperture
+(65,536) held, 45,056 bytes are free, and one 32,768-byte block serves either
+planar mode — 12,288 to spare, whichever is up:
+
+* **Mode Y**: the 64 KB aperture *is* the plane storage (one aliased page,
+  16,384 plane offsets x 4 = 65,536). The arena block is the OFF-SCREEN cache at
+  `0xC300`, 8,192 plane offsets, claimed under `X86_ARENA_ID_SPARE`.
+* **0Dh**: the aperture's bottom 16 KB is the CPU read shadow, and the arena
+  block is the planes — 8,192 offsets, a 32 KB card, under `X86_ARENA_ID_EGA`.
+
+`vmode_find()` gates 0Dh on `x86_arena_would_fit()`, so the mode is REFUSED
+before it is adopted rather than accepted and not rendered, and the refusal is
+loud: `x86_video_mode_log` tag 5 plus `x86_vga_ega_refused`, with
+`x86_arena_deficit` holding the byte count.
+
+### Two improvements over the reference, both from the hook's shape
+
+1. **Latches are exact for PLAIN reads**, not only for read-modify-writes. The
+   reference is a C interpreter whose read path never surfaced a plain load, so
+   it could only latch from a store's destination. `VGA_LATCH` sits on 47 real
+   load sites and records the window offset of the last guest read in
+   `cpu->vga_latch`, so `mov al,[si] / mov [di],al` — the write-mode-1 block copy
+   that is most of the reason to unchain at all — latches from SI, which is where
+   the hardware latches from. Measured on Wolf3D: 107,721 latch reloads, **zero**
+   misses through the setup and title screens.
+2. **No save/restore dance.** `15-mode-y.md` §5 describes saving the aperture
+   bytes a raw store is about to destroy and putting them back, because in Mode Y
+   the shadow address IS plane storage. Our hook REPLACES the store, so the raw
+   byte is never written and `dos_ega_wr_save[]` has no analogue here. Do not
+   reintroduce it.
+
+### What the fold costs — carried forward verbatim, because these are the record
+
+A Mode Y page is still 64,000 bytes. Unchaining does not shrink a page, it makes
+three more of them addressable. Two real pages is 195,072 B; a full card is
+262,144 B. So every plane offset is folded into one page's worth of storage, and:
+
+* **A page flip is a no-op; pages alias. The artefact is TEARING** — against the
+  four-copy stacked-frame garbage a chained blit produces. Every Mode Y title
+  redraws the whole frame each pass, which is why it double-buffers.
+* **Data reads return the wrong plane in Mode Y.** There is no room for a read
+  shadow, because the planes *are* the aperture, so a guest read of `A000:a`
+  returns `aperture[a]`, i.e. plane `a&3` at plane offset `a>>2`. **Latch loads
+  stay exact**, and latch copies are the idiom that matters; a title that reads
+  pixels back for collision detection would not be served.
+* **`0xE300` upward is discarded.** Measured on the reference: 2,688 of 59,616
+  cache latch loads, all in one cold one-off region, and rebuilding with a 48 KB
+  cache produced a **byte-identical frame**. 8,192 offsets is sufficient, not a
+  compromise.
+* **Do not fix the aliasing without bringing ~192 KB with you.** The sums above
+  are the record that stops that being re-proposed.
+* **Commander Keen 4's level backgrounds need a 256 KB card and are NOT fixable
+  in this device's memory.** Its write high-water is plane offset 65,536, 97.2%
+  of its latch copies source from beyond an 8 KB plane, and nothing between 8 KB
+  and 64 KB per plane buys a partial picture — at 16 KB the frame is *worse* than
+  at 8 KB. **0Dh gets Keen's banner and its menus, not its levels.**
+
+Two further limits are ours rather than the reference's:
+
+* **The default stride is a guess.** 16,640 (80 x 208) is what the one Mode Y
+  title we have uses, and learning is too late for the furniture a title paints
+  before its first flip. A title spacing pages 16,384 apart is displaced until it
+  flips. The durable fix is a per-title `.dosmeta` hint.
+* **The off-screen base assumes THREE pages.** A title that double-buffers and
+  caches two pages up has its cache aliased onto page 3's storage. Nothing
+  observable states the page count.
 
 ## 5. What WOLF3D actually does today — measured
 
-It does not reach video at all, so mode 13h is neither confirmed nor refuted by
-it. Under gwemu, 30 s, `x86_video_mode_log` holds two events for the whole run:
-mode 3 adopted at boot, and the renderer following it into text.
-`x86_vga_dac_writes = 0` — the guest never touches the palette.
+It reaches video, it unchains, and it renders. This section used to say the
+guest never got past a DOS-layer seek defect and that the screen was "black
+before this change and black after it"; that is no longer the state.
 
-Where it stops is in **INT 21h**: `x86_dos_path_log` shows a FindFirst for
-`*.WL1`, and `x86_dos_file_log` is then all 32 slots of **AH=42h (seek)
-returning CF=1, AX=0x0006 "invalid handle"**, repeating forever at 3.0 M
-insn/s. That is a DOS-layer defect, in front of everything this commit touched,
-and it is the same shape as the TOPBENCH `AH=43h` failure: an unserviced or
-mis-serviced call in the *middle* of a sequence is indistinguishable, to the
-guest, from broken hardware.
+Under gwemu, `scripts/probe.py --retrogo`, with the ROM preselected:
 
-**The screen is black before this change and black after it, for that reason.**
-Mode 13h's evidence is `tests/test_video.py`, which is pixel-exact over all
-64,000 pixels plus all 256 CLUT entries — not a screenshot of a guest that
-never gets there.
+| counter | value | what it settles |
+|---|---:|---|
+| `x86_vga_modey_armed` | 1 | the guest cleared Chain-4 and we followed it |
+| `x86_vga_modey_page` | **16,640** | learned from the guest's OWN flips, not assumed |
+| `x86_vga_modey_flips` | 2 | CRTC display-start changes seen |
+| `x86_modey_presents` | 2 | frames painted on a page flip rather than at a frame boundary |
+| `x86_vga_planar_stores` | 136,168 | stores that took the adapter |
+| `x86_vga_latch_loads` / `_miss` | 136,168 / 256 | latch reloads, and how many found no cell |
+| `x86_vga_planar_lost` | 17,920 | stores past the fitted card, discarded rather than aliased |
+
+**16,640 is the whole design confirming itself against the real title.** It is
+the id Galaxy engine's `SCREENSIZE`, it is what the reference measured, and our
+core arrives at it from nothing but the distance between two display starts the
+guest programmed.
+
+`scripts/screenshot.py` through the menus shows the setup screen (the one whose
+off-screen tile cache at `0xC300` produced a band of garbage across the top two
+thirds of the reference's screen before that region got its own storage), the
+title screen, the Options menu and the difficulty screens, all rendering
+correctly. Gameplay itself is past the 60 s timeline cap at gwemu's ~3.0 M
+insn/s — the level load does not finish inside it. That is a speed observation,
+not a rendering one, and the counters above are the evidence that the pipeline
+is live.
+
+**gwemu is still not a witness for what the picture looks like on silicon**
+(`15-mode-y.md` says the same, from the other direction — the reference saw a
+black Wolf3D under gwemu with unmodified baseline sources). The pixel evidence
+is `tests/test_video.py`, which compares all 64,000 pixels for chained 13h, for
+Mode Y and for 0Dh against expectations computed host-side from the pattern, and
+`scripts/run_planar_controls.py`, which requires four negative controls to fail
+and the stride learning to work from a deliberately wrong default.
