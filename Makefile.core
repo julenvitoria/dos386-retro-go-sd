@@ -110,7 +110,16 @@ X86_CS_LOG ?= 0
 # on dma2d_blit_hook(). Build with X86_VIDEO_DMA2D=1 to A/B it on hardware.
 X86_VIDEO_DMA2D ?= 0
 
+# How many EXTRA Mode Y display pages to fund out of donated pager frames, at
+# 65,536 B / 16 frames each. 2 is the hardware layout; 1 still removes the
+# draw-over-displayed hazard and hands 16 frames back to the guest; 0 keeps the
+# aliased fold. The trade is a RENDERING defect against a PAGING one -- see
+# x86_video.c at x86_pager_donate_upto(), and grade any rung on the WOLF3D
+# golden AND x86_vga_modey_alias_hits, never on frame rate alone.
+X86_MODEY_EXTRA_PAGES ?= 2
+
 CORE_C_DEFS := \
+-DX86_MODEY_EXTRA_PAGES=$(X86_MODEY_EXTRA_PAGES) \
 -DX86_VIDEO_DMA2D=$(X86_VIDEO_DMA2D) \
 -DX86_SEAM_FIX=$(X86_SEAM_FIX) \
 -DX86_CODE_THREAD_UNSAFE=$(X86_CODE_THREAD_UNSAFE) \
