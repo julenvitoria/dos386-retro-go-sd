@@ -61,32 +61,24 @@ Ordered within each queue. `STATUS.md` holds the evidence for each; this is the
 list, not the history.
 
 **Queue A — Dark Forces and the memory tier: CLOSED, measured 2026-08-14.**
-Evidence in `STATUS.md`; the verdicts, so they are not re-opened by guess:
-1. ~~Re-measure Dark Forces.~~ Done. It exercises the arena now (48h ×3,
-   4Ah ×15, 49h ×0) and **the arena is correct** — the one refusal is real DOS
-   semantics. DF dies in its FIRST frame slice at `0393:005E` executing its own
-   "Not enough memory" string, exit reason 4, opcode `0x63`.
-2. ~~Decide DPMI/VCPI/XMS.~~ **OUT OF SCOPE.** DF wants ~8 MB against the
-   pager's 160 frames = 640 KB, and the read-mostly premise is dead: WOLF3D
-   `_faults_r=0/_faults_w=104`, KEEN4 `0/134`. **Zero read-only pages in either
-   working set.** Do not half-build DPMI.
-3. Protected mode: **sized, not started** (~1,225 lines of tiny386 C, table in
-   `STATUS.md`; V86 not needed since INT 21h is HLE'd). Gated on a title that
-   needs it AND fits in 640 KB. There is none.
-4. ~~Exercise the pager.~~ Done, WOLF3D and KEEN4: quiet, `_exhausted=0`, peak
-   104/160 and 134/160 frames. **New defect found: eviction is not implemented
-   at all** — eight documented `x86_pg_*` counters and `x86_livemap_holds()`
-   have no callers and are GC'd out of the ELF.
-5. **Keen 4 levels: REACHABLE. The "not fixable" verdict was WRONG and is
-   retracted.** It quoted the prior port's budget (~24.9 KB of headroom, COW
-   spare 0) and not ours. Measured here: the arena is 143,360 B, and KEEN4
-   peaks at **134 of 160 pager frames**, leaving 26 frames = 106,496 B idle.
-   `11-ega-planar.md`'s own table puts a correct picture at 48 KB/plane =
-   196,608 B, so the deficit is 53,248 B = 13 pages against 26 spare. The
-   mechanism is already designed in — `x86_pg_donated` ("frames given to the
-   arena"), `x86_arena_add_region()`, and Phase 3's "borrowed from the guest
-   RAM AXI pool". Being implemented alongside eviction, because donating frames
-   without eviction turns a shortfall into a hard `X86_EXIT_MEM_FAULT`.
+Verdicts only; evidence in `STATUS.md`.
+1. Dark Forces exercises the MCB arena and **the arena is correct** — its one
+   refusal is real DOS semantics. DF dies in its first frame slice.
+2. **DPMI/VCPI/XMS OUT OF SCOPE.** DF wants ~8 MB against 640 KB of frames, and
+   the read-mostly premise is dead: zero read-only pages in WOLF3D's or KEEN4's
+   working set. Do not half-build DPMI.
+3. Protected mode **sized, not started** (~1,225 lines of tiny386 C; V86 not
+   needed since INT 21h is HLE'd). Gated on a title that needs it and fits in
+   640 KB. There is none.
+4. Pager exercised. **Defect found: eviction is not implemented at all** —
+   eight `x86_pg_*` counters and `x86_livemap_holds()` have no callers.
+   Being implemented now.
+5. **Keen 4 levels: REACHABLE — the "not fixable" verdict is RETRACTED.** It
+   quoted the prior port's budget, not ours. 26 spare pager frames (106,496 B)
+   against a 53,248 B deficit to the 48 KB/plane size that renders correctly.
+   `x86_pg_donated` + `x86_arena_add_region()` are the designed-in route.
+   Being implemented with eviction, since donating frames without it turns a
+   shortfall into a hard fault.
 
 **Queue B — the planar store path first, then rendering**
 
@@ -127,9 +119,8 @@ order, each measured:
 5. A/B the DMA2D blit on hardware — merged, off, and unverified.
 6. Retro-go overlay legibility over 256-colour modes.
 
-**Not scheduled, but live:** the planar store path roughly halves the
-interpreter for graphics titles (Wolf3D ~1.4 M ips in Mode Y against ~3.0 M in
-text). Mode Y still paints mid-draw frames (`x86_modey_mid_draw`). VBE 320x240
+**Not scheduled, but live:** Mode Y still paints mid-draw frames
+(`x86_modey_mid_draw`). VBE 320x240
 (`DOS_MODE_VBE240` in the prior port) is the only mode that fills the panel and
 reduces the blit to one memcpy — not ported. All three are bigger than most of
 the list above.
