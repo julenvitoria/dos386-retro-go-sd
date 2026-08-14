@@ -120,6 +120,29 @@ The groundwork Queue A just landed is what makes this a road rather than a wall.
 it was called out of scope on a 640 KB denominator that only existed because
 no pagefile was wired.
 
+### Queued — SylverB's FatFs DMA + SPI perf work
+
+`references/FatFs-DMA` (branch `DMA`, `6d6f6fb`). **The changes are in
+`user_diskio_spi.c` / `user_diskio_softspi.c` — the SD driver, which lives in
+the FIRMWARE, not FatFs core.** Our `lib/FatFs` already matches that tree bar
+`ffconf.h` and one function we added, so this is firmware work we consume.
+
+- `fd1ff62` — bulk `HAL_SPI_TransmitReceive` for 512-byte blocks, **CMD18
+  multi-block reads** with a capability probe, ACMD23 pre-count, CMD17
+  fallback. **Needs no DMA**, and replaces per-sector round trips — plausibly
+  the larger win for our access pattern.
+- `6d6f6fb` — DMA for SD reads, +125 lines.
+
+Why it matters: the pagefile costs **~25 ms per writeback**, XMS measured an
+`fopen`/`fclose` per move costing **31%** of Wolf3D's frame rate, and
+`docs/12` parks the `.dsk` cache in D2 AHB SRAM *specifically* because that is
+the only SRAM DMA1/DMA2 can reach — "against the day SPI1's polled transfer
+becomes a DMA transfer". That day is this branch.
+
+**Both commits are READS.** The pagefile's cost is a write, so measure before
+assuming it helps writeback; it should help disk-heavy titles and XMS-backed
+asset loading either way.
+
 ### Not scheduled, but live
 
 - **VBE 320x240** (`DOS_MODE_VBE240` in the prior port) — the only mode that
