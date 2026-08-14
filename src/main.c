@@ -38,6 +38,7 @@
 #include "x86_cpu.h"
 #include "x86_profile.h"
 #include "x86_zones.h"   /* ZONES: frame-loop phase accounting, X86_ZONES=1 */
+#include "x86_vprof.h"   /* VPROF: video-path cycle attribution, X86_VPROF=1 */
 #include "x86_osk.h"
 #include "x86_arena.h"
 #include "x86_video_planar.h"
@@ -800,6 +801,7 @@ static bool dtcm_state_init(void)
         GW_MEM_OP_ALLOC, GW_MEM_DTC, 1, sizeof(x86_zones_t))) ? 1 : 0;
 #endif
 
+
     /* The pager's per-page state: 8 KB, read on every fault, so DTCM like the
        fold table it sits beside. A failure here is not fatal -- the pager
        simply owns nothing and every guest page stays unmapped -- but it would
@@ -978,6 +980,12 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
     DWT_CTRL |= 1;
 
     core_dtcm_ok = dtcm_state_init() ? 1 : 0;
+
+    /* VPROF needs no allocation -- its accumulators are BSS -- but it does
+       need its own cost measured on THIS target at THIS clock, and it must be
+       measured AFTER DWT_CTRL's counter is enabled above or every bracket
+       reads zero and the instrument silently reports a free video path. */
+    x86_vprof_calibrate(1000u);
 
     const gw_firmware_abi_t *abi = gw_firmware_abi();
 
@@ -2621,6 +2629,11 @@ static void dma2d_sync(void) { }
 
 static void modey_paint_both(const gw_firmware_abi_t *abi)
 {
+    /* VPROF: the PARENT bracket. x86_video_render() and x86_osk_draw() carry
+       their own, so `paint - 2*(render + osk)` is the buffer-address and
+       mode-check work around them. See x86_vprof.h on why these three are
+       deliberately not exclusive. */
+    X86_VPROF_BEGIN(pt);
     for (unsigned which = 0; which < 2; which++) {
         uint8_t *fb = (uint8_t *)(which ? abi->lcd_get_inactive_buffer()
                                         : abi->lcd_get_active_buffer());
@@ -2630,13 +2643,22 @@ static void modey_paint_both(const gw_firmware_abi_t *abi)
         /* Unchained only, so the hook cannot have fired -- but a mode change
            between the two paints is the guest's to make, not ours to assume. */
         dma2d_sync();
-        x86_osk_draw(fb, FRAME_W);
+        {
+            X86_VPROF_BEGIN(ok);
+            x86_osk_draw(fb, FRAME_W);
+            X86_VPROF_END(ok, x86_vprof_osk);
+        }
     }
+    X86_VPROF_END(pt, x86_vprof_paint);
 }
 
 void x86_video_page_flip(void)
 {
 #if X86_MODEY_PRESENT_ON_FLIP
+    /* VPROF: this call is reached from INSIDE x86_cpu_interp_asm(), so every
+       cycle it costs is charged to the GUEST zone by x86_zones.h. That is the
+       whole reason this instrument exists -- see x86_vprof.h. */
+    X86_VPROF_COUNT(x86_vprof_paint_flip);
     modey_paint_both(gw_firmware_abi());
     x86_modey_presents++;
 #endif
@@ -2865,6 +2887,13 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
            see x86_zones.h. Everything from here to X86_ZONE_FRAME_END() that
            is not inside a named zone lands there, on purpose. */
         X86_ZONE_FRAME_BEGIN();
+        /* VPROF: the DENOMINATOR. Every share this instrument reports is a
+           share of MEASURED frame cycles, not of an assumed core clock -- the
+           device is overclocked to a level the core is not told. Honouring the
+           host's reset here, at the boundary, is what keeps a window from
+           opening across a half-open bracket. */
+        x86_vprof_frame_boundary();
+        X86_VPROF_BEGIN(fr);
 
         /* Feed the observer the period we are ACTUALLY running at, smoothed.
            NOT panel_ms_min: that is the shortest iteration ever completed, and
@@ -3261,6 +3290,10 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                repaints unconditionally every frame. */
             if (frame_owes_paint()) {
                 if (x86_vga_is_unchained()) {
+                    /* VPROF: the FALLBACK paint. x86_modey_presents counts
+                       only the guest's own flips, so this is the half of the
+                       paint budget no counter has ever shown. */
+                    X86_VPROF_COUNT(x86_vprof_paint_loop);
                     modey_paint_both(abi);
                     x86_video_modey_presented(0);
                 } else {
@@ -3450,6 +3483,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
 
         /* ZONES: close the frame. Charges the last stretch to the root, which
            is the residual, and closes the frame occurrence. */
+        X86_VPROF_END(fr, x86_vprof_frame);
         X86_ZONE_FRAME_END();
     }
 }

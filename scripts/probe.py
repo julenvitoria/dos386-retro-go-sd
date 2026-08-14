@@ -75,6 +75,20 @@ WATCH_GROUPS = {
         "x86_vga_modey_lost_lo", "x86_vga_modey_lost_hi",
         "x86_vga_ega_card_offsets", "x86_arena_largest",
     ],
+    "vprof": [
+        # X86_VPROF=1 only; reads honest zeroes otherwise, which is
+        # deliberate -- a host that cannot tell "instrument off" from "symbol
+        # missing" is how a measurement gets silently skipped.
+        #
+        # The five ACCUMULATORS are {lo, hi, n, worst} structs and --watch
+        # reads one word, so it shows only `lo`. Read them whole with
+        #   --dump x86_vprof_frame:4x4 --dump x86_vprof_store:4x4 ...
+        # These are the scalars, plus the context needed to trust them.
+        "x86_vprof_paint_flip", "x86_vprof_paint_loop", "x86_vprof_ovh",
+        "x86_modey_presents", "x86_modey_fallbacks", "x86_modey_mid_draw",
+        "x86_vga_modey_armed", "guest_insns_total", "guest_ips_achieved",
+        "guest_fps_achieved", "frames_rendered", "x86_disk_cycles_per_us",
+    ],
 }
 
 def main():

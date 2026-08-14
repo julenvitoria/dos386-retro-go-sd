@@ -35,7 +35,8 @@ lib/FatFs/ffunicode.c \
 x86_disk.c \
 x86_profile.c \
 x86_probe.c \
-x86_zones.c
+x86_zones.c \
+x86_vprof.c
 
 CORE_ASM_SOURCES := \
 cpu_exec.S \
@@ -88,6 +89,14 @@ X86_PROFILE ?= 0
 # per-transition cost and scripts/profile_all.py prints it in the report.
 X86_ZONES ?= 0
 
+# Video-path cycle attribution (x86_vprof.h). Off by default. Brackets the four
+# phases zones cannot see -- the planar store hook and the Mode Y paint, both of
+# which run INSIDE the interpreter and are therefore charged to the GUEST zone.
+# The STORE bracket fires ~180,000 times a second in Mode Y and is the one that
+# perturbs its own measurement; x86_vprof_calibrate reports what a bracket costs
+# and nothing subtracts it. See the header.
+X86_VPROF ?= 0
+
 # Probe accumulator (x86_probe.h): every service and port the guest touched, and
 # HOW we answered -- implemented, stubbed, defaulted or never modelled. Off by
 # default because it emits ~2.8 KB of RAM_EMU storage; it is per-SERVICE-CALL
@@ -138,6 +147,7 @@ CORE_C_DEFS := \
 -DX86_DOS_PSP_SHIFT=$(X86_DOS_PSP_SHIFT) \
 -DX86_PROFILE=$(X86_PROFILE) \
 -DX86_ZONES=$(X86_ZONES) \
+-DX86_VPROF=$(X86_VPROF) \
 -DX86_PROBE=$(X86_PROBE) \
 -DX86_CS_LOG=$(X86_CS_LOG) \
 -DX86_TEXT_AA=$(X86_TEXT_AA) \

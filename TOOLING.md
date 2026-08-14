@@ -847,6 +847,71 @@ python3 scripts/probe.py --retrogo --timeline timelines/start-preselected-game.t
     --watch x86_dma2d_selftest,x86_dma2d_blits,x86_dma2d_fallback
 ```
 
+#### `X86_VPROF=1` — where the cycles go INSIDE the video path
+
+```bash
+make -f Makefile.core clean && make -f Makefile.core pack X86_VPROF=1 X86_ZONES=1
+python3 scripts/probe.py --retrogo --target hardware --no-flash \
+    --timeline timelines/wolf3d-owner.tl --watch vprof,planar \
+    --dump x86_vprof_frame:4x4  --dump x86_vprof_store:4x4 \
+    --dump x86_vprof_paint:4x4  --dump x86_vprof_render:4x4 \
+    --dump x86_vprof_osk:4x4
+```
+
+`--watch vprof` is the group of SCALARS. The five accumulators are
+`{lo, hi, n, worst}` structs, and `--watch` reads one word — so they are read
+with `--dump SYM:4x4`, which is why the command above carries both.
+
+**Neither of the two instruments above can see the Mode Y cost, and that is why
+this exists.** `X86_ZONES` is per-frame, but a Mode Y title paints itself from
+`x86_video_page_flip()`, which is called from **inside the interpreter** — so
+two full 64,000-byte paints per present are charged to the `guest` zone and
+never appear as video at all. `X86_PROFILE` charges cycles to the x86 OPCODE,
+and a `stosw` into the Mode Y aperture is the same opcode as a `stosw` into
+ordinary RAM; the table averages the two into one meaningless mean.
+
+Five DWT brackets, `x86_vprof.h`, storage in `x86_vprof.c` (plain BSS, not
+DTCM — the pool is the scarcest thing in the project):
+
+| accumulator | brackets |
+|---|---|
+| `x86_vprof_frame` | one frame-loop iteration. **The denominator** — every share is against MEASURED cycles, never an assumed core clock, because the device is overclocked to a level the core is not told |
+| `x86_vprof_store` | `x86_vga_planar_store()`, the planar write hook |
+| `x86_vprof_paint` | `modey_paint_both()` — BOTH buffers, render + OSK |
+| `x86_vprof_render` | `x86_video_render()` alone: in Mode Y this IS the de-interleave blit |
+| `x86_vprof_osk` | `x86_osk_draw()` alone |
+
+Each is `{lo, hi, n, worst}` — 64-bit because CYCCNT wraps every ~15 s at
+280 MHz and a 32-bit accumulator would wrap inside a measurement window.
+`worst` is there for the same reason `x86_zones.h` carries one: stutter is a
+tail property and a mean cannot contain it.
+
+**`paint` is a PARENT of `render` and `osk` and they are deliberately NOT
+exclusive**, unlike zones — `paint - 2*(render + osk)` is itself a wanted
+number. `store` is disjoint from `paint`.
+
+Two paint counters, because **`x86_modey_presents` was never the paint count**:
+`x86_vprof_paint_flip` is the guest's own page flips (what `presents` counts)
+and `x86_vprof_paint_loop` is the frame loop's fallback paint, which fires
+whenever `x86_video_modey_paint_due()` runs out of idle frames and which no
+counter showed before. Both call `modey_paint_both()` and both cost two blits.
+
+**Cost, and it is not zero.** `x86_vprof_calibrate()` measures an empty bracket
+pair on the target after `DWT_CTRL` is enabled, and stores it in
+`x86_vprof_ovh`. **Nothing on the target subtracts it** and it is a LOWER bound
+(the calibration loop stays in cache). Four of the five brackets fire tens of
+times a second and are noise; `store` fires ~180,000 times a second in Mode Y
+gameplay and is the one bracket that perturbs its own measurement. Grade the
+perturbation rather than assuming it: quote `guest_ips_achieved` on this build
+against the same workload on a clean one.
+
+`x86_vprof_reset` is the window control — the host writes 1, the target clears
+every accumulator at the next **frame boundary**, so a window never opens
+across a half-open bracket. Link cost measured: ITCM `__CORE_ITCM_CODE_END__`
+0xC938 → 0xC978 (+64 B), `__CORE_BSS_END__` +1,432 B with `X86_ZONES=1` as
+well. **A changed `-D` does not trigger a rebuild — `make -f Makefile.core
+clean` first, always.**
+
 #### The zones, and what each one contains
 
 `X86_ZONES=1`, off by default like every other instrument. The design, the
