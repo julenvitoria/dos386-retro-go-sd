@@ -171,6 +171,19 @@
 uint8_t *x86_vga_planar_aperture;
 
 volatile uint32_t x86_vga_planar_stores;
+/*
+ * Stores by WRITE CLASS. Two jobs, and it needs both.
+ *
+ * On a target it says which idiom a title's frame is actually made of, which
+ * is the only honest way to argue that a fast path is worth its risk. At tier
+ * 1 it is COVERAGE: tests/test_video.py requires all three to be non-zero, so
+ * "Mode Y 64000/64000 exact" is a statement about the fast paths and not only
+ * about the general one that happened to run. A fast path the suite never
+ * enters is a fast path with no oracle, and this area has shipped those.
+ */
+volatile uint32_t x86_vga_planar_cls_plane;
+volatile uint32_t x86_vga_planar_cls_copy;
+volatile uint32_t x86_vga_planar_cls_general;
 volatile uint32_t x86_vga_planar_lost;
 volatile uint32_t x86_vga_modey_flips;
 volatile uint32_t x86_vga_modey_page = X86_MODEY_PAGE0;
@@ -241,6 +254,67 @@ static uint8_t   latch[4];
 #define GC_MODE          gc[5]
 #define GC_COLOR_DC      gc[7]
 #define GC_BIT_MASK      gc[8]
+
+/* ---------------------------------------------------------------------------
+ * THE WRITE CLASS, DECIDED AT `OUT` TIME AND NOT PER STORE.
+ *
+ * The Sequencer and Graphics Controller only change on a port write, and a
+ * guest changes them a few hundred times a frame against a few hundred
+ * THOUSAND stores. The store path was re-reading five registers and branching
+ * on them for every byte: measured under gwemu, WOLF3D's PC lands in
+ * x86_vga_planar_store and its throughput halves the moment Mode Y arms
+ * (11.6 M ips in the menus, 5.35 M in gameplay; on the device 3.0 M against
+ * 1.4 M). So the whole register combination is collapsed into ONE index here,
+ * recomputed only when something that feeds it is written.
+ *
+ * Two classes are worth naming, and they are the two idioms a planar title
+ * actually spends its frame in:
+ *
+ *   PL_COPY   write mode 1, every plane enabled. The latched group goes back
+ *             untouched -- `mov al,[si] / mov [di],al`, the page copy.
+ *   PL_PLANE  write mode 0 with NO Set/Reset, Bit Mask 0xFF, no rotate and no
+ *             ALU. Every plane's output is then just the CPU byte, so the
+ *             store is a masked 32-bit merge of `v` into the enabled planes --
+ *             and, crucially, it does not depend on the latches AT ALL, so it
+ *             can skip latch_reload() and the vga_cell() lookup inside it.
+ *             This is what Wolf3D's compiled scalers do, one plane at a time.
+ *
+ * Anything else is PL_GENERAL and goes through planar_byte() exactly as
+ * before. That is the oracle: tests/test_video.py's Mode Y and 0Dh arms drive
+ * all four write modes, set/reset, the ALU and partial bit masks through the
+ * SAME 64,000 pixels, so a fast path that is wrong for a combination it should
+ * not have claimed shows up as wrong pixels rather than as a silent win.
+ */
+enum { PL_GENERAL = 0, PL_COPY = 1, PL_PLANE = 2 };
+static uint8_t  planar_class = PL_GENERAL;
+static uint32_t planar_plane_mask32;    /* 0xFF per plane the Map Mask enables */
+
+static void planar_reclass(void)
+{
+    uint32_t m = 0;
+    int i;
+
+    for (i = 0; i < 4; i++)
+        if (map_mask & (1u << i))
+            m |= 0xFFu << (8 * i);
+    planar_plane_mask32 = m;
+
+    if ((GC_MODE & 3u) == 1u && map_mask == 0x0Fu) {
+        planar_class = PL_COPY;
+        return;
+    }
+    if ((GC_MODE & 3u) == 0u && GC_EN_SET_RESET == 0u
+        && GC_BIT_MASK == 0xFFu && (GC_ROTATE & 0x1Fu) == 0u) {
+        /* Rotate AND the ALU select both live in GC_ROTATE: bits 2-0 are the
+           rotate count and bits 4-3 the ALU. Testing only the rotate would
+           claim an AND/OR/XOR write for a path that ignores the latch, which
+           is a silent corruption of exactly the kind this area keeps
+           producing. */
+        planar_class = PL_PLANE;
+        return;
+    }
+    planar_class = PL_GENERAL;
+}
 
 int x86_vga_is_unchained(void)   { return (int)x86_vga_modey_armed; }
 int x86_vga_planar_active(void)  { return (int)(x86_vga_modey_armed | x86_vga_ega_armed); }
@@ -552,22 +626,74 @@ void x86_vga_planar_store(uint32_t off, uint32_t val, uint32_t size)
         return;
     }
 
+    /*
+     * FAST PATH 1: the CPU byte straight into the enabled planes.
+     *
+     * Write mode 0, no Set/Reset, Bit Mask 0xFF, no rotate, no ALU -- decided
+     * at OUT time, so this is one load of a byte rather than five register
+     * tests. Every plane's output is then exactly `v`, which means THE LATCHES
+     * DO NOT PARTICIPATE: latch_reload() is skipped entirely, and with it the
+     * vga_cell() lookup and four loads it does. That is the single biggest
+     * item in the old per-store cost, and skipping it is safe because the
+     * latches are reloaded from cpu->vga_latch by whichever later store
+     * actually needs them, not carried between stores.
+     *
+     * Wolf3D's compiled scalers write one plane at a time and this is their
+     * whole inner loop.
+     */
+    if (planar_class == PL_PLANE) {
+        const uint32_t m = planar_plane_mask32;
+        /* A word or dword store is still ONE ADAPTER OPERATION PER BYTE, each
+           with its own cell -- folding them is how a `stosw` comes out half
+           right. But it is the same operation each time, so the loop stays in
+           the fast path rather than falling back to the general pipeline:
+           measured on WOLF3D in gameplay, multi-byte stores were 20% of all
+           planar stores and every one of them was paying the full chain. */
+        for (i = 0; i < size; i++) {
+            uint32_t a = (off + i) & (X86_VGA_APERTURE_BYTES - 1u);
+            uint8_t *p = vga_cell(a);
+            uint32_t q;
+            x86_vga_planar_cls_plane++;
+            if (!p) {
+                modey_lost(a);
+                continue;
+            }
+            /* One masked 32-bit merge over the four interleaved plane bytes
+               rather than a four-way test of the Map Mask. `p` is 4-byte
+               aligned by construction (every cell is `base + 4*a`), but
+               memcpy says so without relying on it. */
+            memcpy(&q, p, 4);
+            q = (q & ~m) | (((val >> (8u * i)) & 0xFFu) * 0x01010101u & m);
+            memcpy(p, &q, 4);
+            if (!x86_vga_modey_armed && a < EGA_SHADOW_OFFSETS)
+                ap[a] = ega_read_byte(a);
+        }
+        return;
+    }
+
     latch_reload();
 
-    /* FAST PATH: write mode 1 with every plane enabled, one byte. That is the
+    /* FAST PATH 2: write mode 1 with every plane enabled, one byte. That is the
        page-copy idiom -- `mov al,[si] / mov [di],al` -- and it is what a Mode Y
        title spends its frame doing, so it is one 32-bit copy of the latched
        group rather than twenty instructions of register file. */
-    if (size == 1u && (GC_MODE & 3u) == 1u && map_mask == 0x0Fu) {
-        uint8_t *p = vga_cell(off);
-        if (!p) {
-            modey_lost(off);
-            return;
+    if (planar_class == PL_COPY) {
+        /* The latches are reloaded ONCE for the instruction, above, exactly as
+           the general path does -- a multi-byte store latches from one source
+           address, not from each destination byte in turn. */
+        for (i = 0; i < size; i++) {
+            uint32_t a = (off + i) & (X86_VGA_APERTURE_BYTES - 1u);
+            uint8_t *p = vga_cell(a);
+            x86_vga_planar_cls_copy++;
+            if (!p) {
+                modey_lost(a);
+                continue;
+            }
+            p[0] = latch[0]; p[1] = latch[1];
+            p[2] = latch[2]; p[3] = latch[3];
+            if (!x86_vga_modey_armed && a < EGA_SHADOW_OFFSETS)
+                ap[a] = ega_read_byte(a);
         }
-        p[0] = latch[0]; p[1] = latch[1];
-        p[2] = latch[2]; p[3] = latch[3];
-        if (!x86_vga_modey_armed && off < EGA_SHADOW_OFFSETS)
-            ap[off] = ega_read_byte(off);
         return;
     }
 
@@ -575,6 +701,7 @@ void x86_vga_planar_store(uint32_t off, uint32_t val, uint32_t size)
        is a separate adapter operation with its own cell, its own Map Mask pass
        and its own Bit Mask merge. Folding them into one is how a `stosw` comes
        out half right. */
+    x86_vga_planar_cls_general++;
     for (i = 0; i < size; i++)
         planar_byte((off + i) & (X86_VGA_APERTURE_BYTES - 1u),
                     (uint8_t)(val >> (8u * i)));
@@ -720,6 +847,7 @@ void x86_vga_planar_seq_write(unsigned idx, uint8_t val)
 {
     if ((idx & 7u) == 2u) {
         map_mask = (uint8_t)(val & 0x0Fu);
+        planar_reclass();
         return;
     }
     if ((idx & 7u) == 4u) {
@@ -738,6 +866,9 @@ void x86_vga_planar_gc_write(unsigned idx, uint8_t val)
     gc[idx] = val;
     if (before == val)
         return;
+    /* Every GC register can move the write class, so this is unconditional --
+       unlike the read-shadow rebuild below, which only four of them affect. */
+    planar_reclass();
     /* Only four registers change what a READ returns, and the rebuild is
        expensive enough that the guard is the point -- see ega_shadow_rebuild().
        2 Colour Compare, 4 Read Map Select, 5 Mode, 7 Colour Don't Care. */

@@ -30,6 +30,82 @@ Failing and pre-existing: `test_screen.py`'s text-mode CLUT assertion (entries
 17-19), and `test_core_retrogo.py`'s blitter/CLUT assertions whenever a real
 `.dsk` is on the card — those expect `demo_guest`'s pattern.
 
+## The planar store path was halving the interpreter — the class is decided at `OUT` time now
+
+WOLF3D's throughput fell off a cliff the moment Mode Y armed, and PC samples
+landed in `x86_vga_planar_store`. Every store to `A000:*` re-read five
+Sequencer/GC registers, branched on them, reloaded the latches (a `vga_cell()`
+lookup and four loads) and ran a four-way Map Mask pass — for what is usually
+one byte into one plane.
+
+**Those registers only change on a port write**, a few hundred times a frame
+against a few hundred thousand stores, so the whole combination is collapsed
+into one index in `planar_reclass()`, called from the Sequencer and GC write
+hooks that already live in `x86_video_planar.c`. Two classes are worth naming:
+
+* `PL_PLANE` — write mode 0, no Set/Reset, Bit Mask `0xFF`, no rotate, no ALU.
+  Every plane's output is then exactly the CPU byte, so the store is a masked
+  32-bit merge into the enabled planes and **the latches do not participate at
+  all** — `latch_reload()` and its `vga_cell()` lookup are skipped. This is
+  Wolf3D's compiled scalers, one plane at a time, and it is the common case.
+* `PL_COPY` — write mode 1, every plane enabled: the latched group back
+  untouched. The page copy, which already had a fast path.
+
+Both take multi-byte stores too, as a loop of the same operation. That was
+worth doing on its own: multi-byte stores were **20% of every planar store**
+in gameplay and each was falling back to the full pipeline.
+
+**Measured under gwemu, WOLF3D, `timelines/wolf3d-ingame.tl`, same host,
+back to back** (`probe.py --watch planar`):
+
+| at t+24 s | before | after |
+|---|---|---|
+| `guest_ips_achieved` | 5,348,948 | **8.29 M – 9.25 M** (+55% to +73%) |
+| `guest_insns_total` | 250,461,950 | **299.4 M – 302.3 M** (+19.5% to +20.7%) |
+| `x86_vga_planar_cls_general` | (all of them) | **0** |
+| PC samples | `x86_vga_planar_store+0x26c` | back in the ITCM interpreter |
+
+`ips` is noisy under gwemu because it is host-bound; `guest_insns_total` at a
+fixed wall clock is the stable half, and both runs agree. `cls_general` at 0
+is the strong statement: every planar store WOLF3D makes now takes a fast path.
+
+**The picture is bit-identical, and that is checked rather than eyeballed.**
+The golden gate reports 0 of 76,800 pixels changed for WOLF3D's Mode Y screen
+and for ALLEYCAT; the gameplay frame at 44 s is unchanged too. That is the
+first time this project has been able to make that claim about a rendering
+optimisation.
+
+**Every fast path has the general path as its oracle, and the suite proves it
+ENTERS them.** `x86_vga_planar_cls_*` is reset per arm and
+`tests/test_video.py` fails if a class is never taken: the Mode Y arm requires
+`plane` and `copy` (36,000 and 6,000 of its 42,000 stores), and the 0Dh arm
+requires `general` (4,400), because 0Dh is where Set/Reset, the ALU, write
+modes 2 and 3 and partial Bit Masks are driven — exactly the combinations
+`planar_reclass()` must never claim. Both arms stay at 64,000/64,000 exact.
+
+**Still open.** B0.3, inlining the hot case into the `VGA_ST` stub, collides
+with a documented invariant: `vga_cell()` is deliberately the ONE place that
+says where a plane byte lives, and in Mode Y it is a three-page fold against a
+learned stride plus an off-screen cache lookup — not a couple of instructions,
+and forking it into assembly is the thing the reference deleted two helpers to
+stop. B0.4, a batched planar `REP`, is the next real lever: `.str_exit` already
+re-enters the string handler without a fetch, but each element still pays its
+own hook and C call, and batching them means touching the REP machinery whose
+per-element PIT accounting and sampler determinism are load-bearing.
+
+**To confirm on silicon** (the numbers above are gwemu; only the device sees
+the pipeline):
+
+```bash
+python3 scripts/probe.py --target hardware --wait-magic \
+    --timeline timelines/wolf3d-ingame.tl --samples 4 --interval 8 \
+    --watch planar
+python3 scripts/profile_opcodes.py --retrogo --target hardware \
+    --settle 20 --window 25
+```
+
+The baseline to beat there is **~1.4 M ips in Mode Y against ~3.0 M in text**.
+
 ## The suite can see a picture now, and the first thing it saw was Keen
 
 `scripts/golden_screens.py check` boots a title, reconstructs what the LTDC is

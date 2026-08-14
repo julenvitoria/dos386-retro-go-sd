@@ -60,6 +60,21 @@ WATCH_GROUPS = {
         # the loud failures
         "x86_nor_cow_failures", "x86_nor_unmapped",
     ],
+    "planar": [
+        # is a planar mode up at all, and what is it costing
+        "x86_video_mode_byte", "x86_vga_modey_armed", "x86_vga_ega_armed",
+        "guest_ips_achieved", "guest_insns_total",
+        # the store path: volume, and the write-class MIX that decides whether
+        # a fast path is earning its risk. cls_general is the one to watch --
+        # it is the only class that still pays the full pipeline
+        "x86_vga_planar_stores", "x86_vga_planar_cls_plane",
+        "x86_vga_planar_cls_copy", "x86_vga_planar_cls_general",
+        # storage: what was discarded, and how far past the end it went
+        "x86_vga_planar_lost", "x86_vga_latch_miss",
+        "x86_vga_modey_cache_offs", "x86_vga_modey_lost_cache",
+        "x86_vga_modey_lost_lo", "x86_vga_modey_lost_hi",
+        "x86_vga_ega_card_offsets", "x86_arena_largest",
+    ],
 }
 
 def main():

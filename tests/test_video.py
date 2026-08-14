@@ -897,14 +897,32 @@ def modey_checks(b, syms, quiet=False):
                      tries=600):
         return False
 
-    r = [b.read_uint32(syms["planar_r"] + 4 * i) for i in range(12)]
+    r = [b.read_uint32(syms["planar_r"] + 4 * i) for i in range(20)]
     mode, bda, unchained, page = r[0], r[1], r[2], r[3]
     stores, lost, flips = r[4], r[5], r[6]
     say(f"  mode={mode:#04x} bda449={bda:#04x} unchained={unchained} "
         f"page={page} stores={stores} lost={lost} flips={flips} "
         f"latch={r[8]}/{r[9]} exit={r[7]:#x}")
+    say(f"  write classes: plane={r[16]} copy={r[17]} general={r[18]}")
 
     ok = True
+    # COVERAGE, and it gates. The store path has two fast classes decided at
+    # OUT time; if this guest program never entered one of them, then
+    # "64000/64000 exact" says nothing about it and the fast path has no
+    # oracle. A fast path with no oracle is how a wrong register combination
+    # becomes silent corruption, which is the failure this area repeats.
+    # This arm is where the two FAST classes are graded -- a Mode Y title's
+    # frame is made of exactly these two idioms and nothing else, which is why
+    # `general` is 0 here and is graded by the EGA 0Dh arm instead.
+    for name, n in (("plane", r[16]), ("copy", r[17])):
+        if n == 0:
+            print(f"FAIL: not one store took the '{name}' write class, so the "
+                  f"64,000-pixel comparison does not grade it. Either the "
+                  f"guest program stopped exercising that idiom or the "
+                  f"classification in planar_reclass() no longer selects it. "
+                  f"A fast path with no oracle is how a wrong register "
+                  f"combination becomes silent corruption.")
+            ok = False
     if mode != 0x13 or bda != 0x13:
         print(f"FAIL: mode 13h was never adopted (mode {mode:#x}, BDA {bda:#x})")
         ok = False
@@ -1190,9 +1208,22 @@ def ega_checks(b, syms):
                      tries=600):
         return False
 
-    r = [b.read_uint32(syms["planar_r"] + 4 * i) for i in range(12)]
+    r = [b.read_uint32(syms["planar_r"] + 4 * i) for i in range(20)]
     print(f"  mode={r[0]:#04x} bda449={r[1]:#04x} ega_armed={r[10]} "
           f"stores={r[4]} lost={r[5]} arena_free={r[11]} exit={r[7]:#x}")
+    print(f"  write classes: plane={r[16]} copy={r[17]} general={r[18]}")
+    # THE GENERAL PATH'S coverage lives here, not in the Mode Y arm: 0Dh is
+    # where set/reset, the ALU, write modes 2 and 3 and partial Bit Masks are
+    # driven, and those are precisely the combinations planar_reclass() must
+    # NOT claim for a fast path. A zero here would mean the classification had
+    # started claiming them, and the pixels would be the only thing left to
+    # notice -- which is the same as noticing nothing until a title breaks.
+    if r[18] == 0:
+        print("FAIL: not one store took the 'general' write class. 0Dh drives "
+              "set/reset, the ALU and partial bit masks, and planar_reclass() "
+              "must never claim those for a fast path -- a 0 here means it "
+              "just did.")
+        return False
     if r[0] != 0x0D or r[1] != 0x0D:
         print(f"FAIL: mode 0Dh was not adopted (mode {r[0]:#x}, BDA {r[1]:#x}). "
               f"If the arena could not place 32,768 bytes the mode is REFUSED, "

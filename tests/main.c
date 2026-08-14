@@ -221,7 +221,7 @@ volatile uint32_t text_scroll_arg = 0;      /* (attr << 8) | lines */
  */
 #define PLANAR_CODE_BASE 0x3000u
 volatile uint32_t run_planar_flag = 0;
-volatile uint32_t planar_r[16];
+volatile uint32_t planar_r[20];
 
 /*
  * MODE Y PRESENTATION POLICY -- which frames the loop paints.
@@ -575,8 +575,14 @@ static void planar_test_init(void)
     x86_arena_add_region(arena_test_mem, 8u * 4096u);
     x86_bios_init();
     x86_hle_install(hle_vectors, sizeof(hle_vectors));
-    for (unsigned i = 0; i < 12; i++)
+    for (unsigned i = 0; i < 20; i++)
         planar_r[i] = 0;
+    /* Reset the write-class mix with the arm, not with the process: the
+       coverage assertion is about the stores THIS arm makes, and an earlier
+       arm's leftovers would make it pass without entering anything. */
+    x86_vga_planar_cls_plane = 0;
+    x86_vga_planar_cls_copy = 0;
+    x86_vga_planar_cls_general = 0;
 }
 
 static void planar_test_run(void)
@@ -602,6 +608,12 @@ static void planar_test_run(void)
     planar_r[13] = x86_vga_modey_lost_cache;
     planar_r[14] = x86_vga_modey_lost_hi;
     planar_r[15] = x86_vga_modey_lost_lo;
+    /* Write-class mix. The host asserts all three are non-zero: that is what
+       makes "64000/64000 exact" a statement about the two FAST paths and not
+       only about the general one. */
+    planar_r[16] = x86_vga_planar_cls_plane;
+    planar_r[17] = x86_vga_planar_cls_copy;
+    planar_r[18] = x86_vga_planar_cls_general;
 }
 
 /*

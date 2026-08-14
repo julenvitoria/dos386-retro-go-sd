@@ -74,26 +74,27 @@ list, not the history.
    Recorded so it is not re-proposed.
 
 **Queue B — rendering, then the interpreter**
-1. ~~A **golden-screenshot gate** with programmatic comparison.~~ **DONE**:
-   `scripts/golden_screens.py` + `tests/test_goldens.py`. WOLF3D (Mode Y) and
-   ALLEYCAT (CGA) bit-exact; KEEN4 (EGA 0Dh) recorded `known_bad`.
-2. ~~Wolf3D's off-screen VRAM cache is too small.~~ **DONE**: fitted from the
-   arena, 8,192 -> 15,616 offsets, the whole `0xC300..0xFFFF` window;
-   `lost_cache` 16,896 -> 0. Not confirmed by picture — gwemu never showed the
-   corruption, so the device is the only witness left.
+0. ~~The planar store path halves the interpreter.~~ **MOSTLY DONE**: the write
+   class is decided at `OUT` time; the two dominant idioms have fast paths.
+   gwemu WOLF3D t+24 s: ips 5.35 M -> 8.3-9.2 M, `cls_general` -> 0, picture
+   bit-identical. Left: B0.3 (collides with the `vga_cell()` single-definition
+   invariant) and B0.4 (batched planar `REP`). Confirm on hardware: `STATUS.md`.
+1. ~~A **golden-screenshot gate**.~~ **DONE**: `scripts/golden_screens.py` +
+   `tests/test_goldens.py`. WOLF3D (Mode Y) and ALLEYCAT (CGA) bit-exact;
+   KEEN4 (EGA 0Dh) recorded `known_bad`.
+2. ~~Wolf3D's off-screen cache too small.~~ **DONE**: fitted from the arena,
+   8,192 -> 15,616 offsets, the whole `0xC300..0xFFFF`; `lost_cache` 16,896
+   -> 0. Not confirmed by picture — gwemu never showed the corruption.
 3. Fold-trap the VGA aperture check (~80 sites x 4 instructions) so non-planar
    titles pay nothing. **Now also blocks item 4**: for 0Dh the 64 KB aperture
    claim is only a CPU READ SHADOW, and trapping reads would free it.
-4. Keen's watchdog reset and the clipped intro. **DIAGNOSED, prediction was
-   WRONG**: the intro does not widen the Offset. Measured `crtc_offset=0x20`
-   (pitch 64) with `crtc_start=15360` against a 19,456-offset card, so
-   `(19456-15360)/64` = exactly the 64 rows that render. 200 rows need
-   `15360 + 200*64` = 28,160 offsets = 112,640 B against the 77,824 fitted;
-   the aperture holds the other 65,536 (see item 3).
+4. Keen's watchdog reset and the clipped intro. **DIAGNOSED, prediction WRONG**
+   — the intro does not widen the Offset. Measured `crtc_offset=0x20` (pitch
+   64), `crtc_start=15360`, card 19,456: `(19456-15360)/64` = exactly the 64
+   rows that render. 200 rows need 28,160 offsets = 112,640 B against 77,824
+   fitted; the aperture holds the other 65,536 (see item 3).
 5. A/B the DMA2D blit on hardware — merged, off, and unverified.
 6. Retro-go overlay legibility over 256-colour modes.
 
-**Not scheduled, but live:** the planar store path roughly halves the
-interpreter for graphics titles (Wolf3D ~1.4 M ips in Mode Y against ~3.0 M in
-text). Mode Y still paints mid-draw frames in gameplay
-(`x86_modey_mid_draw`). Both are bigger than most of the above.
+**Not scheduled, but live:** Mode Y still paints mid-draw frames in gameplay
+(`x86_modey_mid_draw`).

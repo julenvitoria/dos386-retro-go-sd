@@ -137,6 +137,13 @@ extern volatile uint32_t x86_modey_mid_draw_max;
 
 /* ---- host-visible witnesses; all of this is the deliverable -------------- */
 extern volatile uint32_t x86_vga_planar_stores;   /* stores that took the hook */
+/* Stores by write class: the CPU byte straight into the enabled planes, the
+   write-mode-1 latched page copy, and everything else. The mix is what says
+   whether a title's frame is worth a fast path, and at tier 1 it is the
+   coverage proof that the pixel arms enter all three. */
+extern volatile uint32_t x86_vga_planar_cls_plane;
+extern volatile uint32_t x86_vga_planar_cls_copy;
+extern volatile uint32_t x86_vga_planar_cls_general;
 extern volatile uint32_t x86_vga_planar_lost;     /* stores with no storage    */
 extern volatile uint32_t x86_vga_modey_flips;     /* display-start changes     */
 extern volatile uint32_t x86_vga_modey_page;      /* the learned page stride   */
