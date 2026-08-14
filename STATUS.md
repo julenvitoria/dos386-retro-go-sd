@@ -520,6 +520,48 @@ than a regression.
 - [ ] Gate: measure DOS FAT/sector overhead → decide the INT 21h fast path
 - [ ] Protected mode: descriptors, far transfers, IRET privilege change, paging
 - [ ] Profile-directed tuning against a Wolf3D DWT profile
+
+### Where Wolf3D stops, located to one predicate — and four claims withdrawn
+
+The guest runs **healthy for 2.64 M of 2.65 M instructions** (SP flat at 0xFFB8
+for 525 k of them) and then derails in the **last 1,532**. Found with the
+predicate traps in `x86_trace.inc`, not by sampling — see `TOOLING.md`.
+
+```
+0x18D14  CALL FAR 1A38:1739 -> SD_SoundPlaying(); AX = 0 on ALL 64 sampled passes
+0x1BAB9  reads SoundMode [0x9265], compares 1 (sdm_PC) and 2 (sdm_AdLib):
+         neither, so DX stays 0 and it returns 0
+0x18D20  `jz` therefore always taken -> 0x18D49 -> CALL FAR SD_StopSound(),
+         re-entered without returning, ~0x52 bytes of stack leaked per pass
+         until a RETF pops a saved SI (0x0018) as a return address -> linear 0x18
+```
+
+**SoundMode is 0 because sound was never started, and that is a SYMPTOM.** The
+IVT shows Wolf3D has hooked **only INT 34h-3Eh**, the Borland FP emulator, and
+**ports 0x388/0x220 are never touched**. So `SDL_SetTimer0()` (which hooks
+INT 08h) and `SDL_DetectAdLib()` have not run: the guest is stuck **inside
+`SD_Startup()`**, past video (mode 13h + two DAC palettes) and before sound.
+
+Four things this investigation asserted and measurement then withdrew — each
+cost a round, and all four are the same mistake, trusting an instrument:
+
+1. **"A 500 k-instruction SP runaway."** An artefact of a sampler whose index
+   counted DISPATCHES (a batched `REP` element bypasses `.resume_fetch`), plus
+   reading its unfilled slots as zeros. SP is flat until the last 0.5%.
+2. **"A rel16/rel32 displacement defect."** `E8`/`E9`/`0F 8x` all use the width
+   macros, and both measured off-by-2 transfers did their arithmetic correctly
+   — they were ENTERED late by an indirect transfer.
+3. **"A RETF width defect."** RETF popped exactly what was on the stack
+   (IP=0x0018, CS=0x0000); the words were already wrong.
+4. **"Nothing writes SoundMode."** A second writer exists at 0x1B47F
+   (`89 36 65 92`, `SD_SetSoundMode`) and it is **guarded** by
+   `cmp si,[0x9265] / jz`, so a call with `sdm_Off` while it is already 0 skips
+   the store. A zero hit count there proves nothing.
+
+**The reference (`scripts/ref_dos.py`, QEMU booting the shipped .dsk) also does
+not reach the menu** — it sits in a TimeCount wait at our-linear 0x1E066 with
+INT 08h still owned by DOS. Until it does, there is no oracle for this point,
+and getting it there is the highest-value next step.
 ## TOPBENCH — running, scoring, screenshotted
 
 The 4 px cell is an **Everex Micro Enhancer 5x8** face squeezed to 4, not a
