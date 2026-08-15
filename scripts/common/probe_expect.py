@@ -233,6 +233,18 @@ INT = {
     (0x21, 0x49): _e("implemented", "free memory"),
     (0x21, 0x4A): _e("implemented", "resize memory block"),
     (0x21, 0x4C): _e("implemented", "terminate with return code"),
+    # AH=52h is PARTIAL and the distinction matters to whoever reads this row:
+    # the pointer and the first-MCB word at -2 are real, and the DPB, SFT,
+    # CLOCK$, CON, buffer and CDS chains are deliberately 0xFFFF:0xFFFF, DOS's
+    # end-of-chain marker. A guest that WALKS one stops; a guest that INDEXES
+    # one faults. Neither is a fabricated structure, which is the point.
+    (0x21, 0x52): _e("partial",
+                     "list of lists (SysVars): ES:BX -> a real block with the "
+                     "first MCB at -2; the DPB/SFT/CLOCK$/CON/buffer/CDS "
+                     "chains are marked absent rather than invented"),
+    (0x21, 0x29): _e("implemented",
+                     "parse filename into FCB, per MS-DOS MakeFcb: AL = 0 / 1 "
+                     "(wildcards) / 0xFF (bad drive), and SI advanced"),
     (0x21, 0x4E): _e("implemented", "find first"),
     (0x21, 0x4F): _e("implemented", "find next"),
     (0x21, 0x56): _e("implemented", "rename"),

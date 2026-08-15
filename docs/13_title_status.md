@@ -186,6 +186,78 @@ Two errors produced the wrong verdict, and both are the same shape:
 > hardware.** Re-measure before concluding anything is impossible. This cost a
 > wrong "impossible" once and a wrong "38% idle" the same day.
 
+## Star Wars: Dark Forces — MEASURED 2026-08-15 (THIRD PASS): AH=52h/29h are IN, and the extender now runs its MEMORY HUNT
+
+`INT 21h AH=52h` (list of lists) and `AH=29h` (parse filename into FCB) are now
+implemented in `x86_dos.c`. The second pass below named them as the suspects and
+said the way to grade them was whether the far jump moved. **It did not move —
+it disappeared.**
+
+Same command, same flags, same 30 s window
+(`probe_report.py --title darkforces --core-flag X86_DOS_EXEC=1 --skip-cost`),
+plus a direct `probe.py` sample of `cpu_state_ptr` for the exit state.
+
+**The control was run, and it matters.** The instrumented build reads
+`guest_ram_pages=158`, `guest_ram_pages_short=2` — and so does the SAME build
+with `x86_dos.c`, `x86_cpu.h` and `x86_hle.c` reverted to master
+(`git checkout master -- …`, rebuilt clean, re-measured). `guest_ram_free_at_claim`
+is **651,264 on both**. So the two lost frames are the instrument's, already
+present on master, and **this change costs zero pager frames**. The baseline run
+reproduced the second pass exactly: `guest_exit_reason=4`, 269,100 insns. Every
+difference below is therefore attributable to the two new calls and to nothing
+else.
+
+**Both calls are answered.** `x86_dos_sysvars_calls=2`, `x86_dos_parse_calls=2`,
+both `CF=0`; `AH=52h` returns `ES:BX = 0050:0022`.
+
+**THE FAR JUMP INTO UNWRITTEN MEMORY IS GONE.** It used to die at linear
+0x3E0C3, ~0x2E800 bytes past the image, executing `0xFF` filler. It now dies at
+`CS:EIP = 023E:0C24` = linear **0x02FC4**, which is **inside the DOS4GW image**
+(seg 0x81, 61,604 B, spanning 0x810..0xF6F4). It is executing the extender's own
+code instead of blank memory.
+
+**And it has reached a phase it had never reached.** The second pass recorded
+that it asked "NOTHING about DPMI, VCPI or XMS". It now asks for all of the
+first two, in order:
+
+| probe | × | we answered |
+|---|---:|---|
+| `INT 2Fh AX=1687h` | 1 | **DPMI** — AX left non-zero, i.e. "not present" |
+| `INT 67h AH=DEh` | 2 | **VCPI** — AH=0x84, "function not supported" |
+| `INT 67h AH=43h` / `AH=45h` | 1 each | EMS allocate / free |
+| `INT 15h AH=BFh AL=DEh` | 2 | unanswered (INT 15h is not even installed) |
+| `INT 15h AH=C0h` | 1 | unanswered — get system configuration |
+| `INT 21h AH=38h` | 1 | unanswered — get country info |
+
+**THE NEXT BLOCKER, and it is mechanically explained, not guessed.** Told no by
+DPMI, VCPI and INT 15h, the extender goes looking for extended memory itself:
+
+* it opens A20 through the fast gate — the port log shows `OUT 0x92, 0x02` and
+  `IN 0x92`, and `x86_a20_state=1` with `x86_a20_changes=1`, exactly one real
+  transition;
+* it loads **`ES=0xFFFF`** (register file at the exit: `ES=0xFFFF`, `DX=0xFFFF`,
+  `AX=0x0002` — the value it just wrote to port 0x92);
+* and it reads over the 1 MB line. `ES=0xFFFF` reaches linear 0x100000 and up.
+
+There is nothing there. `x86_mem_wrap_1mb()` aliases 0x100000-0x110000 onto the
+low 64 KB **only while A20 is MASKED** (`x86_cpu.h`, `X86_HMA_FIRST_PAGE`), and
+the guest has just unmasked it; the pager owns `x86_pager_own(0, GUEST_RAM_SIZE
+/ 4096)` = **640 KB** (`src/main.c:100,1885`). So the fold entry is invalid and
+the access takes `X86_EXIT_MEM_FAULT`. **`guest_exit_reason=5`.**
+
+**IT IS NOT THE WOLF3D MEMORY WALL, which is the other thing reason 5 means.**
+`x86_pg_exhausted=0`, `x86_pg_evictions=0`, `x86_dos_load_shorts=0`,
+`x86_map_failures=0`. Nothing was refused for want of a frame; the address was
+never ownable in the first place.
+
+**`CR0=0`. STILL REAL MODE.** The descriptor walk built in `docs/14` remains
+completely unexercised by this title — the claim was tested here rather than
+assumed, and it still holds. `x86_xms_detects=0`: XMS is never asked either, so
+answering the HMA is upstream of every memory-manager question, not downstream
+of one.
+
+### The second pass, which named AH=52h/29h (superseded by the above)
+
 ## Star Wars: Dark Forces — MEASURED 2026-08-15 (SECOND PASS): AL=03h is IN, DOS4GW loads whole, and it dies past it
 
 `INT 21h AH=4Bh AL=03h` (LOAD OVERLAY) is now implemented in `x86_dos.c`, and
