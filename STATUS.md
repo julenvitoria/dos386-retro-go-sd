@@ -83,31 +83,23 @@ mid-`REP`, so the decision is resolvable once), aperture reads (~4.5%), the
 | Retro-go's Pause overlay is unreadable over 256-colour modes | [`docs/08`](docs/08_vga_mode13h.md) §1 |
 | **Interpreter gaps**: seg override before `REP` survives one element; `moffs` uses operand not ADDRESS size; `MOV SS,x` does not inhibit interrupts; 5 handlers ignore `0x67`; 13 slots exit (x87, `BOUND`/`ARPL`, `XLAT`, `WAIT`, `INT1`) | [`docs/07`](docs/07_opcode_coverage.md) |
 
-## Protected mode — the descriptor walk is IN, and real mode pays NOTHING
+## Protected mode — the descriptor walk is IN, real mode pays NOTHING
 
-`CR0.PE` no longer traps out. `LGDT`/`LIDT`/`LLDT`, the GDT/LDT fetch, the
-type/DPL/present rules with the right vector and error code, the cached
-per-segment descriptor, `CR0.PE` both ways, a same-privilege far JMP.
-`tests/test_pmode.py` **80 checks**; `scripts/run_pmode_controls.py` shows
-**10/10 checks FAILING when compiled out**.
-
-Zero real-mode cost is proven by DISASSEMBLY DIFF, not argued: `.fetch_decode_loop`
-and every `.op_*` handler **byte-identical**; `L(SET_SREG)`'s real-mode arm one
-`STRH`->`STR` (same cost, fixes a stale-flags bug); `x86_cpu_interp_asm` +2
-instructions per interp CALL, `.save_state_and_exit` +1 per EXIT.
-**`test_benchmark` cannot decide this** — under gwemu it spans 10.30-11.88 M
-cycles *on the baseline alone*. NOT built: gates, `IRET` across privilege,
-stack switches, paging, per-access limit enforcement.
-[`docs/14`](docs/14_protected_mode.md).
+`CR0.PE` no longer traps out: `LGDT`/`LIDT`/`LLDT`, GDT/LDT fetch, type/DPL/
+present with the right vector and error code, cached per-segment descriptor,
+`CR0.PE` both ways, same-privilege far JMP. `test_pmode.py` **80 checks**;
+`run_pmode_controls.py` **10/10 seen to fail** when compiled out. Zero
+real-mode cost proven by DISASSEMBLY DIFF, not argued — `.fetch_decode_loop`
+and every `.op_*` handler byte-identical. **`test_benchmark` cannot decide
+this**: under gwemu it spans 10.30–11.88 M cycles on the BASELINE alone. NOT
+built: gates, `IRET` across privilege, stack switches, paging, per-access limit
+enforcement. [`docs/14`](docs/14_protected_mode.md).
 
 ## Retractions worth keeping
 
 One line each; their value is stopping a wrong answer being re-derived.
 
-- **`references/tiny386` HAS NO PROTECTED-MODE PERMISSION CHECKS.** `set_seg()`
-  (i386.c:1076) carries `// TODO: various permission checks` and does no
-  DPL/RPL/CPL validation. Right SHAPE, wrong RULES; DOSBox-X's
-  `CPU_SetSegGeneral` (src/cpu/cpu.cpp:2976) is the authority on the rules.
+- **`references/tiny386` HAS NO PROTECTED-MODE PERMISSION CHECKS.** `set_seg()` (i386.c:1076) carries `// TODO: various permission checks` and does no DPL/RPL/CPL validation. Right SHAPE, wrong RULES; DOSBox-X's `CPU_SetSegGeneral` (src/cpu/cpu.cpp:2976) is the authority on the rules.
 - **ALLEYCAT's golden 0.874% is NOT a palette bug.** Owner-confirmed: the cat moves and the capture never lands twice on one frame; its mask is too narrow for that travel.
 - **Keen 4's levels are NOT impossible.** The verdict quoted the prior port's budget as if it were this hardware's. [`docs/13`](docs/13_title_status.md).
 - **Do not derive the frame period from `guest_fps_achieved`.** It is a runaway: overrun lowers fps, raising the period, raising the budget. [`docs/09`](docs/09_frame_pacing_and_clocks.md) §2.
