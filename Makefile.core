@@ -108,6 +108,13 @@ X86_ZONES ?= 0
 # and nothing subtracts it. See the header.
 X86_VPROF ?= 0
 
+# EGA read-shadow rebuild instrument (x86_video_planar.c). Off by default, and
+# SEPARATE from X86_VPROF because X86_VPROF=1 no longer fits: it adds ~1,080 B
+# to RAM_EMU, guest_ram comes back NULL and core_ready stays 0 with no message
+# (reproduced on stock master, KEEN4, tier 2). Five words of bss and one DWT
+# bracket around ega_shadow_rebuild(), which is the KEEN4-wedge suspect.
+X86_EGA_SHPROF ?= 0
+
 # Probe accumulator (x86_probe.h): every service and port the guest touched, and
 # HOW we answered -- implemented, stubbed, defaulted or never modelled. Off by
 # default because it emits ~2.8 KB of RAM_EMU storage; it is per-SERVICE-CALL
@@ -178,6 +185,7 @@ CORE_C_DEFS := \
 -DX86_PROFILE=$(X86_PROFILE) \
 -DX86_ZONES=$(X86_ZONES) \
 -DX86_VPROF=$(X86_VPROF) \
+-DX86_EGA_SHPROF=$(X86_EGA_SHPROF) \
 -DX86_PROBE=$(X86_PROBE) \
 -DX86_PROBE_ENTS=$(X86_PROBE_ENTS) \
 -DX86_CS_LOG=$(X86_CS_LOG) \

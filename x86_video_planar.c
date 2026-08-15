@@ -623,6 +623,116 @@ static uint8_t ega_read_byte(uint32_t a)
  */
 #define EGA_SHADOW_OFFSETS  0x4000u     /* 16 KB, the CPU-visible window */
 
+/* ---------------------------------------------------------------------------
+ * X86_EGA_SHPROF=1 -- the EGA read-shadow rebuild instrument. OFF by default.
+ *
+ * WHY NOT x86_vprof.h, WHICH ALREADY HAS DWT BRACKETS AND A WINDOW CONTROL.
+ * Because X86_VPROF=1 DOES NOT FIT any more, and it fails SILENTLY in exactly
+ * the way STATUS.md warns about: the flag adds ~1,080 B of code+bss to
+ * RAM_EMU, guest_ram then comes back NULL, core_ready stays 0,
+ * guest_insns_total stays 0 and the frame loop runs on painting nothing. That
+ * was reproduced at tier 2 on STOCK master with no local changes (KEEN4:
+ * core_ready=0 at X86_VPROF=1, core_ready=1 and 157 M insns at X86_VPROF=0),
+ * so it is not this branch's doing -- but it does mean the whole instrument
+ * cannot be switched on to measure one function.
+ *
+ * So this is the same two-CYCCNT-reads bracket in five words of bss and one
+ * call site. Same wrapping rule as x86_vprof.h: CYCCNT is 32-bit and wraps
+ * every ~15 s at 280 MHz, so a DELTA is taken (exact across a wrap by modular
+ * arithmetic) and accumulated 64-bit.
+ *
+ *   _rebuilds   rebuilds actually performed
+ *   _gc_writes  writes to a read-affecting GC register (2/4/5/7) that CHANGED
+ *               it, i.e. calls reaching the rebuild guard. gc_writes minus
+ *               rebuilds is what a tighter guard would save, so one instrument
+ *               grades both the bug and any fix
+ *   _cyc/_hi    64-bit total cycles inside the rebuild
+ *   _worst      worst single rebuild -- a stall is a TAIL property and a mean
+ *               cannot contain one
+ */
+#ifndef X86_EGA_SHPROF
+#define X86_EGA_SHPROF 0
+#endif
+
+#if X86_EGA_SHPROF
+volatile uint32_t x86_ega_shadow_rebuilds;
+volatile uint32_t x86_ega_shadow_gc_writes;
+volatile uint32_t x86_ega_shadow_cyc;
+volatile uint32_t x86_ega_shadow_hi;
+volatile uint32_t x86_ega_shadow_worst;
+
+#define SHPROF_CYCCNT (*(volatile uint32_t *)0xE0001004u)
+#define SHPROF_BEGIN()  uint32_t shprof_t0 = SHPROF_CYCCNT
+#define SHPROF_END()                                                    \
+    do {                                                                \
+        uint32_t d = SHPROF_CYCCNT - shprof_t0;                         \
+        uint32_t lo = x86_ega_shadow_cyc + d;                           \
+        if (lo < x86_ega_shadow_cyc)                                    \
+            x86_ega_shadow_hi++;                                        \
+        x86_ega_shadow_cyc = lo;                                        \
+        x86_ega_shadow_rebuilds++;                                      \
+        if (d > x86_ega_shadow_worst)                                   \
+            x86_ega_shadow_worst = d;                                   \
+    } while (0)
+#define SHPROF_GC_WRITE()  (x86_ega_shadow_gc_writes++)
+#else
+#define SHPROF_BEGIN()     ((void)0)
+#define SHPROF_END()       ((void)0)
+#define SHPROF_GC_WRITE()  ((void)0)
+#endif
+
+
+/*
+ * WHAT A READ RETURNS, reduced to one value -- the rebuild's real precondition.
+ *
+ * The four GC registers that can affect a read do not all affect it AT THE SAME
+ * TIME, and "the register changed" was standing in for "a read changed" at a
+ * cost of 16,384 byte computations a time:
+ *
+ *   read mode 0 (GC5 bit 3 clear)  a read is p[GC_READ_MAP & 3]. Colour Compare
+ *                                  and Colour Don't Care are not consulted, so
+ *                                  writing either changes NOTHING.
+ *   read mode 1                    a read is the colour compare. GC_READ_MAP is
+ *                                  not consulted, so writing it changes nothing.
+ *   either mode                    only bit 3 of GC5 is read state. Bits 0-1 are
+ *                                  the WRITE mode, and a title that alternates
+ *                                  write mode 0 and 1 -- which is the latch-copy
+ *                                  idiom, and is what KEEN4's scroll loop does --
+ *                                  was rebuilding the whole shadow on every one.
+ *
+ * Colour Compare is folded through Don't Care because a compare bit whose Don't
+ * Care bit is clear is never consulted either.
+ *
+ * MEASURED, silicon, KEEN4: one rebuild is 846,000 cycles = 3.0 ms at 280 MHz,
+ * and the wedging slice spent 76 of them -- 230 ms, half of the ~472 ms WWDG
+ * window -- inside this function. See docs/13.
+ */
+/* Graded by scripts/run_planar_controls.py, which compiles each bug back IN
+   and requires the 0Dh read arm to notice:
+     1  a CONSTANT signature -- the shadow is built at the mode set and never
+        again, i.e. the guard is unconditionally too coarse
+     2  the read-MODE bit is dropped, which is the plausible partial version:
+        read mode 1 keeps answering with the read map's plane byte */
+#ifndef X86_EGA_SIG_NEGCTL
+#define X86_EGA_SIG_NEGCTL 0
+#endif
+
+static uint32_t ega_read_sig(void)
+{
+#if X86_EGA_SIG_NEGCTL == 1
+    return 0u;
+#elif X86_EGA_SIG_NEGCTL == 2
+    return GC_READ_MAP & 3u;
+#else
+    if (GC_MODE & 8u)
+        return 0x100u | ((uint32_t)GC_COLOR_DC << 4) | (GC_COLOR_CMP & GC_COLOR_DC);
+    return GC_READ_MAP & 3u;
+#endif
+}
+
+/* The signature the shadow currently HOLDS. Set wherever the shadow is built. */
+static uint32_t ega_shadow_sig;
+
 static void ega_shadow_rebuild(void)
 {
     uint8_t *sh = x86_vga_planar_aperture;
@@ -632,12 +742,14 @@ static void ega_shadow_rebuild(void)
        itself decoded as something else. */
     if (!sh || x86_vga_modey_armed || !x86_vga_ega_armed)
         return;
+    SHPROF_BEGIN();
     for (a = 0; a < ega_plane_size && a < EGA_SHADOW_OFFSETS; a++)
         sh[a] = ega_read_byte(a);
     /* Offsets past the modelled planes read as zero rather than as stale bytes
        from whatever mode ran before. */
     for (; a < EGA_SHADOW_OFFSETS; a++)
         sh[a] = 0;
+    SHPROF_END();
 }
 
 /* ---------------------------------------------------------------------------
@@ -1136,6 +1248,7 @@ int x86_vga_planar_arm(int on)
     memset(x86_vga_planar_aperture, 0, X86_VGA_APERTURE_BYTES);
 
     x86_vga_ega_armed = 1;
+    ega_shadow_sig = ega_read_sig();
     ega_shadow_rebuild();
     hook_set(1);
     return 1;
@@ -1174,9 +1287,19 @@ void x86_vga_planar_gc_write(unsigned idx, uint8_t val)
     planar_reclass();
     /* Only four registers change what a READ returns, and the rebuild is
        expensive enough that the guard is the point -- see ega_shadow_rebuild().
-       2 Colour Compare, 4 Read Map Select, 5 Mode, 7 Colour Don't Care. */
-    if (idx == 2u || idx == 4u || idx == 5u || idx == 7u)
+       2 Colour Compare, 4 Read Map Select, 5 Mode, 7 Colour Don't Care.
+       "The register changed" is NOT the same question as "what a read returns
+       changed", and the difference is the whole cost: see ega_read_sig(). */
+    if (idx == 2u || idx == 4u || idx == 5u || idx == 7u) {
+        uint32_t sig;
+
+        SHPROF_GC_WRITE();
+        sig = ega_read_sig();
+        if (sig == ega_shadow_sig)
+            return;
+        ega_shadow_sig = sig;
         ega_shadow_rebuild();
+    }
 }
 
 /*

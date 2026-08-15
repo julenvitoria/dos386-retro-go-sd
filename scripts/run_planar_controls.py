@@ -65,6 +65,27 @@ anything.
                                         painted, so it is graded here, by
                                         tests/test_video.py --present-only.
 
+  EGASIG   -DX86_EGA_SIG_NEGCTL=1       the EGA read shadow is rebuilt under a
+                                        GUARD -- only when what a read RETURNS
+                                        changes, not on every write to one of
+                                        the four registers that can affect it,
+                                        because a rebuild is 16,384 byte
+                                        computations and measured 846,000
+                                        cycles on silicon. This control makes
+                                        the guard's signature a CONSTANT, so
+                                        the shadow is built at the mode set and
+                                        never again. Graded by the 0Dh arm's
+                                        read-path probes, which is the only
+                                        thing in the tree that reads A000:0
+                                        back through the shadow at all.
+
+  EGAMODE  -DX86_EGA_SIG_NEGCTL=2       the same guard with the read-MODE bit
+                                        dropped -- the plausible partial
+                                        version, where read mode 1 keeps
+                                        answering with the read map's plane
+                                        byte. A control that only tests the
+                                        coarse failure would not catch it.
+
   LEARN    -DX86_MODEY_PAGE0=16384      the POSITIVE control. The same 64,000
                                         pixels must still come out from a WRONG
                                         default, because the core is supposed to
@@ -89,6 +110,8 @@ ARMS = [
     ("PAGE",   "-DX86_MODEY_PAGE_NEGCTL=1",   False, "--modey-only"),
     ("FLIP",   "-DX86_MODEY_PRESENT_ON_FLIP=0", False, "--present-only"),
     ("CACHE",  "-DX86_MODEY_CACHE_NEGCTL=1",  False, "--modeyfit-only"),
+    ("EGASIG", "-DX86_EGA_SIG_NEGCTL=1",     False, "--ega-only"),
+    ("EGAMODE","-DX86_EGA_SIG_NEGCTL=2",     False, "--ega-only"),
     ("LEARN",  "-DX86_MODEY_PAGE0=16384",     True,  "--modey-only"),
 ]
 
@@ -127,7 +150,7 @@ def main():
     if fail:
         print("PLANAR CONTROLS FAIL")
         return 1
-    print("PLANAR CONTROLS PASS (6/6 negative controls caught, stride learning "
+    print("PLANAR CONTROLS PASS (8/8 negative controls caught, stride learning "
           "proven from a wrong default)")
     return 0
 
