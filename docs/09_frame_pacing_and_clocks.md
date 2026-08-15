@@ -146,3 +146,155 @@ Hardware, TOPBENCH (text mode, so it measures the interpreter and not the blit):
 Wolf3D in Mode Y manages **~1.4 M ips** against the same core's ~3.0 M in text,
 with PC samples landing in `x86_vga_planar_store`. The planar store path, not
 the interpreter, is the limit for graphics titles.
+
+## 8. What the interpreter's 47% of Mode Y wall time actually is
+
+The frame budget in §7 left one unexamined block: with the planar store hook at
+25.0% of wall, idle at 27.0% and the Mode Y blit at 0.84%, the remaining ~47%
+was "the interpreter", running at ~95 cycles per guest instruction in gameplay
+against ~64 in menus. Nobody knew why.
+
+**Measured, hardware, oc level 0 (280 MHz), `timelines/wolf3d-hw.tl`, a 19-20 s
+gameplay window gated on `x86_modey_presents` climbing (6 -> 269, i.e. 13.5
+presents/s).** The control is `timelines/wolf3d-menu-hw.tl`, the same core and
+clock with `x86_modey_presents` gated CONSTANT.
+
+### 8a. It is a changed MIX, not a slower interpreter
+
+`profile_opcodes.py --compare menu.json play.json`:
+
+| | cyc/insn |
+|---|---|
+| menus | 66.2 |
+| gameplay | 125.2 |
+| **change** | **+58.95** |
+| ...from a CHANGED OPCODE MIX | **+53.04 (90%)** |
+| ...from a PER-OPCODE COST increase | +5.91 (10%) |
+
+(Both figures are on the `X86_PROFILE=1` build, which adds ~22 cyc/dispatch;
+corrected, gameplay is 103.2 cyc/insn.)
+
+**The mix change is not `IDIV`.** The raycaster's divides are opcode `F7`
+GRP3 Ev, 4.24% of gameplay cycles at a corrected mean of 55.2 — cheaper than
+average. The entire mix change is two opcodes:
+
+| op | | %A menus | %B play | mean B | mix contribution |
+|---|---|---|---|---|---|
+| `88` | MOV Eb,Gb | 0.00 | 13.30 | 360.2 | **+47.91 cyc/insn** |
+| `AB` | STOSW (rep) | 0.00 | 0.11 | 12,880.7 | **+14.42 cyc/insn** |
+
+Both are stores into the Mode Y aperture. Gameplay is slower because it does
+**5.3 million aperture stores per 19 s**, not because the interpreter regressed.
+
+### 8b. Where the 47% goes
+
+Shares of WALL. The interior is the opcode profile's corrected cycles scaled so
+the block sums to the 47.1% the frame budget leaves for it.
+
+| | % of wall |
+|---|---|
+| **interpreter, excluding the store hook** | **47.1** |
+| `88` MOV Eb,Gb (aperture byte store), non-hook | 10.30 |
+| `AB` REP STOSW loop, non-hook | 3.26 |
+| `89` MOV Ev,Gv (ordinary word stores) | 2.28 |
+| `EE`/`EC` VGA register OUT/IN (map mask, etc.) | 1.49 |
+| `26` ES: segment prefix (4.29 M of them) | 0.38 |
+| every other opcode — the guest's own arithmetic and control | 29.36 |
+
+Cross-cutting costs, measured separately and already contained in the rows
+above rather than added to them:
+
+| | % of wall | rate | mean |
+|---|---|---|---|
+| aperture WRITE-trap detour (inside the `88` row) | ~4.63 | 212 k/s | ~45 cyc |
+| aperture READ-trap detour (inside "every other opcode") | ~4.5 | — | ~46 cyc |
+| `x86_code_reloc` (`x86_vprof_reloc`) | **0.79** | 14.8 k/s | 149.7 cyc |
+| `x86_seam_sync` (`x86_vprof_seam`) | **0.04** | 0.9 k/s | 109.7 cyc |
+
+### 8c. The four hypotheses, and what killed each
+
+- **Opcode mix.** TRUE, and it is the answer — but the expensive instructions
+  are aperture STORES, not the raycaster's `IDIV`/`IMUL`. 90% of the
+  menu-to-gameplay slowdown.
+- **`x86_code_reloc`.** DEAD: **0.79% of wall.** The rate was also wrong — 14.8
+  k/s in gameplay, not the ~88 k/s quoted, which was a startup figure.
+- **Aperture READS through the fold trap.** REAL but small, ~4.5% of wall. It
+  shows up as the ONLY per-opcode cost increase in the whole comparison:
+  `8A` MOV Gb,Eb goes 49.0 -> 95.0 cyc and `8B` MOV Gv,Ev 45.5 -> 75.5. The
+  +46 on the byte load matches the +45 write-trap premium on `88` — two
+  independent measurements of the same out-of-line detour.
+- **`SEAM_CHECK`.** DEAD: **0.04% of wall.** The predicate is two instructions
+  and a not-taken branch and the sync it guards fires 909 times a second.
+
+### 8d. The honest verdict
+
+~37 of the 47 points is the interpreter doing ordinary work on the instruction
+stream the guest handed it, at 55-100 cycles per instruction. The `88` slot's
+corrected mean of 338 cyc decomposes as ~237 of planar store hook plus ~101 of
+interpreter, and the hook figure agrees with `x86_vprof_store`'s independent
+286.9 cyc once the ~50 cyc `cell`-bracket inflation is removed. **Two
+instruments built on different principles agree on the same number**, which is
+the reason to believe either.
+
+**`AB` REP STOSW calls the store hook once per element.** Its 12,858 cyc mean is
+~38 elements x (237 hook + ~100 interpreter) = ~12,800 — the arithmetic closes.
+The destination advances linearly and the page cannot change mid-`REP`, so the
+cell decision is resolvable once per `REP` rather than 38 times; that
+amortisation is still on the table and is worth ~3% of wall on these numbers.
+
+## 9. The planar store was reading four bytes to write one, and that was 12% of wall
+
+§8 left `x86_vga_planar_store` at ~237 cyc for a single guest byte and asked what
+a `PL_PLANE` store — the class documented as skipping the latch reload and the
+`vga_cell()` lookup — could possibly be spending it on. The answer was in the
+merge itself:
+
+```c
+memcpy(&q, p, 4);                                   /* <-- THE READ */
+q = (q & ~m) | ((v & 0xFF) * 0x01010101u & m);
+memcpy(p, &q, 4);
+```
+
+**The read is pure waste and always was.** Every plane the Map Mask enables
+receives the same byte `v`; nothing is computed from the cell's old contents.
+The merge existed only to PRESERVE the bytes the mask does not enable — and
+writing just the enabled bytes preserves them too, without ever loading the
+cell.
+
+The read is not merely an extra instruction. The layout is pixel-major
+(`vga_cell()` returns `base + 4*off`), a scaler writes a vertical column, so
+successive stores are 80 plane offsets = **320 bytes apart and each one is its
+own cache line in AXI SRAM**. The load must complete before the merged value
+exists, so the core stalls on a line fill it never needed; the byte stores that
+replace it post to the store buffer and the core walks away.
+
+```c
+if (m == 0xFFFFFFFFu) {                 /* all four: one aligned STR   */
+    q = (v & 0xFF) * 0x01010101u; memcpy(p, &q, 4);
+} else {                                /* k planes: k STRBs, no load  */
+    if (mm & 1u) p[0] = v8;  if (mm & 2u) p[1] = v8;
+    if (mm & 4u) p[2] = v8;  if (mm & 8u) p[3] = v8;
+}
+```
+
+**Measured on hardware, same gated 19 s gameplay window, oc level 0:**
+
+| | before | after | |
+|---|---|---|---|
+| `x86_vprof_store` mean | 286.9 cyc | **171.1 cyc** | −40% |
+| `x86_vprof_cell` mean (differential use only) | 121.8 cyc | **33.4 cyc** | −73% |
+| guest throughput | 1.383 M ips | **1.667 M ips** | **+20.5%** |
+| `x86_modey_presents` | 13.47 /s | **16.3 /s** | **+21%** |
+| share of wall removed | | **~12.0%** | |
+
+An intermediate arm that took the no-load path only when the Map Mask selected
+exactly ONE plane got the store to 233.5 cyc and +5% throughput — **35% of
+`PL_PLANE` stores are single-plane**, so restricting the fix to that case
+captured barely a third of it. Dropping the read for EVERY mask is what the
+argument actually licenses, and it is what the numbers above measure.
+
+**The oracle is `tests/test_video.py`'s Mode Y and EGA 0Dh arms**, which drive
+all four write modes, set/reset, the ALU and partial bit masks through the same
+64,000 pixels: both stay **64000/64000 exact**, and
+`scripts/run_planar_controls.py` still catches all 6 negative controls. A fast
+path claiming a combination it should not have shows up as wrong pixels.

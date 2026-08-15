@@ -327,6 +327,137 @@ def wait(seconds, what, out=print):
     time.sleep(seconds)
 
 
+# ---------------------------------------------------------------------------
+# GATES -- the check that says WHICH WORKLOAD was profiled
+#
+# A profile is a table of numbers that looks equally confident whether the
+# guest was raycasting or sitting on a menu. Two full 57 s hardware runs of
+# Wolf3D data were menus before anyone checked, because nothing in the tool
+# ever looked at whether the screen was flipping. A gate reads named counters
+# at the two ends of the measurement window and asserts the direction each one
+# had to move for the run to be the workload it claims.
+# ---------------------------------------------------------------------------
+
+def parse_gates(specs):
+    """['x86_modey_presents', 'foo=const'] -> [(sym, 'climb'|'const'), ...]"""
+    gates = []
+    for spec in specs or []:
+        for item in spec.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            sym, _, want = item.partition("=")
+            want = want or "climb"
+            if want not in ("climb", "const"):
+                raise ProfileError(f"gate '{item}': want climb or const")
+            gates.append((sym.strip(), want))
+    return gates
+
+
+def read_gates(backend, syms, gates):
+    out = {}
+    for sym, _ in gates:
+        if sym not in syms:
+            raise ProfileError(f"gate symbol '{sym}' is not in the ELF")
+        out[sym] = backend.read_uint32(syms[sym])
+    return out
+
+
+def check_gates(gates, before, after, out=print):
+    """Report every gate, return False if any one was violated."""
+    if not gates:
+        return True
+    ok = True
+    out("workload gates (what the window actually ran):")
+    for sym, want in gates:
+        lo, hi = before.get(sym, 0), after.get(sym, 0)
+        delta = (hi - lo) & 0xFFFFFFFF
+        if delta > 0x7FFFFFFF:            # wrapped backwards: treat as no move
+            delta = hi - lo
+        good = delta > 0 if want == "climb" else delta == 0
+        ok = ok and good
+        verdict = "OK" if good else f"FAILED (wanted {want})"
+        out(f"  {sym:<28} {lo:>12} -> {hi:>12}  delta {delta:>+12}  {verdict}")
+    if not ok:
+        out("")
+        out("*** A GATE FAILED. The numbers above are from a DIFFERENT workload")
+        out("*** than the one this run claims. Do not use them.")
+    out("")
+    return ok
+
+
+def compare(path_a, path_b, top=30, sort="delta", out=print):
+    """Diff two profiles: is B slower because it runs DIFFERENT instructions,
+    or the SAME instructions more slowly? An average cannot tell those apart
+    and they are completely different problems."""
+    with open(path_a) as fh:
+        a = json.load(fh)
+    with open(path_b) as fh:
+        b = json.load(fh)
+
+    def norm(doc):
+        tot = doc["totals"]
+        n = tot["guest_dispatches"] or 1
+        cyc = tot["guest_cycles"] or 1
+        return doc["slots"], n, cyc
+
+    sa, na, ca = norm(a)
+    sb, nb, cb = norm(b)
+    out(f"A = {path_a}   {na} dispatches, {ca} cycles, "
+        f"{ca / na:.1f} cyc/insn")
+    out(f"B = {path_b}   {nb} dispatches, {cb} cycles, "
+        f"{cb / nb:.1f} cyc/insn")
+    out("")
+
+    # The whole point: split the change in cycles-per-instruction into the part
+    # explained by a changed MIX (same per-opcode cost, different shares) and
+    # the part that is a genuine per-opcode SLOWDOWN.
+    labels = set(sa) | set(sb)
+    mix = same = 0.0
+    rows = []
+    for lab in labels:
+        ra, rb = sa.get(lab), sb.get(lab)
+        share_a = (ra["count"] / na) if ra else 0.0
+        share_b = (rb["count"] / nb) if rb else 0.0
+        mean_a = ra["mean"] if ra else 0.0
+        mean_b = rb["mean"] if rb else 0.0
+        # mix term: B's share at A's cost. cost term: B's share x cost change.
+        mix_c = (share_b - share_a) * (mean_a if ra else mean_b)
+        cost_c = share_b * (mean_b - mean_a) if (ra and rb) else 0.0
+        mix += mix_c
+        same += cost_c
+        rows.append({"label": lab,
+                     "mnemonic": (rb or ra)["mnemonic"],
+                     "share_a": 100 * share_a, "share_b": 100 * share_b,
+                     "mean_a": mean_a, "mean_b": mean_b,
+                     "mix": mix_c, "cost": cost_c})
+    total = (cb / nb) - (ca / na)
+    out("cycles/instruction, A -> B, decomposed:")
+    out(f"  total change            {total:>9.2f} cyc/insn")
+    out(f"  from a CHANGED MIX      {mix:>9.2f} cyc/insn  "
+        f"({100 * mix / total if total else 0:.0f}%)")
+    out(f"  from PER-OPCODE COST    {same:>9.2f} cyc/insn  "
+        f"({100 * same / total if total else 0:.0f}%)")
+    out(f"  unexplained             {total - mix - same:>9.2f} cyc/insn")
+    out("")
+    key = {"delta": lambda r: -abs(r["mix"] + r["cost"]),
+           "mix": lambda r: -abs(r["mix"]),
+           "cost": lambda r: -abs(r["cost"])}[sort]
+    rows.sort(key=key)
+    out(f"{'op':<6}{'mnemonic':<18}{'%A':>7}{'%B':>7}{'meanA':>9}{'meanB':>9}"
+        f"{'mix':>9}{'cost':>9}")
+    for r in rows[:top]:
+        out(f"{r['label']:<6}{r['mnemonic'][:17]:<18}{r['share_a']:>7.2f}"
+            f"{r['share_b']:>7.2f}{r['mean_a']:>9.1f}{r['mean_b']:>9.1f}"
+            f"{r['mix']:>9.2f}{r['cost']:>9.2f}")
+    out("")
+    out("mix  = cycles/insn added because B runs MORE of this opcode\n"
+        "cost = cycles/insn added because this opcode got SLOWER in B\n"
+        "A big mix column and a small cost column means the guest asked for\n"
+        "more expensive work, not that the interpreter regressed.")
+    return {"total": total, "mix": mix, "cost": same, "rows": rows}
+
+
 def check_clean(target, symbol_maps, out=print):
     """Fault state after a run. A profile from a hardfaulted target is a lie,
     and the failure mode of a bad dispatch patch is exactly a hardfault."""

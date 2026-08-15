@@ -163,6 +163,10 @@ extern volatile uint32_t x86_vga_planar_stores;   /* stores that took the hook *
    whether a title's frame is worth a fast path, and at tier 1 it is the
    coverage proof that the pixel arms enter all three. */
 extern volatile uint32_t x86_vga_planar_cls_plane;
+/* ...of which the Map Mask selected exactly ONE plane, so the store was a lone
+   STRB and not a four-byte read-modify-write. The ratio of these two is what
+   says whether the single-plane path is the whole frame or a corner case. */
+extern volatile uint32_t x86_vga_planar_cls_plane1;
 extern volatile uint32_t x86_vga_planar_cls_copy;
 extern volatile uint32_t x86_vga_planar_cls_general;
 extern volatile uint32_t x86_vga_planar_lost;     /* stores with no storage    */

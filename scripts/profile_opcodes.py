@@ -83,7 +83,22 @@ def main():
                         "is how the plumbing is proven under gwemu")
     p.add_argument("--no-reset", action="store_true",
                    help="do not reset; read whatever has accumulated since boot")
+    p.add_argument("--gate", action="append", metavar="SYM[=climb|const]",
+                   help="assert a counter MOVED (or did not) across the window, "
+                        "so the report proves WHICH workload it profiled. "
+                        "Repeatable and comma-separated. Mode Y gameplay is "
+                        "--gate x86_modey_presents; a menu control is "
+                        "--gate x86_modey_presents=const. A failed gate makes "
+                        "the run exit non-zero")
+    p.add_argument("--compare", nargs=2, metavar=("A.json", "B.json"),
+                   help="no target: decompose the cycles/instruction difference "
+                        "between two saved profiles into a MIX change and a "
+                        "per-opcode COST change")
     args = p.parse_args()
+
+    if args.compare:
+        prof.compare(args.compare[0], args.compare[1], top=args.top)
+        return 0
 
     if args.retrogo:
         fw = args.firmware_dir
@@ -131,6 +146,8 @@ def main():
             addr = prof.block_address(target.backend, syms)
             if not args.no_reset:
                 prof.reset(target.backend, addr)
+            gates = prof.parse_gates(args.gate)
+            gate_before = prof.read_gates(target.backend, syms, gates)
         except prof.ProfileError as exc:
             target.backend.resume()
             prof.die(str(exc))
@@ -151,12 +168,14 @@ def main():
             prof.wait(args.window, "profiling")
 
         target.backend.halt()
+        gate_after = prof.read_gates(target.backend, syms, gates)
         profile = prof.read_profile(target.backend, addr)
         handlers = prof.resolve_handlers(target.backend, syms, maps,
                                          opsize=args.opsize)
         target.backend.resume()
 
         print("")
+        gates_ok = prof.check_gates(gates, gate_before, gate_after)
         print("fault state after the run:")
         clean = prof.check_clean(target, maps)
         if fw_elf:
@@ -175,7 +194,11 @@ def main():
 
         meta = {"settle_s": args.settle, "window_s": args.window,
                 "elf": elf, "opsize": args.opsize,
-                "fault_state_clean": clean}
+                "fault_state_clean": clean,
+                "gates": [{"symbol": g, "want": w,
+                           "before": gate_before.get(g),
+                           "after": gate_after.get(g)} for g, w in gates],
+                "gates_ok": gates_ok}
         if args.json:
             os.makedirs(os.path.dirname(args.json) or ".", exist_ok=True)
             print(f"\nwrote {prof.write_json(args.json, rows, total, profile, args.target, meta)}")
@@ -186,7 +209,7 @@ def main():
         if not rows:
             prof.die("no opcode executed during the window -- is the guest "
                      "running? Check with scripts/probe.py.")
-        return 0 if clean else 1
+        return 0 if (clean and gates_ok) else 1
     finally:
         target.stop()
 

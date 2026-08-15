@@ -194,6 +194,7 @@ volatile uint32_t x86_vga_planar_stores;
  * enters is a fast path with no oracle, and this area has shipped those.
  */
 volatile uint32_t x86_vga_planar_cls_plane;
+volatile uint32_t x86_vga_planar_cls_plane1;
 volatile uint32_t x86_vga_planar_cls_copy;
 volatile uint32_t x86_vga_planar_cls_general;
 volatile uint32_t x86_vga_planar_lost;
@@ -312,6 +313,27 @@ static uint8_t   latch[4];
 enum { PL_GENERAL = 0, PL_COPY = 1, PL_PLANE = 2 };
 static uint8_t  planar_class = PL_GENERAL;
 static uint32_t planar_plane_mask32;    /* 0xFF per plane the Map Mask enables */
+/*
+ * THE PLANE INDEX WHEN THE MAP MASK SELECTS EXACTLY ONE, ELSE -1.
+ *
+ * The 32-bit masked merge below writes FOUR BYTES to produce, in the case that
+ * dominates Wolf3D's frame, ONE byte of result. The plane layout is
+ * pixel-major -- vga_cell() returns `base + 4*off`, so plane k of an offset is
+ * a single byte at `p[k]` -- which means a single-plane write is an address
+ * computation and one STRB, not a read-modify-write.
+ *
+ * The read half is what costs: a scaler writes a vertical column, so successive
+ * stores are 80 plane offsets = 320 BYTES apart and every one of them is its
+ * own cache line in AXI SRAM. The load MUST complete before the merged value
+ * can be stored, so the core stalls on a line fill it did not need; a lone STRB
+ * posts to the store buffer and the core walks away. That is the difference
+ * between the two paths, and it is far larger than the ALU work they differ by.
+ *
+ * Derived at OUT time with the class, because the Map Mask is written a few
+ * hundred times a frame against a few hundred thousand stores -- the same
+ * argument that put planar_class here in the first place.
+ */
+static int8_t   planar_plane_single = -1;
 
 static void planar_reclass(void)
 {
@@ -322,6 +344,16 @@ static void planar_reclass(void)
         if (map_mask & (1u << i))
             m |= 0xFFu << (8 * i);
     planar_plane_mask32 = m;
+
+    /* Exactly one plane: a power of two, and not zero. map_mask == 0 writes
+       nothing and must NOT take the single-plane path -- it stays at -1, where
+       the merge below is a no-op against a zero mask, which is correct. */
+    planar_plane_single = -1;
+    if (map_mask != 0u && (map_mask & (map_mask - 1u)) == 0u) {
+        for (i = 0; i < 4; i++)
+            if (map_mask & (1u << i))
+                planar_plane_single = (int8_t)i;
+    }
 
     if ((GC_MODE & 3u) == 1u && map_mask == 0x0Fu) {
         planar_class = PL_COPY;
@@ -802,6 +834,8 @@ PLANAR_HOT static void planar_store_body(uint32_t off, uint32_t val, uint32_t si
      */
     if (planar_class == PL_PLANE) {
         const uint32_t m = planar_plane_mask32;
+        const uint32_t mm = map_mask;
+        const int      one = planar_plane_single;
         /* A word or dword store is still ONE ADAPTER OPERATION PER BYTE, each
            with its own cell -- folding them is how a `stosw` comes out half
            right. But it is the same operation each time, so the loop stays in
@@ -832,9 +866,24 @@ PLANAR_HOT static void planar_store_body(uint32_t off, uint32_t val, uint32_t si
                of moving code to ITCM can reach it -- and two such moves have
                already been measured as no help. */
             X86_VPROF_BEGIN(cl);
-            memcpy(&q, p, 4);
-            q = (q & ~m) | (((val >> (8u * i)) & 0xFFu) * 0x01010101u & m);
-            memcpy(p, &q, 4);
+            /* NO READ, FOR ANY MASK. The merge this replaces preserved exactly
+               the bytes the Map Mask does not enable -- and writing only the
+               ENABLED bytes preserves them too, without ever loading the cell.
+               Every plane the mask selects gets the same byte `v`, so there is
+               nothing to compute from the old contents. */
+            if (m == 0xFFFFFFFFu) {
+                q = ((val >> (8u * i)) & 0xFFu) * 0x01010101u;
+                memcpy(p, &q, 4);       /* all four: one aligned STR */
+                x86_vga_planar_cls_plane1++;
+            } else {
+                const uint8_t v8 = (uint8_t)(val >> (8u * i));
+                if (mm & 1u) p[0] = v8;
+                if (mm & 2u) p[1] = v8;
+                if (mm & 4u) p[2] = v8;
+                if (mm & 8u) p[3] = v8;
+                if (one >= 0)
+                    x86_vga_planar_cls_plane1++;
+            }
             X86_VPROF_END(cl, cell);
             if (!x86_vga_modey_armed && a < EGA_SHADOW_OFFSETS)
                 ap[a] = ega_read_byte(a);
