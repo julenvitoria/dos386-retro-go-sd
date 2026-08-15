@@ -7,6 +7,87 @@ Measure with `scripts/probe_report.py --title <name>`, which leads with what we
 did **not** answer. Judge pictures with `scripts/screenshot.py`; judge a text
 screen's *shading* with `--attr`, never `--text`.
 
+## THE "THREE TITLES CONVERGE ON ONE ADDRESS" FINDING IS RETRACTED — MEASURED 2026-08-15
+
+Dark Forces, Mortal Kombat and Epic Pinball were all recorded as dying on
+`X86_EXIT_UNIMPLEMENTED`, `exit_info=0x0F`, `CS:EIP = 0081:032F`. **Not one part
+of that was a fact about the guests.** It was two reporting defects in our own
+interpreter, and the reasoning built on it ("three unrelated programs do not
+converge by coincidence", "segment 0x81 is the child load segment, so it is our
+EXEC") was reasoning about an artefact. EXEC is exonerated: `dos_load_mz()`,
+`mz_place()` and the relocation-factor choice were never in the path.
+
+**Defect 1 — the exit named the ESCAPE, not the opcode.** `.op_0f_0F` loads the
+second opcode byte into **R1** and dispatches; `.exit_loop` stores **R0**, which
+still held `0x0F`. So *every* unimplemented two-byte opcode in the machine
+reported the identical `exit_info=0x0F`. The convergence was that one byte, and
+it was a constant.
+
+**Defect 2 — `0F 01` is a GROUP, not an opcode.** Even the right byte would not
+have said which member. The group-7 exit now carries its ModRM in the high half.
+
+**Defect 3 — the reported `CS` was never read from the CPU.** `probe_report.py`
+now derefs `cpu_state_ptr` directly (`_read_death_site()`), and the same three
+titles read `02BF:032F`, `…`, `099E:20D7` — three different addresses. `0081`
+does not appear anywhere. `032F` was real; the segment beside it was not.
+
+**What the three were ACTUALLY executing — three different opcodes:**
+
+| title | real `exit_info` | instruction |
+|---|---|---|
+| Dark Forces | `0xF00F01` | `0F 01 F0` = **LMSW AX** |
+| Mortal Kombat | `0xF00F01` | `0F 01 F0` = **LMSW AX** |
+| Epic Pinball | `0x0FAF` | `0F AF` = **IMUL Gv,Ev** |
+
+Both are implemented now (`cpu_exec_handlers_0f.S`), with `tests/test_opcodes.py`
+arms 276-283 and every one of the eight **seen to fail** when the fix is backed
+out. Cost: `__CORE_ITCM_CODE_END__` **0xD2D8 -> 0xD580** (+680 B, all cold) and
+`__CORE_BSS_END__` **unchanged** — zero RAM_EMU, zero pager frames.
+
+**The lesson worth keeping: an instrument that cannot distinguish two failures
+will report them as one.** Three titles were read as sharing a blocker for
+several passes because the one number anybody looked at was incapable of
+telling them apart.
+
+### LMSW put the first title ever into PROTECTED MODE
+
+**`cpu_cr0` reads 1 for Dark Forces and Mortal Kombat.** The descriptor walk of
+[`docs/14`](docs/14_protected_mode.md) — built, unit-tested at 80 checks, and
+recorded on every prior pass as "NEVER exercised by any title" — **is now
+exercised by two.** It held: both titles come out of the transition with
+`CS=0x0070` (a real GDT selector, base `0xA900`/`0xA930`, not `sel<<4`) and
+`SS=0x0020`, so `LGDT`, the GDT fetch, the type/DPL/present rules and the
+same-privilege far JMP all ran against a guest's own table for the first time.
+`x86_pmode_sync_mode()` re-derived the dispatch tables on the PE edge.
+
+`LMSW` and not `MOV CR0` is the reason it took this long: a DOS extender must
+also run on a 286, so it uses the 286 entry sequence, and `MOV CR0` (0F 22) —
+which we have had all along — is never issued.
+
+### Where all three stop NOW
+
+| title | insns | `CR0` | `CS:EIP` | stops on | needs |
+|---|---:|---:|---|---|---|
+| Dark Forces | 102,517 | **1** | `0070:5403` | `exit_info=0xCD`, `INT imm8` with PE set | protected-mode **IDT gate dispatch** |
+| Mortal Kombat | 42,188 | **1** | `0070:559D` | `exit_info=0xCD`, same | the same one thing |
+| Epic Pinball | 443,391 | 0 | `078F:093C` | `exit_info=0x0FA0`, `PUSH FS` | `0F A0/A1/A8/A9` |
+
+Dark Forces and Mortal Kombat **do** now converge, and this time it is a real
+convergence with a named cause: `L(HANDLE_INTERRUPT)` branches to `.exit_loop`
+when `CR0.PE` is set, because the gate path needs descriptor validation and a
+possible stack switch. That is PLAN.md Queue B item 5's "`IRET` across
+privilege, call gates, stack switches", and it is now **measured demand from two
+titles** rather than the unsized item it has been.
+
+Epic Pinball is unrelated to both, still real mode, and moved from 477,239 to
+443,391 instructions into a different phase — it programmed the PIT
+(`guest_tick_divisor` 65,536 -> **19,890**), which it had never reached.
+
+Health on all three: `core_ready=1`, `x86_pg_frames_total=155`,
+`guest_ram_pages=155`, `guest_ram_pages_short=5` (the `X86_PROBE=1` build's
+own cost, identical with and without this change), `x86_pg_exhausted=0`,
+`x86_dos_load_shorts=0`.
+
 ## The non-regression baseline
 
 Three titles, three renderers. These pictures and pixel counts are the
@@ -340,6 +421,11 @@ segment 0x81. **That is the same exit, the same info byte and the same CS:EIP as
 Dark Forces**, which is a fact worth carrying forward: the two titles are now
 blocked on ONE thing, in shared extender code, not on two.
 
+**SUPERSEDED — see the retraction at the top of this file.** The caveat below
+was RIGHT to distrust the address, and the answer is that both the segment and
+the opcode byte were our own reporting, not the guest's. Everything from here to
+the end of this section describes the pre-LMSW machine.
+
 **Read this caveat before chasing it.** A `--guest` hexdump at that linear
 address (`0x810 + 0x32F = 0xB3F`) shows an 8-byte-stride DATA table, not an
 instruction stream with an `0F` in it. So either `cpu_state.eip` is not the
@@ -378,6 +464,11 @@ is there for the titles that do ask; it is not what moved this one.
 `X86_EXIT_UNIMPLEMENTED`, `exit_info=0x0F`, `CS:EIP = 0081:032F`, with the same
 caveat about that EIP. `x86_seam_overflow=1`, `x86_pg_exhausted=0`,
 `_evictions=0`, `x86_map_failures=0`.
+
+**ANSWERED, AND IT WAS THE SECOND OF THE TWO — "a shape the exit path reports
+for something else entirely". See the retraction at the top of this file.** The
+question below was posed exactly right; the answer is that `exit_info=0x0F` was
+the 0F ESCAPE byte, reported for every unimplemented two-byte opcode there is.
 
 **THREE titles now end on `exit_info=0x0F`** — these two and Epic Pinball. That
 is either one missing two-byte opcode shared by the runtimes they are built

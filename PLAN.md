@@ -129,6 +129,16 @@ Also live here, measured and sized, unblocked whenever a slot frees:
    on `IN 0x22A`; neither is a memory problem (`x86_pg_exhausted=0`,
    `evictions=0`, `x86_dos_load_short=0`). `docs/13`.
 
+3b. ~~**LMSW**~~ — BUILT (`0F 01 /6`), and it is what actually blocked Dark
+   Forces AND Mortal Kombat. Both were reported as dying on "unimplemented
+   opcode `0x0F`" at one address shared with Epic Pinball; **that convergence
+   was our own exit reporting** (`.exit_loop` named the 0F ESCAPE, and the
+   reported `CS` was never read from the CPU), and the three titles were on
+   three different opcodes. Epic Pinball's was `0F AF` IMUL, also built.
+   **`CR0=1` on both now — the descriptor walk of 5 is exercised by a real
+   title for the first time and it HELD** (`CS=0x0070`, a GDT selector).
+   [`docs/13`](docs/13_title_status.md).
+
 4. **DPMI** (INT 2Fh AX=1687h, INT 31h) — needs 1 and the descriptor walk from
    5. This is what DOS/4GW actually asks for; VCPI is the fallback it tries
    first. **INT 2Fh answers only AX=43xx today**, so 1687h and DE00h both
@@ -143,16 +153,22 @@ Also live here, measured and sized, unblocked whenever a slot frees:
    was already the single funnel for every segment load and already tested
    `CR0.PE`, so only the branch target changed; the fetch loop and every opcode
    handler are byte-identical. +912 B ITCM, +704 B RAM_EMU.
+   **NO LONGER UNEXERCISED, AND THE NEXT STEP IS NOW MEASURED DEMAND.** With
+   LMSW built (3b), Dark Forces and Mortal Kombat both reach `CR0=1` and both
+   stop on the SAME thing: `exit_info=0xCD`, an `INT imm8` with PE set, which
+   `L(HANDLE_INTERRUPT)` refuses because the gate path needs descriptor
+   validation and a possible stack switch. **Protected-mode IDT gate dispatch
+   is therefore the next item here, and two titles are waiting on it** -- it is
+   no longer sized against nothing.
    REMAINING, each its own step, none started: call gates, `IRET` across
    privilege, stack switches, paging, and per-access SEGMENT LIMIT enforcement
    (the predicate is written and tested; putting it on the access path for free
    needs a protected-mode MODE-RECORD axis — the same trick `66`/`67` already
    use — which doubles the record block and needs a second `DECODE_MODRM` in
    ITCM).
-   **V86 is not needed** — INT 21h is HLE'd. **Not sized against Dark Forces**:
-   the title has never executed one protected-mode instruction here, so nothing
-   remaining in this item is measured demand. Re-size after 3 lets DOS4GW.EXE
-   start and 4 says what DPMI actually asks for.
+   **V86 is not needed** — INT 21h is HLE'd. The "not sized against Dark
+   Forces / never executed one protected-mode instruction" note that stood here
+   is RETRACTED: it executes them now.
    *Two references, for two different things:* `references/tiny386`
    (i386.c:1076) for the compact SHAPE, `references/dosbox-x`
    (src/cpu/cpu.cpp:2976) for the RULES — tiny386 has NO permission checks, its

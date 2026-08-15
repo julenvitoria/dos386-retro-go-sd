@@ -490,6 +490,34 @@ reset — the startup probes *are* the subject), and writes one report to
 Presets: `keen4`, `wolf3d`, `topbench`, `alleycat`, `darkforces`,
 `epicpinball`, `mortalkombat`.
 
+##### THE DEATH SITE — `cpu_*` rows, and why they exist
+
+The health table carries eight `cpu_*` rows read by dereferencing
+`cpu_state_ptr` (`_read_death_site()`, offsets from `x86_offsets.inc`):
+`cpu_exit_reason`, `cpu_exit_info`, `cpu_cs_sel`, `cpu_eip`, `cpu_lin_eip`,
+`cpu_ss_sel`, `cpu_esp`, `cpu_cr0`.
+
+**`guest_exit_reason` says the guest stopped; these say WHERE and ON WHAT.**
+They were added because three unrelated titles were reported for several passes
+as dying at one identical `CS:EIP` on one identical opcode, and both halves of
+that were wrong — the opcode was the `0F` ESCAPE rather than the instruction,
+and the `CS` had not been read from the CPU at all. `docs/13` has the
+retraction; the rule it leaves behind is that **a death site quoted without
+these rows is a death site nobody read off the machine.**
+
+The offsets duplicate `x86_offsets.inc`, and a duplicated offset that drifts
+reports the NEIGHBOURING FIELD rather than failing, so
+`python3 tests/test_probe_offsets.py` checks all eight against the generated
+values. It needs no target and runs in a second.
+
+* **`cpu_exit_info` on `guest_exit_reason=4`** is the opcode. `0x00`–`0xFF` is
+  one byte; **`0x0Fnn` is the two-byte opcode `0F nn`**; `0xMM0F01` is group 7
+  with its ModRM. `docs/07` has the table.
+* **`cpu_cr0` bit 0 answers "did this title enter protected mode"** with no
+  build flag and no guessing. It is how "the descriptor walk has never been
+  exercised by any title" was checked every pass — and how it was finally
+  falsified.
+
 The health table also carries the **SOUND** set (`x86_sb_*`, `x86_dos_env_seg`),
 because the port table cannot tell "programmed a transfer" from "played one".
 `x86_sb_starts` against `x86_sb_samples` is exactly that difference, and
