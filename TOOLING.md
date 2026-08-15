@@ -324,8 +324,45 @@ python3 scripts/probe.py --retrogo --wait-magic --set guest_kips=0       # max
 python3 scripts/probe.py --retrogo --wait-magic --set guest_kips=330     # 8088
 ```
 
+#### Where the frame loop IS, and why the device reset
+
+```bash
+python3 scripts/probe.py --retrogo --target hardware --no-flash --hard-reset \
+    --timeline timelines/keen4-keypress.tl --interval 0.4 --samples 130 \
+    --watch x86_frame_phase,x86_frame_phase_seq,x86_frame_phase_worst,\
+x86_frame_phase_worst_id,guest_slice_overruns,guest_asm_ms_worst,\
+guest_asm_overruns,frame_ms_worst,guest_insns_total,frames_rendered
+
+# is the GUEST executing right now? No build, no flag, no RAM_EMU.
+python3 scripts/probe.py --retrogo --target hardware --no-flash \
+    --deref cpu_state_ptr+2184=PITCNT --deref cpu_state_ptr+2188=PITREL
+```
+
+`guest_insns_total`, `frames_rendered` and `frame_ms_last` are all banked at
+the BOTTOM of the frame body, so a stage that never finishes freezes every one
+of them and leaves nothing saying which stage it was. `x86_frame_phase` is the
+answer, readable WHILE the loop is stalled: `1` FWLOOP, `2` INPUT, `4` GUEST,
+`5` VIDEO, `6` AUDIO, `7` SWAP, `8` TAIL (`X86_PHASE_*` in `src/main.c`).
+`_seq` climbing while `frames_rendered` does not means an INNER loop is still
+turning; `_worst`/`_worst_id` are the longest stage ever seen and which.
+
+`FRAME_PHASE()` also **refreshes the watchdog at every stage boundary**, which
+is the fix for the KEEN4 reset ([`docs/13`](docs/13_title_status.md)) --
+without it the ~472 ms window covers a whole iteration. Its negative control is
+`make -f Makefile.core clean && make -f Makefile.core pack
+EXTRA_CFLAGS=-DX86_PHASE_WDOG=0`, which wedges KEEN4 twice in a 52 s run.
+`EXTRA_CFLAGS` passes one-off `-D`s for a control build without editing the
+source being graded; a changed define does NOT rebuild, so `clean` first.
+
+**`boot_magic=0xbad00005` is `BOOT_MAGIC_BSOD | BSOD_WATCHDOG`, and the device
+is already dead when you see it.** retro-go's `BSOD()` then spins on
+`buttons_get()` until a button is pressed, so PC samples after it are that
+loop and say nothing. Read `x86_frame_phase` instead.
+
 | Symbol | Meaning |
 |---|---|
+| `guest_slice_overruns` | sub-slice loops abandoned by the `GUEST_SLICE_WALL_MS` (120 ms) wall-clock escape. Nonzero = a guest budget ran long in TIME; the escape makes that a dropped frame instead of a reset |
+| `guest_asm_ms_worst` / `guest_asm_overruns` | the longest SINGLE `x86_cpu_interp_asm()` call, and how many passed `GUEST_ASM_MS_MAX` (60 ms). One call is uninterruptible, so this is the real exposure; an overrun halves the next budget. Healthy KEEN4 reads **14 ms** |
 | `guest_kips` | emulated CPU speed in thousands of insns/s. **0 = unthrottled, and the default.** `KIPS_*` in `src/main.c` has the profile rungs; the PAUSE/SET menu's "CPU Speed" entry sets it too |
 | `cpu_profile_persisted` / `cpu_profile_events` | what the settings store kept when the menu entry was changed, and how many dialog callbacks reached us. The menu path has no other witness — a malformed options array never calls us at all |
 | `frame_10us_avg` | mean iteration period, 8x oversampled, in 10 us units. What the firmware's `common_emu_frame_loop()` observer is fed |

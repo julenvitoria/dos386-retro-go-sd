@@ -95,7 +95,8 @@ still wedges.**
 
 That both counters freeze together says the FRAME LOOP stopped, not the guest --
 so this is host-side, and `MAX_SLICE_CEIL` (which bounds a slice in
-instructions) cannot be the guard.
+instructions) cannot be the guard. **This paragraph was right and the section
+below now says why.**
 
 **THE `ega_shadow_rebuild()` LEAD IS DEAD AS A CAUSE.** It was measured with a
 counter and a DWT bracket (`X86_EGA_SHPROF=1`, `x86_video_planar.c`), on
@@ -115,14 +116,71 @@ steady-state rebuilds 10 -> 2 and the burst is UNCHANGED at 76-79, because
 those are genuine read-state changes -- **and KEEN4 wedges exactly as before,
 twice in a 60 s run, at 31.5 M/638 and 22.5 M/468.**
 
-**What the instrument found instead, and it supersedes "the frame loop stops".**
-Across the wedge the rebuild counter KEEPS ADVANCING -- 54 -> 79 in the second
-after `guest_insns_total` and `frames_rendered` had already frozen at
-31,519,564/638. The guest is still executing. So the frame loop has not
-stopped: **one emulator SLICE never returns**, and the guest spins inside it
-hammering the Graphics Controller's read state ~25 changes a second (against
-0.15/s in normal play). That is where to look next -- what bounds a slice, and
-what guest loop this is -- not at the video path.
+### ANSWERED, AND FIXED: one FRAME outlives a watchdog window that covers the whole frame
+
+**There is no runaway loop, in the guest or in the host.** The
+"one SLICE never returns / the guest is still executing" reading (from the
+rebuild counter appearing to advance across the freeze) is RETRACTED. It was
+built on a counter sampled either side of the reset the wedge itself causes.
+The direct measurement refuses it: `cpu_state.pit_counter` is stored **once per
+guest instruction** and is readable over the probe while the target runs, and
+across the freeze it is **FROZEN** -- 2066, unchanged over four samples spanning
+1.5 s, with `pit_reload` 5304. The guest is not executing at all.
+
+`probe.py --deref cpu_state_ptr+2184=PITCNT` is the whole instrument. It costs
+no build, no RAM_EMU and no flag; reach for it before adding a counter.
+
+**What is actually happening, measured on silicon:**
+
+1. A frame's GUEST stage takes longer than the ~472 ms WWDG window. The
+   watchdog was refreshed **exactly once per iteration, at the bottom of the
+   body**, so the window covered a WHOLE frame and any single overlong stage
+   reset the device.
+2. The reset is `BSOD_WATCHDOG` = **5**, and `0xbad00005` is
+   `BOOT_MAGIC_BSOD | 5` -- not a code to decode further.
+3. After it, retro-go's `BSOD()` sits in `while (buttons_get() == 0 || ...)`
+   waiting for a keypress, then `HAL_NVIC_SystemReset()`. **Every PC sample
+   taken during "the wedge" is that spin loop** (`buttons_get`,
+   `HAL_GPIO_ReadPin`, `HAL_Delay`), which is why PC sampling kept naming
+   firmware input code. The freeze is not a hang; the device is already dead
+   and waiting to be told to reboot.
+4. Why the stage is slow is NOT a mystery and NOT a new bug: the instruction
+   budget is not a time budget. ~50,000 instructions is 18 ms of ordinary code
+   and most of a second of the aperture-plus-`ega_shadow_rebuild()` mix at
+   846,000 cycles a rebuild. So `ega_shadow_rebuild` is, after all, the
+   PASSENGER the measurement said it was -- it makes the frame expensive, and
+   the missing refresh is what turns an expensive frame into a reset.
+
+**The fix is host-side and is a general guard, not a Keen workaround**
+(`src/main.c`): `FRAME_PHASE(id)` publishes which stage the frame loop is in
+and **refreshes the watchdog at every stage boundary**, so the window bounds a
+STAGE rather than a whole iteration. A slow stage is now a slow frame.
+
+Graded on silicon, both directions, on the same timeline:
+
+| build | result |
+|---|---|
+| per-stage refresh ON, wall-clock escape OFF | **51.6 s, 56.0 M insns, 1,095 frames, no reset** |
+| per-stage refresh OFF (`X86_PHASE_WDOG=0`), escape ON | **WEDGES TWICE** -- 29.5 M/601 and 20.2 M/419, `x86_frame_phase` = 4 (`X86_PHASE_GUEST`) at both |
+| shipping (both) | 51.6 s, 55.7 M insns, 1,128 frames, ~3.0 M insn/s, `frame_ms_worst` 67 |
+
+`X86_PHASE_WDOG=0` is the negative control and it is SEEN TO FAIL. The stage
+identifier in `x86_frame_phase` at the freeze is what named the guest stage;
+nothing derived it.
+
+**Two further bounds went in with it, and neither is the fix** -- say so if
+either is ever quoted as one. `GUEST_SLICE_WALL_MS` (120 ms) escapes the
+sub-slice loop, `guest_slice_overruns` counts it, and it fired 9 times in one
+run; `GUEST_ASM_MS_MAX` (60 ms) halves the next budget when ONE
+uninterruptible `x86_cpu_interp_asm()` call overruns, published as
+`guest_asm_ms_worst` / `guest_asm_overruns`. The escape ALONE does not fix the
+wedge (row 2 above has it on), because it can only act between calls and the
+overlong stage is a single call. `guest_asm_ms_worst` reads **14 ms** on a
+healthy run, so the ceiling has headroom over normal play.
+
+**Still open, and separate: the artefacting.** The owner reaches the main menu
+and the level-selection screen, where the picture corrupts before the crash.
+That is the EGA card shortfall below (`x86_vga_planar_lost`), not this.
 
 ### The read-shadow guard, which is a real fix and is NOT this fix
 

@@ -373,6 +373,39 @@ volatile uint32_t guest_insn_deficit = 0;/* owed and WRITTEN OFF -- the loud   *
 volatile uint32_t guest_ips_achieved = 0;/* measured instructions per second  */
 volatile uint32_t guest_fps_achieved = 0;/* measured iterations per second    */
 volatile uint32_t guest_insns_total = 0; /* instructions run since boot       */
+
+/*
+ * WHERE THE FRAME LOOP IS RIGHT NOW.
+ *
+ * The watchdog is refreshed exactly ONCE per iteration, at the very bottom of
+ * the body, so the WWDG window is a whole FRAME: any single stage that blocks
+ * longer than the window resets the device, and every counter the loop banks
+ * (guest_insns_total, frames_rendered, frame_ms_last) is banked at the bottom
+ * too -- so a stage that never finishes freezes ALL of them and leaves nothing
+ * behind that says which stage it was. Three sessions read that freeze as
+ * evidence about the GUEST; it is not, the guest is not even running.
+ *
+ * x86_frame_phase is one store per stage and it is readable over the probe
+ * WHILE the loop is stalled, which is the only moment the answer exists.
+ * x86_frame_phase_ms is when the stage was entered, so "stalled" and "slow"
+ * are distinguishable from a single sample, and x86_frame_phase_seq
+ * increments per stage so a repeating INNER loop is visible as a sequence
+ * still climbing while frames_rendered does not.
+ */
+volatile uint32_t x86_frame_phase = 0;   /* X86_PHASE_* below                 */
+volatile uint32_t x86_frame_phase_ms = 0;/* HAL tick at which it was entered  */
+volatile uint32_t x86_frame_phase_seq = 0;/* stage transitions since boot     */
+volatile uint32_t x86_frame_phase_worst = 0;/* longest stage, host ms         */
+volatile uint32_t x86_frame_phase_worst_id = 0;/* ...and which stage it was   */
+/* Slices abandoned by the wall-clock escape below. Nonzero = a guest loop ran
+   past its instruction budget in TIME, which is the defect the escape turns
+   into a slow frame instead of a reset. */
+volatile uint32_t guest_slice_overruns = 0;
+/* The same defect measured at the only granularity that can actually starve
+   the watchdog: ONE x86_cpu_interp_asm() call. The interpreter cannot be
+   interrupted, so this is the true worst case the frame loop is exposed to. */
+volatile uint32_t guest_asm_ms_worst = 0;
+volatile uint32_t guest_asm_overruns = 0;
 volatile uint32_t frame_ms_last    = 0;  /* last iteration, host ms           */
 volatile uint32_t panel_ms_min     = 0;  /* shortest iteration seen = the panel*/
 volatile uint32_t frame_10us_avg = 8u * 1667u; /* mean iteration, 8x, 10us units */
@@ -2878,6 +2911,73 @@ static void arm_tick_irq(void)
     guest_ticks++;
 }
 
+/* Stage identifiers for x86_frame_phase. Kept dense and in body order so a
+   sample reads as a position in the iteration, not as a bare tag. */
+#define X86_PHASE_FWLOOP   1
+#define X86_PHASE_INPUT    2
+#define X86_PHASE_PACING   3
+#define X86_PHASE_GUEST    4
+#define X86_PHASE_VIDEO    5
+#define X86_PHASE_AUDIO    6
+#define X86_PHASE_SWAP     7
+#define X86_PHASE_TAIL     8
+
+/*
+ * Enter a stage: publish it, and REFRESH THE WATCHDOG.
+ *
+ * The refresh is the host-side guard, and it is deliberately here rather than
+ * only at the bottom of the body. One refresh per iteration means the window
+ * bounds the WHOLE frame, so a stage that overruns takes the device down with
+ * a reset -- which destroys the evidence and, on a title that does it every
+ * run, makes the machine unusable. Refreshing per stage bounds each STAGE
+ * instead: a slow stage becomes a slow frame (visible in
+ * x86_frame_phase_worst), and only a stage that genuinely never returns still
+ * resets. That is the difference between a hang we can read and a reboot loop.
+ */
+#define FRAME_PHASE(id)                                                       \
+    do {                                                                      \
+        uint32_t now__ = abi->HAL_GetTick();                                  \
+        uint32_t took__ = now__ - x86_frame_phase_ms;                         \
+        if (took__ > x86_frame_phase_worst) {                                 \
+            x86_frame_phase_worst = took__;                                   \
+            x86_frame_phase_worst_id = x86_frame_phase;                       \
+        }                                                                     \
+        x86_frame_phase = (id);                                               \
+        x86_frame_phase_ms = now__;                                           \
+        x86_frame_phase_seq++;                                                \
+        if (X86_PHASE_WDOG)                                                   \
+            abi->wdog_refresh();                                              \
+    } while (0)
+
+/*
+ * The guest slice's WALL-CLOCK escape.
+ *
+ * MAX_SLICE_CEIL bounds a slice in INSTRUCTIONS, and that bound is sound --
+ * pit_counter is decremented once per instruction and the interpreter exits
+ * when it reaches zero. What it cannot bound is TIME: an instruction is 55
+ * cycles or, through the planar aperture with a shadow rebuild behind it, tens
+ * of thousands, so a budget that finishes in 12 ms of ordinary code can take a
+ * second of that. This turns the worst case into a dropped frame rather than a
+ * stage that outlives the watchdog window.
+ */
+#ifndef GUEST_SLICE_WALL_MS
+#define GUEST_SLICE_WALL_MS 120u
+#endif
+
+/* The per-stage refresh, separable so the two halves of the guard can be
+   graded independently. X86_PHASE_WDOG=0 leaves the single bottom-of-body
+   refresh master had, which is the negative control for the refresh half. */
+#ifndef X86_PHASE_WDOG
+#define X86_PHASE_WDOG 1
+#endif
+
+/* Wall-clock ceiling on ONE uninterruptible interpreter call. Well under the
+   ~472 ms watchdog window, and above the 65-100 ms whole FRAMES a healthy
+   title produces, so it fires on the pathological mix and nothing else. */
+#ifndef GUEST_ASM_MS_MAX
+#define GUEST_ASM_MS_MAX 60u
+#endif
+
 static void emulator_loop(const gw_firmware_abi_t *abi)
 {
     /* Give the I/O layer the host clock BEFORE the guest runs: it is what
@@ -2961,6 +3061,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
            fiction (measured: 768 "skipped" of 1032 drawn). */
         common_emu_state.frame_time_10us = (int16_t)(frame_10us_avg / 8u);
         /* Bookkeeping only -- see above. The verdict is deliberately unused. */
+        FRAME_PHASE(X86_PHASE_FWLOOP);
         X86_ZONE_ENTER(X86_ZONE_FWLOOP);            /* ZONES */
         (void)abi->common_emu_frame_loop();
         X86_ZONE_EXIT();                            /* ZONES */
@@ -2985,6 +3086,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
 
         uint32_t frame_start_ms = abi->HAL_GetTick();
 
+        FRAME_PHASE(X86_PHASE_INPUT);
         X86_ZONE_ENTER(X86_ZONE_INPUT);             /* ZONES */
         poll_input(abi);
         X86_ZONE_EXIT();                            /* ZONES */
@@ -3226,8 +3328,17 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         cpu_state_ptr->pit_reload = sub_slice;
         arm_tick_irq();
 
+        FRAME_PHASE(X86_PHASE_GUEST);
         uint32_t exec_start_ms = abi->HAL_GetTick();
         while (!guest_halted) {
+            /* THE WALL-CLOCK ESCAPE. See GUEST_SLICE_WALL_MS. Checked at the
+               sub-slice boundary, which costs one tick read per boundary and
+               nothing per instruction. */
+            if ((uint32_t)(abi->HAL_GetTick() - exec_start_ms)
+                    > GUEST_SLICE_WALL_MS) {
+                guest_slice_overruns++;
+                break;
+            }
             /*
              * Keep the controller draining. A BUTTON produces at most two
              * codes, so one IRQ per frame was enough; an OSK keypress produces
@@ -3248,8 +3359,44 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                growing stale and vetoing evictions forever. */
             x86_livemap_clear();
             X86_ZONE_ENTER(X86_ZONE_GUEST);         /* ZONES */
+            /* THE WATCHDOG WINDOW IS PER FRAME, AND ONE CALL CAN OUTLIVE IT.
+             * Refresh here as well: this loop can run several sub-slices and
+             * each is bounded only in INSTRUCTIONS. Measured on KEEN4 --
+             * without the per-stage refreshes the device BSODs with
+             * BSOD_WATCHDOG (boot_magic 0xbad00005) inside this stage. */
+            uint32_t asm_start_ms = abi->HAL_GetTick();
+            abi->wdog_refresh();
             x86_cpu_interp_asm();
             X86_ZONE_EXIT();                        /* ZONES */
+            /*
+             * WHAT ONE CALL COST IN TIME, and the only bound on it.
+             *
+             * The instruction budget is not a time budget: an ordinary opcode
+             * is ~55 cycles and one that lands on the EGA aperture behind a
+             * shadow rebuild is 846,000 (docs/13), so the same 50,000-insn
+             * budget is 18 ms of one mix and most of a second of another. The
+             * interpreter cannot be interrupted mid-call, so the only lever is
+             * the budget the NEXT call gets: halve it whenever a call overran,
+             * and let the frame-loop regulator grow it back when it stops.
+             */
+            uint32_t asm_ms = abi->HAL_GetTick() - asm_start_ms;
+            if (asm_ms > guest_asm_ms_worst)
+                guest_asm_ms_worst = asm_ms;
+            if (asm_ms > GUEST_ASM_MS_MAX) {
+                guest_asm_overruns++;
+                if (max_slice > MAX_SLICE_FLOOR) {
+                    max_slice /= 2u;
+                    if (max_slice < MAX_SLICE_FLOOR)
+                        max_slice = MAX_SLICE_FLOOR;
+                    guest_max_slice = max_slice;
+                }
+                if (sub_slice > MAX_SLICE_FLOOR) {
+                    sub_slice /= 2u;
+                    if (sub_slice < MAX_SLICE_FLOOR)
+                        sub_slice = MAX_SLICE_FLOOR;
+                    cpu_state_ptr->pit_reload = sub_slice;
+                }
+            }
             /* Bank the slice's guest time while pit_counter still holds what
                the guest left it at -- every host store to it below is a
                forced one and would otherwise be charged as elapsed time. */
@@ -3332,6 +3479,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
 
         /* Video. The beam fraction drives the CGA status register, so a guest
            polling for vertical retrace sees it arrive about once per frame. */
+        FRAME_PHASE(X86_PHASE_VIDEO);
         X86_ZONE_ENTER(X86_ZONE_VIDEO);             /* ZONES */
         x86_video_set_beam(0xE000);
         uint8_t *fb = (uint8_t *)abi->lcd_get_active_buffer();
@@ -3420,6 +3568,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
          * ~12.5% of full scale at maximum, one binary step below the 25% the
          * tama core uses for its own square wave -- a PC-speaker square is
          * full-swing with no envelope, so it carries more energy than that. */
+        FRAME_PHASE(X86_PHASE_AUDIO);
         X86_ZONE_ENTER(X86_ZONE_AUDIO);             /* ZONES */
         int16_t *abuf = abi->audio_get_active_buffer();
         if (abuf && audio_frames) {
@@ -3440,6 +3589,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         /* ZONES: SWAP is the loop's only genuine IDLE. A big number here is
            HEADROOM, not a cost -- which is why it must be its own zone and not
            part of the residual. */
+        FRAME_PHASE(X86_PHASE_SWAP);
         X86_ZONE_ENTER(X86_ZONE_SWAP);
         abi->lcd_swap();
         {
@@ -3469,6 +3619,10 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
          * signal. */
         if (!guest_halted)
             guest_insns_total += slice;
+        FRAME_PHASE(X86_PHASE_TAIL);
+        /* Master's ONE refresh per iteration. Unconditional, so
+           X86_PHASE_WDOG=0 is a control on the EXTRA refreshes and not a build
+           with no watchdog service at all. */
         abi->wdog_refresh();
 
         /* What this iteration really cost. */
