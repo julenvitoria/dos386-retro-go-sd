@@ -557,6 +557,10 @@ int x86_dos_terminate_code(uint16_t code);
    without a trace. x86_dos_exec_last_err carries the DOS error of the last
    refusal, or 0x1xx for an unimplemented SUBfunction (AL). */
 extern volatile uint32_t x86_dos_execs;
+/* The ROOT program's environment segment. It was always 0 -- dos_env_build()
+   was reachable only from EXEC and every shipped title is the root -- which is
+   why BLASTER could not have been seen by anything even had it been written. */
+extern volatile uint32_t x86_dos_env_seg;
 extern volatile uint32_t x86_dos_exec_fails;
 extern volatile uint32_t x86_dos_exec_depth_max;
 extern volatile uint32_t x86_dos_exec_last_err;
@@ -700,11 +704,18 @@ extern volatile uint32_t x86_kb_peek_hits;
 extern volatile uint32_t x86_kbd_port60_reads;
 extern volatile uint32_t x86_kbd_read_log[32];
 extern volatile uint32_t x86_kbd_read_log_idx;
-/* SOUND -- DETECTION ONLY, NO AUDIO. See the sound block in x86_io.c: the OPL2
-   timer registers and the SB DSP reset handshake are modelled so a probe gets a
-   truthful answer instead of a floating 0xFF; nothing here produces a sample.
-   x86_sb_dma_refused is the honest count of "a title asked for digitised audio
-   and got silence" -- read it before believing any title is audio-clean. */
+/* SOUND. Detection (OPL2 timers, the DSP reset handshake) AND DIGITISED
+   PLAYBACK: an 8237 pair, IRQ 5 through the 8259, the CT1745 mixer and the
+   SB16 command block. See the sound block in x86_io.c.
+
+   FM SYNTHESIS IS STILL ABSENT -- the OPL timers answer a detection probe and
+   the register file is deliberately not stored, so a title using AdLib MUSIC
+   is silent while its digitised effects play.
+
+   x86_sb_dma_refused now means what its name says and no more: a transfer this
+   model CANNOT run (record, or a direct-DAC write with no DMA behind it). It
+   is no longer the count of "asked for audio and got silence" -- for that, read
+   x86_sb_samples against x86_sb_starts. */
 extern volatile uint32_t x86_opl_writes;
 extern volatile uint32_t x86_opl_status_reads;
 extern volatile uint32_t x86_opl_timer_expiry;
@@ -713,6 +724,32 @@ extern volatile uint32_t x86_sb_cmds;
 extern volatile uint32_t x86_sb_cmds_unknown;
 extern volatile uint32_t x86_sb_dma_refused;
 extern volatile uint32_t x86_sb_reads_empty;
+extern volatile uint32_t x86_sb_starts;
+extern volatile uint32_t x86_sb_blocks;
+extern volatile uint32_t x86_sb_dma_bytes;
+extern volatile uint32_t x86_sb_samples;
+extern volatile uint32_t x86_sb_irqs;
+extern volatile uint32_t x86_sb_irqs_delivered;
+extern volatile uint32_t x86_sb_irqs_masked;
+extern volatile uint32_t x86_sb_irqs_lost;
+extern volatile uint32_t x86_sb_irqs_acked;
+extern volatile uint32_t x86_sb_eois;
+extern volatile uint32_t x86_sb_underruns;
+extern volatile uint32_t x86_sb_adpcm_silenced;
+extern volatile uint32_t x86_sb_rate;
+extern volatile uint32_t x86_sb_dma_maps;
+extern volatile uint32_t x86_dma_writes;
+
+/* Mix one frame's worth of Sound Blaster output ON TOP of `dst`, and by doing
+   so advance the DMA transfer -- there is no other clock. Call it AFTER
+   x86_speaker_render() has filled the buffer. Returns the samples contributed.
+   See the engine block in x86_io.c for why this is the only driver. */
+unsigned x86_sb_render_mix(int16_t *dst, unsigned frames, unsigned sample_rate,
+                           int16_t amplitude);
+int x86_sb_playing(void);
+/* Hand the guest IRQ 5 if the card is asking for one and the 8259 can take it.
+   Same contract as x86_kbd_raise_irq(); call it from the same places. */
+int x86_sb_raise_irq(X86CPUState *cpu);
 
 #define X86_MODE_REC_STRIDE     2048
 #define X86_MODE_REC_TABLE_OFF  1024

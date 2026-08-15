@@ -272,7 +272,19 @@ CONTEXT = ["core_ready", "core_dtcm_ok", "hle_calls_seen", "x86_hle_calls",
            # zero frames. guest_ram_pages_short is the target's own alarm for
            # a pool that was shortened rather than refused.
            "x86_pg_frames_total", "guest_ram_pages", "guest_ram_pages_short",
-           "guest_ram_free_at_claim"]
+           "guest_ram_free_at_claim",
+           # SOUND, and it needs its own set because the port table cannot tell
+           # "programmed a transfer" from "played one". x86_sb_starts vs
+           # x86_sb_samples is exactly that difference; x86_sb_irqs vs
+           # _delivered separates "the card asked" from "the guest was given
+           # it", which is the hang this path exists to remove; and
+           # x86_dos_env_seg says whether BLASTER was reachable at all.
+           "x86_dos_env_seg", "x86_sb_resets", "x86_sb_cmds",
+           "x86_sb_cmds_unknown", "x86_sb_dma_refused", "x86_sb_starts",
+           "x86_sb_blocks", "x86_sb_dma_bytes", "x86_sb_samples",
+           "x86_sb_rate", "x86_sb_irqs", "x86_sb_irqs_delivered",
+           "x86_sb_irqs_masked", "x86_sb_irqs_acked", "x86_sb_underruns",
+           "x86_sb_adpcm_silenced", "x86_opl_timer_expiry"]
 
 # How long to watch guest_insns_total to decide it is ADVANCING. A guest that
 # halted at instruction 1 has a non-zero count forever, so a single sample

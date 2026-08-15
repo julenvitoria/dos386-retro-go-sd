@@ -1638,6 +1638,229 @@ static void sound_test_run(void)
     snd_r[14] = x86_opl_timer_expiry;
 }
 
+/* ---------------------------------------------------------------------------
+ * SOUND BLASTER DIGITISED PLAYBACK -- the DMA transfer, the terminal count, the
+ * IRQ 5 that closes it, and the samples that come out the other end.
+ *
+ * The arm above proves a card is FOUND. This one proves it PLAYS, and it is
+ * written so that no part of that claim rests on a counter alone:
+ *
+ *   the guest WRITES a 256-byte ramp into its own memory, programs the 8237 to
+ *   point at it, programs the DSP for 6,000 Hz 8-bit single-cycle, starts the
+ *   transfer, and then WAITS FOR THE INTERRUPT -- which is exactly the wait
+ *   that hangs a title today, so if the interrupt does not arrive this arm
+ *   spins to its bound and fails rather than quietly passing.
+ *
+ *   the host then checks the AUDIO. 6,000 Hz into a 48,000 Hz buffer is exactly
+ *   eight output samples per source byte, so sample k must be the guest's byte
+ *   k/8, decoded from unsigned 8-bit. That single assertion covers the DMA
+ *   address walk, the page register, the decode and the rate conversion at
+ *   once, and no counter can fake it.
+ *
+ * The host loop here IS the frame loop in miniature and deliberately so: the
+ * engine has no other clock (x86_io.c), so a harness that never rendered would
+ * see a transfer that never advances -- which is a real property of the design
+ * and not a defect to work around.
+ */
+#define SBD_CODE    0x3000u
+#define SBD_ISR     0x3200u
+#define SBD_RES     0x3300u
+#define SBD_BUF     0x4000u
+#define SBD_FRAMES  64u              /* small on purpose: this harness has
+                                         176 BYTES of RAM_EMU slack and a
+                                         800-sample buffer overflows it */
+#define SBD_RATE    48000u
+
+volatile uint32_t run_sbdma_flag = 0;
+volatile uint32_t sbd_r[24];
+/* The first 64 rendered samples, PACKED TWO PER WORD. This harness has a few
+   hundred bytes of RAM_EMU and an int32 per sample overflows the region -- see
+   TEST.ld. Low half is the even sample. */
+volatile uint32_t sbd_pcm[32] __attribute__((section(".test_bss")));
+/* HOST scratch, not guest memory -- so it belongs in .test_bss (RAM_UC),
+   which is exactly the lesson TEST.ld's comment records: RAM_EMU has no
+   slack and a new object in front of the 4 KB-aligned test_ram costs a
+   whole page. */
+static int16_t sbd_audio[SBD_FRAMES] __attribute__((section(".test_bss")));
+
+static const uint8_t sbdma_code[] = {
+    /* -- fill 4000h..40FFh with a ramp: the guest's OWN data -------------- */
+    0xBF, 0x00, 0x40,             /* MOV DI,4000h                          */
+    0xB0, 0x00,                   /* MOV AL,0                              */
+    0xB9, 0x00, 0x01,             /* MOV CX,256                            */
+    0x88, 0x05,                   /* fill: MOV [DI],AL                     */
+    0x47,                         /*       INC DI                          */
+    0xFE, 0xC0,                   /*       INC AL                          */
+    0xE2, 0xF9,                   /*       LOOP fill                       */
+    /* -- DSP reset ------------------------------------------------------- */
+    0xBA, 0x26, 0x02,             /* MOV DX,0226h                          */
+    0xB0, 0x01, 0xEE,             /* MOV AL,1  / OUT DX,AL                 */
+    0xB0, 0x00, 0xEE,             /* MOV AL,0  / OUT DX,AL                 */
+    0xBA, 0x2A, 0x02,             /* MOV DX,022Ah                          */
+    0xEC,                         /* IN AL,DX                              */
+    0xA2, 0x00, 0x33,             /* MOV [3300h],AL   MUST BE 0xAA         */
+    /* -- E1h: the version. 4.05 is what puts a title on the SB16 path ---- */
+    0xBA, 0x2C, 0x02,             /* MOV DX,022Ch                          */
+    0xB0, 0xE1, 0xEE,             /* MOV AL,E1h / OUT DX,AL                */
+    0xBA, 0x2A, 0x02,             /* MOV DX,022Ah                          */
+    0xEC, 0xA2, 0x01, 0x33,       /* IN AL,DX / MOV [3301h],AL  major = 4  */
+    0xEC, 0xA2, 0x02, 0x33,       /* IN AL,DX / MOV [3302h],AL  minor = 5  */
+    /* -- the mixer's IRQ and DMA select registers ------------------------ */
+    0xBA, 0x24, 0x02,             /* MOV DX,0224h                          */
+    0xB0, 0x80, 0xEE,             /* MOV AL,80h / OUT DX,AL   IRQ select   */
+    0x42, 0xEC,                   /* INC DX / IN AL,DX                     */
+    0xA2, 0x0C, 0x33,             /* MOV [330Ch],AL   expect 02h = IRQ 5   */
+    0x4A,                         /* DEC DX                                */
+    0xB0, 0x81, 0xEE,             /* MOV AL,81h / OUT DX,AL   DMA select   */
+    0x42, 0xEC,                   /* INC DX / IN AL,DX                     */
+    0xA2, 0x0D, 0x33,             /* MOV [330Dh],AL   expect 22h = D1 + H5 */
+    /* -- install the INT 0Dh (IRQ 5) vector ------------------------------ */
+    0xC7, 0x06, 0x34, 0x00, 0x00, 0x32,   /* MOV WORD [0034h],3200h        */
+    0xC7, 0x06, 0x36, 0x00, 0x00, 0x00,   /* MOV WORD [0036h],0000h        */
+    /* -- unmask IRQ 5 at the 8259, then enable interrupts ---------------- */
+    0xE4, 0x21,                   /* IN AL,21h                             */
+    0x24, 0xDF,                   /* AND AL,DFh                            */
+    0xE6, 0x21,                   /* OUT 21h,AL                            */
+    0xFB,                         /* STI                                   */
+    /* -- program 8237 channel 1 for a 256-byte read at 0:4000 ------------ */
+    0xB0, 0x05, 0xE6, 0x0A,       /* MOV AL,05h / OUT 0Ah,AL   mask ch1    */
+    0xB0, 0x00, 0xE6, 0x0C,       /* MOV AL,00h / OUT 0Ch,AL   clear ff    */
+    0xB0, 0x49, 0xE6, 0x0B,       /* MOV AL,49h / OUT 0Bh,AL   single/inc/ */
+                                  /*                           read/ch1    */
+    0xB0, 0x00, 0xE6, 0x02,       /* MOV AL,00h / OUT 02h,AL   addr lo     */
+    0xB0, 0x40, 0xE6, 0x02,       /* MOV AL,40h / OUT 02h,AL   addr hi     */
+    0xB0, 0x00, 0xE6, 0x83,       /* MOV AL,00h / OUT 83h,AL   page (ch1!) */
+    0xB0, 0xFF, 0xE6, 0x03,       /* MOV AL,FFh / OUT 03h,AL   count-1 lo  */
+    0xB0, 0x00, 0xE6, 0x03,       /* MOV AL,00h / OUT 03h,AL   count-1 hi  */
+    0xB0, 0x01, 0xE6, 0x0A,       /* MOV AL,01h / OUT 0Ah,AL   unmask ch1  */
+    /* -- speaker on, 6,000 Hz, and GO ------------------------------------ */
+    0xBA, 0x2C, 0x02,             /* MOV DX,022Ch                          */
+    0xB0, 0xD1, 0xEE,             /* MOV AL,D1h / OUT DX,AL   speaker on   */
+    0xB0, 0x41, 0xEE,             /* MOV AL,41h / OUT DX,AL   set rate     */
+    0xB0, 0x17, 0xEE,             /* MOV AL,17h / OUT DX,AL   6000 >> 8    */
+    0xB0, 0x70, 0xEE,             /* MOV AL,70h / OUT DX,AL   6000 & FF    */
+    0xB0, 0x14, 0xEE,             /* MOV AL,14h / OUT DX,AL   8-bit single */
+    0xB0, 0xFF, 0xEE,             /* MOV AL,FFh / OUT DX,AL   len-1 lo     */
+    0xB0, 0x00, 0xEE,             /* MOV AL,00h / OUT DX,AL   len-1 hi     */
+    /* -- WAIT FOR THE COMPLETION INTERRUPT. This is the wait that hangs a
+          title today; it is BOUNDED so a missing IRQ fails instead of hanging
+          the harness, and the residual count says how close it came. ----- */
+    0xB9, 0x40, 0x9C,             /* MOV CX,40000                          */
+    0xA0, 0x08, 0x33,             /* wait: MOV AL,[3308h]  the ISR's count */
+    0x84, 0xC0,                   /*       TEST AL,AL                      */
+    0x75, 0x02,                   /*       JNZ done                        */
+    0xE2, 0xF7,                   /*       LOOP wait                       */
+    0x89, 0x0E, 0x04, 0x33,       /* done: MOV [3304h],CX  polls left      */
+    /* -- the 8237's own view: TC for channel 1 in the status register ---- */
+    0xE4, 0x08,                   /* IN AL,08h                             */
+    0xA2, 0x09, 0x33,             /* MOV [3309h],AL                        */
+    /* -- and the DSP's, after the handler acknowledged it ---------------- */
+    0xBA, 0x2E, 0x02,             /* MOV DX,022Eh                          */
+    0xEC,                         /* IN AL,DX                              */
+    0xA2, 0x0A, 0x33,             /* MOV [330Ah],AL                        */
+    0xF4,                         /* HLT                                   */
+};
+
+/* The IRQ 5 handler. It does the two acknowledgements a real one does -- the
+   DSP's (a read of 0x22E) and the 8259's (an EOI) -- and records the mixer's
+   IRQ-status byte on the way, which is what an SB16 driver reads to find out
+   whether the 8-bit or the 16-bit line fired. */
+static const uint8_t sbdma_isr[] = {
+    0x50, 0x52,                   /* PUSH AX / PUSH DX                     */
+    0xFE, 0x06, 0x08, 0x33,       /* INC BYTE [3308h]                      */
+    0xBA, 0x24, 0x02,             /* MOV DX,0224h                          */
+    0xB0, 0x82, 0xEE,             /* MOV AL,82h / OUT DX,AL                */
+    0x42, 0xEC,                   /* INC DX / IN AL,DX                     */
+    0xA2, 0x0B, 0x33,             /* MOV [330Bh],AL   expect bit 0 set     */
+    0xBA, 0x2E, 0x02,             /* MOV DX,022Eh                          */
+    0xEC,                         /* IN AL,DX      the DSP acknowledge     */
+    0xB0, 0x20, 0xE6, 0x20,       /* MOV AL,20h / OUT 20h,AL   the EOI     */
+    0x5A, 0x58,                   /* POP DX / POP AX                       */
+    0xCF,                         /* IRET                                  */
+};
+
+static void sbdma_test_run(void)
+{
+    /* 0x0D is DELIBERATELY NOT in this list: IRQ 5 must go through the guest's
+       own vector, which is the path being graded. */
+    static const uint8_t hle_vectors[] = { 0x08, 0x09, 0x10, 0x16, 0x1A, 0x20, 0x21 };
+
+    x86_video_init(cga_test_vram, cga_test_palette);
+    x86_video_set_aperture(vga_test_aperture, vga_test_pal);
+    x86_bios_init();
+    x86_hle_install(hle_vectors, sizeof(hle_vectors));
+
+    memset(&test_ram[SBD_RES], 0, 64);
+    memset(&test_ram[SBD_BUF], 0, 256);
+    memcpy(&test_ram[SBD_CODE], sbdma_code, sizeof(sbdma_code));
+    memcpy(&test_ram[SBD_ISR],  sbdma_isr,  sizeof(sbdma_isr));
+    for (unsigned i = 0; i < 32; i++)
+        sbd_pcm[i] = 0;
+
+    kbd_test_reset_cpu(SBD_CODE);
+    cpu_state_dtcm.pit_counter = cpu_state_dtcm.pit_reload = 1200;
+
+    unsigned captured = 0;
+    uint32_t reason = 0xFFFFFFFFu;
+    int guard;
+    for (guard = 0; guard < 600; guard++) {
+        x86_cpu_interp_asm();
+        uint32_t er = cpu_state_dtcm.exit_reason;
+        if (er == X86_EXIT_HLE_INT) {
+            cpu_state_dtcm.exit_reason = 0;
+            x86_hle_service();
+            if (cpu_state_dtcm.exit_reason != 0) {
+                reason = cpu_state_dtcm.exit_reason;
+                break;
+            }
+        } else if (er == X86_EXIT_TIMER) {
+            cpu_state_dtcm.exit_reason = 0;
+            cpu_state_dtcm.pit_counter = 1200;
+        } else {
+            reason = er;
+            break;
+        }
+        /* THE FRAME LOOP, in miniature: render (which is what advances the
+           transfer) and then offer the interrupt, in that order and at every
+           boundary -- exactly what src/main.c does. */
+        memset(sbd_audio, 0, sizeof(sbd_audio));
+        unsigned got = x86_sb_render_mix(sbd_audio, SBD_FRAMES, SBD_RATE, 32767);
+        if (got && !captured) {
+            for (unsigned i = 0; i < 32; i++)
+                sbd_pcm[i] = (uint32_t)(uint16_t)sbd_audio[i * 2] |
+                             ((uint32_t)(uint16_t)sbd_audio[i * 2 + 1] << 16);
+            captured = 1;
+        }
+        x86_sb_raise_irq(&cpu_state_dtcm);
+    }
+
+    sbd_r[0]  = test_ram[SBD_RES + 0];                  /* the 0xAA        */
+    sbd_r[1]  = test_ram[SBD_RES + 1];                  /* version major   */
+    sbd_r[2]  = test_ram[SBD_RES + 2];                  /* version minor   */
+    sbd_r[3]  = (uint32_t)(test_ram[SBD_RES + 4] |
+                           (test_ram[SBD_RES + 5] << 8));   /* polls left  */
+    sbd_r[4]  = test_ram[SBD_RES + 8];                  /* ISR entry count */
+    sbd_r[5]  = test_ram[SBD_RES + 9];                  /* 8237 status     */
+    sbd_r[6]  = test_ram[SBD_RES + 10];                 /* 0x22E, post-ack */
+    sbd_r[7]  = test_ram[SBD_RES + 11];                 /* mixer 0x82      */
+    sbd_r[8]  = test_ram[SBD_RES + 12];                 /* mixer 0x80      */
+    sbd_r[9]  = test_ram[SBD_RES + 13];                 /* mixer 0x81      */
+    sbd_r[10] = x86_sb_starts;
+    sbd_r[11] = x86_sb_blocks;
+    sbd_r[12] = x86_sb_dma_bytes;
+    sbd_r[13] = x86_sb_samples;
+    sbd_r[14] = x86_sb_irqs;
+    sbd_r[15] = x86_sb_irqs_delivered;
+    sbd_r[16] = x86_sb_irqs_acked;
+    sbd_r[17] = x86_sb_eois;
+    sbd_r[18] = x86_sb_underruns;
+    sbd_r[19] = x86_sb_rate;
+    sbd_r[20] = x86_sb_dma_maps;
+    sbd_r[21] = (uint32_t)guard;
+    sbd_r[22] = captured;
+    sbd_r[23] = reason;
+}
+
 static void kbd_test_run(void)
 {
     static const uint8_t hle_vectors[] = {
@@ -2161,8 +2384,14 @@ static void dossys_test_run(void)
 #define NORPG_PAGES     4u
 #define NORPG_MEM_OFF   (700u * 1024u)
 
+/* HARNESS-ONLY: a RAM stand-in for the NOR part, 32 KB. It belongs in
+   .test_bss (RAM_UC, the firmware's framebuffer pool, which the bare-metal
+   harness never uses) for the same reason the video test's buffers do — it is
+   the HOST's scratch, not guest memory, and leaving it in RAM_EMU spends space
+   the pager's frames are measured against. RAM_EMU overflowed by 176 bytes
+   when a session's work landed together; this is where the slack lives. */
 static uint8_t nor_test_ram[NOR_TEST_BYTES]
-    __attribute__((aligned(4096)));
+    __attribute__((aligned(4096), section(".test_bss")));
 
 static uint8_t nor_pattern_byte(uint32_t off)
 {
@@ -5636,6 +5865,11 @@ void Reset_Handler(void) {
         if (run_sound_flag == 1) {
             sound_test_run();
             run_sound_flag = 0;
+        }
+
+        if (run_sbdma_flag == 1) {
+            sbdma_test_run();
+            run_sbdma_flag = 0;
         }
 
         if (run_sysinfo_flag == 1) {

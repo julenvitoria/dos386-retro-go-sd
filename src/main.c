@@ -3842,6 +3842,14 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
              * 8259A's whole model of one.
              */
             input_irqs += (uint32_t)x86_kbd_raise_irq(cpu_state_ptr);
+            /* IRQ 5, on the same terms and in the same place. A sound driver
+               that starts a transfer and waits for the completion interrupt is
+               the failure mode this whole path exists to remove, and the wait
+               happens INSIDE a slice -- so the retry has to be here, at every
+               sub-slice boundary, and not once per frame. The card's line stays
+               asserted until the guest reads 0x22E, so a refusal costs nothing
+               but a retry. */
+            x86_sb_raise_irq(cpu_state_ptr);
             /* Re-entering the guest is the one moment at which no host pointer
                into guest memory can still be live: every HLE service that took
                one has returned. Clearing the ring here is what keeps it from
@@ -4064,6 +4072,15 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
             int16_t amp = (int16_t)(((int32_t)abi->common_emu_sound_get_volume()
                                      * INT16_MAX) >> 11);
             x86_speaker_render(abuf, audio_frames, SAMPLE_RATE, amp);
+            /* THE SOUND BLASTER IS MIXED ON TOP, AND THIS CALL IS ALSO WHAT
+               ADVANCES THE DMA TRANSFER -- there is no per-instruction engine
+               anywhere (x86_io.c's engine block says why). It pulls exactly the
+               guest bytes this frame's samples needed, so the transfer runs at
+               the sample clock, which is what the hardware does. A card at half
+               amplitude against the speaker keeps a beep audible under music
+               rather than being swamped by it. */
+            x86_sb_render_mix(abuf, audio_frames, SAMPLE_RATE,
+                              (int16_t)(amp >> 1));
         }
         X86_ZONE_EXIT();                            /* ZONES: end AUDIO */
 

@@ -54,7 +54,177 @@ sys.path.insert(0, ".")
 from scripts.common.runner import add_runner_args, build_and_create_runner
 from scripts.common.elf import get_symbols
 
-DSP_VERSION = (2, 1)            # DSP 2.01: a plain SB 2.0, no mixer, no SB16
+DSP_VERSION = (4, 5)            # DSP 4.05: an SB16, which is what we implement
+
+# The playback arm's fixed numbers. 6,000 Hz into a 48,000 Hz buffer is EXACTLY
+# eight output samples per source byte, which is why that rate was chosen: the
+# expected waveform is arithmetic, not a simulation of the resampler.
+SBD_SRC_RATE = 6000
+SBD_OUT_RATE = 48000
+SBD_HOLD = SBD_OUT_RATE // SBD_SRC_RATE     # 8
+SBD_BYTES = 256
+SBD_AMP = 32767
+
+
+def _s16(v):
+    return v - 0x10000 if v & 0x8000 else v
+
+
+def playback(args, runner):
+    """The DMA transfer, the terminal count, the IRQ 5, and the SAMPLES."""
+    b = runner.backend
+    syms = get_symbols("test_core.elf")
+    for n in ("run_sbdma_flag", "sbd_r", "sbd_pcm"):
+        if n not in syms:
+            print(f"missing symbol {n} -- rebuild tests/main.c")
+            return False
+
+    b.write_uint32(syms["run_sbdma_flag"], 1)
+    for _ in range(600):
+        if b.read_uint32(syms["run_sbdma_flag"]) == 0:
+            break
+        time.sleep(0.05)
+    else:
+        print("FAIL: the playback arm never completed")
+        return False
+
+    r = [b.read_uint32(syms["sbd_r"] + 4 * i) for i in range(24)]
+    (aa, major, minor, polls_left, isr_count, dma_status, dsp_stat,
+     mix82, mix80, mix81, starts, blocks, dma_bytes, samples, irqs,
+     delivered, acked, eois, underruns, rate, maps, guard, captured,
+     reason) = r
+    # Packed two samples per word: this harness has no RAM_EMU to spare.
+    pcm = []
+    for i in range(32):
+        w = b.read_uint32(syms["sbd_pcm"] + 4 * i)
+        pcm.append(_s16(w & 0xFFFF))
+        pcm.append(_s16((w >> 16) & 0xFFFF))
+
+    print()
+    print("=== DIGITISED PLAYBACK ===")
+    print(f"handshake  0x22A {aa:#04x}   version {major}.{minor:02d}")
+    print(f"mixer      0x80 IRQ sel {mix80:#04x} (expect 0x02 = IRQ 5)   "
+          f"0x81 DMA sel {mix81:#04x} (expect 0x22 = D1 + H5)")
+    print(f"transfer   starts {starts} blocks {blocks} dma_bytes {dma_bytes} "
+          f"rate {rate} Hz  granule maps {maps}")
+    print(f"           8237 status {dma_status:#04x} (bit 1 = TC on ch1)")
+    print(f"IRQ 5      asserted {irqs} delivered {delivered} acked {acked} "
+          f"EOIs {eois}   guest ISR entered {isr_count}x")
+    print(f"           mixer 0x82 in the handler {mix82:#04x} "
+          f"(bit 0 = the 8-bit line)   0x22E after the ack {dsp_stat:#04x}")
+    print(f"           the guest's bounded wait had {polls_left} polls left "
+          f"(0 = it gave up)")
+    print(f"audio      {samples} samples rendered, underruns {underruns}, "
+          f"first 64 captured {captured}")
+    print(f"           " + " ".join(f"{v:6d}" for v in pcm[:16]))
+    print(f"host loop  {guard} iterations, exit reason {reason} (6 = HLT)")
+
+    ok = True
+
+    def fail(msg):
+        nonlocal ok
+        print("FAIL: " + msg)
+        ok = False
+
+    # ---- identity: 4.05 is a PROMISE, and the rest of this arm is it ----
+    if aa != 0xAA:
+        fail(f"0x22A returned {aa:#04x}, not 0xAA -- the card is not even found")
+    if (major, minor) != DSP_VERSION:
+        fail(f"E1h returned {major}.{minor}, expected "
+             f"{DSP_VERSION[0]}.{DSP_VERSION[1]:02d}. A title uses this number "
+             f"to decide whether the 16-bit channel and the 0xBx/0xCx command "
+             f"block exist, so it must match what is implemented")
+    if mix80 != 0x02:
+        fail(f"the mixer's IRQ select reads {mix80:#04x}, expected 0x02 (IRQ 5) "
+             f"-- 0xFF is the unmodelled port, and a driver that believes it "
+             f"hooks a vector nothing will ever raise")
+    if mix81 != 0x22:
+        fail(f"the mixer's DMA select reads {mix81:#04x}, expected 0x22 "
+             f"(channel 1 and channel 5) -- this is what BLASTER's D1/H5 "
+             f"advertises and the two must agree")
+
+    # ---- the transfer ---------------------------------------------------
+    if starts != 1:
+        fail(f"x86_sb_starts is {starts}, expected exactly 1")
+    if rate != SBD_SRC_RATE:
+        fail(f"the DSP took the rate as {rate} Hz, not {SBD_SRC_RATE} -- "
+             f"command 41h's two argument bytes are big-endian and a swap "
+             f"here plays everything at the wrong pitch")
+    if dma_bytes != SBD_BYTES:
+        fail(f"the DMA moved {dma_bytes} bytes, expected exactly {SBD_BYTES}. "
+             f"Fewer means the walk stopped early (a count off by one, or a "
+             f"granule boundary it could not cross); more means terminal "
+             f"count never fired and it ran off the end of the buffer")
+    if not (dma_status & 0x02):
+        fail(f"the 8237 status register reads {dma_status:#04x}: channel 1's "
+             f"terminal count bit is CLEAR after a completed transfer. A "
+             f"driver that polls this instead of taking the interrupt waits "
+             f"for ever")
+
+    # ---- the interrupt, end to end --------------------------------------
+    if isr_count < 1:
+        fail("THE GUEST'S OWN IRQ 5 HANDLER NEVER RAN. This is the failure "
+             "the whole task exists to remove: the transfer completes and the "
+             "title waits for a completion interrupt that never arrives")
+    if polls_left == 0:
+        fail("the guest's bounded wait ran to its full bound -- the interrupt "
+             "arrived late or not at all, which on a real title is a hang")
+    if irqs < 1 or delivered < 1:
+        fail(f"IRQ 5 asserted {irqs} / delivered {delivered}: the card never "
+             f"raised the line, or the 8259 never handed it over")
+    if acked < 1:
+        fail("the DSP's interrupt was never acknowledged -- a read of 0x22E "
+             "must drop the line, and without that a second block never "
+             "interrupts")
+    if eois < 1:
+        fail("no EOI reached the 8259, so the in-service bit is still set and "
+             "IRQ 5 can never be delivered again")
+    if not (mix82 & 0x01):
+        fail(f"the mixer's IRQ status read {mix82:#04x} inside the handler; "
+             f"bit 0 (the 8-bit DMA line) must be set. An SB16 handler reads "
+             f"this to decide WHICH acknowledge to issue, and a constant here "
+             f"sends it to acknowledge the line that did not fire")
+    if dsp_stat & 0x80:
+        fail(f"0x22E still reports data available ({dsp_stat:#04x}) after the "
+             f"handler acknowledged")
+
+    # ---- THE SAMPLES. No counter can fake this one. ---------------------
+    if not captured:
+        fail("no audio was captured at all -- x86_sb_render_mix() returned 0 "
+             "on every call, so nothing was ever played")
+    else:
+        bad = 0
+        first_bad = None
+        for k, got in enumerate(pcm):
+            src = k // SBD_HOLD                 # the guest wrote byte == index
+            want = ((src - 128) << 8)
+            want = (want * SBD_AMP) >> 15
+            if abs(got - want) > 2:
+                bad += 1
+                if first_bad is None:
+                    first_bad = (k, got, want, src)
+        if bad:
+            k, got, want, src = first_bad
+            fail(f"{bad} of 64 rendered samples are not what the guest wrote. "
+                 f"First at output sample {k}: got {got}, expected {want} "
+                 f"(the guest's byte {src} of the ramp, unsigned 8-bit). At "
+                 f"{SBD_SRC_RATE} Hz into {SBD_OUT_RATE} Hz each source byte "
+                 f"must be held for exactly {SBD_HOLD} output samples -- so "
+                 f"this catches a wrong DMA address, a wrong decode AND a "
+                 f"wrong resampler step")
+        else:
+            print(f"           all 64 samples match the guest's ramp, held "
+                  f"{SBD_HOLD} apiece -- data path AND rate conversion")
+    if underruns:
+        fail(f"x86_sb_underruns is {underruns}: the source ran dry mid-render, "
+             f"so some of the audio above is whatever was held over")
+    if samples < 1:
+        fail("x86_sb_samples is 0")
+    if reason != 6:
+        fail(f"the guest exited with reason {reason}, not 6 (HLT)")
+
+    print("\nPLAYBACK PASS" if ok else "\nPLAYBACK FAIL")
+    return ok
 
 
 def main(args):
@@ -160,6 +330,12 @@ def main(args):
             fail(f"the guest exited with reason {exit_reason}, not 6 (HLT) -- "
                  f"it did not reach the end of the program")
 
+        print("\nDETECTION PASS" if ok else "\nDETECTION FAIL")
+
+        # The playback arm runs on the SAME target: rebuilding for it would
+        # double every negative control's cost for nothing.
+        ok = playback(args, runner) and ok
+
         print("\nPASS" if ok else "\nFAIL")
         return ok
     finally:
@@ -179,7 +355,42 @@ MUTATE_T1 = """    if (opl.t1_run && !(opl.ctrl & 0x40u) &&
 """
 
 
-def _mutate_and_require_failure(args, target, what):
+# ---------------------------------------------------------------------------
+# THE PLAYBACK CONTROLS. Each deletes ONE link in the chain and requires the
+# test to notice -- a green suite over a broken engine is the failure mode these
+# exist to make impossible.
+
+# TERMINAL COUNT. Without the borrow test the count never reaches zero, the DMA
+# walks past the end of the guest's buffer and no block ever completes.
+MUTATE_TC = """    if (c->cur_count-- == 0u) {        /* the borrow IS terminal count      */
+        c->tc = 1;
+        if (c->mode & 0x10u) {         /* auto-init: reload from the latches */
+            c->cur_addr  = c->base_addr;
+            c->cur_count = c->base_count;
+        } else {
+            c->masked = 1;
+        }
+        sb_win_drop();                 /* the address just jumped           */
+    }
+"""
+
+# IRQ DELIVERY. The line still comes up and the counters still move; what does
+# not happen is the guest's handler running. This is exactly the shape of the
+# hang the task is about, so the test MUST catch it.
+MUTATE_IRQ = """    pic_isr |= 0x20u;
+    cpu->hard_int_pending = 0x0Du;    /* IRQ 5 -> vector 0Dh                */
+    x86_sb_irqs_delivered++;
+"""
+
+# RATE CONVERSION. Replacing the fractional step with a whole source sample per
+# output sample plays the buffer six times too fast: every counter stays green
+# and only the SAMPLES say so.
+MUTATE_RATE = ("    uint32_t step = (uint32_t)(((uint64_t)sbp.rate << 16) "
+               "/ sample_rate);\n")
+MUTATE_RATE_TO = "    uint32_t step = 0x10000u;\n"
+
+
+def _mutate_and_require_failure(args, target, what, replacement=""):
     import pathlib
     src = pathlib.Path("x86_io.c")
     original = src.read_text()
@@ -188,10 +399,12 @@ def _mutate_and_require_failure(args, target, what):
               f"control would pass without testing anything")
         return False
     try:
-        src.write_text(original.replace(target, "", 1))
-        print(f"-- negative control: rebuilt with {what} DELETED --")
-        args.negative = False
-        args.negative_opl = False
+        src.write_text(original.replace(target, replacement, 1))
+        verb = "REPLACED" if replacement else "DELETED"
+        print(f"-- negative control: rebuilt with {what} {verb} --")
+        for a in ("negative", "negative_opl", "negative_tc",
+                  "negative_irq", "negative_rate"):
+            setattr(args, a, False)
         failed = not main(args)
     finally:
         src.write_text(original)
@@ -211,6 +424,12 @@ if __name__ == "__main__":
                    help="rebuild with the DSP's 0xAA push deleted, require FAIL")
     p.add_argument("--negative-opl", action="store_true",
                    help="rebuild with the OPL timer-1 flag deleted, require FAIL")
+    p.add_argument("--negative-tc", action="store_true",
+                   help="rebuild with the 8237's terminal count deleted")
+    p.add_argument("--negative-irq", action="store_true",
+                   help="rebuild with IRQ 5 delivery deleted")
+    p.add_argument("--negative-rate", action="store_true",
+                   help="rebuild with the resampler step forced to 1:1")
     args = p.parse_args()
     if args.negative:
         sys.exit(0 if _mutate_and_require_failure(
@@ -218,4 +437,13 @@ if __name__ == "__main__":
     if args.negative_opl:
         sys.exit(0 if _mutate_and_require_failure(
             args, MUTATE_T1, "the OPL timer 1 expiry flag") else 1)
+    if args.negative_tc:
+        sys.exit(0 if _mutate_and_require_failure(
+            args, MUTATE_TC, "the 8237's TERMINAL COUNT") else 1)
+    if args.negative_irq:
+        sys.exit(0 if _mutate_and_require_failure(
+            args, MUTATE_IRQ, "IRQ 5 DELIVERY") else 1)
+    if args.negative_rate:
+        sys.exit(0 if _mutate_and_require_failure(
+            args, MUTATE_RATE, "the RESAMPLER STEP", MUTATE_RATE_TO) else 1)
     sys.exit(0 if main(args) else 1)

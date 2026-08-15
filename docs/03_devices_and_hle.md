@@ -56,53 +56,139 @@ EXPECTATION, not evidence — the title stops at its EXEC and never gets there.
 348 status reads and 32 data-available polls are what a detect loop looks like
 when the port floats: it runs to its bound every time.
 
-### 4b. What is modelled (x86_io.c), and it is DETECTION ONLY
+### 4b. What is modelled (x86_io.c)
+
+**Detection**, unchanged from the first pass:
 
 * **OPL2 timers.** 0x388 status / 0x389 data, aliased at 0x220/0x221 and
   0x228/0x229 as on a real SB. Timers 1 and 2 expire in guest time (`x86_pit_ticks`,
-  80 µs and 320 µs per step), the flags are sticky until a register-4 IRQ reset,
-  and the status low bits read `0x06` — the YM3812 answer, so an OPL2/OPL3 test
-  concludes OPL2. **The FM register file is deliberately NOT stored**: it is
-  write-only on the real part, so a guest cannot tell, and storing it would only
-  imply a synthesiser that does not exist.
+  80 us and 320 us per step), the flags are sticky until a register-4 IRQ reset,
+  and the status low bits read `0x06` -- the YM3812 answer. **The FM register file
+  is deliberately NOT stored**: it is write-only on the real part.
 * **SB DSP reset handshake.** 0x226 write-1-then-0 puts `0xAA` in the read
-  buffer; 0x22A reads it, 0x22E reports data-available in bit 7, 0x22C reports
-  write-ready (bit 7 clear). Commands: `E1h` version (**2.01** — a plain SB 2.0,
-  which claims no mixer and no SB16), `E0h` identify, `E4h`/`E8h` test register,
-  `D1h`/`D3h`/`D8h` speaker, `E3h` answered with a bare NUL terminator so a
-  copyright-string reader terminates instead of hanging.
-* **ONE card at ONE base.** 0x240/0x280/0x2C0 stay absent, so a scanning title
-  finds exactly one. Measured effect on Prince of Persia: the scan collapses to
-  0x220 alone and the other three bases disappear from its trace entirely.
+  buffer; 0x22A reads it, 0x22E reports data-available, 0x22C reports
+  write-ready. **ONE card at ONE base** (0x220), so a scanning title finds one.
 
-### 4c. What is ABSENT on purpose, and the counters that say so
+**And digitised PLAYBACK**, which is what turns that into sound:
 
-The mixer (0x224/0x225), DMA and the IRQ are **not** modelled. We cannot deliver
-a DMA-completion IRQ 5, so a transfer would start and never finish. The DSP
-therefore *accepts* a transfer command's argument bytes — refusing them
-mid-command desynchronises the command stream, which is worse — and counts them
-in **`x86_sb_dma_refused`**. That counter is the honest reading of "a title asked
-for digitised audio and got silence"; `x86_sb_cmds_unknown` is the same for a
-command we accept and do nothing with.
+* **An 8237A pair.** DMA1 at 0x00-0x0F, DMA2 at 0xC0-0xDF (stride 2), page
+  latches at 0x80-0x8F with the NON-SEQUENTIAL channel map (`0x87/0x83/0x81/
+  0x82`, `0x8F/0x8B/0x89/0x8A`). Address and count latches behind a PER-CHIP
+  lo/hi flip-flop, mask/mode/master-clear, auto-init reload, and a status
+  register whose TC bits clear on read. **Channel 5 counts WORDS**: the physical
+  address is `(page & 0xFE) << 16 | addr << 1`.
+* **IRQ 5 through the 8259.** `x86_sb_raise_irq()` is called from the frame loop
+  beside `x86_kbd_raise_irq()` and obeys the same one-deep-slot contract. **The
+  IMR is enforced for IRQ 5 and only for IRQ 5** -- the boot mask 0xB8 masks it,
+  so a title that never installs a handler is never given the interrupt. The
+  in-service bit is cleared by the EOI at 0x20; the DSP's own line is cleared by
+  a READ of 0x22E (8-bit) or 0x22F (16-bit). **Both acknowledgements are
+  required and a guest that does one gets exactly one interrupt.**
+* **DSP 4.05 and the SB16 command set.** `E1h` answers 4.05, and that identity is
+  a promise the rest of the file keeps: `0x40`/`0x41` rate, `0x14`/`0x15`
+  single-cycle, `0x1C`/`0x90` auto-init, `0x48` block size, `0xD0`/`0xD4`/
+  `0xD5`/`0xD6` pause-continue, `0xD9`/`0xDA` exit-auto-init, and the whole
+  `0xB0`-`0xCF` block (16-/8-bit, auto-init, signed, stereo, length in SAMPLE
+  FRAMES minus one, THREE argument bytes). Claiming 4.05 with a 2.x command
+  table is the specific way this device desynchronises a driver.
+* **The CT1745 mixer** at 0x224/0x225. A register file, plus three that are not:
+  0x80 IRQ select, 0x81 DMA select (**honoured** -- a driver may move the
+  channel), and 0x82 IRQ status, read-only and derived from the live line.
+* **`BLASTER=A220 I5 D1 H5 T6`** in the environment. Every field is checkable
+  against `x86_io.c`.
 
-**`BLASTER` is deliberately NOT in the environment.** `x86_dos.c` builds
-`PATH=\0COMSPEC=C:\COMMAND.COM\0` and nothing else. Wolfenstein 3D reads BLASTER
-to find the card and does not probe 0x22x without it — which is exactly what the
-table above shows. Setting it would make WOLF3D start a DMA transfer and wait for
-an IRQ that cannot arrive. **Adding BLASTER is the LAST step of sound support,
-not the first.**
+**THE BLOCK BOUNDARY IS WHERE THE INTERRUPT COMES FROM, NOT THE DMA'S TC.**
+They are separate on the hardware and the difference is not academic: a
+double-buffering driver programs the 8237 for the whole buffer and the DSP for
+half of it, and takes an interrupt at each half. Driving the IRQ off terminal
+count gives it one interrupt per two blocks and it plays the same stale half
+for ever.
 
-### 4d. Measured after the change (gwemu, tier 2)
+**ADPCM RUNS BUT IS SILENT.** `0x16`/`0x17`/`0x74`-`0x77`/`0x1F`/`0x2C`/`0x7D`/
+`0x7F` drain the DMA, complete the block and raise the interrupt, and emit
+silence, counted in `x86_sb_adpcm_silenced`. Refusing them mid-transfer would
+reinstate the hang; decoding them is separate, gradeable work.
+
+### 4b-2. The engine has ONE clock, and it is the frame loop
+
+`x86_sb_render_mix()` is called once per rendered frame from the audio phase in
+`src/main.c`, and **pulling the bytes it needs for the samples it emits IS the
+transfer**. There is no per-instruction DMA tick anywhere. That is both the
+cheap arrangement -- a VGA `OUT` already measures 1,242 cycles on this hardware
+and an engine that ran per instruction would dwarf it -- and the physically
+honest one, because on real hardware the transfer advances at the sample clock.
+
+The consequence to know: **a transfer only advances while audio is being
+rendered.** A harness that never renders sees a transfer that never moves. That
+is a property of the design, not a defect, and `tests/main.c`'s playback arm
+reproduces the frame loop in miniature for exactly that reason.
+
+**Resampling** is a zero-order hold on a 16.16 accumulator: one add and one
+compare per output sample, a source fetch only when it crosses, and the fraction
+carried ACROSS frame boundaries so the pitch is the guest's rate and not that
+rate rounded to a frame. Linear interpolation is one multiply-add per output
+sample (800 of them per frame, in host C) and is a one-line change if the
+aliasing is judged audible on silicon.
+
+**The source walk respects the granule seam.** A host pointer is good only for
+the 4 KB page it was resolved in, so the walk caches one granule and re-resolves
+at each boundary -- measured at **one `x86_guest_ptr()` call per render call**
+(`x86_sb_dma_maps`), not one per byte. The window is dropped at the end of every
+render, because between two calls the pager may move any page.
+
+### 4c. The counters, and what each one separates
+
+| counter | the question it answers |
+|---|---|
+| `x86_sb_starts` vs `x86_sb_samples` | "programmed a transfer" vs "played one" |
+| `x86_sb_irqs` vs `_delivered` | "the card asked" vs "the guest was given it" |
+| `_irqs_masked` / `_irqs_lost` | refused by the IMR / by the one-deep slot |
+| `_irqs_acked` / `x86_sb_eois` | the DSP ack / the 8259 ack -- BOTH are needed |
+| `x86_sb_dma_bytes` | bytes actually pulled out of guest RAM |
+| `x86_sb_underruns` | the source ran dry mid-render |
+| `x86_sb_adpcm_silenced` | a block that ran but could not be decoded |
+| `x86_sb_dma_refused` | **narrowed**: only what this model CANNOT run (record, direct DAC). It is no longer "asked for audio and got silence" |
+| `x86_dos_env_seg` | whether `BLASTER` was reachable at all |
+
+All of them are in `probe_report.py`'s health table.
+
+### 4d. Measured at tier 2 (gwemu), and one claim in 4c above was DISPROVED
 
 | title | before | after |
 |---|---|---|
-| PRINCE_OF_PERSIA | 4 bases scanned, 33 reads of 0x22A, no card found | `x86_sb_resets=2`, `x86_sb_cmds=4`, **`x86_sb_dma_refused=0`**, one base, 296 M insns, no hang |
-| WOLF3D | golden 0.000% | golden **0.000%**, 262 M insns |
-| ALLEYCAT / KEEN4 | — | unchanged (0.874% pre-existing / known-bad) |
+| **EPIC_PINBALL** | reached mode 13h and **spun on `IN 0x22A` 64,000 times** | **the spin is GONE: 6 reads.** `sb_resets=2`, `sb_cmds=5`, **`cmds_unknown=0`**, `dma_refused=0`, and it programs the MIXER (10 writes / 5 reads of 0x224/0x225) and a rate of **22,050 Hz**. It now dies EARLIER in instruction count (483,354 vs 620,904) on `guest_exit_reason=4` `exit_info=0x0F` -- **an unimplemented opcode, not a sound defect** |
+| **PRINCE_OF_PERSIA** | one base found, no transfer | unchanged and healthy: `sb_resets=2`, `sb_cmds=4`, `cmds_unknown=1`, still running at 233 M instructions. Its digitised effects are in-game and the timeline stops at the title screen |
+| **WOLF3D** | golden 0.000% | golden **0.000%**, and see the retraction below |
 
-Cost: **+1,096 B of RAM_EMU** (`__CORE_BSS_END__` 0x2405EBF8 → 0x2405F040, both
-clean `X86_PROBE=0` builds), ITCM **unchanged** at 0xD2D8, and the pager pool is
-159 frames with `guest_ram_pages_short=1` **before and after** — no frame lost.
+**RETRACTED: "Wolf3D reads BLASTER to find the card and does not probe 0x22x
+without it."** That was a hypothesis and it is now disproved. `BLASTER=A220 I5
+D1 H5 T6` is present, well-formed and reachable (`x86_dos_env_seg=113`, block
+dumped out of guest memory), and **WOLF3D still touches no 0x22x port at all**.
+What it does instead is the AdLib timer probe at 0x388 (348 reads), which
+concludes "no card" under gwemu for the clock reason in 4e -- so it never
+reaches its Sound Blaster path. The prediction that follows is a **tier-3**
+one: on silicon, where the OPL timer does elapse, it should get there.
+
+The safe side of that result is that setting `BLASTER` left WOLF3D bit-identical
+-- the golden is 0.000% with it set.
+
+### 4d-2. What it cost
+
+* **RAM_EMU +2,816 B**, `__CORE_BSS_END__` 0x2405FC30 -> 0x24060718, of which
+  only ~280 B is data; the rest is CODE. **This costs ONE guest page frame**:
+  `guest_ram_pages` 159 -> **158**, `guest_ram_pages_short` 1 -> **2**
+  (measured at tier 2 on a clean `X86_PROBE=0` build). That is the honest price
+  and it is the RAM_EMU cliff in STATUS.md, paid deliberately rather than
+  tripped over.
+* **ITCM unchanged** at `__CORE_ITCM_CODE_END__` = **0xD2D8**. Nothing here is
+  on the interpreter's hot path.
+* **No per-instruction cost at all.** The only new work on the guest's path is
+  the port decode, and the 8237 and page latches are decoded in the FALL-THROUGH
+  arm of the switch so the hot ports (0x3DA, 0x60, 0x40) pay nothing for them.
+  The render early-outs on `sbp.active` when nothing is playing.
+* **NOT MEASURED: cycles on silicon.** gwemu must not be trusted for timing
+  (CLAUDE.md), so the per-frame cost of the render is a tier-3 question and is
+  stated here as unmeasured rather than estimated.
 
 ### 4e. THE OPEN PROBLEM: our CPU is too fast for an 80 µs timer
 
@@ -117,21 +203,33 @@ arithmetic, not a measurement: it is a tier-3 check nobody has run.** Do not
 "fix" it by shortening the OPL period — the period is right and the clock model
 is the subject. This is the same three-clock question as `docs/09`.
 
-### 4f. Producing actual SAMPLES — what it would take, and it is not small
+### 4f. What is STILL not here: FM synthesis, and what it would take
 
-Not built, deliberately, and sized here so nobody re-derives it. Retro-go's ABI
-(`audio_get_buffer_length` / `audio_get_active_buffer` / `audio_start_playing`,
-`src/main.c`) is a **once-per-frame** render, not an ISR-fed ring, and
-`x86_speaker_render()` already uses it for the PC speaker. Digitised SB output
-therefore needs, in order: a DMA controller model (8237 channel 1: page, address
-and count registers on ports 0x00-0x0F and 0x81-0x8F, none of which exist today),
-an IRQ 5 raised at transfer completion and acknowledged through the 8259 we
-currently do not enforce, a sample-rate conversion from the DSP time constant to
-the panel's frame-quantised buffer, and — the part that decides the whole thing —
-a per-frame budget on a machine where 29.4% of wall is already ordinary opcodes
-at ~57 cyc/insn. OPL FM synthesis is a second, larger project again (nine
-channels of two operators each, per sample). **Neither belongs on this hardware
-before the interpreter's cost comes down.**
+Digitised playback is built (4b). **OPL FM tone generation is not**, and the
+gap is visible: the OPL timers answer a detection probe and the register file is
+deliberately not stored, so a title whose MUSIC is AdLib is silent while its
+digitised effects play.
+
+Sizing it, so nobody re-derives it: an OPL2 is nine channels of two operators,
+and each operator is a phase accumulator, an exponential envelope generator in
+four stages, a sine/waveform table lookup and a level multiply -- **per output
+sample**, plus feedback and FM modulation routing between the pair. At the
+48,000 Hz this core renders at, that is 18 operators x 48,000 = 864,000 operator
+updates per second of audio, against ~2.8 M insn/s of TOTAL hardware budget of
+which 29.4% is already ordinary guest opcodes. It does not fit at full rate.
+What might: rendering FM at a lower internal rate and upsampling through the
+same accumulator the DMA path already uses, and only while a channel's key is
+on. That is a project with its own measurement, not an increment on this one.
+
+The register file would also have to start being STORED, which 4b explains is
+currently and correctly not the case.
+
+**Also unmodelled and larger than everything sound-related combined:** WOLF3D
+issues **2.3 M reads of the game port `IN 0x201`** (measured, tier 2), which
+floats 0xFF -- read as "present but stuck". It is trivially answerable in
+`x86_io.c` (buttons up, axis timers never firing) and is deliberately NOT done
+here: it changes a 2.3-million-times-per-run path and belongs in a change that
+grades it on its own.
 
 Reference for the SB16 register set: the Linux driver,
 https://raw.githubusercontent.com/torvalds/linux/refs/heads/master/sound/isa/sb/sb16.c
