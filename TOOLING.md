@@ -486,6 +486,13 @@ reset — the startup probes *are* the subject), and writes one report to
 Presets: `keen4`, `wolf3d`, `topbench`, `alleycat`, `darkforces`,
 `epicpinball`.
 
+The health table also carries the **SOUND** set (`x86_sb_*`, `x86_dos_env_seg`),
+because the port table cannot tell "programmed a transfer" from "played one".
+`x86_sb_starts` against `x86_sb_samples` is exactly that difference, and
+`x86_sb_irqs` against `_irqs_delivered` separates "the card asked" from "the
+guest was given it" — which is the hang the SB path exists to remove. See
+[`docs/03`](docs/03_devices_and_hle.md) §4c for what each one rules out.
+
 ##### `X86_PROBE=1` USED TO TAKE THE PAGER TO ZERO FRAMES — FIXED, BOTH ENDS
 
 The accumulator is ~2.8 KB of RAM_EMU and **`guest_ram` is the last claim out of
@@ -1521,19 +1528,42 @@ python3 tests/test_dos.py --negative     # 13 controls: rollback, largest,
                                          # x86_dos_execs stays 0 and the arena
                                          # is untouched -- an overlay is not a
                                          # process and allocates nothing.
-python3 tests/test_sound.py              # SOUND CARD DETECTION, not audio: the
-                                         # SB DSP reset handshake (write 1 then
-                                         # 0 to 0x226, poll 0x22E, read 0xAA off
-                                         # 0x22A), the 0x22C write-ready bit,
-                                         # DSP command E1h returning 2.01, and
-                                         # the AdLib timer test (status &0xE0
-                                         # 0 -> 0xC0 -> 0) -- all run as GUEST
-                                         # instructions, and all shapes measured
-                                         # off our own titles (docs/03 §4a).
-python3 tests/test_sound.py --negative    # rebuilds with the DSP's 0xAA push
-python3 tests/test_sound.py --negative-opl # / the OPL timer-1 flag DELETED and
-                                         # requires a FAIL; source restored in a
-                                         # finally. Both seen to fail.
+python3 tests/test_sound.py              # TWO ARMS, both driven by GUEST code.
+                                         # DETECTION: the SB DSP reset handshake
+                                         # (write 1 then 0 to 0x226, poll 0x22E,
+                                         # read 0xAA off 0x22A), the 0x22C
+                                         # write-ready bit, E1h returning 4.05,
+                                         # and the AdLib timer test (status
+                                         # &0xE0  0 -> 0xC0 -> 0).
+                                         # PLAYBACK: the guest writes a 256-byte
+                                         # ramp, programs 8237 channel 1 at it,
+                                         # sets 6,000 Hz, starts an 8-bit single-
+                                         # cycle transfer and WAITS FOR IRQ 5 --
+                                         # the wait that hangs a title today. It
+                                         # grades terminal count, the interrupt
+                                         # end to end (delivery, the DSP ack at
+                                         # 0x22E, the EOI, the mixer's 0x82) and
+                                         # then THE SAMPLES: 6,000 into 48,000 is
+                                         # exactly 8 output samples per source
+                                         # byte, so sample k must be the guest's
+                                         # byte k/8. One assertion covering the
+                                         # DMA walk, the decode and the rate
+                                         # conversion, which no counter can fake.
+                                         # The host loop is the FRAME LOOP in
+                                         # miniature, because the engine has no
+                                         # other clock (docs/03 §4b-2).
+python3 tests/test_sound.py --negative    # the DSP's 0xAA push
+python3 tests/test_sound.py --negative-opl # the OPL timer-1 flag
+python3 tests/test_sound.py --negative-tc  # the 8237's TERMINAL COUNT
+python3 tests/test_sound.py --negative-irq # IRQ 5 DELIVERY
+python3 tests/test_sound.py --negative-rate # the resampler step forced to 1:1
+                                         # Each rebuilds with that one link
+                                         # broken and requires a FAIL; source
+                                         # restored in a finally. ALL FIVE SEEN
+                                         # TO FAIL. --negative-rate is the one
+                                         # that matters most: it leaves every
+                                         # counter green and only the SAMPLES
+                                         # say so.
 python3 tests/test_pit.py                # PIT channel 0 -- the SYSTEM TIMER's
                                          # divisor -- programmed by GUEST OUTs:
                                          # the real Wolf3D sequence (0x214B =

@@ -1054,6 +1054,13 @@ static void dos_prog_enter(const dos_prog_t *p)
     cpu_state_ptr->eip = p->ip;
 }
 
+static uint16_t dos_env_build(const char *path, uint16_t owner);
+
+/* The root program's environment segment, 0 if none could be allocated. Read it
+   to answer "does this guest have BLASTER" without guessing:
+     python3 scripts/probe.py --watch x86_dos_env_seg */
+volatile uint32_t x86_dos_env_seg = 0;
+
 /* The FIRST program. Its parent is itself, as it is under real DOS -- there is
    no process above it to resume, and AH=4Ch at depth zero really does stop the
    machine. */
@@ -1067,7 +1074,32 @@ int x86_dos_exec(const char *path, const char *cmdline)
        and only the loader knows which one that is. It fills PSP:0016 with the
        value passed here, so the root case is patched afterwards rather than
        predicted. */
-    if (dos_load_mz(path, cmdline, n, psp_guess, 0, NULL, &p) != 0)
+    /*
+     * THE ROOT PROGRAM HAD NO ENVIRONMENT AT ALL -- PSP:002C was zero and had
+     * always been zero, because dos_env_build() was reached only from EXEC and
+     * every title we ship is launched as the ROOT. So "BLASTER is not in the
+     * environment" was true twice over, and writing the string without this
+     * would have changed nothing observable for any title in the library.
+     *
+     * IT MUST BE ALLOCATED BEFORE THE PROGRAM, and that is not a preference.
+     * dos_load_mz() hands an MZ with the usual 0xFFFF maxalloc EVERY FREE
+     * PARAGRAPH there is, so an environment allocated afterwards finds nothing
+     * and comes back 0 -- which is exactly what it did, measured at tier 2
+     * (x86_dos_env_seg=0, WOLF3D still touching no 0x22x port at all). Real
+     * DOS builds the environment first for the same reason.
+     *
+     * Owned by MCB_OWNER_DOS rather than by the PSP, because the PSP does not
+     * exist yet. The root process never terminates into a parent that would
+     * reclaim it, so nothing leaks that anything could notice; an EXEC'd child
+     * still gets the PSP-owned block dos_exec_child() builds.
+     *
+     * A failure is not fatal: an environment is optional under DOS and a
+     * program with none behaves exactly as it did before this.
+     */
+    x86_dos_env_seg = dos_env_build(path, MCB_OWNER_DOS);
+
+    if (dos_load_mz(path, cmdline, n, psp_guess, (uint16_t)x86_dos_env_seg,
+                    NULL, &p) != 0)
         return -1;
     {
         uint8_t *q = x86_guest_ptr(SEG(p.psp) + 0x16u, 2);
@@ -1244,13 +1276,33 @@ int x86_dos_terminate(void) { return x86_dos_terminate_code(0); }
  * the program's own full path. A protected-mode extender reads that path to
  * re-open the file it was loaded from, so an environment without it is worse
  * than none at all. Owned by the CHILD's PSP so it is freed with the child.
+ *
+ * BLASTER IS THE THIRD STRING AND IT IS NOT DECORATION. It is how a DOS title
+ * finds the card: base, IRQ, 8-bit DMA channel, 16-bit DMA channel, type.
+ * Wolfenstein 3D does not touch 0x22x at all without it (measured -- docs/03
+ * 4a), so this variable is the switch that turns the whole Sound Blaster path
+ * on for the library. It was deliberately withheld while a transfer could be
+ * started and never finished; it is set now because it can finish.
+ *
+ * EVERY FIELD HERE IS A PROMISE x86_io.c HAS TO KEEP, and each one is checkable
+ * against that file rather than copied off a forum post:
+ *   A220  SB_BASE, the only base that answers
+ *   I5    IRQ 5, the only line x86_sb_raise_irq() drives
+ *   D1    8-bit DMA channel 1   -- sbp.dma8 default, and the mixer's 0x81 bit 1
+ *   H5    16-bit DMA channel 5  -- sbp.dma16 default, and 0x81 bit 5
+ *   T6    an SB16, which is what E1h answers with 4.05
+ * Advertising anything we do not implement -- a T4 with no 16-bit channel, an
+ * I7 nothing raises -- is worse than advertising nothing, because the driver
+ * believes it and waits.
  */
-#if X86_DOS_EXEC
+#define DOS_ENV_BLASTER "BLASTER=A220 I5 D1 H5 T6"
+
 static uint16_t dos_env_build(const char *path, uint16_t owner)
 {
-    uint8_t env[96];
+    uint8_t env[128];
     unsigned n = 0;
-    static const char base[] = "PATH=\0COMSPEC=C:\\COMMAND.COM\0";
+    static const char base[] =
+        "PATH=\0COMSPEC=C:\\COMMAND.COM\0" DOS_ENV_BLASTER "\0";
     memcpy(env, base, sizeof(base) - 1);
     n = sizeof(base) - 1;
     env[n++] = 0;                       /* end of the strings */
@@ -1267,7 +1319,6 @@ static uint16_t dos_env_build(const char *path, uint16_t owner)
     x86_guest_copy_in(SEG(seg), env, n);
     return seg;
 }
-#endif
 
 /*
  * AH=4Bh. ES:BX is the parameter block:

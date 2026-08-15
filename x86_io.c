@@ -253,6 +253,10 @@ static void pit_ch2_gate(unsigned on)
  */
 static uint8_t pic_ocw3_read = 2;   /* 2 = IRR, 3 = ISR */
 static uint8_t pic_imr = 0xB8;      /* the mask a booted PC/AT BIOS leaves  */
+static uint8_t pic_imr2 = 0xFF;     /* the SLAVE's, stored and read back    */
+
+static uint8_t sb_irq_pending_line(void);   /* the SB's line; see the sound block */
+static uint8_t pic_isr_bits(void);
 
 static uint32_t pic_read_irr(void)
 {
@@ -260,6 +264,10 @@ static uint32_t pic_read_irr(void)
     uint32_t r = 0;
     if (pending == 0x08u) r |= 1u;
     if (pending == 0x09u) r |= 2u;
+    /* IRQ 5 is REQUESTED while the Sound Blaster's line is up and the interrupt
+       has not yet been taken. A driver's handler reads the IRR to decide whose
+       interrupt this was when several devices share a level. */
+    if (sb_irq_pending_line() && !(pic_isr_bits() & 0x20u)) r |= 0x20u;
     return r;
 }
 
@@ -822,20 +830,26 @@ static uint8_t kbd_read_data(void)
  * ONE CARD, AT ONE BASE. 0x240/0x280/0x2C0 stay absent so a scanning title
  * finds exactly one, at 0x220, the address every DOS title defaults to.
  *
- * WHAT IS NOT HERE, AND WHY IT IS ABSENT RATHER THAN FAKED: the mixer chip
- * (0x224/0x225), DMA, and the IRQ. We cannot deliver a DMA-completion IRQ 5,
- * so a transfer would be started and never finish. The DSP therefore ACCEPTS
- * a transfer command's bytes -- refusing them mid-command desynchronises the
- * command stream, which is worse -- and counts them in x86_sb_dma_refused.
- * That counter is the honest statement "a title asked for digitised audio and
- * got silence"; read it before believing any title is audio-clean.
+ * DIGITISED PLAYBACK IS NOW BUILT, and the header above is the part of the
+ * card that finds it; everything from the 8237 block onwards is the part that
+ * PLAYS it. The DSP identity is 4.05 (SB16) and that identity is a PROMISE the
+ * rest of this file has to keep -- a title told 4.05 will program the 16-bit
+ * channel, the mixer and the 0xBx/0xCx command block, so all three are here.
+ * Claiming 4.05 with an SB2.0 command set is the specific way this device
+ * wedges a guest, which is why the version constant and the command table are
+ * changed in the same commit.
  *
- * AND `BLASTER` IS DELIBERATELY NOT IN THE ENVIRONMENT (x86_dos.c builds
- * "PATH=\0COMSPEC=..." and nothing else). Wolfenstein 3D reads BLASTER to find
- * the card and does not probe 0x22x without it -- which is exactly what the
- * measurement above shows. Setting it would make WOLF3D start a DMA transfer
- * and wait for an IRQ that cannot arrive. Adding BLASTER is the LAST step of
- * sound support, not the first.
+ * THE ENGINE IS DRIVEN FROM THE FRAME LOOP, NOT FROM THE INTERPRETER. There is
+ * no per-instruction DMA tick anywhere: x86_sb_render_mix() pulls exactly the
+ * bytes it needs for the samples it emits, once per rendered frame, out of the
+ * audio phase in src/main.c. That is both the cheap arrangement (a port handler
+ * here already costs 1,242 cycles on the VGA path -- see CLAUDE.md -- and an
+ * engine that ran per instruction would dwarf it) and the physically honest
+ * one: on real hardware the transfer advances at the sample clock, which is
+ * precisely what "the bytes this frame's audio needed" means.
+ *
+ * `BLASTER` IS NOW IN THE ENVIRONMENT (x86_dos.c). It was held back because a
+ * transfer could be started and never finish; it can finish now, so it is set.
  */
 #define SB_BASE       0x220u
 #define OPL_T1_STEP   96u    /* 80 us at 1.193182 MHz -- 95.45, rounded  */
@@ -848,8 +862,26 @@ volatile uint32_t x86_opl_timer_expiry;  /* times a timer flag came up set  */
 volatile uint32_t x86_sb_resets;         /* completed 1-then-0 handshakes   */
 volatile uint32_t x86_sb_cmds;           /* DSP command bytes accepted      */
 volatile uint32_t x86_sb_cmds_unknown;   /* accepted, no reply, no effect   */
-volatile uint32_t x86_sb_dma_refused;    /* transfers asked for, none run   */
+volatile uint32_t x86_sb_dma_refused;    /* transfers we CANNOT run at all  */
 volatile uint32_t x86_sb_reads_empty;    /* data reads with nothing queued  */
+
+/* The playback engine's own numbers. Every one of these answers a question the
+   counters above could not: "it asked" is not "it played". */
+volatile uint32_t x86_sb_starts;         /* transfers begun                 */
+volatile uint32_t x86_sb_blocks;         /* DSP blocks completed (IRQ edge) */
+volatile uint32_t x86_sb_dma_bytes;      /* bytes pulled out of guest RAM   */
+volatile uint32_t x86_sb_samples;        /* OUTPUT samples the SB produced  */
+volatile uint32_t x86_sb_irqs;           /* IRQ 5 asserted at a block end   */
+volatile uint32_t x86_sb_irqs_delivered; /* ...and actually handed to the CPU */
+volatile uint32_t x86_sb_irqs_masked;    /* refused: IMR bit 5 set          */
+volatile uint32_t x86_sb_irqs_lost;      /* refused: the one-deep slot was full */
+volatile uint32_t x86_sb_irqs_acked;     /* DSP acks (a 0x22E / 0x22F read) */
+volatile uint32_t x86_sb_eois;           /* non-specific EOIs seen at 0x20  */
+volatile uint32_t x86_sb_underruns;      /* the source ran dry mid-render   */
+volatile uint32_t x86_sb_adpcm_silenced; /* ADPCM consumed, emitted silent  */
+volatile uint32_t x86_sb_rate;           /* the rate last programmed, Hz    */
+volatile uint32_t x86_sb_dma_maps;       /* granule re-resolves per render  */
+volatile uint32_t x86_dma_writes;        /* 8237 register writes accepted   */
 
 static struct {
     uint8_t  idx;             /* the register index latch                 */
@@ -863,9 +895,175 @@ static struct {
 static struct {
     uint8_t  reset_armed;     /* a write with bit 0 set is pending a 0    */
     uint8_t  out[8], out_head, out_tail;
-    uint8_t  cmd, args_left, arg0;
+    uint8_t  cmd, args_left, nargs;
+    uint8_t  args[3];         /* 0xBx/0xCx take THREE: mode, len lo, hi   */
     uint8_t  test_reg, speaker_on;
 } dsp;
+
+/* ---------------------------------------------------------------------------
+ * THE 8237A DMA CONTROLLER PAIR.
+ *
+ * Two chips: DMA1 (channels 0-3, 8-bit, registers one port apart at 0x00-0x0F)
+ * and DMA2 (channels 4-7, 16-bit, registers TWO ports apart at 0xC0-0xDF
+ * because the second controller sits on the high half of a 16-bit bus). The
+ * page registers are a separate latch chip at 0x80-0x8F and their channel
+ * mapping is NOT sequential -- it is 0x87/0x83/0x81/0x82 for channels 0-3 and
+ * 0x8F/0x8B/0x89/0x8A for 4-7, and getting that table wrong points the transfer
+ * at a 64 KB block of the guest that has nothing to do with the sound.
+ *
+ * Two details a half-model gets wrong and a guest notices:
+ *
+ *  - THE LO/HI FLIP-FLOP IS PER CONTROLLER, NOT PER REGISTER. A driver clears
+ *    it (port 0x0C / 0xD8) and then writes address-lo, address-hi, count-lo,
+ *    count-hi to two different ports; one flip-flop shared across both ports is
+ *    what the chip does and what makes that sequence land correctly.
+ *  - THE COUNT IS PROGRAMMED AS LENGTH-1 AND TERMINAL COUNT IS THE BORROW.
+ *    The transfer ends on the unit that takes the counter from 0 to 0xFFFF, so
+ *    a block of N bytes is N units and the last one is TC. Off by one here is a
+ *    click at the end of every buffer.
+ *
+ * CHANNEL 5 COUNTS WORDS, NOT BYTES. Its address register is a word address:
+ * the physical address is (page & 0xFE) << 16 | addr << 1, and one "unit" of
+ * the transfer is two bytes. A model that treats it as bytes plays the guest's
+ * 16-bit buffer at half speed and an octave down.
+ *
+ * Only what a sound card uses is modelled: single/block/demand mode all behave
+ * the same here (we are the device and we pull on our own clock), cascade is
+ * accepted and inert, and a DECREMENTING transfer is refused and counted rather
+ * than silently played forwards.
+ */
+typedef struct {
+    uint16_t base_addr, base_count;   /* the auto-init RELOAD latches       */
+    uint16_t cur_addr,  cur_count;    /* what the running transfer uses     */
+    uint8_t  page;
+    uint8_t  mode;                    /* b7-6 mode, b5 dec, b4 auto-init    */
+    uint8_t  masked;
+    uint8_t  tc;                      /* sticky in the status register      */
+} dma_chan_t;
+
+static dma_chan_t dma_ch[8];
+static uint8_t dma_ff[2];             /* the lo/hi flip-flop, one per chip  */
+
+/* channel -> page port. Not sequential; see the header. */
+static const uint8_t dma_page_port[8] = {
+    0x87, 0x83, 0x81, 0x82, 0x8F, 0x8B, 0x89, 0x8A
+};
+
+static void dma_reset_chip(unsigned chip)
+{
+    for (unsigned i = 0; i < 4; i++) {
+        dma_chan_t *c = &dma_ch[chip * 4 + i];
+        c->cur_addr = c->cur_count = c->base_addr = c->base_count = 0;
+        c->mode = 0;
+        c->masked = 1;                /* master clear MASKS every channel   */
+        c->tc = 0;
+    }
+    dma_ff[chip] = 0;
+}
+
+/* A byte written to an address or count register, honouring the flip-flop. */
+static uint16_t dma_latch(unsigned chip, uint16_t cur, uint8_t v)
+{
+    uint16_t r = dma_ff[chip] ? (uint16_t)((cur & 0x00FFu) | ((uint16_t)v << 8))
+                              : (uint16_t)((cur & 0xFF00u) | v);
+    dma_ff[chip] ^= 1u;
+    return r;
+}
+
+static uint8_t dma_read_latch(unsigned chip, uint16_t cur)
+{
+    uint8_t r = dma_ff[chip] ? (uint8_t)(cur >> 8) : (uint8_t)cur;
+    dma_ff[chip] ^= 1u;
+    return r;
+}
+
+/* Writes to a controller's register file. `chip` 0 = 0x00-0x0F, 1 = 0xC0-0xDF;
+   `reg` is the register number after the x2 stride of DMA2 is divided out. */
+static void dma_write_reg(unsigned chip, unsigned reg, uint8_t v)
+{
+    x86_dma_writes++;
+    if (reg < 8) {
+        dma_chan_t *c = &dma_ch[chip * 4 + (reg >> 1)];
+        if (reg & 1u) {
+            c->base_count = c->cur_count =
+                dma_latch(chip, c->base_count, v);
+        } else {
+            c->base_addr = c->cur_addr = dma_latch(chip, c->base_addr, v);
+        }
+        return;
+    }
+    switch (reg) {
+    case 0x8: break;                          /* command register: inert    */
+    case 0x9:                                 /* software DMA request       */
+        break;
+    case 0xA: {                               /* single mask bit            */
+        dma_chan_t *c = &dma_ch[chip * 4 + (v & 3u)];
+        c->masked = (uint8_t)((v & 4u) ? 1u : 0u);
+        break;
+    }
+    case 0xB: {                               /* mode register              */
+        dma_chan_t *c = &dma_ch[chip * 4 + (v & 3u)];
+        c->mode = v;
+        break;
+    }
+    case 0xC: dma_ff[chip] = 0; break;        /* clear the flip-flop        */
+    case 0xD: dma_reset_chip(chip); break;    /* master clear               */
+    case 0xE:                                 /* clear mask register        */
+        for (unsigned i = 0; i < 4; i++)
+            dma_ch[chip * 4 + i].masked = 0;
+        break;
+    case 0xF:                                 /* write all mask bits        */
+        for (unsigned i = 0; i < 4; i++)
+            dma_ch[chip * 4 + i].masked = (uint8_t)((v >> i) & 1u);
+        break;
+    default: break;
+    }
+}
+
+/* The status register (0x08 / 0xD0) reports TC in the low nibble and an active
+   request in the high one, and READING IT CLEARS THE TC BITS. A driver polls
+   this instead of taking the interrupt often enough that a sticky-forever TC is
+   its own hang. */
+static uint32_t dma_read_status(unsigned chip)
+{
+    uint32_t r = 0;
+    for (unsigned i = 0; i < 4; i++) {
+        dma_chan_t *c = &dma_ch[chip * 4 + i];
+        if (c->tc) { r |= 1u << i; c->tc = 0; }
+        if (!c->masked && c->cur_count != 0xFFFFu) r |= 0x10u << i;
+    }
+    return r;
+}
+
+static uint32_t dma_read_reg(unsigned chip, unsigned reg)
+{
+    if (reg < 8) {
+        dma_chan_t *c = &dma_ch[chip * 4 + (reg >> 1)];
+        return (reg & 1u) ? dma_read_latch(chip, c->cur_count)
+                          : dma_read_latch(chip, c->cur_addr);
+    }
+    if (reg == 8)
+        return dma_read_status(chip);
+    return 0xFFu;
+}
+
+/* Port decode. DMA1 is 0x00-0x0F one-per-register; DMA2 is 0xC0-0xDF at a
+   stride of two, so 0xC4 is register 4 and 0xD4 is register 0xA. */
+static int dma_decode(uint32_t port, unsigned *chip, unsigned *reg)
+{
+    if (port <= 0x0Fu) { *chip = 0; *reg = port; return 1; }
+    if (port >= 0xC0u && port <= 0xDFu && !(port & 1u)) {
+        *chip = 1; *reg = (port - 0xC0u) >> 1; return 1;
+    }
+    return 0;
+}
+
+static int dma_page_decode(uint32_t port, unsigned *ch)
+{
+    for (unsigned i = 0; i < 8; i++)
+        if (dma_page_port[i] == port) { *ch = i; return 1; }
+    return 0;
+}
 
 static void opl_push_status(void)
 {
@@ -926,6 +1124,372 @@ static void opl_write(uint32_t port, uint8_t v)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * THE PLAYBACK ENGINE, THE MIXER, AND IRQ 5.
+ *
+ * Three pieces of state, and the split between them is the design:
+ *
+ *  - the 8237 above owns the ADDRESS and the byte count. Its terminal count
+ *    wraps the address (auto-init) or masks the channel (single cycle).
+ *  - the DSP owns the BLOCK, in samples, and THE BLOCK BOUNDARY IS WHERE THE
+ *    INTERRUPT COMES FROM. These really are separate on the hardware and the
+ *    difference is not academic: a double-buffering driver programs the 8237
+ *    for the WHOLE buffer and the DSP for HALF of it, and takes an interrupt at
+ *    each half so it can refill the one that just played. Driving the IRQ off
+ *    the DMA's terminal count instead gives it one interrupt per two blocks and
+ *    it plays the same stale half for ever.
+ *  - the 8259 owns DELIVERY, and it is one-deep here (see pic_read_irr), so the
+ *    line stays asserted and is retried from the frame loop.
+ *
+ * THE INTERRUPT IS ACKNOWLEDGED IN TWO PLACES AND BOTH ARE REQUIRED. The DSP's
+ * line is dropped by READING 0x22E (8-bit) or 0x22F (16-bit) -- a status read
+ * with a side effect, which is exactly the sort of thing a detection-only model
+ * omits -- and the 8259's in-service bit is dropped by the EOI at 0x20. A guest
+ * that does one and not the other gets exactly one interrupt and then silence,
+ * which is the failure this comment exists to stop someone re-deriving.
+ */
+#define SB_DMA_END  0xFFFFFFFFu
+
+static struct {
+    uint8_t  active, autoinit, paused, bits16, stereo, sign, silent;
+    uint8_t  dma8, dma16;         /* the channels the mixer has selected   */
+    uint32_t rate;                /* sample rate in Hz                     */
+    uint32_t blk, blk_left;       /* DSP block length, in SAMPLES          */
+    uint32_t frac;                /* 16.16 resampler accumulator           */
+    int16_t  last;                /* the sample currently being held       */
+} sbp = { .dma8 = 1, .dma16 = 5 };
+
+static uint8_t sb_irq_line;       /* the DSP's interrupt output            */
+static uint8_t sb_irq_kind;       /* mixer 0x82: b0 = 8-bit, b1 = 16-bit   */
+
+/* The 8259's in-service latch, for IRQ 5 only. IRQ 0 and IRQ 1 keep the older
+   one-deep hard_int_pending arrangement untouched -- they are proven and this
+   change has no business perturbing them. */
+static uint8_t pic_isr;
+
+static uint8_t sb_irq_pending_line(void) { return sb_irq_line; }
+static uint8_t pic_isr_bits(void)        { return pic_isr; }
+
+static void sb_irq_assert(void)
+{
+    sb_irq_kind |= (uint8_t)(sbp.bits16 ? 0x02u : 0x01u);
+    sb_irq_line = 1;
+    x86_sb_irqs++;
+}
+
+/*
+ * Hand IRQ 5 to the CPU, if it is owed and can be taken. Called from the frame
+ * loop next to x86_kbd_raise_irq(), and written to the SAME contract for the
+ * same reasons -- read the comment above that function before changing this.
+ *
+ * THE IMR IS ENFORCED HERE AND NOWHERE ELSE, deliberately. The boot mask this
+ * file models is 0xB8, which masks IRQ 5: a title that never installs a sound
+ * handler never unmasks it and must never be given the interrupt, because the
+ * vector it would dispatch through is BIOS filler. IRQ 0 and IRQ 1 stay
+ * unenforced because they are unmasked in 0xB8 anyway and because changing
+ * their delivery is a separate piece of work with its own evidence.
+ */
+int x86_sb_raise_irq(X86CPUState *cpu)
+{
+    if (!sb_irq_line)
+        return 0;
+    if (pic_isr & 0x20u)
+        return 0;                     /* still in service: not acked yet    */
+    if (pic_imr & 0x20u) {
+        x86_sb_irqs_masked++;
+        return 0;
+    }
+    if (cpu->hard_int_pending) {
+        x86_sb_irqs_lost++;           /* the slot is one deep; retried next */
+        return 0;
+    }
+    pic_isr |= 0x20u;
+    cpu->hard_int_pending = 0x0Du;    /* IRQ 5 -> vector 0Dh                */
+    x86_sb_irqs_delivered++;
+    if (cpu->eflags & 0x200u)
+        x86_pit_counter_forced(1);    /* NOT a raw store: see x86_pit_sync() */
+    return 1;
+}
+
+/*
+ * The source window.
+ *
+ * A DMA transfer is a walk up guest LINEAR memory, and the granule seam
+ * (CLAUDE.md) says a host pointer is only good for the 4 KB page it was
+ * resolved in -- guest page N+1 is almost never the host memory after page N.
+ * So the walk caches ONE granule and re-resolves at each boundary: at 11 kHz
+ * mono that is one x86_guest_ptr() call per 4,096 samples, about one every
+ * four frames, instead of one per byte. x86_sb_dma_maps is that rate, published
+ * so the claim is checkable rather than asserted.
+ *
+ * Re-resolving per granule is also what keeps the live-pointer hazard closed:
+ * x86_guest_ptr() notes each page in the livemap as it hands it out, so the
+ * pager cannot evict the page under a pointer we are still walking.
+ */
+static const uint8_t *sb_win_p;
+static uint32_t sb_win_lin, sb_win_end;
+
+static const uint8_t *sb_map(uint32_t lin)
+{
+    if (sb_win_end && lin >= sb_win_lin && lin < sb_win_end)
+        return sb_win_p + (lin - sb_win_lin);
+    uint32_t run = 0x1000u - (lin & 0xFFFu);
+    const uint8_t *p = (const uint8_t *)x86_guest_ptr(lin, run);
+    if (!p) {
+        sb_win_end = 0;
+        return NULL;
+    }
+    x86_sb_dma_maps++;
+    sb_win_p = p;
+    sb_win_lin = lin;
+    sb_win_end = lin + run;
+    return p;
+}
+
+static void sb_win_drop(void) { sb_win_end = 0; }
+
+/* One DMA unit: a byte on an 8-bit channel, a word on a 16-bit one. */
+static uint32_t sb_dma_unit(void)
+{
+    dma_chan_t *c = &dma_ch[sbp.bits16 ? sbp.dma16 : sbp.dma8];
+    if (c->masked)
+        return SB_DMA_END;
+    if (c->mode & 0x20u)              /* DECREMENT: refused, not faked      */
+        return SB_DMA_END;
+
+    uint32_t lin, v;
+    if (sbp.bits16) {
+        lin = ((uint32_t)(c->page & 0xFEu) << 16) | ((uint32_t)c->cur_addr << 1);
+        const uint8_t *p = sb_map(lin);
+        if (!p) return SB_DMA_END;
+        v = *p;
+        /* The second byte may sit in the next granule -- resolve it in its own
+           right rather than reading one past the window. This is the same
+           straddle SEAM_CHECK guards in the interpreter. */
+        p = sb_map(lin + 1u);
+        if (!p) return SB_DMA_END;
+        v |= (uint32_t)*p << 8;
+        x86_sb_dma_bytes += 2u;
+    } else {
+        lin = ((uint32_t)c->page << 16) | (uint32_t)c->cur_addr;
+        const uint8_t *p = sb_map(lin);
+        if (!p) return SB_DMA_END;
+        v = *p;
+        x86_sb_dma_bytes += 1u;
+    }
+
+    c->cur_addr++;
+    if (c->cur_count-- == 0u) {        /* the borrow IS terminal count      */
+        c->tc = 1;
+        if (c->mode & 0x10u) {         /* auto-init: reload from the latches */
+            c->cur_addr  = c->base_addr;
+            c->cur_count = c->base_count;
+        } else {
+            c->masked = 1;
+        }
+        sb_win_drop();                 /* the address just jumped           */
+    }
+    return v;
+}
+
+static int32_t sb_decode(uint32_t u)
+{
+    if (sbp.bits16)
+        return sbp.sign ? (int32_t)(int16_t)(uint16_t)u
+                        : (int32_t)u - 32768;
+    return sbp.sign ? ((int32_t)(int8_t)(uint8_t)u) << 8
+                    : ((int32_t)(uint8_t)u - 128) << 8;
+}
+
+/* Advance the source by one SAMPLE FRAME. Returns 0 when the source is dry. */
+static int sb_next_sample(void)
+{
+    if (!sbp.active)
+        return 0;
+    unsigned chans = sbp.stereo ? 2u : 1u;
+    int32_t sum = 0;
+    for (unsigned i = 0; i < chans; i++) {
+        uint32_t u = sb_dma_unit();
+        if (u == SB_DMA_END) {
+            x86_sb_underruns++;
+            sbp.active = 0;
+            return 0;
+        }
+        if (!sbp.silent)
+            sum += sb_decode(u);
+    }
+    sbp.last = (int16_t)(chans == 2u ? sum / 2 : sum);
+
+    if (sbp.blk_left && --sbp.blk_left == 0u) {
+        x86_sb_blocks++;
+        sb_irq_assert();
+        if (sbp.autoinit)
+            sbp.blk_left = sbp.blk;    /* the next half is already queued   */
+        else
+            sbp.active = 0;            /* single cycle: this was the block  */
+    }
+    return 1;
+}
+
+/*
+ * Render one frame's worth of SB output on top of whatever is already in the
+ * buffer, and BY DOING SO advance the transfer. There is no other clock.
+ *
+ * The resampler is a zero-order hold on a 16.16 accumulator: one add and one
+ * compare per output sample, a source fetch only when the accumulator crosses.
+ * That is deliberately the cheap one. Linear interpolation would cost one
+ * multiply-add per output sample -- 800 of them at 48 kHz/60 fps, which is host
+ * C and not the interpreter -- and is affordable if the aliasing is judged
+ * audible on silicon; it is a one-line change here and NOT a re-architecture.
+ * What ZOH does not do is get the pitch wrong, which is the failure that would
+ * matter: the accumulator carries the fraction across frame boundaries, so a
+ * 11,025 Hz stream is 11,025 Hz and not 11,025 rounded to a frame's worth.
+ *
+ * Returns the number of output samples the SB contributed.
+ */
+unsigned x86_sb_render_mix(int16_t *dst, unsigned frames, unsigned sample_rate,
+                           int16_t amplitude)
+{
+    if (!sbp.active || sbp.paused || !sbp.rate || !sample_rate || !frames)
+        return 0;
+
+    uint32_t step = (uint32_t)(((uint64_t)sbp.rate << 16) / sample_rate);
+    if (!step)
+        step = 1;
+    unsigned n = 0;
+    for (; n < frames; n++) {
+        while (sbp.frac >= 0x10000u) {
+            sbp.frac -= 0x10000u;
+            if (!sb_next_sample())
+                goto done;
+        }
+        int32_t v = ((int32_t)sbp.last * amplitude) >> 15;
+        int32_t o = (int32_t)dst[n] + v;
+        dst[n] = (int16_t)(o > 32767 ? 32767 : (o < -32768 ? -32768 : o));
+        sbp.frac += step;
+    }
+done:
+    /* The window must not outlive the render: between two calls the pager is
+       free to move any page, and the livemap is cleared on every re-entry to
+       the guest. Holding it would be the live-pointer hazard exactly. */
+    sb_win_drop();
+    x86_sb_samples += n;
+    return n;
+}
+
+int x86_sb_playing(void) { return sbp.active && !sbp.paused; }
+
+static void sb_start(uint8_t bits16, uint8_t autoinit, uint8_t stereo,
+                     uint8_t sign, uint8_t silent, uint32_t samples)
+{
+    sbp.bits16   = bits16;
+    sbp.autoinit = autoinit;
+    sbp.stereo   = stereo;
+    sbp.sign     = sign;
+    sbp.silent   = silent;
+    if (samples)
+        sbp.blk = samples;
+    if (!sbp.blk)
+        sbp.blk = 1;
+    sbp.blk_left = sbp.blk;
+    sbp.frac     = 0x10000u;          /* fetch on the first output sample   */
+    sbp.paused   = 0;
+    sbp.active   = 1;
+    sb_win_drop();
+    if (silent)
+        x86_sb_adpcm_silenced++;
+    x86_sb_starts++;
+}
+
+static void sb_stop(void)
+{
+    sbp.active = 0;
+    sbp.paused = 0;
+    sb_win_drop();
+}
+
+/* ---------------------------------------------------------------------------
+ * THE CT1745 MIXER at 0x224 (index) / 0x225 (data).
+ *
+ * Mostly a register file, and honestly so -- the volume registers change no
+ * sample here, and pretending otherwise would be inventing a gain stage. Three
+ * indices are NOT a plain store and they are the three that matter:
+ *
+ *   0x80  IRQ select   -- bit 1 is IRQ 5, which is what BLASTER advertises
+ *   0x81  DMA select   -- bit 1 is DMA 1, bit 5 is DMA 5; HONOURED, so a driver
+ *                         that picks a different channel gets that channel
+ *   0x82  IRQ status   -- READ ONLY, and derived from the live interrupt. This
+ *                         is how an SB16 driver's handler decides whether to
+ *                         acknowledge the 8-bit or the 16-bit line, so a
+ *                         constant here sends it to acknowledge the wrong one
+ *                         and the interrupt is never dropped.
+ */
+static uint8_t mixer_idx;
+static uint8_t mixer_regs[0x40];
+
+static void mixer_reset(void)
+{
+    memset(mixer_regs, 0, sizeof(mixer_regs));
+    mixer_regs[0x04] = 0xCC;          /* voice  L/R, legacy pair            */
+    mixer_regs[0x0A] = 0x00;          /* mic                                */
+    mixer_regs[0x22] = 0xCC;          /* master L/R, legacy pair            */
+    mixer_regs[0x26] = 0xCC;          /* FM                                 */
+    mixer_regs[0x28] = 0x00;          /* CD                                 */
+    mixer_regs[0x2E] = 0x00;          /* line                               */
+    mixer_regs[0x30] = mixer_regs[0x31] = 0xC0;   /* master L / R           */
+    mixer_regs[0x32] = mixer_regs[0x33] = 0xC0;   /* voice  L / R           */
+    mixer_regs[0x34] = mixer_regs[0x35] = 0xC0;   /* MIDI   L / R           */
+    mixer_regs[0x36] = mixer_regs[0x37] = 0x00;
+    mixer_regs[0x38] = mixer_regs[0x39] = 0x00;
+    mixer_regs[0x3A] = 0x00;
+    mixer_regs[0x3B] = mixer_regs[0x3C] = 0x00;
+    mixer_regs[0x3D] = mixer_regs[0x3E] = 0x00;
+    mixer_regs[0x3F] = 0x00;
+    sbp.dma8 = 1;
+    sbp.dma16 = 5;
+}
+
+static uint32_t mixer_read(void)
+{
+    switch (mixer_idx) {
+    case 0x80: return 0x02u;                       /* IRQ 5                 */
+    case 0x81:
+        return (uint32_t)((1u << sbp.dma8) |
+                          (sbp.dma16 < 8u ? (1u << sbp.dma16) : 0u));
+    case 0x82:
+        /* Bit 2 is the MPU-401 line and we have no MIDI port, so it is 0 --
+           not set "for completeness", which would send a handler looking for a
+           UART that is not there. */
+        return sb_irq_kind;
+    default:
+        return mixer_regs[mixer_idx & 0x3Fu];
+    }
+}
+
+static void mixer_write(uint8_t v)
+{
+    switch (mixer_idx) {
+    case 0x00: mixer_reset(); return;
+    case 0x82: return;                             /* read only             */
+    case 0x81: {
+        /* Honour the selection. A driver told 4.05 is entitled to move the
+           channel, and a card that ignores that plays from whichever channel we
+           assumed -- i.e. from the wrong guest buffer, silently. */
+        static const int8_t dma8_of[8]  = { 0, 1, -1, 3, -1, -1, -1, -1 };
+        for (unsigned i = 0; i < 4; i++)
+            if ((v & (1u << i)) && dma8_of[i] >= 0)
+                sbp.dma8 = (uint8_t)dma8_of[i];
+        for (unsigned i = 5; i < 8; i++)
+            if (v & (1u << i))
+                sbp.dma16 = (uint8_t)i;
+        return;
+    }
+    default:
+        mixer_regs[mixer_idx & 0x3Fu] = v;
+        return;
+    }
+}
+
 static void dsp_push(uint8_t v)
 {
     uint8_t next = (uint8_t)((dsp.out_tail + 1u) & 7u);
@@ -950,55 +1514,184 @@ static uint32_t dsp_read_data(void)
  * How many ARGUMENT bytes follow a command. Getting this wrong is the one way
  * this block can wedge a guest: an argument mistaken for a command makes every
  * later byte a command, and a command mistaken for an argument swallows the
- * next one. Only the commands a DSP 2.01 answers are listed; anything else
- * takes no arguments, which is true of every remaining 2.x command.
+ * next one.
+ *
+ * THIS TABLE IS PART OF THE 4.05 CLAIM. A DSP that answers E1h with 4.05 and
+ * then mis-parses the 0xBx/0xCx block -- which is THREE arguments, not two, and
+ * exists on no earlier part -- desynchronises on the very first thing an SB16
+ * driver does after detection. The version constant and this table have to move
+ * together, and they did.
  */
 static uint8_t dsp_cmd_args(uint8_t c)
 {
+    if (c >= 0xB0u && c <= 0xCFu)
+        return 3;                     /* SB16: mode byte, then length-1 LE */
     switch (c) {
     case 0x10:                        /* direct DAC output                 */
     case 0x40:                        /* time constant                     */
     case 0xE0:                        /* DSP identify                      */
+    case 0xE2:                        /* DMA identification                */
     case 0xE4:                        /* write test register               */
         return 1;
     case 0x14: case 0x15:             /* 8-bit single-cycle DMA output     */
     case 0x16: case 0x17:             /* 2-bit ADPCM                       */
     case 0x24:                        /* 8-bit DMA input                   */
+    case 0x41: case 0x42:             /* SB16 output / input sample rate   */
     case 0x48:                        /* set DMA block size                */
+    case 0x74: case 0x75:             /* 4-bit ADPCM                       */
+    case 0x76: case 0x77:             /* 2.6-bit ADPCM                     */
         return 2;
     default:
         return 0;
     }
 }
 
-static void dsp_exec(uint8_t c, uint8_t a0)
+/* The 8-bit block length, in SAMPLES, from a 2.x transfer command's arguments
+   -- or, for an auto-init command that carries none, from the 0x48 block. */
+static uint32_t dsp_len(void)
 {
-    (void)a0;
+    return (uint32_t)dsp.args[0] | ((uint32_t)dsp.args[1] << 8);
+}
+
+static void dsp_exec(uint8_t c)
+{
+    /*
+     * The SB16 generic block. One command byte encodes the whole transfer:
+     *   0xB0 = 16-bit, 0xC0 = 8-bit
+     *   bit 3  0 = D/A (playback), 1 = A/D (record)
+     *   bit 2  auto-init
+     *   bit 1  FIFO (a bus detail; nothing here depends on it)
+     * and the MODE byte that follows carries bit 4 = signed, bit 5 = stereo.
+     * The length is in SAMPLE FRAMES minus one, not bytes -- so a stereo 16-bit
+     * block of 512 frames is 2,048 bytes of DMA and the driver writes 511.
+     */
+    if (c >= 0xB0u && c <= 0xCFu) {
+        if (c & 0x08u) {              /* A/D: there is no input source      */
+            x86_sb_dma_refused++;
+            return;
+        }
+        uint8_t bits16 = (uint8_t)(c < 0xC0u);
+        uint8_t mode   = dsp.args[0];
+        uint32_t len   = ((uint32_t)dsp.args[1] |
+                          ((uint32_t)dsp.args[2] << 8)) + 1u;
+        sb_start(bits16, (uint8_t)((c & 0x04u) != 0u),
+                 (uint8_t)((mode & 0x20u) != 0u),
+                 (uint8_t)((mode & 0x10u) != 0u), 0, len);
+        return;
+    }
+
     switch (c) {
-    case 0xE1:                        /* DSP version. 2.01: a plain SB 2.0 */
-        dsp_push(2); dsp_push(1);
+    case 0xE1:
+        /* DSP 4.05. This is the identity a title tests to decide whether it may
+           use the 16-bit channel, the mixer and the 0xBx/0xCx block, and all
+           three are implemented above -- the number is a claim about this file,
+           not a wish. */
+        dsp_push(4); dsp_push(5);
         break;
     case 0xE0:                        /* identify: the argument, inverted  */
-        dsp_push((uint8_t)~dsp.arg0);
+        dsp_push((uint8_t)~dsp.args[0]);
         break;
-    case 0xE4: dsp.test_reg = dsp.arg0; break;
+    case 0xE2:                        /* DMA identification: a bus test    */
+        break;
+    case 0xE4: dsp.test_reg = dsp.args[0]; break;
     case 0xE8: dsp_push(dsp.test_reg); break;
     case 0xE3:
-        /* The copyright string. A DSP 2.01 does not answer this at all, but a
-           reader loops until it sees a NUL and silence there is a HANG, so we
-           answer with the terminator and no string. Nothing can be computed
-           from an empty string; something can be computed from an invented
-           one, which is why there is not one here. */
+        /* The copyright string. A reader loops until it sees a NUL and silence
+           there is a HANG, so we answer with the terminator and no string.
+           Nothing can be computed from an empty string; something can be
+           computed from an INVENTED one, which is why there is not one here. */
         dsp_push(0);
         break;
     case 0xD1: dsp.speaker_on = 1; break;
     case 0xD3: dsp.speaker_on = 0; break;
     case 0xD8: dsp_push(dsp.speaker_on ? 0xFFu : 0x00u); break;
-    case 0x10: case 0x14: case 0x15: case 0x16: case 0x17: case 0x24:
-        x86_sb_dma_refused++;         /* accepted, consumed, NOT PLAYED    */
+
+    /* ---- rate ------------------------------------------------------- */
+    case 0x40: {
+        /* The time constant is 256 - 1000000/rate, so the rate back out of it
+           is 1000000/(256-tc). tc = 0xFF would divide by one and is the
+           card's own maximum; anything at or above it is clamped rather than
+           dividing by zero. */
+        uint32_t tc = dsp.args[0];
+        sbp.rate = 1000000u / (256u - (tc > 254u ? 254u : tc));
+        x86_sb_rate = sbp.rate;
         break;
-    case 0x40: case 0x48:             /* rate/block size: no audio, no-op  */
-    case 0xD0: case 0xD4:             /* pause/continue a transfer         */
+    }
+    case 0x41:                        /* SB16: the rate outright, big-endian */
+        sbp.rate = ((uint32_t)dsp.args[0] << 8) | dsp.args[1];
+        if (!sbp.rate)
+            sbp.rate = 11025u;
+        x86_sb_rate = sbp.rate;
+        break;
+    case 0x42:                        /* input rate: stored, nothing records */
+        break;
+    case 0x48:                        /* the auto-init block, in BYTES-1     */
+        sbp.blk = dsp_len() + 1u;
+        break;
+
+    /* ---- the 2.x transfer commands ---------------------------------- */
+    case 0x14: case 0x15:             /* 8-bit PCM, single cycle           */
+        sb_start(0, 0, 0, 0, 0, dsp_len() + 1u);
+        break;
+    case 0x1C:                        /* 8-bit PCM, auto-init, 0x48 block  */
+        sb_start(0, 1, 0, 0, 0, 0);
+        break;
+    case 0x90:                        /* high-speed auto-init  (SB 2.0)    */
+        sb_start(0, 1, 0, 0, 0, 0);
+        break;
+    case 0x91:                        /* high-speed single cycle           */
+        sb_start(0, 0, 0, 0, 0, 0);
+        break;
+
+    /*
+     * ADPCM. The transfer RUNS -- the DMA is drained, the block completes, the
+     * interrupt is raised -- and the samples come out SILENT, counted in
+     * x86_sb_adpcm_silenced. That is the deliberate choice: a driver that is
+     * refused mid-transfer waits for an interrupt for ever, which is the hang
+     * this whole task exists to remove, whereas a driver whose ADPCM block
+     * plays quiet keeps running and the counter says exactly why. Decoding
+     * Creative's 2-/2.6-/4-bit ADPCM is a separate, gradeable piece of work.
+     */
+    case 0x16: case 0x17:             /* 2-bit ADPCM, +reference           */
+        sb_start(0, 0, 0, 0, 1, dsp_len() + 1u);
+        break;
+    case 0x74: case 0x75:             /* 4-bit ADPCM                       */
+    case 0x76: case 0x77:             /* 2.6-bit ADPCM                     */
+        sb_start(0, 0, 0, 0, 1, dsp_len() + 1u);
+        break;
+    case 0x1F:                        /* 2-bit ADPCM, auto-init            */
+    case 0x2C:                        /* ...and its 0x2C spelling          */
+    case 0x7D: case 0x7F:             /* 4-bit / 2.6-bit ADPCM, auto-init  */
+        sb_start(0, 1, 0, 0, 1, 0);
+        break;
+
+    /* ---- flow control ------------------------------------------------ */
+    case 0xD0:                        /* pause 8-bit DMA                   */
+    case 0xD5:                        /* pause 16-bit DMA                  */
+        sbp.paused = 1;
+        break;
+    case 0xD4:                        /* continue 8-bit                    */
+    case 0xD6:                        /* continue 16-bit                   */
+        sbp.paused = 0;
+        break;
+    case 0xD9:                        /* exit auto-init, 16-bit            */
+    case 0xDA:                        /* exit auto-init, 8-bit             */
+        /* NOT a stop: the current block still plays out and still raises its
+           interrupt, and only then does the transfer end. A driver calls this
+           and then waits for that last interrupt. */
+        sbp.autoinit = 0;
+        break;
+
+    case 0x10:                        /* direct DAC: a single sample, no DMA */
+        /* One sample written straight to the DAC. Held until the next one,
+           which is what a direct-DAC guest is doing anyway: it writes at its
+           own pace from a delay loop. It advances no transfer, so it is not a
+           start -- and with no DMA behind it, it is the one path here that is
+           still not audible. Counted, not faked. */
+        x86_sb_dma_refused++;
+        break;
+    case 0x24:                        /* 8-bit DMA INPUT: nothing to record */
+        x86_sb_dma_refused++;
         break;
     default:
         x86_sb_cmds_unknown++;
@@ -1009,17 +1702,20 @@ static void dsp_exec(uint8_t c, uint8_t a0)
 static void dsp_write_cmd(uint8_t v)
 {
     if (dsp.args_left) {
-        if (dsp.args_left == dsp_cmd_args(dsp.cmd))
-            dsp.arg0 = v;
+        unsigned i = (unsigned)(dsp.nargs - dsp.args_left);
+        if (i < sizeof(dsp.args))
+            dsp.args[i] = v;
         if (--dsp.args_left == 0)
-            dsp_exec(dsp.cmd, dsp.arg0);
+            dsp_exec(dsp.cmd);
         return;
     }
     x86_sb_cmds++;
     dsp.cmd = v;
-    dsp.args_left = dsp_cmd_args(v);
-    if (!dsp.args_left)
-        dsp_exec(v, 0);
+    dsp.nargs = dsp.args_left = dsp_cmd_args(v);
+    if (!dsp.args_left) {
+        dsp.args[0] = dsp.args[1] = dsp.args[2] = 0;
+        dsp_exec(v);
+    }
 }
 
 static void dsp_write_reset(uint8_t v)
@@ -1032,8 +1728,16 @@ static void dsp_write_reset(uint8_t v)
         return;                       /* a lone 0 is not a reset           */
     dsp.reset_armed = 0;
     dsp.out_head = dsp.out_tail = 0;
-    dsp.args_left = 0;
+    dsp.args_left = dsp.nargs = 0;
     dsp.speaker_on = 0;
+    /* A DSP reset STOPS ANY TRANSFER and drops the interrupt line. Leaving a
+       transfer running across a reset would have the previous title's buffer
+       playing under the next one's -- and, worse, would keep pulling DMA from
+       an address the guest has since freed. */
+    sb_stop();
+    sb_irq_line = 0;
+    sb_irq_kind = 0;
+    sbp.blk = sbp.blk_left = 0;
     dsp_push(0xAAu);                  /* THE handshake: "a card is here"   */
     x86_sb_resets++;
 }
@@ -1081,9 +1785,21 @@ static uint32_t port_read_inner(uint32_t port)
     case 0x42:
         return pit_read_data(2);
     case 0x20:
-        return (pic_ocw3_read == 3) ? 0u : pic_read_irr();
+        /* The ISR arm used to be a constant 0, which was harmless while nothing
+           could be in service. IRQ 5 can be, and a handler that reads the ISR
+           to confirm the interrupt is its own must see it. */
+        return (pic_ocw3_read == 3) ? pic_isr : pic_read_irr();
     case 0x21:
         return pic_imr;
+    case 0xA0:
+        /* The SLAVE 8259. Nothing is wired to it here, so its IRR and ISR are
+           genuinely 0 -- but 0 and a floating 0xFF are opposite answers, and a
+           handler that reads this to decide "was it mine" takes the wrong
+           branch on 0xFF. Epic Pinball reads 0xA1 during its sound setup
+           (measured, tier 2). */
+        return 0u;
+    case 0xA1:
+        return pic_imr2;
     case 0x60:
         /* 0x64 command 0xD0 is "read output port", and its answer comes back
            HERE, not on 0x64. A guest that reads the port, flips bit 1 and
@@ -1174,17 +1890,40 @@ static uint32_t port_read_inner(uint32_t port)
      * Bit 3 is vertical retrace; bit 0 is "display disabled", true during
      * either.
      */
-    /* ---- sound: see the block above. Detection only, no audio. -------- */
+    /* ---- sound: see the block above. -------------------------------- */
     case 0x388: case 0x220: case 0x228:
         return opl_read_status();
     case 0x389: case 0x221: case 0x229:
         return 0xFFu;                /* FM data is WRITE-ONLY on a YM3812 */
+    case SB_BASE + 5:                /* mixer data                        */
+        return mixer_read();
     case SB_BASE + 0xA:              /* DSP read data                     */
         return dsp_read_data();
     case SB_BASE + 0xC:              /* write-buffer status: b7=0 = ready */
         return 0x7Fu;
-    case SB_BASE + 0xE:              /* read-buffer status: b7=1 = data   */
+    case SB_BASE + 0xE:
+        /*
+         * Read-buffer status AND THE 8-BIT DMA INTERRUPT ACKNOWLEDGE. The two
+         * live on the same port on the real part, and the acknowledge is the
+         * half a detection-only model leaves out: without it the DSP's line
+         * stays up, the 8259 never re-arms, and the guest gets exactly one
+         * interrupt and then plays the same block for ever.
+         */
+        if (sb_irq_kind & 0x01u) {
+            sb_irq_kind &= (uint8_t)~0x01u;
+            if (!sb_irq_kind)
+                sb_irq_line = 0;
+            x86_sb_irqs_acked++;
+        }
         return (dsp.out_head != dsp.out_tail) ? 0xFFu : 0x7Fu;
+    case SB_BASE + 0xF:              /* 16-bit DMA interrupt acknowledge  */
+        if (sb_irq_kind & 0x02u) {
+            sb_irq_kind &= (uint8_t)~0x02u;
+            if (!sb_irq_kind)
+                sb_irq_line = 0;
+            x86_sb_irqs_acked++;
+        }
+        return 0xFFu;
 
     case 0x3BA:
         if (!vga_mono_decoded()) return 0xFFu;
@@ -1249,6 +1988,16 @@ static uint32_t port_read_inner(uint32_t port)
     case 0x3C9:
         return x86_vga_dac_read();
     }
+    /* The 8237 pair and the page latches. Decoded HERE rather than as switch
+       cases so the hot ports above -- 0x3DA, 0x60, 0x40, one of which a title
+       reads millions of times -- never pay for the range tests. */
+    {
+        unsigned chip, reg, ch;
+        if (dma_decode(port, &chip, &reg))
+            return dma_read_reg(chip, reg);
+        if (dma_page_decode(port, &ch))
+            return dma_ch[ch].page;
+    }
     /* An unassigned port floats high, which is what a real bus does and what
        DOS code probing for hardware expects to see. */
 #if X86_PROBE
@@ -1306,12 +2055,29 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
         spk_event(port, value);
         break;
     case 0x20:
-        /* EOI still has nothing to model while delivery is a one-deep slot.
-           OCW3 does: bit 3 set with bit 4 clear selects which register the
-           NEXT read of this port returns, and reading the IRR is how the Zen
-           Timer detects overflow. */
-        if ((value & 0x18u) == 0x08u)
+        /* OCW3: bit 3 set with bit 4 clear selects which register the NEXT read
+           of this port returns, and reading the IRR is how the Zen Timer
+           detects overflow.
+           OCW2: an EOI, which NOW HAS SOMETHING TO MODEL -- IRQ 5 keeps an
+           in-service bit, and without clearing it here the guest's handler
+           returns and no second Sound Blaster interrupt is ever delivered. The
+           whole EOI group (0x20 non-specific, 0x60|n specific, 0xA0 rotate) is
+           accepted; only level 5 is tracked. */
+        if ((value & 0x18u) == 0x08u) {
             pic_ocw3_read = (uint8_t)(value & 3u);
+        } else if (value & 0x20u) {
+            if ((value & 0xF8u) == 0x60u) {
+                if ((value & 7u) == 5u) pic_isr &= (uint8_t)~0x20u;
+            } else {
+                pic_isr = 0;
+            }
+            x86_sb_eois++;
+        }
+        break;
+    case 0xA0:                       /* the slave 8259: EOI accepted, inert */
+        break;
+    case 0xA1:
+        pic_imr2 = (uint8_t)value;   /* stored and read back, not enforced  */
         break;
     case 0x21:                       /* IMR: stored and read back, not enforced */
         pic_imr = (uint8_t)value;
@@ -1374,10 +2140,16 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
         x86_a20_set((value & 0x02u) != 0u);
         break;
 
-    /* ---- sound: see the block above. Detection only, no audio. -------- */
+    /* ---- sound: see the block above. -------------------------------- */
     case 0x388: case 0x389:
     case 0x220: case 0x221: case 0x228: case 0x229:
         opl_write(port, (uint8_t)value);
+        break;
+    case SB_BASE + 4:                /* mixer index                       */
+        mixer_idx = (uint8_t)value;
+        break;
+    case SB_BASE + 5:                /* mixer data                        */
+        mixer_write((uint8_t)value);
         break;
     case SB_BASE + 6:                /* DSP reset: 1 then 0 -> 0xAA       */
         dsp_write_reset((uint8_t)value);
@@ -1465,7 +2237,19 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
     case 0x3C9:
         x86_vga_dac_write((uint8_t)value);
         break;
-    default:
+    default: {
+        /* The 8237 pair and the page latches, decoded here for the same reason
+           as on the read side: the hot ports above must not pay for it. */
+        unsigned chip, reg, ch;
+        if (dma_decode(port, &chip, &reg)) {
+            dma_write_reg(chip, reg, (uint8_t)value);
+            break;
+        }
+        if (dma_page_decode(port, &ch)) {
+            dma_ch[ch].page = (uint8_t)value;
+            x86_dma_writes++;
+            break;
+        }
         /* A write to a port nothing models is DROPPED. That is usually right,
            but it is not nothing: a guest programming a sound card or a mouse
            gets silence and no error, and the report has to be able to name it.*/
@@ -1473,6 +2257,7 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
         unmodelled = 1;
 #endif
         break;
+    }
     }
     X86_PROBE_PORT(X86_PROBE_KIND_OUT, (uint16_t)port, value, unmodelled);
 }
