@@ -403,6 +403,7 @@ x86_arena_refusals,x86_arena_deficit,x86_pinned_pages,x86_a20_state
 | `x86_arena_refusals` / `_claims_ok` | claims refused outright and claims satisfied. A claim is **all or nothing**: the previous port measured a partial EGA card as producing worse output than no EGA (8 KB/plane truncates cleanly; 16 KB and 32 KB alias the floating pages onto each other and fill the screen with noise that reads as a rendering defect). A rising `_refusals` with a black screen is the system working |
 | `x86_pinned_pages` | guest pages the pager may never evict. 24 with CGA VRAM and the 13h aperture mapped (8 + 16); a 0 here while a mode is up means the display's storage is evictable, which is a defect the picture would show a frame later |
 | `x86_livemap_hits` | evictions vetoed because a host pointer into the page might still be live. `cow_lost == 0` does NOT cover this -- the previous project measured 5 such evictions producing 26,329 wrong bytes with that invariant green throughout |
+| `x86_x87_escapes` | x87 ESCAPE opcodes (D8-DF) the interpreter IGNORED, because no coprocessor is fitted -- which is a real machine configuration and is what makes a C runtime's detection conclude "no x87" instead of dying on `.exit_loop`. **Read it before trusting a picture from a title new to this tree**: a detection costs a HANDFUL (MORTAL_KOMBAT: 2), and a title actually computing in floating point runs millions and is silently producing wrong arithmetic that no screenshot would show. Zero means the title never even looked |
 | `x86_a20_state` / `x86_a20_changes` | the A20 gate, and how many times a guest has actually MOVED it (a probe that writes an already-open gate is not a transition). While it is masked the HMA aliases the bottom of memory; while it is open there is memory above 1 MB at all |
 | `x86_pg_frames_total` / `_frames_free` / `_resident` | the pager's AXI, in 4 KB frames, and how many guest pages are resident. **`_frames_total` is the number to check first after any change to the core**: it read 159 instead of 160 purely because `ram_malloc()` returned a 4-byte-aligned block, losing a frame to a partial page at each end |
 | `x86_pg_faults_r` / `_faults_w` / `_faults_host` | fold misses serviced, split by cause. `_faults_host` are from `x86_guest_ptr()` and carry **every DOS program load** -- loading is a copy into memory the guest has never touched, so under demand paging all of it faults from the host side. A title whose `_faults_r` is 0 is not broken: any page the host wrote is already resident |
@@ -1289,7 +1290,7 @@ with retro-go spinning in `show_corrupted_installation_screen()`.
 ## Harnesses (`tests/`)
 
 ```bash
-python3 tests/test_opcodes.py            # 273 cases: EFLAGS, segmentation,
+python3 tests/test_opcodes.py            # 287 cases: EFLAGS, segmentation,
                                          # 16-bit, 66/67, interrupts, speaker
 python3 tests/test_alu_fuzz.py           # DIFFERENTIAL fuzz vs Unicorn, 16-bit
 python3 tests/test_alu_fuzz.py --cases 20000 --seed 7

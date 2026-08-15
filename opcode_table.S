@@ -215,14 +215,14 @@
     .word .op_aad_D5 + 1 // 0xd5
     .word .op_salc_D6 + 1 // 0xd6
     .word .op_xlat_D7 + 1 // 0xd7
-    .word .exit_loop + 1 // 0xd8
-    .word .exit_loop + 1 // 0xd9
-    .word .exit_loop + 1 // 0xda
-    .word .exit_loop + 1 // 0xdb
-    .word .exit_loop + 1 // 0xdc
-    .word .exit_loop + 1 // 0xdd
-    .word .exit_loop + 1 // 0xde
-    .word .exit_loop + 1 // 0xdf
+    .word .op_esc_x87 + 1 // 0xd8
+    .word .op_esc_x87 + 1 // 0xd9
+    .word .op_esc_x87 + 1 // 0xda
+    .word .op_esc_x87 + 1 // 0xdb
+    .word .op_esc_x87 + 1 // 0xdc
+    .word .op_esc_x87 + 1 // 0xdd
+    .word .op_esc_x87 + 1 // 0xde
+    .word .op_esc_x87 + 1 // 0xdf
     .word .op_loopnz_E0 + 1 // 0xe0
     .word .op_loopz_E1 + 1 // 0xe1
     .word .op_loop_E2 + 1 // 0xe2

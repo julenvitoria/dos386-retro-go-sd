@@ -3213,8 +3213,154 @@ def run_test(args):
             },
         ])
 
+        # ------------------------------------------------------------------
+        # THE CPU-DETECTION PREAMBLE every C runtime runs before main().
+        #
+        # MORTAL_KOMBAT died on three consecutive walls of it (docs/13): SMSW,
+        # the x87 escapes, and 0F BA / CPUID. None is exotic; all three are what
+        # a Microsoft or Borland startup issues in its first few hundred
+        # instructions, so these cases guard a path every future title takes.
+        #
+        # expected_eip is measured PAST the trailing HLT, as everywhere else in
+        # this file -- except the #UD case, which stops at the offending opcode.
+        # ------------------------------------------------------------------
+        test_cases.extend([
+            {
+                # The REGISTER form is the whole point: 0F 01's ModRM walk was
+                # unconditional, so mod=11 fell through the group into #UD.
+                "name": "SMSW: 0F 01 E0 reads CR0 into AX, high half untouched",
+                "code": bytes([0x0F, 0x01, 0xE0, 0xF4]),
+                "regs_initial": {0: 0xFFFFFFFF},
+                "regs_expected": {0: 0xFFFF0000},   # real mode: CR0 == 0
+                "expected_eip": 4,
+            },
+            {
+                "name": "SMSW: memory form stores a HALFWORD, disp16",
+                # SMSW [0x0300] ; HLT
+                "code": bytes([0x0F, 0x01, 0x26, 0x00, 0x03, 0xF4]),
+                "mode": 16,
+                "ram_setup": [(0x300, bytes([0xFF, 0xFF, 0xFF, 0xFF]))],
+                "mem_expected": [(0x300, bytes([0x00, 0x00, 0xFF, 0xFF]))],
+                "regs_initial": {},
+                "regs_expected": {},
+                "expected_eip": 6,
+            },
+            {
+                "name": "x87 ABSENT: DB E3 (FNINIT) is ignored, not #UD",
+                "code": bytes([0xDB, 0xE3, 0xF4]),
+                "regs_initial": {0: 0x12345678},
+                "regs_expected": {0: 0x12345678},
+                "expected_eip": 3,
+            },
+            {
+                # The only real work in .op_esc_x87 is stepping over the
+                # operand. If the ModRM+disp16 is not consumed the INC never
+                # runs and EIP lands mid-instruction.
+                "name": "x87 ABSENT: DD /6 [disp16] consumes its operand, stores nothing",
+                # FNSTSW [0x0300] ; INC AX ; HLT
+                "code": bytes([0xDD, 0x36, 0x00, 0x03, 0x40, 0xF4]),
+                "mode": 16,
+                "ram_setup": [(0x300, bytes([0xFF, 0xFF]))],
+                "mem_expected": [(0x300, bytes([0xFF, 0xFF]))],
+                "regs_initial": {0: 0x00000041},
+                "regs_expected": {0: 0x00000042},
+                "expected_eip": 6,
+            },
+            {
+                "name": "BT: 0F BA /4 sets CF from the bit and writes nothing",
+                "code": bytes([0x0F, 0xBA, 0xE0, 0x05, 0xF4]),   # BT EAX,5
+                "regs_initial": {0: 0x00000020},
+                "regs_expected": {0: 0x00000020},
+                "flags_expected": {"CF": 1},
+                "expected_eip": 5,
+            },
+            {
+                "name": "BT: a clear bit clears CF",
+                "code": bytes([0x0F, 0xBA, 0xE0, 0x04, 0xF4]),   # BT EAX,4
+                "regs_initial": {0: 0x00000020},
+                "regs_expected": {0: 0x00000020},
+                "flags_expected": {"CF": 0},
+                "expected_eip": 5,
+            },
+            {
+                # The imm8 form takes the offset MODULO the operand size, so 37
+                # is bit 5. Getting this wrong shifts by 37 and reads zero.
+                "name": "BT: the imm8 bit number is taken modulo 32",
+                "code": bytes([0x0F, 0xBA, 0xE0, 0x25, 0xF4]),   # BT EAX,37
+                "regs_initial": {0: 0x00000020},
+                "regs_expected": {0: 0x00000020},
+                "flags_expected": {"CF": 1},
+                "expected_eip": 5,
+            },
+            {
+                "name": "BTS: 0F BA /5 sets the bit, CF = its old value",
+                "code": bytes([0x0F, 0xBA, 0xE8, 0x05, 0xF4]),   # BTS EAX,5
+                "regs_initial": {0: 0x00000001},
+                "regs_expected": {0: 0x00000021},
+                "flags_expected": {"CF": 0},
+                "expected_eip": 5,
+            },
+            {
+                "name": "BTR: 0F BA /6 clears the bit, CF = its old value",
+                "code": bytes([0x0F, 0xBA, 0xF0, 0x05, 0xF4]),   # BTR EAX,5
+                "regs_initial": {0: 0x000000FF},
+                "regs_expected": {0: 0x000000DF},
+                "flags_expected": {"CF": 1},
+                "expected_eip": 5,
+            },
+            {
+                # Twice, which is exactly what a runtime does to EFLAGS.ID: the
+                # second toggle must put the bit back.
+                "name": "BTC: 0F BA /7 toggles, and toggling twice restores",
+                # BTC EAX,5 ; BTC EAX,5 ; HLT
+                "code": bytes([0x0F, 0xBA, 0xF8, 0x05,
+                               0x0F, 0xBA, 0xF8, 0x05, 0xF4]),
+                "regs_initial": {0: 0x00000000},
+                "regs_expected": {0: 0x00000000},
+                "flags_expected": {"CF": 1},   # the SECOND read saw it set
+                "expected_eip": 9,
+            },
+            {
+                "name": "BTS: memory form, disp32",
+                # BTS DWORD [0x0300],5 ; HLT
+                "code": bytes([0x0F, 0xBA, 0x2D, 0x00, 0x03, 0x00, 0x00,
+                               0x05, 0xF4]),
+                "ram_setup": [(0x300, bytes([0x01, 0x00, 0x00, 0x00]))],
+                "mem_expected": [(0x300, bytes([0x21, 0x00, 0x00, 0x00]))],
+                "regs_initial": {},
+                "regs_expected": {},
+                "flags_expected": {"CF": 0},
+                "expected_eip": 9,
+            },
+            {
+                "name": "BT group: /0 is an undefined encoding and stays #UD",
+                "code": bytes([0x0F, 0xBA, 0xC0, 0x05, 0xF4]),
+                "regs_initial": {0: 0x00000020},
+                "regs_expected": {0: 0x00000020},
+                "expected_exit_reason": 4,
+                "expected_eip": 3,
+            },
+            {
+                "name": "CPUID: leaf 0 returns 1 and GenuineIntel",
+                "code": bytes([0x0F, 0xA2, 0xF4]),
+                "regs_initial": {0: 0},
+                "regs_expected": {0: 1, 3: 0x756E6547,
+                                  2: 0x49656E69, 1: 0x6C65746E},
+                "expected_eip": 3,
+            },
+            {
+                # Family 4 and NO feature bits -- EDX bit 0 is the on-chip FPU,
+                # and it must agree with the x87 cases above.
+                "name": "CPUID: leaf 1 is a 486SX signature with no FPU bit",
+                "code": bytes([0x0F, 0xA2, 0xF4]),
+                "regs_initial": {0: 1, 2: 0xFFFFFFFF},
+                "regs_expected": {0: 0x00000400, 2: 0},
+                "expected_eip": 3,
+            },
+        ])
+
         all_passed = True
-        
+
         only = getattr(args, "only", None)
         for test_num, tc in enumerate(test_cases, 1):
             if only and test_num not in only:
