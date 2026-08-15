@@ -87,6 +87,16 @@ OP .op_0f_01
     CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
+    /* SMSW (/4) is decided BEFORE the ModRM walk, because it is the one member
+     * of this group with a REGISTER form -- `0F 01 E0`, SMSW AX, which is what
+     * a Microsoft/Borland C startup issues to read CR0.EM before it probes for
+     * an x87. LGDT/LIDT are memory-only, so the walk was unconditional here and
+     * a mod=11 encoding fell through it into .exit_loop: the whole title died
+     * on the first instruction of its runtime's coprocessor detection.
+     * Measured on MORTAL_KOMBAT (docs/13). */
+    UBFX R3, R1, #3, #3
+    CMP R3, #4
+    BEQ.W L(OP_SMSW)
     /* The ADDRESS-SIZE decoder from the mode record, not a hardwired 32-bit
        one. `BL L(DECODE_MODRM_32)` was unconditional here, so in a 16-bit
        guest -- which is every guest in this tree -- `LIDT [disp16]` (ModRM
@@ -102,6 +112,27 @@ OP .op_0f_01
     CMP R3, #3
     BEQ.N L(OP_LIDT)
     B.W .exit_loop
+
+/* SMSW: store the low 16 bits of CR0. Unprivileged at every CPL on a 286 and
+ * later (tiny386 i386.c, DOSBox-X src/cpu/cpu.cpp CPU_SMSW), which is the whole
+ * point of it -- LMSW is the privileged half. A halfword in both operand sizes,
+ * matching SLDT above; Intel's `SMSW r32` zero-extension buys nothing for a
+ * guest that only ever tests the bottom four bits. */
+L(OP_SMSW):
+    LDR.W R5, [R8, #CPU_CR0]
+    CMP R1, #192
+    BLO.W L(OP_SMSW_MEM)
+    AND.W R3, R1, #7
+    ADD.W R3, R8, R3, LSL #2
+    STRH.W R5, [R3, #CPU_REGS]
+    B.W .fetch_decode_loop
+L(OP_SMSW_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN]
+    BLX R12
+    LDR.W R5, [R8, #CPU_CR0]
+    MEM_GET_PTR R3, R7
+    VGA_ST_H R5, R3, R12
+    B.W .fetch_decode_loop
 
 /* LGDT and LIDT read the SAME six-byte operand -- a 16-bit limit then a 32-bit
  * base -- and differ only in where they put it. They shared no code, and LGDT
@@ -360,6 +391,137 @@ L(OP_0F_SETCC_MEM):
  * machine: a segment load with PE set is what traps, and that check already
  * exists in SET_SREG.
  */
+/* 0F A2 -- CPUID. Leaf 0 and leaf 1, and nothing else.
+ *
+ * We ANSWER it rather than refusing it because the guest has already proved it
+ * may: the same routine toggles EFLAGS.ID (bit 21) with `0F BA` above and finds
+ * it writable, which on real silicon is the definition of "CPUID is present".
+ * The alternative -- masking ID in POPF so the guest concludes 386 -- puts a
+ * test on the hot flag path to buy the same outcome, and would then be a lie
+ * about a machine whose 0F opcodes are all 486-era anyway.
+ *
+ * The signature is a 486SX: family 4, EDX feature bits ALL ZERO, and bit 0 of
+ * EDX is the on-chip FPU bit, so this agrees with .op_esc_x87 -- one machine
+ * with no coprocessor, described the same way twice. Do not set a feature bit
+ * here without the instruction behind it.
+ *
+ * MEASURED on MORTAL_KOMBAT (docs/13): `66 B8 01 00 00 00 / 0F A2 / 8A C4 /
+ * 25 0F 00` -- leaf 1, then AH masked to the family nibble. Its THIRD wall. */
+OP_AGNOSTIC .op_0f_cpuid_A2
+    LDR.W R3, [R8, #CPU_REGS]
+    CBNZ R3, 1f
+    MOV.W R4, #1                   @ EAX: highest leaf we answer
+    STR.W R4, [R8, #(CPU_REGS + 0)]
+    MOVW R4, #0x6547               @ EBX "Genu"
+    MOVT R4, #0x756E
+    STR.W R4, [R8, #(CPU_REGS + 12)]
+    MOVW R4, #0x6E69               @ EDX "ineI"
+    MOVT R4, #0x4965
+    STR.W R4, [R8, #(CPU_REGS + 8)]
+    MOVW R4, #0x746E               @ ECX "ntel"
+    MOVT R4, #0x6C65
+    STR.W R4, [R8, #(CPU_REGS + 4)]
+    B.W .fetch_decode_loop
+1:  MOVW R4, #0x0400               @ family 4, model 0, stepping 0
+    STR.W R4, [R8, #(CPU_REGS + 0)]
+    MOV.W R4, #0
+    STR.W R4, [R8, #(CPU_REGS + 4)]
+    STR.W R4, [R8, #(CPU_REGS + 8)]    @ no FPU, no TSC, no MSR, no CX8
+    STR.W R4, [R8, #(CPU_REGS + 12)]
+    B.W .fetch_decode_loop
+
+/* 0F BA -- Group 8: BT/BTS/BTR/BTC with an IMMEDIATE bit number.
+ *
+ * The imm8 forms only. The register-source forms (0F A3/AB/B3/BB) address a bit
+ * STRING -- a signed offset that walks off the effective address into adjacent
+ * words -- and are deliberately left at .exit_loop rather than half-built.
+ * These four take the offset MODULO the operand size (Intel SDM, Group 8), so
+ * the address never moves and the whole opcode is a mask.
+ *
+ * /0../3 are undefined encodings and stay loud.
+ *
+ * Only CF is architecturally defined; OF/SF/ZF/AF/PF are undefined, so R11's
+ * other bits are left exactly as they were rather than invented.
+ *
+ * MEASURED on MORTAL_KOMBAT (docs/13): its runtime's CPU identification is
+ * `66 0F BA FA 15 / 66 0F BA FA 12` -- toggling EFLAGS.ID and EFLAGS.AC in EDX
+ * to tell a 386 from a 486 from a 586 -- and it was the title's SECOND wall,
+ * three instructions after the x87 detection. */
+OP .op_0f_ba
+    CODE_PTR R1
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    UBFX R3, R1, #3, #3
+    CMP R3, #4
+    BLO.W .exit_loop
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.W L(BTGRP_MEM)
+    AND.W R4, R1, #7
+    MOV.W R4, R4, LSL #2
+    ADD.W R4, R4, #CPU_REGS
+    LDREG_V R5, R4
+    CODE_PTR R3
+    LDRB R3, [R3, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R3, #(OPSZ * 8 - 1)
+    LSR.W R12, R5, R3
+    BFI R11, R12, #0, #1           @ CF = the bit as it was
+    UBFX R12, R1, #3, #3
+    CMP R12, #4
+    BEQ.W .fetch_decode_loop       @ BT: no write-back
+    MOV.W R0, #1
+    LSL.W R0, R0, R3
+    CMP R12, #5
+    BEQ.N 1f
+    CMP R12, #6
+    BEQ.N 2f
+    EOR.W R5, R5, R0               @ BTC
+    B.N 3f
+1:  ORR.W R5, R5, R0               @ BTS
+    B.N 3f
+2:  BIC.W R5, R5, R0               @ BTR
+3:  STREG_V R5, R4
+    B.W .fetch_decode_loop
+
+L(BTGRP_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    CODE_PTR R3                    @ the imm8 comes AFTER the displacement
+    LDRB R3, [R3, #0]
+    ADD.W R10, R10, #1
+    AND.W R3, R3, #(OPSZ * 8 - 1)
+    UBFX R12, R1, #3, #3           @ R1 survives DECODE_MODRM; R2-R5 do not
+    CMP R12, #4
+    BNE.N 4f
+    /* BT: a pure read, so it takes the READ walk. Going through the RMW walk
+       would record a VGA latch for an access that never writes. */
+    SEAM_CHECK R2, R7
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    MEM_TRAP_R R2
+    LD_V R5, R2
+    LSR.W R12, R5, R3
+    BFI R11, R12, #0, #1
+    B.W .fetch_decode_loop
+4:  MEM_GET_PTR_RMW R2, R7
+    LD_V R5, R2
+    LSR.W R4, R5, R3
+    BFI R11, R4, #0, #1
+    MOV.W R0, #1
+    LSL.W R0, R0, R3
+    CMP R12, #5
+    BEQ.N 5f
+    CMP R12, #6
+    BEQ.N 6f
+    EOR.W R5, R5, R0
+    B.N 7f
+5:  ORR.W R5, R5, R0
+    B.N 7f
+6:  BIC.W R5, R5, R0
+7:  VGA_ST_V R5, R2, R7
+    B.W .fetch_decode_loop
+
 OP_AGNOSTIC .op_0f_mov_r32_cr_20
     MOV.W R4, #0
     B.N L(OP_0F_CR)
@@ -529,6 +691,7 @@ L(OP_0F_MOVSX_GV_EW_WRITE):
 .set .op_0f_0F, .op_0f_0F_32
 .set .op_0f_00, .op_0f_00_32
 .set .op_0f_01, .op_0f_01_32
+.set .op_0f_ba, .op_0f_ba_32
 .set .op_int3_CC, .op_int3_CC_32
 .set .op_into_CE, .op_into_CE_32
 .set .op_int_imm8_CD, .op_int_imm8_CD_32
@@ -620,6 +783,7 @@ opcode_table_0f_32:
 .set .op_0f_0F, .op_0f_0F_16
 .set .op_0f_00, .op_0f_00_16
 .set .op_0f_01, .op_0f_01_16
+.set .op_0f_ba, .op_0f_ba_16
 .set .op_int3_CC, .op_int3_CC_16
 .set .op_into_CE, .op_into_CE_16
 .set .op_int_imm8_CD, .op_int_imm8_CD_16

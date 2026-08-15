@@ -2873,6 +2873,50 @@ OP_AGNOSTIC .op_xlat_D7
     STRB.W R4, [R8, #8]
     B.W .fetch_decode_loop
 
+/* D8-DF, the x87 ESCAPE group, ON A MACHINE WITH NO COPROCESSOR.
+ *
+ * This is NOT an x87 implementation and must not be mistaken for one. It is the
+ * OTHER honest answer: a 386-class PC with no 387 fitted and CR0.EM/MP clear
+ * ignores every ESC opcode outright -- the bus cycle goes to a socket nobody
+ * populated -- and that is precisely what makes the standard C-runtime
+ * detection conclude "no coprocessor":
+ *
+ *     6A FF      PUSH -1            ; [BP-2] = 0xFFFF
+ *     0F 01 E0   SMSW AX
+ *     A8 04      TEST AL,4          ; CR0.EM?
+ *     75 19      JNZ  no_fpu
+ *     DB E3      FNINIT             ; a real 387 would zero the status word
+ *     DD 7E FE   FNSTSW [BP-2]      ; ...here
+ *     38 4E FE   CMP  [BP-2],CL     ; still 0xFFFF -> no coprocessor
+ *
+ * Reaching .exit_loop instead KILLED THE GUEST on the third line of its own
+ * startup, which is what MORTAL_KOMBAT did (docs/13): every title built with a
+ * Microsoft or Borland runtime runs this sequence whether or not it ever uses a
+ * float. `x86_x87_escapes` is the number that says which: a detection costs a
+ * HANDFUL, and a title that actually computes in floating point runs millions
+ * and is silently producing wrong arithmetic. READ IT before trusting a picture
+ * from a title that is new to this tree.
+ *
+ * The only real work is advancing EIP correctly. mod!=11 has a full ModRM/SIB/
+ * displacement to step over, so the address-size decoder from the mode record
+ * runs (its result is then discarded); mod=11 is the whole instruction and must
+ * NOT be walked -- L(OP_SLDT) avoids the same call for the same reason. */
+OP_AGNOSTIC .op_esc_x87
+    MOVW R3, #:lower16:x86_x87_escapes
+    MOVT R3, #:upper16:x86_x87_escapes
+    LDR R4, [R3]
+    ADD R4, R4, #1
+    STR R4, [R3]
+    CODE_PTR R1
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    CMP R1, #192
+    BLO.N 1f
+    B.W .fetch_decode_loop
+1:  LDR.W R12, [R2, #REC_MODRM_FN]
+    BLX R12
+    B.W .fetch_decode_loop
+
 OP_AGNOSTIC .op_loopnz_E0
     CODE_PTR R5
     LDRSB.W R5, [R5]

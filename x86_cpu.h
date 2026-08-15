@@ -716,6 +716,8 @@ extern volatile uint32_t x86_seam_flushes;
    the last fifteen bytes of its granule, so cpu->code_k cannot cover the whole
    instruction; stages sixteen bytes into DTCM and re-points code_k. */
 void *x86_code_reloc(uint32_t lin);
+extern volatile uint32_t x86_x87_escapes; /* D8-DF ignored: no x87 fitted */
+
 extern volatile uint32_t x86_code_relocs;       /* instructions staged        */
 extern volatile uint32_t x86_code_reloc_faults; /* bytes that would not fold  */
 

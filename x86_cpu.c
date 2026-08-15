@@ -307,4 +307,10 @@ uint32_t x86_eip_log_idx;
    The stack words are captured AT THE CATCH and not read afterwards on purpose:
    between a wild transfer and the halt the guest runs a few hundred thousand
    more instructions and writes straight over the frame that explains it.  */
+/* x87 ESCAPE opcodes (D8-DF) ignored, because no coprocessor is fitted. See
+   .op_esc_x87 in cpu_exec_handlers.S: a handful means a C runtime's detection
+   ran; millions means a title is computing in floating point and getting
+   nothing, which no picture would tell you. */
+volatile uint32_t x86_x87_escapes = 0;
+
 uint32_t x86_oddsp_log[82];

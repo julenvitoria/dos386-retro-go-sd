@@ -161,7 +161,7 @@
     .word .op_0f_setcc + 1 // 0x9f
     .word .exit_loop + 1 // 0xa0
     .word .exit_loop + 1 // 0xa1
-    .word .exit_loop + 1 // 0xa2
+    .word .op_0f_cpuid_A2 + 1 // 0xa2
     .word .exit_loop + 1 // 0xa3
     .word .exit_loop + 1 // 0xa4
     .word .exit_loop + 1 // 0xa5
@@ -185,7 +185,7 @@
     .word .op_0f_movzx_gv_ew + 1 // 0xb7
     .word .exit_loop + 1 // 0xb8
     .word .exit_loop + 1 // 0xb9
-    .word .exit_loop + 1 // 0xba
+    .word .op_0f_ba + 1 // 0xba
     .word .exit_loop + 1 // 0xbb
     .word .exit_loop + 1 // 0xbc
     .word .exit_loop + 1 // 0xbd

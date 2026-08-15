@@ -306,7 +306,79 @@ reflects none of the graphics work. Its six sub-timings read `65535` until port
 `0x20` answered — see
 [`11_pit_and_interrupt_controller.md`](11_pit_and_interrupt_controller.md) §3.
 
-## Alley Cat — playable
+## Mortal Kombat — BLOCKED on the HMA, after four walls in the first 200 instructions
+
+First measured 2026-08-15, gwemu tier 2, `timelines/start-preselected-game.tl`.
+The `.dsk` mounts, the program LOADS (`dsk_startup_ok=1`, `dsk_exec_rc=0`), the
+BIOS sets text mode 3 — and then the title dies inside its own C-runtime
+startup, before it has drawn one pixel or asked for anything a device could
+answer. **Every counter that names a subsystem read healthy the whole time**:
+`x86_pg_frames_total=160`, `_exhausted=0`, `_evictions=0`, `x86_arena_largest=110,592`,
+`x86_xms_detects=0`. The video mode log holds three events for the entire run —
+the BIOS's own boot set-mode and the renderer following it — and no tag 5, so
+there is nothing refused and nothing to render. This title has never asked for
+video, memory, XMS or sound. It never got that far.
+
+`guest_insns_total=0` is the shape to recognise: the guest halted inside its
+FIRST frame slice, and the slice budget is only banked for a live guest, so a
+title that dies this early reports zero rather than a rate.
+
+### The four walls, in the order the guest hit them
+
+Each was found the same way — `cpu_state_ptr->exit_reason`, `+2200` for the
+offending opcode (`CPU_EXIT_INFO`), and `probe.py --guest` to disassemble
+around CS:EIP. Three were ours and are FIXED here; the fourth is not an opcode.
+
+| # | at | opcode | what the guest was doing |
+|---|---|---|---|
+| 1 | `023E:68CE` | `0F 01 /4` **SMSW** | reading CR0.EM before probing for an x87 |
+| 2 | `023E:68D1` | `DB E3` **FNINIT** | the x87 detection itself |
+| 3 | `023E:6624` | `0F BA /7` **BTC** | toggling EFLAGS.ID and .AC to identify the CPU |
+| 3b| `023E:664D` | `0F A2` **CPUID** | ...having found ID writable |
+| 4 | `023E:0C24` | *not an opcode* | `REPE CMPSW` against `FFFF:0030` — the A20 wrap test |
+
+Walls 1-3b are one continuous routine: `PUSH -1 / SMSW AX / TEST AL,4 /
+JNZ / FNINIT / FNSTSW [BP-2] / CMP [BP-2],CL`, then `PUSHF / BTC EDX,21 /
+BTC EDX,18 / POPF / PUSHF / CPUID`. It is the standard Microsoft/Borland
+startup preamble, **not** anything specific to this title, which is why the
+fixes are worth more than one game: any DOS title built with those runtimes
+runs it.
+
+- **SMSW** was `.exit_loop` because `0F 01`'s ModRM walk was unconditional and
+  SMSW is the only member of the group with a register form.
+- **D8-DF** now behave as a machine with NO COPROCESSOR FITTED: the escape is
+  ignored and only its operand is stepped over, which is what makes the
+  detection above conclude "no x87" instead of killing the guest. `x86_x87_escapes`
+  counts them, and **it is the number to read before trusting a picture from a
+  new title** — a detection costs a handful (this title: **2**), a title
+  actually computing in floating point runs millions and is silently wrong.
+- **`0F BA`** (BT/BTS/BTR/BTC, imm8 form only) and **`0F A2`** (CPUID leaves 0
+  and 1, a 486SX with no feature bits) are implemented. The register-source bit
+  ops `0F A3/AB/B3/BB` address a bit STRING and are deliberately still loud.
+
+Fourteen cases in `tests/test_opcodes.py` (274-287) cover all of it; all
+fourteen were SEEN TO FAIL with the table entries reverted.
+
+### The single next blocker: the HMA has no backing when A20 is open
+
+The guest opens A20 through the **fast gate at port 0x92** (`x86_a20_changes=1`,
+`x86_a20_state=1`; the io log's only two entries are that IN and that OUT) and
+immediately runs the classic wrap test — `ES=0xFFFF`, `REPE CMPSW` at
+`FFFF:0030` against `0000:0020`, i.e. linear **0x100020**. That page is not
+mapped: `x86_mem_wrap_1mb()` writes `FOLD_INVALID` across the sixteen HMA pages
+whenever the gate is open, on purpose ("nothing here owns it yet"), and the
+pager's `owns()` does not cover them either. Result: `x86_pg_unmapped=1`,
+`X86_EXIT_MEM_FAULT`, dead. `x86_seam_overflow=1` is the same event seen from
+the seam — a straddle whose low granule has no frame cannot be served.
+
+**Size of the fix: 16 pages = 64 KB, against 144 free frames.** It is not a
+memory problem and not an XMS problem — `x86_xms_detects` is still 0, the guest
+has not talked to a driver at all. The pager already has an `aux_first/aux_count`
+region beside its own; giving the HMA sixteen ordinary demand-paged frames is
+the shape of it. Whether the wrap test then PASSES is the second question and
+the more interesting one: the guest is checking that the gate really opened.
+
+
 
 CGA mode 4, pixel-exact. Its skill menu wants K/H/T/A, which no button can send;
 that needs the on-screen keyboard, not a mapping change.
