@@ -993,6 +993,41 @@ python3 scripts/probe.py --retrogo --timeline timelines/start-preselected-game.t
     --watch x86_dma2d_selftest,x86_dma2d_blits,x86_dma2d_fallback
 ```
 
+#### `X86_PGF_BENCH=1` — what a pagefile write is made of, asked of the card
+
+```bash
+make -f Makefile.core clean && make -f Makefile.core pack X86_PGF_BENCH=1
+python3 scripts/deploy_device.py --no-firmware --preselect KEEN4.dsk
+python3 scripts/probe.py --retrogo --target hardware --no-flash --hard-reset \
+    --timeline timelines/keen4-keypress.tl --interval 5 --samples 5 \
+    --watch pgfb_grow4k,pgfb_inplace4k,pgfb_inplace1k,pgfb_inplace512,\
+pgfb_inplace32k,pgfb_random4k,pgfb_read4k,pgfb_inplace_late,pgfb_grow4k_late
+```
+
+`pgf_bench()` in `src/main.c` writes the same 4 KB in six different shapes
+(appended past EOF, rewritten in place, one 32 KB call, 512 B × 64, scattered,
+and read back) and repeats two of them at the END so warm-up cannot be mistaken
+for a result. ~1 s at title load and it truncates the pagefile afterwards, so
+it is a build flag and never a default. It is what proved the cost is
+**rewriting recently-written sectors** (60–67 ms/4 KB) rather than appending
+(12–14 ms), the call size, or the cluster-chain walk — see `docs/12` §1b.
+
+#### `X86_DSK_OPEN_PER_CALL=1` — the `.dsk` handle A/B
+
+Puts the read path back on `rg_storage_copy_file_range_to_ram`, which f_opens
+and f_closes the image around every sector, so the held handle can be graded
+against it with the same workload. MEASURED on KEEN4, hardware, at the same 616
+reads / 20 backend calls: `x86_disk_us_total` **352,173 µs** open-per-call
+against **291,066–291,390 µs** held — ~3.0 ms per backend call. Never ship 1.
+
+#### `X86_PG_DONATE_RESERVE=<n>` — force the pager to evict
+
+The shipping floor (134) is KEEN4's measured working set and the title pays
+ZERO writebacks at it, which is correct and useless for measuring the pagefile.
+`X86_PG_DONATE_RESERVE=90` reproduces the eviction workload: 81 writebacks in a
+21 s KEEN4 run. The default lives in `x86_pager.h` and is unchanged; this only
+makes it `-D`-overridable.
+
 #### `X86_EGA_SHPROF=1` — the EGA read-shadow rebuild
 
 ```bash

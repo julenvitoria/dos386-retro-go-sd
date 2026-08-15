@@ -43,6 +43,7 @@
 #include "x86_arena.h"
 #include "x86_video_planar.h"
 #include "x86_pager.h"
+#include "x86_pgfile.h"
 #include "x86_xms.h"
 #include "x86_ems.h"
 
@@ -1351,17 +1352,105 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
  * 1.44 MB image costs no AXI at all and any .dsk in /roms/dos works without a
  * rebuild.
  */
+/*
+ * THE .dsk HANDLE IS HELD OPEN. This used to be
+ * abi->rg_storage_copy_file_range_to_ram, which opens and closes the image on
+ * EVERY call -- and x86_disk.c already recorded what that costs in as many
+ * words: f_open is a directory walk with LFN on, f_lseek with FF_USE_FASTSEEK 0
+ * walks the cluster chain from byte zero reading FAT sectors, and only then are
+ * the bytes the guest asked for read.
+ *
+ * It is the same correction the pagefile took, for the same reasons and with
+ * the same evidence behind it (see the pagefile header, and `xms_opens` as its
+ * witness): FF_FS_TINY 1 means a FIL carries no private sector window, so a
+ * held handle costs the FIL struct and nothing else, and FF_FS_LOCK 0 means
+ * nothing was refusing the duplicate open this path took while the WRITE path
+ * below had its own open on the same file.
+ *
+ * dsk_us_open / dsk_us_seek / dsk_us_read split the cost the way pgf_us_* does
+ * for the pagefile, so "which of the three is it" stays a measurement.
+ */
+static uint32_t pgf_us(uint32_t cycles);
+static void pgf_acc(volatile uint32_t *total, volatile uint32_t *worst,
+                    uint32_t cycles);
+
+volatile uint32_t dsk_opens        = 0;   /* ONE per title if this is working */
+volatile uint32_t dsk_us_open      = 0;
+volatile uint32_t dsk_us_seek      = 0;
+volatile uint32_t dsk_us_read      = 0;
+volatile uint32_t dsk_us_write     = 0;
+volatile uint32_t dsk_seek_us_worst = 0;
+volatile uint32_t dsk_read_us_worst = 0;
+volatile uint32_t dsk_errors       = 0;
+
+static FILE *dsk_fp;
+
+static void dsk_close_file(void)
+{
+    const gw_firmware_abi_t *abi = gw_firmware_abi();
+    if (dsk_fp) {
+        X86_ZONE_ENTER(X86_ZONE_DISK);
+        abi->fclose(dsk_fp);
+        X86_ZONE_EXIT();
+        dsk_fp = NULL;
+    }
+}
+
+/* "r+b": ONE handle for reads and writes both. Two handles on a file one of
+   them writes is exactly what FF_FS_LOCK 0 fails to refuse. */
+static FILE *dsk_file(const char *path)
+{
+    const gw_firmware_abi_t *abi = gw_firmware_abi();
+    if (dsk_fp)
+        return dsk_fp;
+    if (!path || !path[0])
+        return NULL;
+    X86_ZONE_ENTER(X86_ZONE_DISK);
+    uint32_t t0 = DWT_CYCCNT;
+    dsk_fp = abi->fopen(path, "r+b");
+    if (!dsk_fp)                       /* a read-only card still has to boot */
+        dsk_fp = abi->fopen(path, "rb");
+    dsk_us_open += pgf_us(DWT_CYCCNT - t0);
+    X86_ZONE_EXIT();
+    if (dsk_fp) dsk_opens++;
+    return dsk_fp;
+}
+
 static int sd_sector_read(void *ctx, void *dst, uint32_t offset, uint32_t len)
 {
     const gw_firmware_abi_t *abi = gw_firmware_abi();
-    /* ZONES: the DISK zone is the SD ROUND TRIP and nothing else. It nests
-       inside whatever asked for it (normally HLE), so FatFs's own cluster-chain
-       walk stays charged to HLE -- which is correct, that walk is CPU work. */
+#if X86_DSK_OPEN_PER_CALL
+    /* THE A/B ARM, and the only reason it still exists: this is what the path
+       did before the handle was held -- rg_storage_copy_file_range_to_ram,
+       which f_opens and f_closes the image around every 512-byte sector. Build
+       X86_DSK_OPEN_PER_CALL=1 to put the old cost back and read
+       x86_disk_us_total against it. */
     X86_ZONE_ENTER(X86_ZONE_DISK);
     size_t got = abi->rg_storage_copy_file_range_to_ram(
         (char *)ctx, (uint8_t *)dst, offset, len, NULL);
     X86_ZONE_EXIT();
+    if (got != len) dsk_errors++;
     return (got == len) ? 0 : -1;
+#else
+    FILE *f = dsk_file((const char *)ctx);
+    int rc = -1;
+
+    if (!f) { dsk_errors++; return -1; }
+    /* ZONES: the DISK zone is the SD ROUND TRIP and nothing else. It nests
+       inside whatever asked for it (normally HLE), so FatFs's own cluster-chain
+       walk stays charged to HLE -- which is correct, that walk is CPU work. */
+    X86_ZONE_ENTER(X86_ZONE_DISK);
+    uint32_t t0 = DWT_CYCCNT;
+    int sought = abi->fseek(f, (long)offset, SEEK_SET);
+    uint32_t t1 = DWT_CYCCNT;
+    pgf_acc(&dsk_us_seek, &dsk_seek_us_worst, t1 - t0);
+    if (sought == 0 && abi->fread(dst, 1, len, f) == len)
+        rc = 0;
+    pgf_acc(&dsk_us_read, &dsk_read_us_worst, DWT_CYCCNT - t1);
+    X86_ZONE_EXIT();
+    if (rc != 0) dsk_errors++;
+    return rc;
+#endif
 }
 
 /*
@@ -1379,16 +1468,24 @@ static int sd_sector_write(void *ctx, const void *src, uint32_t offset,
                            uint32_t len)
 {
     const gw_firmware_abi_t *abi = gw_firmware_abi();
-    X86_ZONE_ENTER(X86_ZONE_DISK);          /* ZONES: see sd_sector_read */
-    FILE *f = abi->fopen((char *)ctx, "r+b");
+    FILE *f = dsk_file((const char *)ctx);
     int rc = -1;
-    if (f) {
-        if (abi->fseek(f, (long)offset, SEEK_SET) == 0 &&
-            abi->fwrite(src, 1, len, f) == len)
-            rc = 0;
-        abi->fclose(f);
-    }
+
+    if (!f) { dsk_errors++; return -1; }
+    X86_ZONE_ENTER(X86_ZONE_DISK);          /* ZONES: see sd_sector_read */
+    uint32_t t0 = DWT_CYCCNT;
+    if (abi->fseek(f, (long)offset, SEEK_SET) == 0 &&
+        abi->fwrite(src, 1, len, f) == len)
+        rc = 0;
+    /* The guest was told the write succeeded, so it has to be on the card
+       before the next thing that could read it -- the handle is shared with
+       the read path above, and fflush is what makes the two agree through
+       stdio's buffer. */
+    if (rc == 0 && abi->fflush(f) != 0)
+        rc = -1;
+    dsk_us_write += pgf_us(DWT_CYCCNT - t0);
     X86_ZONE_EXIT();
+    if (rc != 0) dsk_errors++;
     return rc;
 }
 
@@ -1508,6 +1605,28 @@ volatile uint32_t pgf_us_read  = 0;
 volatile uint32_t pgf_seek_us_worst  = 0;
 volatile uint32_t pgf_write_us_worst = 0;
 
+/*
+ * ALLOCATING vs IN-PLACE -- the split that says WHICH of the two candidate
+ * stories is true, and it is the only one the totals above cannot separate.
+ *
+ * A write whose offset is at or past the file's high-water mark has to make the
+ * cluster chain longer: create_chain() searches the FAT for a free cluster and
+ * writes the FAT back, and when the offset is far past EOF f_lseek stretches
+ * the chain over the WHOLE hole first. A write below the high-water mark
+ * touches an already-allocated cluster and is just data.
+ *
+ * If the allocating writes are the expensive ones, the fix is to stop making
+ * holes (a dense, append-ordered slot map). If both cost the same, the cost is
+ * the card's random-write behaviour and no amount of layout will move it.
+ */
+volatile uint32_t pgf_ext_writes    = 0;   /* at/past the high-water mark */
+volatile uint32_t pgf_ext_us        = 0;
+volatile uint32_t pgf_ext_us_worst  = 0;
+volatile uint32_t pgf_inp_writes    = 0;   /* below it -- pure data */
+volatile uint32_t pgf_inp_us        = 0;
+volatile uint32_t pgf_inp_us_worst  = 0;
+volatile uint32_t pgf_high_water    = 0;   /* bytes, the largest offset+len */
+
 extern volatile uint32_t x86_disk_cycles_per_us;
 
 /* Cycles -> us against the SAME calibration x86_pg_wb_us_worst uses, so the
@@ -1546,6 +1665,97 @@ static FILE *pgf_file(void)
     return pgf_fp;
 }
 
+#if X86_PGF_BENCH
+/*
+ * WHAT A 4 KB PAGEFILE WRITE IS MADE OF, measured against the card itself.
+ *
+ * The counters above already settled that it is NOT the cluster-chain walk:
+ * KEEN4 on silicon wrote 86 pages of which 85 landed in already-allocated
+ * clusters, and those still cost 47 ms mean / 405 ms worst while every seek
+ * together came to 340 ms. So the cost is in f_write, and the only things that
+ * can be varied from THIS side of the ABI are how many bytes per call and
+ * where they land. These arms vary exactly that and nothing else.
+ *
+ * Source bytes come from intflash (0x08000000): 32 KB of guaranteed-readable
+ * memory at a point in the boot where no buffer that big exists yet.
+ *
+ * ~1 s at title load, and it TRUNCATES the file again afterwards, so it can
+ * only ever be a build flag.
+ */
+volatile uint32_t pgfb_grow4k    = 0;   /* 8 x 4 KB, each extending the file  */
+volatile uint32_t pgfb_inplace4k = 0;   /* 8 x 4 KB, sequential, allocated    */
+volatile uint32_t pgfb_inplace1k = 0;   /* 32 x 1 KB over the same 32 KB      */
+volatile uint32_t pgfb_inplace512= 0;   /* 64 x 512 B over the same 32 KB     */
+volatile uint32_t pgfb_inplace32k= 0;   /* 1 x 32 KB -- the batching question */
+volatile uint32_t pgfb_random4k  = 0;   /* 8 x 4 KB, scattered, allocated     */
+volatile uint32_t pgfb_read4k    = 0;   /* 8 x 4 KB reads, for scale          */
+/* ORDERING CONTROLS. The first arm runs on a freshly truncated file with an
+   idle card, so "extending is cheaper" could just as well be "first is
+   cheaper". These repeat both shapes at the END, after ~2 s of traffic. */
+volatile uint32_t pgfb_grow4k_late = 0;   /* 24 x 4 KB extending, run LAST    */
+volatile uint32_t pgfb_inplace_late = 0;  /* 8 x 4 KB in-place, run last-1    */
+
+#define PGFB_SRC ((const void *)0x08000000u)
+
+static uint32_t pgf_bench_run(FILE *f, uint32_t off, uint32_t chunk,
+                              uint32_t count, uint32_t stride, int read)
+{
+    const gw_firmware_abi_t *abi = gw_firmware_abi();
+    static uint8_t sink[1024];
+    uint32_t t0 = DWT_CYCCNT;
+    for (uint32_t i = 0; i < count; i++) {
+        if (abi->fseek(f, (long)(off + i * stride), SEEK_SET) != 0)
+            break;
+        if (read) {
+            uint32_t left = chunk;
+            while (left) {
+                uint32_t n = left > sizeof(sink) ? sizeof(sink) : left;
+                if (abi->fread(sink, 1, n, f) != n) break;
+                left -= n;
+            }
+        } else if (abi->fwrite(PGFB_SRC, 1, chunk, f) != chunk) {
+            break;
+        }
+    }
+    return pgf_us(DWT_CYCCNT - t0);
+}
+
+static void pgf_bench(void)
+{
+    const gw_firmware_abi_t *abi = gw_firmware_abi();
+    FILE *f = pgf_file();
+    if (!f)
+        return;
+    X86_ZONE_ENTER(X86_ZONE_DISK);
+    /* Grow to 96 KB first: every later arm then writes into allocated
+       clusters, which is the case the KEEN4 measurement showed the pager is
+       actually in, and the scattered arm has somewhere to scatter. */
+    pgfb_grow4k     = pgf_bench_run(f, 0, 4096, 24, 4096, 0);
+    pgfb_inplace4k  = pgf_bench_run(f, 0, 4096,  8, 4096, 0);
+    pgfb_inplace1k  = pgf_bench_run(f, 0, 1024, 32, 1024, 0);
+    pgfb_inplace512 = pgf_bench_run(f, 0,  512, 64,  512, 0);
+    pgfb_inplace32k = pgf_bench_run(f, 0, 32768, 1, 32768, 0);
+    pgfb_random4k   = pgf_bench_run(f, 0, 4096,  8, 4096u * 3u, 0);
+    pgfb_read4k     = pgf_bench_run(f, 0, 4096,  8, 4096, 1);
+    pgfb_inplace_late = pgf_bench_run(f, 0, 4096, 8, 4096, 0);
+    pgfb_grow4k_late  = pgf_bench_run(f, 98304, 4096, 24, 4096, 0);
+    X86_ZONE_EXIT();
+
+    /* Put the file back to empty -- the guest must not inherit any of this. */
+    pgf_close_file();
+    FILE *t = abi->fopen(pgf_path, "wb");
+    if (t) abi->fclose(t);
+    pgf_reads = pgf_writes = pgf_errors = 0;
+    pgf_us_open = pgf_us_seek = pgf_us_write = pgf_us_read = 0;
+    pgf_seek_us_worst = pgf_write_us_worst = 0;
+    pgf_ext_writes = pgf_ext_us = pgf_ext_us_worst = 0;
+    pgf_inp_writes = pgf_inp_us = pgf_inp_us_worst = 0;
+    pgf_high_water = 0;
+    x86_pgf_map_reset();
+    xms_opens = 0;
+}
+#endif  /* X86_PGF_BENCH */
+
 static int pgf_open_file(void)
 {
     const gw_firmware_abi_t *abi = gw_firmware_abi();
@@ -1572,10 +1782,27 @@ static int pgf_open_file(void)
     pgf_reads = pgf_writes = pgf_errors = 0;
     pgf_us_open = pgf_us_seek = pgf_us_write = pgf_us_read = 0;
     pgf_seek_us_worst = pgf_write_us_worst = 0;
+    pgf_ext_writes = pgf_ext_us = pgf_ext_us_worst = 0;
+    pgf_inp_writes = pgf_inp_us = pgf_inp_us_worst = 0;
+    pgf_high_water = 0;
+    x86_pgf_map_reset();
     pgf_result = PGF_OK;
     pgf_ready = 1;
+#if X86_PGF_BENCH
+    pgf_bench();
+#endif
     return 0;
 }
+
+/*
+ * THE SLOT RING lives in x86_pgfile.c, and the measurement that forced it is
+ * in x86_pgfile.h. Short version: on this card a 4 KB append past EOF costs
+ * 12-14 ms and a 4 KB rewrite of recently-written sectors costs 60-67 ms, so a
+ * page's slot is no longer its page number -- it comes from a cursor sweeping
+ * a ring, and the map remembers where each page's copy went. It is a separate
+ * file because this one cannot be driven at tier 1 and that allocator is the
+ * part that decides where a guest's bytes end up.
+ */
 
 /*
  * Both of these do an ABSOLUTE fseek before every access, which is not
@@ -1583,7 +1810,7 @@ static int pgf_open_file(void)
  * position on entry belongs to whoever ran last. It is also what C requires
  * between a read and a write on the same update-mode stream.
  */
-static int pgf_write(uint32_t slot, const void *src)
+static int pgf_write(uint32_t page, const void *src)
 {
     const gw_firmware_abi_t *abi = gw_firmware_abi();
     int rc = -1;
@@ -1591,20 +1818,40 @@ static int pgf_write(uint32_t slot, const void *src)
 
     if (!f)
         return -1;
+    uint32_t slot = x86_pgf_slot_claim(page);
+    if (slot == X86_PGF_NO_SLOT) { pgf_errors++; return -1; }
+
+    uint32_t off = slot * X86_PG_SIZE;
+    int extending = (off + X86_PG_SIZE > pgf_high_water);
     X86_ZONE_ENTER(X86_ZONE_DISK);          /* ZONES: see sd_sector_read */
     uint32_t t0 = DWT_CYCCNT;
-    int sought = abi->fseek(f, (long)(slot * X86_PG_SIZE), SEEK_SET);
+    int sought = abi->fseek(f, (long)off, SEEK_SET);
     uint32_t t1 = DWT_CYCCNT;
     pgf_acc(&pgf_us_seek, &pgf_seek_us_worst, t1 - t0);
     if (sought == 0 && abi->fwrite(src, 1, X86_PG_SIZE, f) == X86_PG_SIZE)
         rc = 0;
     pgf_acc(&pgf_us_write, &pgf_write_us_worst, DWT_CYCCNT - t1);
+    pgf_acc(extending ? &pgf_ext_us : &pgf_inp_us,
+            extending ? &pgf_ext_us_worst : &pgf_inp_us_worst,
+            DWT_CYCCNT - t0);           /* seek+write: what the frame pays */
+    if (extending) pgf_ext_writes++; else pgf_inp_writes++;
     X86_ZONE_EXIT();
-    if (rc == 0) pgf_writes++; else pgf_errors++;
+
+    /* The map moves ONLY on success -- see rule 1 in x86_pgfile.h. A failed
+       writeback now leaves the page on its previous copy instead of on a slot
+       that was half-written over the only one it had. */
+    x86_pgf_commit(page, slot, rc == 0);
+    if (rc == 0) {
+        if (off + X86_PG_SIZE > pgf_high_water)
+            pgf_high_water = off + X86_PG_SIZE;
+        pgf_writes++;
+    } else {
+        pgf_errors++;
+    }
     return rc;
 }
 
-static int pgf_read(uint32_t slot, void *dst)
+static int pgf_read(uint32_t page, void *dst)
 {
     const gw_firmware_abi_t *abi = gw_firmware_abi();
     int rc = -1;
@@ -1612,6 +1859,15 @@ static int pgf_read(uint32_t slot, void *dst)
 
     if (!f)
         return -1;
+    uint32_t slot = x86_pgf_slot_of(page);
+    if (slot == X86_PGF_NO_SLOT) {
+        /* FILE tier with no slot. The pager only sets FILE tier after a write
+           SUCCEEDED, so this is unreachable by construction -- and it is
+           counted rather than papered over with zeros, because "the page was
+           never written" and "the card failed" must not read the same. */
+        pgf_errors++;
+        return -1;
+    }
     X86_ZONE_ENTER(X86_ZONE_DISK);
     uint32_t t0 = DWT_CYCCNT;
     int sought = abi->fseek(f, (long)(slot * X86_PG_SIZE), SEEK_SET);
@@ -1737,6 +1993,8 @@ static int xms_write(uint32_t off, const void *src, uint32_t bytes)
         rc = 0;
     X86_ZONE_EXIT();
     if (rc != 0) { xms_file_errors++; return -1; }
+    if (XMS_FILE_BASE + off + bytes > pgf_high_water)
+        pgf_high_water = XMS_FILE_BASE + off + bytes;
     xms_bytes_written += bytes;
     return 0;
 }
@@ -1874,6 +2132,8 @@ static int mount_guest_disk(void)
 {
     if (!ACTIVE_FILE || !ACTIVE_FILE->path[0])
         return -1;
+    /* A different title means a different image: the held handle goes first. */
+    dsk_close_file();
     strncpy(dsk_path, ACTIVE_FILE->path, sizeof(dsk_path) - 1);
     x86_disk_set_reader(sd_sector_read, dsk_path, ACTIVE_FILE->size);
     x86_disk_set_writer(sd_sector_write);
@@ -1916,6 +2176,10 @@ static void guest_reset(void)
      */
     x86_pager_reset();
     x86_pager_own(0, GUEST_RAM_SIZE / 4096u);
+    /* The slot map covers exactly the pages the pager can hand to a
+       backing-store callback -- the same two windows, and nothing else. */
+    x86_pgf_map_init(GUEST_RAM_SIZE / 4096u,
+                     X86_EMS_BACK_PAGE, X86_EMS_BACK_PAGES);
     /*
      * The SECOND window: EMS's logical pages, at linear 4 MB.
      *

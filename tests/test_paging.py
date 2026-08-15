@@ -279,6 +279,51 @@ def main(args):
             ("shipping reserve covers KEEN4's peak", p[76], 1),
         ]
 
+        # ---- the pagefile SLOT RING (x86_pgfile.c) -------------------------
+        # WHERE an evicted page's bytes land, which stopped being "at its own
+        # page number" once the card was measured: a 4 KB append past EOF is
+        # 12-14 ms on silicon and a 4 KB rewrite of recently-written sectors is
+        # 60-67 ms. See x86_pgfile.h for the whole table.
+        g = run_arm(b, syms, "run_pgfile_flag", "pgfile_r", 24)
+        if g is None:
+            print("FAIL: target never ran the pagefile-ring test")
+            return False
+
+        checks += [
+            ("pagefile: a page claims a slot",       g[0], 1),
+            ("  ... and reads back byte-identical",  g[1], 1),
+            # The append property itself. Same page, second write, new slot.
+            ("rewrite APPENDS to a new slot",        g[2], 1),
+            ("  ... the old slot is freed",          g[3], 1),
+            ("  ... the new slot is live",           g[4], 1),
+            ("  ... and the NEW bytes come back",    g[5], 1),
+            # NEGATIVE CONTROL: corrupt the writeback under the mapped slot.
+            ("CONTROL: corrupted slot is CAUGHT",    g[6], 1),
+            ("  ... and uncorrupting it passes",     g[7], 1),
+            # NEGATIVE CONTROL: read the copy the page had BEFORE its last
+            # write -- what a refill that overtook a pending write would see.
+            ("CONTROL: the stale copy still exists", g[8], 1),
+            ("CONTROL: stale != current, so a read " "that took it is CAUGHT",
+                                                     g[9], 1),
+            # Ordering under failure: the map moves only on success.
+            ("a FAILED write reports failure",       g[10], 1),
+            ("  ... the page does not move",         g[11], 1),
+            ("  ... its previous copy is intact",    g[12], 1),
+            # The ring's one hard rule, over a full wrap.
+            ("every pageable page got a slot",       g[13], 12),
+            ("a LIVE slot is never handed out",      g[14], 0),
+            ("  ... and the ring never ran dry",     g[15], 0),
+            ("every page still reads back its own",  g[16], 0),
+            ("  ... having actually wrapped",        g[17], 1),
+            # Outside both windows: refused, and loudly.
+            ("an unpageable page is refused",        g[18], 1),
+            ("  ... and counted",                    g[19], 1),
+            ("  ... and has no slot",                g[20], 1),
+            ("reset forgets the map",                g[21], 1),
+            ("  ... so a refill has nothing to read", g[22], 1),
+            ("  ... and every slot is free",         g[23], 1),
+        ]
+
         bad = 0
         for name, got, want in checks:
             ok = got == want
