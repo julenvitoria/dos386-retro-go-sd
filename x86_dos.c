@@ -766,46 +766,155 @@ typedef struct {
 } dos_prog_t;
 
 /*
+ * An MZ file opened and MEASURED, but not yet placed.
+ *
+ * THE SPLIT EXISTS BECAUSE THERE MUST BE ONLY ONE LOADER. AH=4Bh AL=00h and
+ * AL=03h need the identical header parse and the identical image copy, and
+ * differ entirely in the step BETWEEN them: AL=00h must allocate a block
+ * before it can know where the image goes, while AL=03h (overlay) is TOLD
+ * where by its caller and allocates nothing whatsoever. Cutting the loader at
+ * exactly that seam lets both share the parts that are the same instead of
+ * growing a second copy that drifts.
+ */
+typedef struct {
+    FIL      f;
+    mz_header_t h;
+    uint32_t hdr_bytes;
+    uint32_t image;             /* bytes of image AFTER the header */
+} mz_open_t;
+
+/*
+ * Open an MZ .EXE and compute its header and image sizes. The file is left
+ * OPEN on success -- mz_place() closes it, and every failure path here closes
+ * it before returning.
+ *
+ * .COM images are NOT handled and are refused with error 0x0B, the same as any
+ * other non-MZ file. Adding the .COM path is a separate, small change; saying
+ * so is better than a loader that half-does it.
+ */
+static int mz_open(const char *path, mz_open_t *m)
+{
+    if (f_open(&m->f, path, FA_READ) != FR_OK) {
+        x86_dos_last_error = 0x02;          /* file not found */
+        return -1;
+    }
+
+    UINT got = 0;
+    if (f_read(&m->f, &m->h, sizeof(m->h), &got) != FR_OK
+        || got != sizeof(m->h)) {
+        f_close(&m->f);
+        x86_dos_last_error = 0x1E;
+        return -1;
+    }
+    if (m->h.sig != 0x5A4D && m->h.sig != 0x4D5A) {
+        f_close(&m->f);
+        x86_dos_last_error = 0x0B;          /* invalid format */
+        return -1;
+    }
+
+    m->hdr_bytes = (uint32_t)m->h.hdr_paras * 16u;
+    m->image = (uint32_t)m->h.pages * 512u;
+    if (m->h.last_page)
+        m->image = m->image - 512u + m->h.last_page;
+    if (m->image < m->hdr_bytes) {
+        f_close(&m->f);
+        x86_dos_last_error = 0x0B;
+        return -1;
+    }
+    m->image -= m->hdr_bytes;
+    return 0;
+}
+
+/*
+ * Copy the image to load_seg:0000 and apply relocations, then close the file.
+ *
+ * THE TWO SEGMENTS ARE NOT THE SAME THING, and that is the whole content of
+ * AL=03h. `load_seg` says where the bytes go. `reloc_factor` is the value
+ * ADDED to every word the relocation table names. For a normal load they are
+ * equal and the distinction is invisible; for an overlay the caller supplies
+ * each independently, which is why the parameter block has two words.
+ *
+ * WHICH SEGMENT BIASES THE ADDRESS OF A RELOCATION ITEM -- the references
+ * DISAGREE, and this follows real MS-DOS:
+ *
+ *   references/MS-DOS/v4.0/src/DOS/EXEC.ASM:515-527 loads SI = exec_rel_fac and
+ *   uses it BOTH to reach the item (`MOV AX,DS / ADD AX,SI / MOV DS,AX`) and as
+ *   the addend (`ADD [BX],SI`). v2.0/source/EXEC.ASM:632-641 is the same code.
+ *   references/dosbox-x/src/dos/dos_execute.cpp:509-517 instead reaches the
+ *   item through `RealSeg(relocpt)+loadseg` while adding `relocate`.
+ *
+ * Real MS-DOS is the authority on what a DOS program was linked against, so
+ * the factor biases both. The two only differ when a caller passes a load
+ * segment and a relocation factor that are not equal -- and a caller that does
+ * that is asking for the image to be fixed up as though it lived at the
+ * factor, which is precisely MS-DOS's reading.
+ */
+static int mz_place(mz_open_t *m, uint16_t load_seg, uint16_t reloc_factor)
+{
+    /* Copy the image in, a page at a time so it can cross granules.
+     *
+     * A SHORT COPY IS RECORDED, NOT SWALLOWED. x86_guest_copy_in() stops at
+     * the first page the pager cannot resolve and returns how far it got, so
+     * an image bigger than the memory available lands PARTIALLY and this loop
+     * used to just stop -- leaving the tail of the program as whatever those
+     * pages already held, with a success returned to the caller. The guest
+     * then dies much later and somewhere else, executing 0xFF. That is the
+     * single hardest failure in this file to diagnose from the outside, and
+     * x86_dos_load_short is the number that names it. */
+    f_lseek(&m->f, m->hdr_bytes);
+    uint32_t done = 0;
+    while (done < m->image) {
+        uint8_t buf[512];
+        UINT n = 0;
+        UINT want = (m->image - done > sizeof(buf)) ? sizeof(buf)
+                                                    : (UINT)(m->image - done);
+        if (f_read(&m->f, buf, want, &n) != FR_OK || n == 0)
+            break;
+        if (x86_guest_copy_in(SEG(load_seg) + done, buf, n) != n)
+            break;
+        done += n;
+    }
+    /* Both describe the LAST load and are therefore assigned unconditionally:
+       leaving _short at its previous value on a successful load would report a
+       stale shortfall against an image that is completely resident, which is
+       worse than not counting at all. _shorts is the cumulative one. */
+    x86_dos_load_bytes = done;
+    x86_dos_load_short = m->image - done;
+    if (done < m->image)
+        x86_dos_load_shorts++;
+
+    /* Relocations: each entry names a word holding a segment, which has to be
+       biased by the relocation factor. */
+    if (m->h.relocs) {
+        f_lseek(&m->f, m->h.reloc_off);
+        for (unsigned i = 0; i < m->h.relocs; i++) {
+            uint16_t ro[2];
+            UINT n = 0;
+            if (f_read(&m->f, ro, 4, &n) != FR_OK || n != 4)
+                break;
+            uint32_t lin = SEG((uint16_t)(reloc_factor + ro[1])) + ro[0];
+            uint16_t *w = (uint16_t *)x86_guest_ptr(lin, 2);
+            if (w)
+                *w = (uint16_t)(*w + reloc_factor);
+        }
+    }
+    f_close(&m->f);
+    return 0;
+}
+
+/*
  * Load an MZ .EXE and build its PSP. Nothing else: no CPU state, no arena
  * bookkeeping beyond the block itself.
- *
- * .COM images are NOT handled here and are refused with error 0x0B, the same
- * as any other non-MZ file. Adding the .COM path is a separate, small change;
- * saying so is better than a loader that half-does it.
  */
 static int dos_load_mz(const char *path, const char *tail, unsigned tail_len,
                        uint16_t parent, uint16_t env_seg, const uint8_t *fcbs,
                        dos_prog_t *out)
 {
-    FIL f;
-    if (f_open(&f, path, FA_READ) != FR_OK) {
-        x86_dos_last_error = 0x02;          /* file not found */
+    mz_open_t m;
+    if (mz_open(path, &m) != 0)
         return -1;
-    }
-
-    mz_header_t h;
-    UINT got = 0;
-    if (f_read(&f, &h, sizeof(h), &got) != FR_OK || got != sizeof(h)) {
-        f_close(&f);
-        x86_dos_last_error = 0x1E;
-        return -1;
-    }
-    if (h.sig != 0x5A4D && h.sig != 0x4D5A) {
-        f_close(&f);
-        x86_dos_last_error = 0x0B;          /* invalid format */
-        return -1;
-    }
-
-    uint32_t hdr_bytes = (uint32_t)h.hdr_paras * 16u;
-    uint32_t image = (uint32_t)h.pages * 512u;
-    if (h.last_page)
-        image = image - 512u + h.last_page;
-    if (image < hdr_bytes) {
-        f_close(&f);
-        x86_dos_last_error = 0x0B;
-        return -1;
-    }
-    image -= hdr_bytes;
+    mz_header_t h = m.h;
+    uint32_t image = m.image;
 
     /*
      * One block for the PSP, the image and the memory the header asks for.
@@ -864,7 +973,7 @@ static int dos_load_mz(const char *path, const char *tail, unsigned tail_len,
         }
     }
     if (!block) {
-        f_close(&f);
+        f_close(&m.f);
         x86_dos_last_error = 0x08;          /* insufficient memory */
         return -1;
     }
@@ -887,37 +996,10 @@ static int dos_load_mz(const char *path, const char *tail, unsigned tail_len,
         }
     }
 
-    /* Copy the image in, a page at a time so it can cross granules. */
-    f_lseek(&f, hdr_bytes);
-    uint32_t done = 0;
-    while (done < image) {
-        uint8_t buf[512];
-        UINT n = 0;
-        UINT want = (image - done > sizeof(buf)) ? sizeof(buf)
-                                                 : (UINT)(image - done);
-        if (f_read(&f, buf, want, &n) != FR_OK || n == 0)
-            break;
-        if (x86_guest_copy_in(SEG(load_seg) + done, buf, n) != n)
-            break;
-        done += n;
-    }
-
-    /* Relocations: each entry names a word holding a segment, which has to be
-       biased by where we actually loaded. */
-    if (h.relocs) {
-        f_lseek(&f, h.reloc_off);
-        for (unsigned i = 0; i < h.relocs; i++) {
-            uint16_t ro[2];
-            UINT n = 0;
-            if (f_read(&f, ro, 4, &n) != FR_OK || n != 4)
-                break;
-            uint32_t lin = SEG(load_seg) + SEG(ro[1]) + ro[0];
-            uint16_t *w = (uint16_t *)x86_guest_ptr(lin, 2);
-            if (w)
-                *w = (uint16_t)(*w + load_seg);
-        }
-    }
-    f_close(&f);
+    /* A normal load fixes the image up as though it lived where it was put --
+       load segment and relocation factor are the same value. Only AL=03h ever
+       separates them. */
+    mz_place(&m, load_seg, load_seg);
 
     /* Top of memory as the program sees it: the end of what it was GRANTED,
        not of what it minimally needed. A Borland startup compares its own top
@@ -1021,6 +1103,7 @@ int x86_dos_exec(const char *path, const char *cmdline)
 #define DOS_EXEC_DEPTH 4
 
 static void fail(uint16_t code);
+static void ok_clear_cf(void);
 static void dos_log_path(const char *p);
 
 typedef struct {
@@ -1043,6 +1126,22 @@ volatile uint32_t x86_dos_execs;
 volatile uint32_t x86_dos_exec_fails;
 volatile uint32_t x86_dos_exec_depth_max;
 volatile uint32_t x86_dos_exec_last_err;
+
+/* AL=03h overlay loads. Separate from x86_dos_execs because an overlay is not
+   a process: nothing was allocated, nothing will terminate, and "did the
+   overlay land, and where" is the only question worth asking of it. */
+/* The MZ loader's own honesty. x86_dos_load_bytes is how much of the last
+   image actually reached guest memory; x86_dos_load_short is how much of it
+   did NOT, and x86_dos_load_shorts counts the loads that came up short.
+   Non-zero means a program is resident only in part -- which the guest
+   discovers much later, in an unrelated place, usually by executing 0xFF. */
+volatile uint32_t x86_dos_load_bytes;
+volatile uint32_t x86_dos_load_short;
+volatile uint32_t x86_dos_load_shorts;
+
+volatile uint32_t x86_dos_overlays;
+volatile uint32_t x86_dos_overlay_seg;
+volatile uint32_t x86_dos_overlay_reloc;
 
 /* Free every block the terminating process owns. DOS does this on exit and it
    is not optional here: the child's block is the largest thing in the arena
@@ -1178,11 +1277,87 @@ static uint16_t dos_env_build(const char *path, uint16_t owner)
  *   +6  dd  far pointer to the first  FCB
  *   +10 dd  far pointer to the second FCB
  *
- * AL=00 (load and execute) is implemented. AL=01 (load, do not execute) and
- * AL=03 (overlay) are NOT -- they are refused loudly through the same
+ * ...but ONLY for AL=00h and AL=01h. AL=03h has a COMPLETELY DIFFERENT and
+ * much shorter parameter block -- see dos_exec_overlay() below.
+ *
+ * AL=00 (load and execute) and AL=03 (load overlay) are implemented. AL=01
+ * (load, do not execute) is NOT -- it is refused loudly through the same
  * unhandled-function path as any other missing service, because a program
  * whose overlay was silently not loaded fails somewhere unrelated.
  */
+
+#if X86_DOS_EXEC
+/*
+ * AH=4Bh AL=03h -- LOAD OVERLAY.
+ *
+ * The easy sibling of AL=00h, and deliberately so: there is no child PSP, no
+ * MCB allocation, no environment block, no parent link, no transfer of
+ * control and no AH=4Ch return path. The caller has already decided where the
+ * image goes and will CALL into it itself; all DOS does is put the bytes there
+ * and fix them up.
+ *
+ * ES:BX is a TWO-WORD parameter block, not the fourteen-byte one AL=00h uses:
+ *
+ *   +0  dw  segment address where the file will be loaded
+ *   +2  dw  relocation factor to be applied to the image
+ *
+ * references/MS-DOS/v2.0/source/EXEC.ASM:56-63 is the comment block that
+ * documents exactly those two words; v4.0/src/DOS/EXEC.ASM:326-333 is the code
+ * that reads them (`exec3_load_addr` -> exec_dma, `exec3_reloc_fac` ->
+ * exec_rel_fac). references/dosbox-x/include/dos_inc.h:570-573 carries the
+ * same pair as `struct sOverlay { uint16_t loadseg; uint16_t relocation; }`.
+ *
+ * NO MEMORY IS ALLOCATED AND NO BOUNDS ARE CHECKED. That is not an omission:
+ * references/dosbox-x/src/dos/dos_execute.cpp:313-319 records that MS-DOS 4.0
+ * "will blindly load the EXE image to whatever segment is given even if it
+ * overruns one MCB into another", which is why titles rely on overlay loads
+ * landing in a buffer they allocated themselves. We do the same and let the
+ * caller own the memory.
+ *
+ * On success MS-DOS returns CF=0 with AX and DX BOTH ZERO
+ * (dos_execute.cpp:823-826, confirmed there against MS-DOS 6.22), and
+ * v4.0/src/DOS/EXEC.ASM:588-590 returns SYS_RET_OK the moment the overlay is
+ * placed -- no PSP is built and no entry state is computed.
+ */
+static int dos_exec_overlay(const char *path)
+{
+    uint32_t *r = cpu_state_ptr->regs;
+
+    /* Read granule-aware: ES:BX is an address the GUEST chose and even four
+       bytes from it can straddle a 4 KB boundary, which x86_guest_ptr()
+       refuses outright. */
+    uint8_t pb[4];
+    uint32_t pb_lin = cpu_state_ptr->segs[0].base + (uint16_t)r[3];
+    if (x86_guest_copy_out(pb, pb_lin, sizeof(pb)) != sizeof(pb)) {
+        x86_dos_exec_fails++;
+        x86_dos_exec_last_err = 0x0B;
+        fail(0x0B);
+        return 1;
+    }
+    uint16_t load_seg     = (uint16_t)(pb[0] | (pb[1] << 8));
+    uint16_t reloc_factor = (uint16_t)(pb[2] | (pb[3] << 8));
+
+    mz_open_t m;
+    if (mz_open(path, &m) != 0) {
+        x86_dos_exec_fails++;
+        x86_dos_exec_last_err = x86_dos_last_error;
+        fail((uint16_t)x86_dos_last_error);
+        return 1;
+    }
+    mz_place(&m, load_seg, reloc_factor);
+
+    x86_dos_overlays++;
+    x86_dos_overlay_seg = load_seg;
+    x86_dos_overlay_reloc = reloc_factor;
+
+    /* AX and DX are both zero on a successful overlay load, and CF is clear. */
+    x86_set_ax(0);
+    x86_set_dx(0);
+    ok_clear_cf();
+    return 1;
+}
+#endif /* X86_DOS_EXEC */
+
 static int dos_exec_child(void)
 {
     uint32_t *r = cpu_state_ptr->regs;
@@ -1219,25 +1394,34 @@ static int dos_exec_child(void)
     fail(0x01);
     return 0;
 #else
-    if (al != 0x00) {
+    if (al != 0x00 && al != 0x03) {
         x86_hle_unhandled_vector = 0x21;
         x86_hle_unhandled_func = 0x4B;
         x86_dos_exec_last_err = 0x100u | al;    /* the SUBfunction, not 4B */
         fail(0x01);
         return 0;
     }
+
+    /* DS:DX names the file for every subfunction, so it is parsed before the
+       split. Everything AFTER the split is process machinery an overlay has
+       no use for. */
+    char path[64];
+    dos_path_from_guest(cpu_state_ptr->segs[3].base + (uint16_t)r[2],
+                        path, sizeof(path));
+    strncpy(x86_dos_last_path, path, sizeof(x86_dos_last_path) - 1);
+    dos_log_path(path);
+
+    /* AL=03h leaves here. No depth check (an overlay does not nest -- it never
+       takes the CPU), no parameter block beyond two words, no PSP, no frame. */
+    if (al == 0x03)
+        return dos_exec_overlay(path);
+
     if (dos_exec_depth >= DOS_EXEC_DEPTH) {
         x86_dos_exec_fails++;
         x86_dos_exec_last_err = 0x08;
         fail(0x08);
         return 1;
     }
-
-    char path[64];
-    dos_path_from_guest(cpu_state_ptr->segs[3].base + (uint16_t)r[2],
-                        path, sizeof(path));
-    strncpy(x86_dos_last_path, path, sizeof(x86_dos_last_path) - 1);
-    dos_log_path(path);
 
     /* The parameter block. Read granule-aware: ES:BX is an address the GUEST
        chose and 14 bytes from it can straddle a 4 KB boundary, which

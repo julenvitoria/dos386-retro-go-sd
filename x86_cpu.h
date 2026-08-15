@@ -545,6 +545,18 @@ extern volatile uint32_t x86_dos_execs;
 extern volatile uint32_t x86_dos_exec_fails;
 extern volatile uint32_t x86_dos_exec_depth_max;
 extern volatile uint32_t x86_dos_exec_last_err;
+/* AL=03h (LOAD OVERLAY) counters. An overlay allocates nothing and terminates
+   never, so the EXEC counters above cannot describe it: these say how many
+   landed, and where the last one went. */
+/* The MZ loader's honesty counters. A guest access can be unresolvable
+   mid-copy, so an image can land PARTIALLY; these say whether the last one
+   did. x86_dos_load_shorts != 0 means some program is only half resident. */
+extern volatile uint32_t x86_dos_load_bytes;
+extern volatile uint32_t x86_dos_load_short;
+extern volatile uint32_t x86_dos_load_shorts;
+extern volatile uint32_t x86_dos_overlays;
+extern volatile uint32_t x86_dos_overlay_seg;
+extern volatile uint32_t x86_dos_overlay_reloc;
 void x86_dos_arena_init(void);
 void x86_disk_set_memory(const void *base, uint32_t bytes);
 void x86_disk_set_reader(int (*rd)(void *, void *, uint32_t, uint32_t),

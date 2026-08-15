@@ -337,6 +337,8 @@ python3 scripts/probe.py --retrogo --wait-magic --set guest_kips=330     # 8088
 | `panel_ms_min` | the display period, **learned** from the shortest iteration ever completed. Nothing assumes 60 fps |
 | `x86_kbd_read_log` / `x86_spk_log` | the last 32 bytes off port 0x60, and the last 32 writes that can move the speaker tone. `--dump x86_kbd_read_log:32x8` |
 | `x86_kb_pushes` / `x86_kb_pops` / `x86_kb_peek_hits` | the BDA ring's producer and its two consumers. "The guest polls INT 16h forever" has two opposite causes -- nothing was queued, or something dequeued it first -- and only these three separate them. `pushes == pops == peek_hits` means every key was queued, seen and taken; `pushes > 0` with `pops == 0` is the reported failure |
+| `x86_dos_load_bytes` / `x86_dos_load_short` / `x86_dos_load_shorts` | **Whether the MZ loader actually got the whole program in.** `x86_guest_copy_in()` stops at the first page the pager cannot resolve and returns how far it got, so an image can land PARTIALLY -- and the loader used to just stop, returning success, leaving the tail of the program as whatever those pages already held. The guest then dies much later and somewhere else, executing `0xFF`, which is the hardest failure in `x86_dos.c` to diagnose from the outside. `_bytes` is how much of the LAST image reached guest memory, `_short` how much did not, `_shorts` how many loads came up short. **Read these before blaming an opcode for an `exit_reason=4` at an address full of `0xFF`** -- that is exactly the check that proved Dark Forces' DOS4GW load was COMPLETE (61,604 B, short 0) and moved the diagnosis off memory entirely |
+| `x86_dos_overlays` / `x86_dos_overlay_seg` / `x86_dos_overlay_reloc` | `AH=4Bh AL=03h` (LOAD OVERLAY). An overlay is not a process -- nothing is allocated and nothing will terminate -- so the `x86_dos_exec*` counters cannot describe it. `_seg` and `_reloc` are the TWO WORDS of the AL=03h parameter block as the core read them: the load segment and the relocation factor, which are separate and need not be equal. Dark Forces passes them equal (both 0x81) |
 | `x86_dos_file_log` / `x86_dos_path_log` | The **first 96** file-family INT 21h calls, four words each -- `(func << 8) \| AL`, `(CF << 16) \| AX`, `BX`, `CX:DX` -- plus the last sixteen paths. Read it with **`probe.py --dos-log`**, which decodes it to one line per call. It **SATURATES rather than wrapping**, and that is the point: a guest stuck in a loop overwrote a 32-slot ring with the loop body in milliseconds, so the call that ISSUED the handle the loop was failing on was always gone -- WOLF3D's 32 identical AH=42h slots said nothing, and with 96 saturating slots the answer was in entry 2. The old two-word form also could not say WHICH handle, which is the only question a failing seek raises. `x86_dos_file_calls` counts every call whether recorded or not; write 0 to `x86_dos_file_log_idx` to re-arm for a later phase. `x86_hle_log` cannot answer a file question at all: a guest polling the keyboard fills all 32 of its slots between one open and the next. **The MEMORY calls `48h`/`49h`/`4Ah` also take a slot** -- an arena that refuses an allocation is unreadable as a bare count, which is exactly how Dark Forces' 15 `4Ah` calls sat unexplained -- but they are NOT counted in `x86_dos_file_calls`, and for them slot+3 is `(ES << 16) \| DX`, since ES is the block for `49h`/`4Ah` and DX means nothing there. `--dos-log` prints those as `BX=... paras ES=...` |
 | `x86_io_log` | Every port access, **coalesced by (direction, port)** into 32 runs, decoded by **`probe.py --io-log`**. Coalescing is what makes it useful: a mode-13h palette upload is 768 consecutive writes to 0x3C9 and would flush every other port out of a raw ring. What it shows is the SHAPE of a guest's hardware conversation -- which register files it programs, in what order -- and that named WOLF3D's wall in one run: `OUT 3D4,0F / OUT 3D5,66 / IN 3D5` reading back 0xFF, i.e. a CRTC write-then-read-back probe against a register file that did not exist. It also caught the FIX overshooting -- answering the 0x3B4/0x3B5 mono alias too made the guest conclude MONO and poll 0x3BA 32,000 times |
 | `x86_vga_planar_stores` / `_cls_plane` / `_cls_copy` / `_cls_general` | Guest stores that took the planar hook, split by WRITE CLASS -- the class is decided at `OUT` time, not per store. `_plane` is the CPU byte straight into the enabled planes (write mode 0, no Set/Reset, Bit Mask 0xFF, no rotate, no ALU); `_copy` is the write-mode-1 latched page copy; `_general` is everything else and is the only class still paying the full pipeline. **The MIX is the number that says whether a fast path is earning its risk**, and `_general` is the one to watch: WOLF3D in Mode Y gameplay reads 0 there, so the fast paths cover its whole frame. The class counters count PER BYTE while `_stores` counts per store, so a guest doing word stores makes them exceed it -- that is not a discrepancy. Read the set with `probe.py --watch planar` |
@@ -423,7 +425,17 @@ python3 scripts/probe_report.py --title wolf3d --settle 30
 python3 scripts/probe_report.py --rom .../GAME.dsk --name mygame
 python3 scripts/probe_report.py --title keen4 --skip-build --skip-cost   # fast
 python3 scripts/probe_report.py --compare before.json after.json
+python3 scripts/probe_report.py --title darkforces \
+    --core-flag X86_DOS_EXEC=1 --skip-cost      # measure a NON-DEFAULT core
 ```
+
+`--core-flag NAME=VALUE` (repeatable) is passed straight to `Makefile.core`. It
+exists because the useful question is often "what does the title ask for once we
+ANSWER something the shipping core refuses" — Dark Forces cannot be diagnosed at
+all without `X86_DOS_EXEC=1`, which is 0 by default. The flags are recorded in
+the report's `meta.core_flags`, so **a report on a non-default core says so on
+its face**; without that a number gets quoted later as if it described the
+shipping build.
 
 Boots a named title, lets it run **from its first instruction** (no settle-then-
 reset — the startup probes *are* the subject), and writes one report to
@@ -1344,13 +1356,20 @@ zero). Needs `pip install unicorn`; it SKIPs cleanly without it.
 python3 tests/test_benchmark.py
 python3 tests/test_game.py
 python3 tests/test_dos.py                # MCB arena, walked from the host, plus
-python3 tests/test_dos.py --negative     # 7 controls: rollback, largest,
-                                         # coalesce, owner, and the three EXEC
+python3 tests/test_dos.py --negative     # 9 controls: rollback, largest,
+                                         # coalesce, owner, the three EXEC
                                          # ones -- pspparent (the child's
                                          # PSP:0016 link zeroed), reloc (the MZ
                                          # relocation table not applied) and
                                          # resume (the parent's registers not
-                                         # restored) -- each rebuilds
+                                         # restored) -- and the two OVERLAY
+                                         # ones: ovlfactor (AL=03h relocates by
+                                         # the LOAD SEGMENT instead of the
+                                         # caller's relocation factor) and
+                                         # ovlseg (the image is placed one
+                                         # paragraph off the segment asked for,
+                                         # so the caller's far CALL misses it).
+                                         # Each rebuilds
                                          # x86_dos.c with ONE fix mutated back
                                          # to its defective form and requires a
                                          # FAIL; source restored in a finally.
@@ -1405,6 +1424,26 @@ python3 tests/test_dos.py --negative     # 7 controls: rollback, largest,
                                          # shipping core (Makefile.core sets 0;
                                          # honouring AH=4Bh kills WOLF3D --
                                          # see the flag's comment there).
+                                         # ALSO the OVERLAY arm (AH=4Bh AL=03h):
+                                         # a real HOST.EXE overlay-loads a real
+                                         # OVL.EXE into a segment IT chose and
+                                         # then FAR CALLs into it; the overlay
+                                         # returns a sentinel computed from its
+                                         # OWN relocated word, which is one byte
+                                         # carrying three facts -- placed right,
+                                         # fixed up right, reachable -- because
+                                         # it had to execute to produce it.
+                                         # THE LOAD SEGMENT AND THE RELOCATION
+                                         # FACTOR ARE DELIBERATELY DIFFERENT
+                                         # (the overlay's reloc entry carries a
+                                         # compensating segment half), or a core
+                                         # that ignored the factor would pass
+                                         # and both overlay controls would be
+                                         # inert. It also checks CF=0 and
+                                         # AX=DX=0 on return, and that
+                                         # x86_dos_execs stays 0 and the arena
+                                         # is untouched -- an overlay is not a
+                                         # process and allocates nothing.
 python3 tests/test_pit.py                # PIT channel 0 -- the SYSTEM TIMER's
                                          # divisor -- programmed by GUEST OUTs:
                                          # the real Wolf3D sequence (0x214B =

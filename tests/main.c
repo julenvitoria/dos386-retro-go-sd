@@ -146,6 +146,27 @@ volatile uint32_t dosexec_r[16];
 volatile uint32_t run_dosexec2_flag = 0;
 volatile uint32_t dosexec2_r[16];
 
+/* OVERLAY self-test: INT 21h AH=4Bh AL=03h.
+
+   The claim an overlay load makes is narrower than EXEC's and so is the test:
+   the bytes landed at the segment THE CALLER CHOSE, the relocation table was
+   applied with THE FACTOR THE CALLER SUPPLIED (which is not necessarily that
+   segment -- that separation is the entire content of AL=03h), and control
+   came straight back to the caller with CF clear.
+
+   The host cannot assert any of that from a counter. So a real HOST.EXE picks
+   a segment, overlay-loads a real OVL.EXE into it, and then FAR CALLS into the
+   loaded image; the overlay computes a sentinel FROM ITS OWN RELOCATED WORD
+   and returns it. A sentinel that comes back right proves the image is intact,
+   correctly relocated and reachable -- three facts one byte can carry only
+   because the overlay had to execute to produce it.
+
+   Evidence goes at linear 0x520, above the EXEC arm's 32 bytes at 0x500 and
+   still inside the DOS scratch area below the arena at 0x700. */
+#define DOSOVL_MARK  0x0520u
+volatile uint32_t run_dosovl_flag = 0;
+volatile uint32_t dosovl_r[16];
+
 volatile uint32_t run_nor_flag = 0;
 volatile uint32_t nor_r[40];
 
@@ -4419,6 +4440,58 @@ static void dosexec2_test_run(void)
     }
 }
 
+/*
+ * AH=4Bh AL=03h. Same shape as the EXEC arm: mount, load a real HOST.EXE with
+ * x86_dos_exec(), run to HLT, and read back what the guests wrote. The arena
+ * is checked afterwards because an overlay that allocated anything at all is
+ * already wrong -- AL=03h has no MCB of its own.
+ */
+static void dosovl_test_run(void)
+{
+    static const uint8_t hle_vectors[] = {
+        0x08, 0x09, 0x10, 0x16, 0x1A, 0x20, 0x21,
+    };
+    for (int i = 0; i < 16; i++)
+        dosovl_r[i] = 0;
+    memset(&test_ram[DOSOVL_MARK], 0, 32);
+
+    x86_video_init(cga_test_vram, cga_test_palette);
+    x86_video_set_aperture(vga_test_aperture, vga_test_pal);
+    x86_bios_init();
+    x86_hle_install(hle_vectors, sizeof(hle_vectors));
+
+    x86_disk_set_memory(dosfile_img, DOSFILE_IMG_BYTES);
+    dosovl_r[0] = (uint32_t)f_mount(&dosfile_fs, "", 1);
+
+    kbd_test_reset_cpu(0);
+    x86_dos_arena_init();
+    x86_dos_execs = 0;
+    x86_dos_exec_fails = 0;
+    x86_dos_exec_last_err = 0;
+    x86_dos_overlays = 0;
+    x86_dos_overlay_seg = 0;
+    x86_dos_overlay_reloc = 0;
+
+    dosovl_r[1] = (uint32_t)x86_dos_exec("HOST.EXE", "");
+    dosovl_r[2] = x86_dos_psp();                /* the host program's PSP */
+    dosovl_r[3] = kbd_test_run_to_halt();       /* 1 = HOST.EXE terminated */
+    dosovl_r[4] = x86_dos_overlays;
+    dosovl_r[5] = x86_dos_exec_fails;
+    dosovl_r[6] = x86_dos_exec_last_err;
+    dosovl_r[7] = x86_dos_overlay_seg;
+    dosovl_r[8] = x86_dos_overlay_reloc;
+    dosovl_r[9] = dos_test_walk();              /* chain still consistent */
+    /* An overlay allocates NOTHING, so the arena must be exactly what it was
+       with only HOST.EXE resident. A load that quietly took a block shows up
+       here and nowhere else. */
+    {
+        uint16_t largest = 0;
+        (void)dos_test_alloc(0xFFFF, &largest);
+        dosovl_r[10] = largest;
+    }
+    dosovl_r[11] = x86_dos_execs;               /* must stay 0: no process */
+}
+
 // External arrays from x86_cpu.c
 extern uint32_t (*io_port_read_table[1024])(void *opaque, uint32_t offset, int size_log2);
 extern void *io_port_opaque_table[1024];
@@ -4806,6 +4879,11 @@ void Reset_Handler(void) {
         if (run_dosexec2_flag == 1) {
             dosexec2_test_run();
             run_dosexec2_flag = 0;
+        }
+
+        if (run_dosovl_flag == 1) {
+            dosovl_test_run();
+            run_dosovl_flag = 0;
         }
 
         if (run_video_flag == 1) {
