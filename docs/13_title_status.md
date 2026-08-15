@@ -134,6 +134,83 @@ Why DPMI/VCPI/XMS stays unbuilt:
 
 **Do not half-build DPMI.**
 
+## Epic Pinball — BLOCKED on one call: `INT 21h AH=4Bh` EXEC
+
+Measured 2026-08-15, gwemu tier 2, `EPIC_PINBALL.dsk` (11.7 MB), stock master,
+`X86_PROBE=0` (rings only — the accumulator's RAM_EMU cost is not needed to
+answer this and its pager trap is not worth taking).
+
+**It boots, reaches DOS, loads and runs `PINBALL.EXE`, and stops at the launcher.**
+The literal screen, mode 3, attribute `0x07` in all 2,000 cells (checked with
+`--attr`; nothing is highlighted, nothing is a false "detected"):
+
+```
+Please run SETUP!
+Press any Key.
+```
+
+Then `guest_halted=1`, `guest_exit_reason=4` (UNIMPLEMENTED), frozen at
+`guest_insns_total=8,421,787` across three samples 8 s apart.
+
+### The cause, and it is ours
+
+`x86_hle_unhandled_vector=33` (0x21), `x86_hle_unhandled_func=75` (**0x4B**).
+`probe.py --dos-log` gives the whole conversation — four file calls, and they
+are the textbook prelude to an EXEC:
+
+| # | call | result |
+|---|---|---|
+| 0 | `47h` getcwd | ok |
+| 1 | `3Dh` open `PINBALL.EXE` (itself) | ok, handle 5 |
+| 2 | `42h/02` lseek to end | ok, `AX=0x9255` = 37,461 = the exact file size |
+| 3 | `3Eh` close | ok |
+| 4 | `4Ah` resize own block to `0x926` paras (37,472 B) | ok — **shrink-to-self** |
+
+Then `AH=4Bh`, which falls off the end of the `INT 21h` switch in `x86_dos.c`
+and returns `CF=1, AX=0x01` ("invalid function"). The launcher reads that as
+"cannot start the child", prints the SETUP message and waits for a key
+(`x86_io_log`: one port access in the whole run, `IN 0x60` = 0x39, space, from
+the timeline). After the key it runs off into an unimplemented opcode and halts.
+
+**Negative control, seen to succeed where we fail:** the SAME `.dsk` under
+DOSBox-X (`ref_dos.py --engine dosbox --launch PINBALL.EXE`) reaches mode 13h
+and paints the "EPIC PIN…" dot-matrix intro
+(`build/artifacts/ref_epic_db.png`). The image is configured and correct; the
+message is not the disk's fault. (QEMU on the same image also reaches mode 13h
+but paints nothing — a reference limit, not evidence either way.)
+
+**This is the same blocker as Dark Forces' "Not enough memory"** — a second,
+independent title dying on the one missing DOS call. `x86_dos_exec()` (the MZ
+loader) already exists and is what loads the initial program; what is missing is
+the `AH=4Bh` entry: the ASCIZ path at `DS:DX`, the EXEC parameter block at
+`ES:BX` (child cmdline and two FCBs), a child PSP whose parent field points at
+the caller, and save/restore of the parent's `CS:IP`/`SS:SP` so the child's
+`AH=4Ch` returns to it rather than exiting the guest. `AL=03` (load overlay) is
+a separate, smaller case.
+
+### Everything else it asked for, we answered
+
+| counter | value | reading |
+|---|---|---|
+| `x86_video_mode_byte` | 3 | text only |
+| `x86_video_mode_log` | tag 6 request 3 (old 4), tag 1 adopted 3 / 80 col, tag 3 renderer followed, is_text=1 | **no tag 5** — no mode was refused, and no graphics mode was ever asked for |
+| `x86_xms_detects` / `_calls` | 0 / 0 | never got that far |
+| `x86_ems_calls` | 0 | ditto |
+| DPMI `2Fh/1687h`, VCPI `DE00h` | never issued | — |
+| Sound Blaster ports 0x220 / 0x388 | **never touched** | the only port access in the run is `IN 0x60`. `SOUNDCRD.INF` on the disk reads `REAL16 MAS ISBSERIES MDRV004R.MUS` — a Miles AIL/SB-series driver is configured, so SB probing is what to expect *after* EXEC lands, but this title has produced no evidence about it yet |
+| `x86_pg_frames_total` | 160 | healthy; the guest ran |
+| `x86_pg_evictions` / `_fill_file` / `_exhausted` | 0 / 0 / 0 | no thrash, nothing near the working set |
+| `x86_arena_largest` | 110,592 | untouched, text mode only |
+
+Memory is **not** this title's problem and there is no evidence it ever will be:
+it never allocated past its own image. `PINBALL.EXE` is a 37 KB launcher; the
+13 tables are separate `EP1..EP13.EXE` of ~220–300 KB each, each with a `.DAT`,
+which is precisely why it needs EXEC — and why, once EXEC lands, the next
+measurement to take is a table's working set, not the launcher's.
+
+**Next blocker, one line: `INT 21h AH=4Bh`.** Nothing beyond it has been
+measured, so no further claim about this title is supported.
+
 ## Protected mode — SIZED, not started
 
 `CR0` has never been non-zero on this tree. Sized against

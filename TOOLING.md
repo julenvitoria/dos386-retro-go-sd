@@ -426,7 +426,8 @@ python3 scripts/probe_report.py --compare before.json after.json
 Boots a named title, lets it run **from its first instruction** (no settle-then-
 reset — the startup probes *are* the subject), and writes one report to
 `build/artifacts/probe_<title>_<target>.md` plus the same content as JSON.
-Presets: `keen4`, `wolf3d`, `topbench`, `alleycat`, `darkforces`.
+Presets: `keen4`, `wolf3d`, `topbench`, `alleycat`, `darkforces`,
+`epicpinball`.
 
 ##### `X86_PROBE=1` CAN TAKE THE PAGER TO ZERO FRAMES — check the run ran
 
