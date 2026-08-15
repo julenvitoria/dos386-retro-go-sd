@@ -1791,7 +1791,25 @@ python3 tests/test_paging.py             # the guest memory ARCHITECTURE, as
                                          # NOTHING and reports its exact
                                          # deficit. Two arms (0x110000 and
                                          # 0x200000 not aliased) fail on the
-                                         # pre-fix whole-space wrap
+                                         # pre-fix whole-space wrap. 149 checks
+                                         # now, the last 16 being the DONATION
+                                         # POLICY: frames borrowed while the
+                                         # pool is idle, and handed back on the
+                                         # free-frame watermark BEFORE the
+                                         # first eviction, with the ratchet
+                                         # proving it re-evaluates rather than
+                                         # re-lending the same amount
+python3 scripts/run_paging_controls.py   # ITS NEGATIVE CONTROLS, one clean
+                                         # build each and both SEEN TO FAIL:
+                                         # X86_PG_POLICY_NO_SHRINK=1 (the
+                                         # frames stay lent and 17 evictions
+                                         # appear, pagefile written) and
+                                         # X86_PG_POLICY_NO_GROW=1 (nothing is
+                                         # ever borrowed, so the card stays
+                                         # whatever the arena alone can place).
+                                         # X86_PG_POLICY=0 is the whole policy
+                                         # off -- the tree's old fixed-reserve
+                                         # behaviour, byte for byte
 python3 tests/test_xms.py                # XMS, driven by GUEST code doing the
                                          # real sequence: INT 2Fh AX=4300h ->
                                          # AX=4310h -> CALL FAR the returned

@@ -272,6 +272,49 @@ uint32_t x86_pager_donate_upto(uint32_t max_bytes, uint32_t min_bytes);
    claim inside it -- the frames stay lent until the display lets go. */
 int x86_pager_reclaim_from_arena(void);
 
+/* ---- the donation POLICY -------------------------------------------------
+ *
+ * X86_PG_DONATE_RESERVE above is a BUILD-TIME constant evaluated ONCE, at mode
+ * adoption, and that is the whole of the "EGA or frames" dichotomy: KEEN4's
+ * intro wants a big card and few frames, its gameplay wants the opposite, and
+ * one number cannot be both. The policy re-evaluates instead, once per FRAME,
+ * off a working set it MEASURES:
+ *
+ *     reserve = max(FLOOR, x86_pg_resident_peak + MARGIN, ratchet)
+ *
+ * The card grows while frames are genuinely idle and the frames go back
+ * BEFORE the guest evicts -- the trigger is free frames falling below MARGIN,
+ * not x86_pg_evictions, because an eviction is the COST (up to 433 ms of
+ * pagefile write on silicon), not a warning. See x86_pager.c for the two
+ * alternatives that were rejected and why.
+ *
+ * With the policy disabled (X86_PG_POLICY=0, or x86_pager_policy_enable(0))
+ * the reserve is exactly X86_PG_DONATE_RESERVE and the behaviour is the
+ * tree's previous behaviour, byte for byte. That is the negative-control
+ * build AND the tier-1 harness's mode, so the arms that state the static
+ * reserve's arithmetic keep stating it.
+ */
+#define X86_PG_RESERVE_FLOOR   64u   /* frames the guest keeps come what may */
+#define X86_PG_RESERVE_MARGIN   8u   /* runway: the shrink fires on this      */
+#define X86_PG_POLICY_QUIET    60u   /* frames of calm before lending again   */
+
+#define X86_PG_POLICY_HOLD    0
+#define X86_PG_POLICY_GROW    1
+#define X86_PG_POLICY_SHRINK (-1)
+
+/* Once per frame, off the video path. GROW is PERMISSION (the caller must
+   still find that a bigger card fits -- a refit costs the card's contents);
+   SHRINK is an instruction, and the caller must release its claims inside the
+   donated extent before the reclaim or the frames stay lent. */
+int x86_pager_policy_tick(void);
+uint32_t x86_pager_policy_reserve(void);
+uint32_t x86_pager_policy_headroom(void);   /* bytes a donation could take now */
+void x86_pager_policy_enable(int on);
+void x86_pager_policy_reset(void);
+/* Floor, margin and quiet period. The harness scales them to an 8-frame pool;
+   the shipping core never calls it and runs on the three constants above. */
+void x86_pager_policy_config(uint32_t floor, uint32_t margin, uint32_t quiet);
+
 /* Hotness. Fed by faults (free) and by guest-EIP samples taken at each
    interpreter exit. Decayed by halving, which is one pass over 2 KB. */
 void x86_pager_note_eip(uint32_t lin);
@@ -302,5 +345,10 @@ extern volatile uint32_t x86_pg_donated;        /* frames given to the arena  */
 extern volatile uint32_t x86_pg_donate_bytes;   /* bytes the arena took       */
 extern volatile uint32_t x86_pg_donate_refused; /* donations refused outright */
 extern volatile uint32_t x86_pg_reclaim_busy;   /* reclaims the arena vetoed  */
+extern volatile uint32_t x86_pg_resident_peak;  /* the MEASURED working set   */
+extern volatile uint32_t x86_pg_reserve_eff;    /* the reserve in force now   */
+extern volatile uint32_t x86_pg_shrink_signals; /* times frames were recalled */
+extern volatile uint32_t x86_pg_grow_signals;   /* times lending was permitted */
+extern volatile uint32_t x86_pg_policy_ratchet; /* what pressure has taught it */
 
 #endif /* X86_PAGER_H */
