@@ -300,8 +300,21 @@ void *x86_code_reloc(uint32_t lin)
         }
         /* A NOR-backed granule folds to 0x9xxxxxxx, which is memory-mapped XIP
            and plainly readable -- the write trap exists for stores, and there
-           are none here. */
-        buf[i] = *(const volatile uint8_t *)(uintptr_t)(a + k);
+           are none here.
+
+           x86_fold_ptr(), NOT a raw `a + k`. While a planar mode is armed the
+           sixteen aperture entries hold X86_FOLD_VGA_K, which is
+           0x80000000 + host and so is NOT equal to FOLD_INVALID -- the guard
+           above passes it through, and `a + k` then yields 0xAxxxxxxx, which
+           is Cortex-M7 device space and hard-faults on silicon. Reachable two
+           ways: CS:EIP in 0x9FFF1..0x9FFFF, where the sixteen-byte staging
+           window spills into 0xA0000; and CS:EIP inside the aperture, which
+           MEM_TRAP_R_CODE (cpu_exec.S) already handles for the opcode byte
+           before handing the REST of the instruction to this function. The
+           two sister walks below/above use x86_fold_ptr for this reason and
+           this one was missed. CLAUDE.md's rule, and the pager's slack prime
+           is the incident that produced it. */
+        buf[i] = *(const volatile uint8_t *)x86_fold_ptr(a, k);
     }
 
     cpu_state_ptr->code_k = (uint32_t)(uintptr_t)buf - lin;
