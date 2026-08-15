@@ -151,14 +151,23 @@ def nm_syms(elf):
     return syms
 
 
-def build_core(rom, probe, quiet=False):
+def build_core(rom, probe, quiet=False, core_flags=()):
     """Clean-build with X86_PROBE on or off, and lay the SD image down.
 
     CLEAN, always: build flags are not dependencies in this project, so an
     incremental rebuild after a flag change links objects from two different
     configurations and the report describes neither.
+
+    core_flags are extra `NAME=VALUE` arguments passed straight to
+    Makefile.core. The reason this exists is that the interesting question is
+    often "what does the title ask for once we ANSWER something we currently
+    refuse" -- Dark Forces' whole diagnosis needs X86_DOS_EXEC=1, which is 0 in
+    the shipping core -- and that cannot be measured by a runner that can only
+    ever build the default configuration. Every flag is echoed and recorded in
+    the report, because a probe of a non-default core that does not say so is
+    a number nobody can place.
     """
-    flags = [f"X86_PROBE={1 if probe else 0}"]
+    flags = [f"X86_PROBE={1 if probe else 0}"] + list(core_flags)
     print(f"[build] {' '.join(flags)}")
     sh(["make", "-f", "Makefile.core", "clean"], quiet=quiet)
     sh(["make", "-f", "Makefile.core", "pack"] + flags, quiet=quiet)
@@ -177,7 +186,7 @@ def build_core(rom, probe, quiet=False):
                               if os.path.exists("dos.bin") else 0)}
 
 
-def measure_cost(rom, quiet):
+def measure_cost(rom, quiet, core_flags=()):
     """Build BOTH ways and report the difference.
 
     A claimed cost is not a measured one, and RAM_EMU headroom in this tree has
@@ -185,8 +194,8 @@ def measure_cost(rom, quiet):
     get a number that is not an estimate; --skip-cost exists for when the
     caller has already paid for it.
     """
-    off = build_core(rom, probe=False, quiet=quiet)
-    on = build_core(rom, probe=True, quiet=quiet)
+    off = build_core(rom, probe=False, quiet=quiet, core_flags=core_flags)
+    on = build_core(rom, probe=True, quiet=quiet, core_flags=core_flags)
     return {
         "off": off, "on": on,
         "ram_emu_delta_bytes": (off["region_left_bytes"] -
@@ -693,6 +702,12 @@ def main():
     p.add_argument("--skip-cost", action="store_true",
                    help="do not build the core both ways to measure the "
                         "instrument's RAM_EMU cost (saves one clean build)")
+    p.add_argument("--core-flag", action="append", default=[],
+                   metavar="NAME=VALUE",
+                   help="extra Makefile.core flag, repeatable "
+                        "(e.g. --core-flag X86_DOS_EXEC=1). Recorded in the "
+                        "report's meta so a non-default core is never "
+                        "mistaken for the shipping one")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--compare", nargs=2, metavar=("A.json", "B.json"),
                    help="diff two reports and exit; runs nothing")
@@ -731,9 +746,10 @@ def main():
         sh(["python3", "scripts/sdcard.py", "--image", "sdcard_retrogo.img",
             "--rom", title["rom"]], quiet=args.quiet)
     elif args.skip_cost:
-        build_core(title["rom"], probe=True, quiet=args.quiet)
+        build_core(title["rom"], probe=True, quiet=args.quiet,
+                   core_flags=args.core_flag)
     else:
-        cost = measure_cost(title["rom"], args.quiet)
+        cost = measure_cost(title["rom"], args.quiet, core_flags=args.core_flag)
 
     r = collect(args, title)
     blk = r["block"]
@@ -746,6 +762,8 @@ def main():
             "rom": title["rom"],
             "timeline": args.timeline,
             "target": "hardware" if args.target == "hardware" else "gwemu",
+            # A report on a non-default core must say so on its face.
+            "core_flags": list(args.core_flag),
             "run_s": r["run_s"],
             "generated": datetime.datetime.now().isoformat(timespec="seconds"),
         },

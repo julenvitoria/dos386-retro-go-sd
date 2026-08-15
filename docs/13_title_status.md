@@ -186,7 +186,54 @@ Two errors produced the wrong verdict, and both are the same shape:
 > hardware.** Re-measure before concluding anything is impossible. This cost a
 > wrong "impossible" once and a wrong "38% idle" the same day.
 
-## Star Wars: Dark Forces — MEASURED 2026-08-15: it blocks at EXEC AL=03h, long before memory
+## Star Wars: Dark Forces — MEASURED 2026-08-15 (SECOND PASS): AL=03h is IN, DOS4GW loads whole, and it dies past it
+
+`INT 21h AH=4Bh AL=03h` (LOAD OVERLAY) is now implemented in `x86_dos.c`, and
+the measurement below — which named it as the blocker — has been re-run against
+it (`probe_report.py --title darkforces --core-flag X86_DOS_EXEC=1`, gwemu,
+30 s).
+
+**DOS4GW.EXE now loads, completely.** The overlay is taken (`4Bh/03 -> ok
+AX=0x0000`, path log `DF/dos4gw.exe`), `x86_dos_overlays=1`, at load segment
+**0x81** with relocation factor **0x81** — Dark Forces passes the two words
+equal, which is the ordinary idiom. **The image is whole**:
+`x86_dos_load_bytes=61604`, `x86_dos_load_short=0`, `x86_dos_load_shorts=0`.
+The guest now executes **269,100** instructions where it previously executed
+**0**.
+
+**IT IS NOT THE MEMORY WALL.** `x86_pg_exhausted=0`, `x86_pg_evictions=0`,
+`x86_pg_frames_total=158` (2 short only because `X86_PROBE=1` *and*
+`X86_DOS_EXEC=1` are both in this build), `x86_seam_overflow=0`. Wolf3D's
+`guest_exit_reason=5` (MEM_FAULT) does **not** appear, and an overlay load is
+not the same shape after all: it writes into the caller's OWN block, which the
+caller has already allocated and touched, so there are no ~30 fresh pages to
+find. **This is a Queue B problem, not a Queue A one.**
+
+**Where it now dies.** `guest_exit_reason=4` (UNIMPLEMENTED), `exit_info=0xFF`,
+`CS:EIP = 0x3674:0x7983` = linear **0x3E0C3**, `CR0=0` (still REAL MODE). The
+32 bytes there are **all `0xFF`** — memory that was never written. The DOS4GW
+image spans linear 0x810..0xF8B4, so the guest far-jumped roughly **0x2E800
+bytes past the end of the program it just loaded**. It is executing blank
+memory; the "unimplemented opcode" is the blank itself, not a missing handler.
+
+**The next blocker, and the prime suspect.** Two DOS calls are still refused,
+and both happen in the handful of calls immediately BEFORE that jump:
+
+| probe | × | what it is |
+|---|---:|---|
+| `INT 21h AH=52h` | 1 | **get the DOS list-of-lists.** A DOS extender uses it to find the DOS data segment and the head of the MCB chain. Refused, it returns CF=1 AX=0001 with ES:BX untouched — and a segment computed from that garbage is exactly the shape of a far jump to 0x3674 |
+| `INT 21h AH=29h` | 2 | parse filename into an FCB. Refused immediately before the overlay load |
+
+Neither was implemented in this pass. `AH=52h` is the one to build next, and
+the way to grade it is this same re-measurement: if the far jump moves or
+disappears, it was the cause.
+
+**It still asks NOTHING about DPMI, VCPI or XMS** — no `INT 2Fh AX=1687h`, no
+`AX=DE00h` — and touches exactly one port (`OUT 0x0000`, unmodelled). So the
+extender has not yet reached its own memory-manager detection, and the
+prerequisite chain further down this file is still not what gates the title.
+
+### The first pass, which named AL=03h (superseded by the above)
 
 The first measurement of this title with a working instrument
 (`probe_report.py`, `X86_PROBE=1 X86_DOS_EXEC=1`, gwemu, 30 s;
@@ -199,7 +246,7 @@ for and did not get:
 
 | probe | × | what it is |
 |---|---:|---|
-| `INT 21h AH=4Bh AL=03h` | 1 | **LOAD OVERLAY.** `X86_DOS_EXEC=1` implements AL=00h only; AL=01h/03h are refused by design (`x86_dos.c`). **This is the blocker** |
+| `INT 21h AH=4Bh AL=03h` | 1 | **LOAD OVERLAY.** At the time, `X86_DOS_EXEC=1` implemented AL=00h only. **This was the blocker, and it is now implemented — see above** |
 | `INT 21h AH=52h` | 1 | get the DOS list-of-lists — a DOS-internals probe |
 | `INT 21h AH=29h` | 2 | parse filename into an FCB |
 

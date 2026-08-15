@@ -598,9 +598,16 @@ E2_CHILD_SS, E2_CHILD_SP, E2_CHILD_IMAGE = 0x0060, 0x0080, 0x0700
 E2_PARENT_BP, E2_CHILD_BP = 0xBEEF, 0x1234
 
 
-def _mz(body, relocs=(), ss=E2_SS, sp=E2_SP):
+def _mz(body, relocs=(), ss=E2_SS, sp=E2_SP, reloc_seg=0):
     """A real MZ .EXE. hdr_paras is 2, so 28 bytes of header leave exactly one
-    4-byte relocation entry at 0x1C -- which is all either program needs."""
+    4-byte relocation entry at 0x1C -- which is all either program needs.
+
+    reloc_seg is the SEGMENT half of that entry. It is 0 for every ordinary
+    program, and the overlay arm below is the only caller that sets it: a
+    relocation item is reached at (factor + entry.seg):entry.off, so a non-zero
+    entry segment is what lets an overlay be loaded at one segment and
+    relocated by a DIFFERENT one while its fixups still land inside the image.
+    """
     import struct
     assert len(relocs) <= 1
     hdr_paras = 2
@@ -609,7 +616,7 @@ def _mz(body, relocs=(), ss=E2_SS, sp=E2_SP):
     h = struct.pack("<14H", 0x5A4D, total % 512, pages, len(relocs), hdr_paras,
                     0x0060, 0x0080, ss, sp, 0, 0x0000, 0x0000, 0x001C, 0)
     for off in relocs:
-        h += struct.pack("<2H", off, 0)
+        h += struct.pack("<2H", off, reloc_seg)
     return h + bytes(hdr_paras * 16 - len(h)) + body
 
 
@@ -859,6 +866,269 @@ def exec2_test(b, syms):
     return ok
 
 
+# --------------------------------------------------------------------------
+# The OVERLAY test -- INT 21h AH=4Bh AL=03h.
+#
+# WHY IT EXISTS. Dark Forces does not die on AL=00h, it dies on AL=03h: it
+# overlay-loads before it ever reaches DOS4GW.EXE, and an unimplemented AL=03h
+# is refused, so nothing is loaded and the CALL that follows lands in whatever
+# was already at that segment.
+#
+# WHAT AL=03h PROMISES, and therefore what is asserted here:
+#   1. the image bytes land at the segment THE CALLER named;
+#   2. the relocation table is applied with THE FACTOR THE CALLER supplied,
+#      which is a SEPARATE word and need not equal that segment;
+#   3. control returns to the caller with CF=0 and AX=DX=0, having transferred
+#      nothing and allocated nothing.
+#
+# THE LOAD SEGMENT AND THE RELOCATION FACTOR ARE DELIBERATELY DIFFERENT HERE.
+# If the test passed the same value for both -- which is what a real overlay
+# caller usually does -- then a core that ignored the factor and used the load
+# segment would pass, and the two negative controls at the bottom of this file
+# ('ovlfactor' and 'ovlseg') would both be inert. They are only able to fail
+# because the two words differ, so the test is built around making them differ:
+# the factor is OVL_FACTOR_BACK paragraphs BELOW the load segment, and the
+# overlay's single relocation entry carries a segment half of exactly
+# OVL_FACTOR_BACK to compensate, which puts the fixup back inside the image.
+# That is the arithmetic real MS-DOS does -- references/MS-DOS/v4.0/src/DOS/
+# EXEC.ASM:522-527 reaches the item through the FACTOR, not the load address.
+#
+# HOW IT IS PROVED. Not by a counter. A real HOST.EXE overlay-loads a real
+# OVL.EXE and then FAR CALLS into it; the overlay reports its own relocated
+# word and the segment it is executing at, and returns. The overlay only
+# produces those bytes if it was placed at the right segment AND fixed up with
+# the right factor AND is reachable -- one sentinel, three facts, because the
+# code had to run to emit it.
+# OVL_MARK is LINEAR -- what the host reads and what tests/main.c clears.
+# OVL_OFF is the same place as an OFFSET inside segment 0x0050, which is how
+# the guest programs reach it. Conflating the two puts every write 0x500 bytes
+# high, where it is invisible and looks exactly like a program that never ran.
+OVL_MARK = 0x0520               # DOS scratch, above the EXEC arm's 0x500
+OVL_OFF = OVL_MARK - 0x0500     # ... as seen from segment 0x0050
+OVL_IMAGE = 0x0400              # HOST.EXE image size
+OVL_OVL_IMAGE = 0x0200          # OVL.EXE image size
+
+OVL_PBLK = 0x0300               # in HOST.EXE: the 2-word AL=03h block
+OVL_FPTR = 0x0310               # in HOST.EXE: far pointer to the overlay
+OVL_FNAME = 0x0320              # in HOST.EXE: "OVL.EXE"
+
+OVL_LOAD_DELTA = 0x50           # load segment = HOST's CS + this
+OVL_FACTOR_BACK = 0x10          # relocation factor = load segment - this
+OVL_RELOC = 0x0100              # in OVL.EXE: the word the fixup rewrites
+
+OVL_HOST_MARK, OVL_RUN_MARK = 0x1111, 0x3333
+
+
+def build_ovl_host_exe():
+    """Fills in its own parameter block (only it knows its segment), calls
+    AH=4Bh AL=03h, then FAR CALLs the overlay it just loaded."""
+    import struct
+    code = bytes([
+        0x8C, 0xC8,                          # mov ax,cs
+        0x8E, 0xD8,                          # mov ds,ax
+        # "the host ran" -- without this every later zero is ambiguous.
+        0xB8, 0x50, 0x00,                    # mov ax,0050
+        0x8E, 0xC0,                          # mov es,ax
+        0x26, 0xC7, 0x06, OVL_OFF & 0xFF, OVL_OFF >> 8,
+        OVL_HOST_MARK & 0xFF, OVL_HOST_MARK >> 8,     # mov es:[mark],1111
+
+        # The parameter block. load segment = CS + 0x50 ...
+        0x8C, 0xC8,                          # mov ax,cs
+        0x05, OVL_LOAD_DELTA & 0xFF, OVL_LOAD_DELTA >> 8,     # add ax,0050
+        0xA3, OVL_PBLK & 0xFF, OVL_PBLK >> 8,                 # mov [pblk+0],ax
+        0xA3, (OVL_FPTR + 2) & 0xFF, (OVL_FPTR + 2) >> 8,     # far ptr segment
+        # ... and the relocation factor is 0x10 paragraphs BELOW it.
+        0x2D, OVL_FACTOR_BACK & 0xFF, OVL_FACTOR_BACK >> 8,   # sub ax,0010
+        0xA3, (OVL_PBLK + 2) & 0xFF, (OVL_PBLK + 2) >> 8,     # mov [pblk+2],ax
+
+        0x8C, 0xC8,                          # mov ax,cs
+        0x8E, 0xC0,                          # mov es,ax        ES:BX = block
+        0xBA, OVL_FNAME & 0xFF, OVL_FNAME >> 8,               # mov dx,fname
+        0xBB, OVL_PBLK & 0xFF, OVL_PBLK >> 8,                 # mov bx,pblk
+        0xB8, 0x03, 0x4B,                    # mov ax,4B03
+        0xCD, 0x21,                          # int 21h
+
+        # CF, AX and DX exactly as the overlay load left them.
+        0x9C, 0x59,                          # pushf ; pop cx
+        0x89, 0xC6,                          # mov si,ax
+        0x89, 0xD7,                          # mov di,dx
+        0xB8, 0x50, 0x00,                    # mov ax,0050
+        0x8E, 0xC0,                          # mov es,ax
+        0x26, 0x89, 0x0E, (OVL_OFF + 8) & 0xFF, (OVL_OFF + 8) >> 8,
+        0x26, 0x89, 0x36, (OVL_OFF + 10) & 0xFF, (OVL_OFF + 10) >> 8,
+        0x26, 0x89, 0x3E, (OVL_OFF + 12) & 0xFF, (OVL_OFF + 12) >> 8,
+
+        # INTO THE OVERLAY. Nothing above this proves the image is really
+        # there; this does, because the bytes have to execute.
+        0xFF, 0x1E, OVL_FPTR & 0xFF, OVL_FPTR >> 8,           # call far [fptr]
+
+        # The overlay's answer comes back in BX, NOT AX: re-loading ES costs an
+        # AX and the overlay's return value would be gone. It writes the same
+        # word to the mark area, so the two disagreeing means the RETF did not
+        # return cleanly.
+        0xB8, 0x50, 0x00,                    # mov ax,0050
+        0x8E, 0xC0,                          # mov es,ax
+        0x26, 0x89, 0x1E, (OVL_OFF + 14) & 0xFF, (OVL_OFF + 14) >> 8,
+        #                                    # mov es:[mark+14],bx
+        0xB8, 0x00, 0x4C,                    # mov ax,4C00
+        0xCD, 0x21,                          # int 21h
+    ])
+    img = bytearray(OVL_IMAGE)
+    img[:len(code)] = code
+    img[OVL_PBLK:OVL_PBLK + 4] = struct.pack("<2H", 0, 0)   # host fills it in
+    img[OVL_FPTR:OVL_FPTR + 4] = struct.pack("<2H", 0, 0)   # offset 0, seg TBD
+    img[OVL_FNAME:OVL_FNAME + 8] = b"OVL.EXE\0"
+    return _mz(bytes(img))
+
+
+def build_ovl_exe():
+    """The overlay. Entered by a FAR CALL at offset 0 of wherever it was put;
+    reports what it is and what its relocation became, then RETFs."""
+    code = bytes([
+        0xB8, 0x50, 0x00,                    # mov ax,0050
+        0x8E, 0xC0,                          # mov es,ax
+        # "the overlay actually executed"
+        0x26, 0xC7, 0x06, (OVL_OFF + 2) & 0xFF, (OVL_OFF + 2) >> 8,
+        OVL_RUN_MARK & 0xFF, OVL_RUN_MARK >> 8,
+        # The relocated word: shipped as zero, must now be the FACTOR.
+        0x2E, 0xA1, OVL_RELOC & 0xFF, OVL_RELOC >> 8,         # mov ax,cs:[reloc]
+        0x26, 0xA3, (OVL_OFF + 4) & 0xFF, (OVL_OFF + 4) >> 8,
+        0x89, 0xC3,                          # mov bx,ax   (survives for HOST)
+        # The segment it is running at, which is where it was loaded.
+        0x8C, 0xC8,                          # mov ax,cs
+        0x26, 0xA3, (OVL_OFF + 6) & 0xFF, (OVL_OFF + 6) >> 8,
+        0xCB,                                # retf
+    ])
+    img = bytearray(OVL_OVL_IMAGE)
+    img[:len(code)] = code
+    # Starts at ZERO. The loader must add the RELOCATION FACTOR to it.
+    img[OVL_RELOC:OVL_RELOC + 2] = b"\0\0"
+    return _mz(bytes(img), relocs=(OVL_RELOC,),
+               reloc_seg=OVL_FACTOR_BACK)
+
+
+def overlay_test(b, syms):
+    from scripts.common.fat12 import build_image
+
+    for n in ("run_dosovl_flag", "dosovl_r", "dosfile_img", "test_ram"):
+        if n not in syms:
+            print(f"missing symbol {n} -- rebuild tests/main.c")
+            return False
+    ram = syms["test_ram"]
+    b.write_memory(syms["dosfile_img"],
+                   build_image([("HOST.EXE", build_ovl_host_exe()),
+                                ("OVL.EXE", build_ovl_exe())]))
+
+    b.write_uint32(syms["run_dosovl_flag"], 1)
+    for _ in range(400):
+        if b.read_uint32(syms["run_dosovl_flag"]) == 0:
+            break
+        time.sleep(0.05)
+    else:
+        print("FAIL: the overlay test never completed")
+        return False
+
+    r = [b.read_uint32(syms["dosovl_r"] + 4 * i) for i in range(16)]
+    (mount, rc, hpsp, exit_reason, overlays, fails, last_err,
+     core_seg, core_reloc, nblocks, largest_after, execs) = r[:12]
+
+    m = bytes(b.read_memory(ram + OVL_MARK, 32))
+    w = lambda o: m[o] | (m[o + 1] << 8)
+    host_mark, run_mark = w(0x00), w(0x02)
+    ovl_reloc, ovl_cs = w(0x04), w(0x06)
+    back_flags, back_ax, back_dx, back_bx = w(0x08), w(0x0A), w(0x0C), w(0x0E)
+
+    host_cs = (hpsp + 0x10) & 0xFFFF
+    want_seg = (host_cs + OVL_LOAD_DELTA) & 0xFFFF
+    want_factor = (want_seg - OVL_FACTOR_BACK) & 0xFFFF
+
+    print("\nOVERLAY (AH=4Bh AL=03h):")
+    print(f"  mount {mount}   x86_dos_exec(HOST.EXE) {rc}   "
+          f"host PSP 0x{hpsp:04x} (CS 0x{host_cs:04x})")
+    print(f"  exit_reason {exit_reason} (1 = HOST.EXE terminated)")
+    print(f"  overlays {overlays}  execs {execs}  fails {fails}  "
+          f"last_err 0x{last_err:04x}")
+    print(f"  core says: load seg 0x{core_seg:04x}  factor 0x{core_reloc:04x}")
+    print(f"  test wants: load seg 0x{want_seg:04x}  factor 0x{want_factor:04x}")
+    print(f"  host mark 0x{host_mark:04x}   overlay mark 0x{run_mark:04x}")
+    print(f"  overlay CS 0x{ovl_cs:04x}   its relocated word 0x{ovl_reloc:04x}")
+    print(f"  back: FLAGS 0x{back_flags:04x} AX 0x{back_ax:04x} "
+          f"DX 0x{back_dx:04x}  overlay returned BX 0x{back_bx:04x}")
+    print(f"  chain {nblocks} blocks   largest free after 0x{largest_after:04x}")
+
+    ok = True
+
+    def fail(msg):
+        nonlocal ok
+        print("FAIL: " + msg)
+        ok = False
+
+    if mount != 0 or rc != 0:
+        print("FAIL: HOST.EXE did not load at all")
+        return False
+    if host_mark != OVL_HOST_MARK:
+        fail("the host program never ran; nothing below means anything")
+        return False
+
+    # THE REFUSAL CASE, named explicitly -- this is the state master is in.
+    if overlays != 1:
+        fail(f"x86_dos_overlays is {overlays}, expected exactly 1 "
+             f"(fails {fails}, last_err 0x{last_err:04x}). "
+             f"0x1{0x03:02x} in last_err means AL=03h was REFUSED")
+    if back_flags & 1:
+        fail(f"CF is set on return (FLAGS 0x{back_flags:04x}); a successful "
+             f"overlay load returns with carry clear")
+    # MS-DOS returns AX=DX=0 -- references/dosbox-x/src/dos/dos_execute.cpp:823.
+    if back_ax != 0 or back_dx != 0:
+        fail(f"AX 0x{back_ax:04x} DX 0x{back_dx:04x} on return; MS-DOS returns "
+             f"both ZERO from an overlay load")
+
+    # THE OVERLAY ITSELF. Everything above could be true of a core that
+    # returned success and loaded nothing.
+    if run_mark != OVL_RUN_MARK:
+        fail("THE OVERLAY NEVER EXECUTED. Either it was not loaded, or it was "
+             "not loaded where the caller asked for it")
+        return False
+
+    # WHERE it landed. The overlay reports the segment it ran at, and the core
+    # reports the segment it was told; both must be the one the host computed.
+    if ovl_cs != want_seg:
+        fail(f"the overlay is executing at 0x{ovl_cs:04x}, but the host asked "
+             f"for 0x{want_seg:04x}")
+    if core_seg != want_seg:
+        fail(f"the core read a load segment of 0x{core_seg:04x} out of the "
+             f"parameter block, expected 0x{want_seg:04x}")
+    if core_reloc != want_factor:
+        fail(f"the core read a relocation factor of 0x{core_reloc:04x}, "
+             f"expected 0x{want_factor:04x} -- the two words of the AL=03h "
+             f"block are load segment THEN factor")
+
+    # THE FACTOR. The word shipped as zero. It must now be the FACTOR, which is
+    # deliberately NOT the load segment: a core that relocated by the load
+    # segment lands on want_seg and is caught right here.
+    if ovl_reloc != want_factor:
+        extra = ""
+        if ovl_reloc == want_seg:
+            extra = (" -- that is the LOAD SEGMENT, so the relocation factor "
+                     "was ignored and the load address used instead")
+        elif ovl_reloc == 0:
+            extra = " -- still zero, so no relocation was applied at all"
+        fail(f"the overlay's relocated word is 0x{ovl_reloc:04x}, expected the "
+             f"relocation factor 0x{want_factor:04x}{extra}")
+    if back_bx != ovl_reloc:
+        fail(f"the overlay returned BX 0x{back_bx:04x} but wrote "
+             f"0x{ovl_reloc:04x}; the RETF did not come back cleanly")
+
+    # AN OVERLAY IS NOT A PROCESS. No MCB, no PSP, no depth.
+    if execs != 0:
+        fail(f"x86_dos_execs is {execs}; an overlay load starts no process and "
+             f"must not be counted as one")
+    if nblocks == 0:
+        fail("the MCB chain is inconsistent after the overlay load")
+
+    return ok
+
+
 def main(args):
     runner = build_and_create_runner(args)
     try:
@@ -986,6 +1256,9 @@ def main(args):
         if not exec2_test(b, syms):
             ok = False
 
+        if not overlay_test(b, syms):
+            ok = False
+
         print("\nPASS" if ok else "\nFAIL")
         return ok
     finally:
@@ -1041,9 +1314,29 @@ MUTATIONS = {
     "reloc": ("the MZ relocation table is not applied", [
         ("            uint16_t *w = (uint16_t *)x86_guest_ptr(lin, 2);\n"
          "            if (w)\n"
-         "                *w = (uint16_t)(*w + load_seg);",
+         "                *w = (uint16_t)(*w + reloc_factor);",
          "            uint16_t *w = (uint16_t *)x86_guest_ptr(lin, 2);\n"
          "            (void)w;"),
+    ]),
+    # OVERLAY. Use the LOAD SEGMENT as the relocation factor -- the natural
+    # wrong answer, because the two are equal for every non-overlay load and a
+    # loader written from the AL=00h path alone would never notice. The image
+    # still lands correctly and the overlay still runs; only the fixed-up word
+    # is wrong, which is exactly the failure that makes an overlay compute far
+    # addresses into the wrong segment once it starts calling through them.
+    "ovlfactor": ("the overlay ignores the relocation factor and uses the "
+                  "load segment", [
+        ("    uint16_t reloc_factor = (uint16_t)(pb[2] | (pb[3] << 8));",
+         "    uint16_t reloc_factor = (uint16_t)(pb[0] | (pb[1] << 8));"),
+    ]),
+    # OVERLAY. Load somewhere other than where the caller asked. One paragraph
+    # is enough and is the honest size of the mistake: an off-by-one in reading
+    # a two-word block. The overlay is then not at the address the caller far
+    # CALLs, so it never runs at all.
+    "ovlseg": ("the overlay is loaded one paragraph off the segment the "
+               "caller named", [
+        ("    uint16_t load_seg     = (uint16_t)(pb[0] | (pb[1] << 8));",
+         "    uint16_t load_seg     = (uint16_t)((pb[0] | (pb[1] << 8)) + 1);"),
     ]),
     # The way back. Without the saved SS:SP the stub's IRET pops the CHILD's
     # stack, so the parent resumes at whatever happens to be on it.
