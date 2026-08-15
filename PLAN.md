@@ -95,10 +95,31 @@ tier that sees the pipeline, peripheral init or real memory ordering.
    5. This is what DOS/4GW actually asks for; VCPI is the fallback it tries
    first. **INT 2Fh answers only AX=43xx today**, so 1687h and DE00h both
    return with the guest's registers untouched.
-5. **Protected mode** — ~1,225 lines sized against `references/tiny386`.
+5. **Protected mode** — **the DESCRIPTOR WALK is BUILT and PROVEN**
+   (`x86_pmode.c`, `tests/test_pmode.py` 80 checks,
+   `scripts/run_pmode_controls.py` 10/10 negative controls SEEN TO FAIL).
+   `LGDT`/`LIDT`/`LLDT`, the GDT/LDT fetch and its bound, the type/DPL/present
+   rules with the right vector and error code, the cached per-segment
+   descriptor, `CR0.PE` both ways, a same-privilege far JMP.
+   **It costs real mode NOTHING, proven by disassembly diff**: `L(SET_SREG)`
+   was already the single funnel for every segment load and already tested
+   `CR0.PE`, so only the branch target changed; the fetch loop and every opcode
+   handler are byte-identical. +912 B ITCM, +704 B RAM_EMU.
+   REMAINING, each its own step, none started: call gates, `IRET` across
+   privilege, stack switches, paging, and per-access SEGMENT LIMIT enforcement
+   (the predicate is written and tested; putting it on the access path for free
+   needs a protected-mode MODE-RECORD axis — the same trick `66`/`67` already
+   use — which doubles the record block and needs a second `DECODE_MODRM` in
+   ITCM).
    **V86 is not needed** — INT 21h is HLE'd. **Not sized against Dark Forces**:
    the title has never executed one protected-mode instruction here, so nothing
-   in this item is measured demand. Re-size after 3 lets DOS4GW.EXE start.
+   remaining in this item is measured demand. Re-size after 3 lets DOS4GW.EXE
+   start and 4 says what DPMI actually asks for.
+   *Two references, for two different things:* `references/tiny386`
+   (i386.c:1076) for the compact SHAPE, `references/dosbox-x`
+   (src/cpu/cpu.cpp:2976) for the RULES — tiny386 has NO permission checks, its
+   own `// TODO` says so, so copying it wholesale produces checks that can never
+   fire. [`docs/14`](docs/14_protected_mode.md).
 6. **Dark Forces** — RE-MEASURED 2026-08-15, tier 2, XMS and EMS live with a
    pagefile (`x86_pg_frames_total`=160, `x86_xms_total_kb`=4096,
    `x86_ems_total_pages`=64). **The pre-XMS verdict is wrong and must stop being

@@ -90,11 +90,17 @@ CFLAGS += -DX86_PROBE=$(X86_PROBE)
 X86_CS_LOG ?= 0
 CFLAGS += -DX86_CS_LOG=$(X86_CS_LOG)
 
+# Protected-mode NEGATIVE CONTROLS (x86_pmode.c). Compiles ONE descriptor-walk
+# check out, so tests/test_pmode.py can be shown failing on it. 0 ships.
+# Driven by scripts/run_pmode_controls.py; see the table in x86_pmode.c.
+X86_PMODE_NEGCTL ?= 0
+CFLAGS += -DX86_PMODE_NEGCTL=$(X86_PMODE_NEGCTL)
+
 LDFLAGS = -mcpu=cortex-m7 -mthumb -T STM32H7B0VBTx_SDCARD.ld -Wl,--gc-sections --specs=nosys.specs
 
 PROGS = test_core.elf
 
-TEST_OBJS = x86_cpu.o x86_nor.o x86_profile.o x86_probe.o x86_io.o x86_mem.o x86_arena.o x86_pager.o x86_seam.o x86_video.o x86_video_planar.o x86_osk.o x86_hle.o x86_bios.o x86_dos.o x86_ems.o cga_blit.o cpu_exec.o tests/main.o hw_accel.o x86_disk.o lib/FatFs/ff.o lib/FatFs/ffunicode.o
+TEST_OBJS = x86_cpu.o x86_nor.o x86_profile.o x86_probe.o x86_io.o x86_mem.o x86_arena.o x86_pager.o x86_seam.o x86_pmode.o x86_video.o x86_video_planar.o x86_osk.o x86_hle.o x86_bios.o x86_dos.o x86_ems.o cga_blit.o cpu_exec.o tests/main.o hw_accel.o x86_disk.o lib/FatFs/ff.o lib/FatFs/ffunicode.o
 
 all: $(PROGS)
 

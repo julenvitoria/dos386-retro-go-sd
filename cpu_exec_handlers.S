@@ -3430,10 +3430,16 @@ OP_AGNOSTIC .op_pfx_67
 /* ===========================================================================
  * Segment register loads.
  *
- * Real mode only: base = sel<<4, limit = 0xFFFF. A protected-mode load has to
- * walk the GDT/LDT and validate the descriptor, which does not exist yet, so
- * CR0.PE traps out loudly instead of quietly installing a real-mode base --
- * that would look like it worked and fail much later.
+ * Real mode: base = sel<<4, limit = 0xFFFF. Protected mode walks the GDT/LDT
+ * and validates the descriptor -- x86_pmode_load_seg() in x86_pmode.c.
+ *
+ * THIS IS THE ONE PLACE PROTECTED MODE ENTERS THE INTERPRETER, and that is the
+ * whole reason it costs real mode nothing. Every segment load in the machine
+ * funnels here -- MOV Sreg,Ev; POP Sreg; LES/LDS; far JMP/CALL/RETF/IRET; the
+ * interrupt dispatch -- and the three instructions below already stood here to
+ * trap protected mode out. Only the BRANCH TARGET changed. A real-mode guest
+ * executes exactly the instruction sequence it executed before this work, and
+ * nothing was added to any memory-access or dispatch path anywhere.
  *
  * R4 = segment index (0=ES 1=CS 2=SS 3=DS 4=FS 5=GS), R5 = selector.
  * Clobbers R3, R12.
@@ -3441,7 +3447,7 @@ OP_AGNOSTIC .op_pfx_67
 L(SET_SREG):
     LDR.W R12, [R8, #CPU_CR0]
     TST.W R12, #1
-    BNE.W .exit_loop
+    BNE.W L(SET_SREG_PMODE)
     /* A selector is 16 bits. The store below truncates, but the base is built
        by shifting, so an unmasked register produced a base above the 1 MB real
        mode limit while the stored selector still looked correct. */
@@ -3475,12 +3481,60 @@ L(SET_SREG_NOLOG):
 #endif
     MOV.W R3, #SEG_STRIDE
     MLA R3, R4, R3, R8
-    STRH.W R5, [R3, #SEG_ES_SEL]
+    /* STR, not STRH: the word at SEG_ES_SEL is `sel | (flags << 16)`, and R5
+       is already zero-extended by the UXTH above, so this stores the selector
+       AND CLEARS THE CACHED FLAGS in one instruction -- the same instruction
+       the STRH was, at the same cost.
+       That matters now that flags can be non-zero. A guest LEAVING protected
+       mode reloads its segments in real mode, and an STRH left the descriptor
+       rights from the protected-mode load in place -- including D, which
+       selects the operand size. A real-mode segment has no rights and D=0, so
+       the correct real-mode cache is a zero flags field. */
+    STR.W R5, [R3, #SEG_ES_SEL]
     LSL.W R12, R5, #4
     STR.W R12, [R3, #(SEG_ES_SEL + 4)]     @ base
     MOV.W R12, #0xFFFF
     STR.W R12, [R3, #(SEG_ES_SEL + 8)]     @ limit
     BX LR
+
+/* The protected-mode arm of the above. COLD, and out of line so the real-mode
+ * fall-through keeps its straight-line layout.
+ *
+ * Everything is done in C (x86_pmode.c): the walk reads guest memory through
+ * the pager, decodes eight bytes and runs a dozen predicates, none of which is
+ * anything Thumb-2 would do better and all of which is off the hot path by
+ * construction -- it runs once per segment LOAD in a protected-mode guest and
+ * never at all in a real-mode one.
+ *
+ * R4 = segment index, R5 = selector, LR = the caller's return. R4/R5 and the
+ * reserved R6/R8-R11 all survive the call: AAPCS makes R4-R11 callee-saved, so
+ * only R0-R3 and R12 need saving, and they are saved rather than assumed dead
+ * because the callers do not agree about what is live here (LOAD_FAR_PTR has
+ * already popped R0/R1 but MOV_SREG_SET still holds the ModRM in R1).
+ *
+ * A FAULT EXITS THE INTERPRETER. There is no protected-mode IDT gate walk yet,
+ * so the vector cannot be delivered; it is recorded in cpu->pmode_excp and the
+ * error code in cpu->pmode_err, and the exit carries X86_EXIT_GPF with the
+ * error code in exit_info. That makes an undelivered fault LOUD and readable
+ * rather than lost. Delivery is the next step and needs the gate walk.
+ *
+ * The exit's EIP is sound: x86_pmode_load_seg commits nothing to the segment
+ * cache until every check has passed, so CS.base is untouched on a fault and
+ * .save_state_and_exit recovers EIP from it correctly. */
+L(SET_SREG_PMODE):
+    PUSH {R0-R3, R12, LR}
+    MOV R0, R8
+    MOV R1, R4
+    UXTH R2, R5
+    BL x86_pmode_load_seg
+    CBNZ R0, 1f
+    POP {R0-R3, R12, PC}
+1:  POP {R0-R3, R12, LR}
+    MOV.W R0, #X86_EXIT_GPF
+    STR.W R0, [R8, #CPU_EXIT_REASON]
+    LDR.W R0, [R8, #CPU_PMODE_ERR]
+    STR.W R0, [R8, #CPU_EXIT_INFO]
+    B.W .save_state_and_exit
 
 /* MOV Sreg, Ew (8E). The source is always 16 bits regardless of operand size. */
 OP_AGNOSTIC .op_mov_seg_Ew_8E

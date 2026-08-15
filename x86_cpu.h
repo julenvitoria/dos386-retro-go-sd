@@ -37,6 +37,55 @@ typedef struct {
    32-bit guest code must set it explicitly. */
 #define X86_DESC_D_FLAG  (1u << 6)
 
+/* ---- descriptor `flags`, and why the layout is what it is ----------------
+ *
+ * `flags` is 16 bits and has to carry BOTH halves of the descriptor's second
+ * dword that matter: the granularity byte (descriptor byte 6) and the access
+ * byte (descriptor byte 5). It is the two of them concatenated:
+ *
+ *     flags == desc[6] | (desc[5] << 8)
+ *           == ((w2 >> 16) & 0x00FF) | (w2 & 0xFF00)
+ *
+ *   bits 0-3   limit 19:16      bits 8-11  TYPE
+ *   bit  4     AVL              bit  12    S  (0 = system, 1 = code/data)
+ *   bit  5     reserved / L     bits 13-14 DPL
+ *   bit  6     D/B              bit  15    P
+ *   bit  7     G
+ *
+ * THE D BIT'S POSITION IS NOT A CHOICE. X86_DESC_D_FLAG above already shipped
+ * as (1 << 6), and the interpreter reads it as bit 22 of the 32-bit word
+ * `sel | (flags << 16)` at SEG_CS_SEL. Byte 6 of the descriptor carries D at
+ * ITS bit 6, so putting byte 6 in the low half is the only packing that leaves
+ * that instruction correct -- and the access byte then has nowhere to go but
+ * the high half. A "just shift w2 right by 16" layout looks equivalent and
+ * silently drops P, S, DPL and TYPE entirely; that was written here first and
+ * every descriptor came back not-present.
+ *
+ * Neither reference uses this packing and neither can: tiny386 stores
+ * (w2 >> 8) (references/tiny386/i386.c:1117), putting type at bits 0-3 and D
+ * at bit 14, and DOSBox-X uses a bitfield struct (include/cpu.h:284). Where a
+ * line from either is cited for a RULE, the rule is what is cited, never the
+ * bit position.
+ */
+#define X86_DESC_G_FLAG    (1u << 7)
+#define X86_DESC_S_FLAG    (1u << 12)
+#define X86_DESC_P_FLAG    (1u << 15)
+#define X86_DESC_TYPE(f)   (((f) >> 8) & 0xFu)
+#define X86_DESC_DPL(f)    (((f) >> 13) & 3u)
+/* TYPE bits, for a code/data descriptor (S=1). Names follow DOSBox-X's
+   DESC_* enum (references/dosbox-x/include/cpu.h). */
+#define X86_TYPE_CODE      0x8u   /* set = code, clear = data          */
+#define X86_TYPE_DATA_ED   0x4u   /* data: expand-down                 */
+#define X86_TYPE_CODE_CONF 0x4u   /* code: conforming                  */
+#define X86_TYPE_WRITABLE  0x2u   /* data: writable                    */
+#define X86_TYPE_READABLE  0x2u   /* code: readable                    */
+#define X86_TYPE_ACCESSED  0x1u
+/* A cached descriptor that may not be used. A null selector loaded into
+   DS/ES/FS/GS is legal and faults only when the segment is USED, so the cache
+   has to record "loaded, but unusable" -- P clear with a zero selector is
+   exactly that state and needs no extra field. */
+#define X86_SEG_USABLE(s)  (((s)->flags & X86_DESC_P_FLAG) != 0)
+
 struct X86CPUState {
     uint32_t eip;
     uint32_t eflags;
@@ -151,6 +200,38 @@ struct X86CPUState {
      * as at the other 272. See cpu_exec.S's dispatch and x86_code_reloc(). */
     uint32_t code_k;
     uint8_t  code_buf[16];
+    /* ---- PROTECTED MODE -------------------------------------------------
+     *
+     * All of this is touched ONLY on a segment LOAD and on LGDT/LLDT, never on
+     * a memory access and never per instruction. That is the whole design
+     * constraint: 29.4% of wall is ordinary opcodes, and a protected-mode
+     * check on the access path would tax every real-mode title for a feature
+     * none of them use. The descriptor is walked once, decoded into the
+     * segs[] cache, and every later access reads the cache exactly as real
+     * mode does. tiny386 makes the same choice (i386.c:1076 set_seg).
+     *
+     * The GDT and LDT are kept as plain base/limit pairs rather than as
+     * X86CPUSeg entries. tiny386 puts the LDT in seg[SEG_LDT] (i386.c:53-63)
+     * so LLDT can reuse set_seg, but our segs[] is indexed by the assembly
+     * through SEG_STRIDE arithmetic over exactly six registers, and widening
+     * it would move every SEG_* offset the interpreter is built against. */
+    uint32_t gdt_base;
+    uint32_t gdt_limit;      /* BYTE limit, as LGDT loaded it */
+    uint32_t ldt_base;
+    uint32_t ldt_limit;      /* byte limit, G already applied */
+    uint32_t ldt_sel;
+    uint32_t cpl;            /* == CS.RPL; see x86_pmode.c */
+    /* The last segmentation fault, recorded where a host can read it. There is
+       no protected-mode IDT gate path yet, so a fault EXITS the interpreter
+       with X86_EXIT_GPF rather than being delivered -- delivery is the next
+       step and needs the gate walk. Recording the vector and error code keeps
+       that a deferred DELIVERY rather than a lost fault. */
+    uint32_t pmode_excp;
+    uint32_t pmode_err;
+    /* The host SP the interpreter's prologue left, so any exit can unwind to
+       it no matter how deep in a handler's subroutine it was taken. See
+       .save_state_and_exit in cpu_exec.S. */
+    uint32_t host_sp;
 };
 typedef struct X86CPUState X86CPUState;
 
@@ -580,6 +661,29 @@ extern volatile uint32_t x86_kbd_read_log_idx;
 #define X86_MODE_REC_TABLE_OFF  1024
 #define X86_MODE_RECORDS_BYTES  (4 * X86_MODE_REC_STRIDE)
 #define X86_MODE_RECORDS_ALIGN  8192
+
+/* ---- the protected-mode descriptor walk (x86_pmode.c) --------------------
+ *
+ * Called from L(SET_SREG) in cpu_exec_handlers.S, and ONLY when CR0.PE is set
+ * -- the test that reaches it is the one that already stood there to trap out,
+ * so real mode pays nothing new for this existing.
+ *
+ * Returns 0 on success. On failure returns the EXCEPTION VECTOR (13 #GP,
+ * 11 #NP, 12 #SS) and leaves the error code in cpu->pmode_err; the caller
+ * exits the interpreter. `seg` is X86_CPU_SEG_*.
+ */
+int x86_pmode_load_seg(X86CPUState *cpu, uint32_t seg, uint32_t sel);
+/* LLDT. Same return convention. */
+int x86_pmode_lldt(X86CPUState *cpu, uint32_t sel);
+/* Re-derive the dispatch table from CS.D after a protected-mode CS load.
+   Exposed for the tier-1 harness, which sets segments up by hand. */
+void x86_pmode_sync_mode(X86CPUState *cpu);
+/* Segment-limit test for one access, in the shape a future protected-mode
+   ModRM decoder will inline. NOT on the access path today -- see x86_pmode.c
+   on why enforcing it costs real mode nothing only via a mode-record axis. */
+int x86_pmode_limit_ok(const X86CPUSeg *s, uint32_t off, uint32_t bytes);
+extern volatile uint32_t x86_pmode_loads;      /* descriptor walks performed */
+extern volatile uint32_t x86_pmode_faults;     /* walks that raised          */
 
 void x86_build_mode_records(void *dtcm_block);
 uint32_t x86_mode_table(int op32, int addr32);

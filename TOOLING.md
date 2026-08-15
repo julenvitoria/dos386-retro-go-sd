@@ -1452,6 +1452,47 @@ python3 scripts/run_planar_controls.py   # grades those arms: FIVE negative
                                          # nothing tests the stride learning.
                                          # One CLEAN build per arm (flags are
                                          # not dependencies), so it is slow
+python3 tests/test_pmode.py              # PROTECTED MODE: the descriptor walk.
+                                         # 80 checks, all driven by GUEST code
+                                         # -- the walk is reachable from exactly
+                                         # one place (L(SET_SREG)), so a
+                                         # host-side call would leave the path
+                                         # that reaches it, where a register-
+                                         # contract violation would live,
+                                         # untested. Covers LGDT/LIDT/LLDT,
+                                         # the GDT/LDT fetch and its bound, the
+                                         # type/DPL/present rules with the
+                                         # right VECTOR and ERROR CODE for
+                                         # each, base/limit/G taking effect,
+                                         # null selectors (three different
+                                         # behaviours for DS, SS and CS),
+                                         # CR0.PE both ways, and a same-
+                                         # privilege far JMP. It also asserts
+                                         # x86_pmode_loads == 0 after a
+                                         # REAL-MODE program: the check that
+                                         # says real mode never enters the walk
+python3 scripts/run_pmode_controls.py    # grades those arms. TEN negative
+                                         # controls (X86_PMODE_NEGCTL=1..10),
+                                         # each compiling ONE rule out and each
+                                         # required to make test_pmode FAIL,
+                                         # plus a BASELINE arm that must pass
+                                         # first -- without it every arm below
+                                         # "fails" for an unrelated reason.
+                                         # Not optional for this feature: the
+                                         # obvious reference to copy,
+                                         # references/tiny386, has NO
+                                         # permission checks (its own
+                                         # `// TODO` at i386.c:1097), so an
+                                         # implementation and a test written
+                                         # together from it would share the
+                                         # same hole and stay green. THREE arms
+                                         # survived on the first run and each
+                                         # named a real gap in the suite --
+                                         # see docs/14 section 7.
+                                         # --only N runs one; --verbose shows
+                                         # the arm's output. One CLEAN build
+                                         # per arm (flags are not
+                                         # dependencies), so it is slow
 python3 tests/test_nor.py                # NOR cold-page backing and COW, driven
                                          # by GUEST code. The fake NOR is the
                                          # extflash window ITSELF, written with

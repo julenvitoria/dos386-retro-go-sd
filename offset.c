@@ -55,6 +55,17 @@ int main(void)
     printf("    .equ %-24s, %zu\n", "SEG_STRIDE", sizeof(X86CPUSeg));
     printf("\n");
 
+    EMIT("CPU_GDT_BASE",   offsetof(X86CPUState, gdt_base));
+    EMIT("CPU_GDT_LIMIT",  offsetof(X86CPUState, gdt_limit));
+    EMIT("CPU_LDT_BASE",   offsetof(X86CPUState, ldt_base));
+    EMIT("CPU_LDT_LIMIT",  offsetof(X86CPUState, ldt_limit));
+    EMIT("CPU_LDT_SEL",    offsetof(X86CPUState, ldt_sel));
+    EMIT("CPU_CPL",        offsetof(X86CPUState, cpl));
+    EMIT("CPU_PMODE_EXCP", offsetof(X86CPUState, pmode_excp));
+    EMIT("CPU_PMODE_ERR",  offsetof(X86CPUState, pmode_err));
+    EMIT("CPU_HOST_SP",    offsetof(X86CPUState, host_sp));
+    printf("\n");
+
     EMIT("CPU_CR0", offsetof(X86CPUState, cr0));
     EMIT("CPU_CR2", offsetof(X86CPUState, cr2));
     EMIT("CPU_CR3", offsetof(X86CPUState, cr3));
