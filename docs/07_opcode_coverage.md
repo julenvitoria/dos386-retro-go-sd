@@ -32,7 +32,7 @@ scope* rather than as gaps.
 | Non-stack memory operand used without a segment base | 5 | `A0`, `A1`, `A2`, `A3`, `D7` |
 | Address-size axis ignored (uses full `ECX`/32-bit moffs) | 6 | `E0`, `E1`, `E2`, `E3`, `A0`, `A2` |
 | CS.base mishandled on a control transfer | 4 | `C2`, `CA`, `FF /2`, `FF /4` |
-| Implemented as a silent no-op | 2 | `84` (TEST), `0F 01 /2` (LGDT) |
+| Implemented as a silent no-op | 1 | `84` (TEST). `0F 01 /2` LGDT is no longer a no-op. |
 
 Slots can appear in more than one row. Counting distinct one-byte slots, **43 of the 235
 implemented opcodes have at least one defect** and **7 more are partial** (register form
@@ -333,7 +333,7 @@ project; the slot is nevertheless accounted for individually.
 | Op | Mnemonic | Era | Status | Handler | Notes |
 |---|---|---|---|---|---|
 | 0F 00 | Grp6 (SLDT/STR/LLDT/LTR/VERR/VERW) | 286 | unimplemented | `.exit_loop` | Entire group unimplemented. |
-| 0F 01 | Grp7 (SGDT/SIDT/LGDT/LIDT/SMSW/LMSW) | 286 | partial | `.op_0f_01` (dual) | Partial: only /2 LGDT (a no-op stub) and /3 LIDT. See group table. |
+| 0F 01 | Grp7 (SGDT/SIDT/LGDT/LIDT/SMSW/LMSW) | 286 | partial | `.op_0f_01` (dual) | /2 LGDT, /3 LIDT, /4 SMSW and **/6 LMSW** are in; /0, /1, /7 exit, naming the ModRM. See group table. |
 | 0F 02 | LAR/LSL | 286 | unimplemented | `.exit_loop` | Not implemented. |
 | 0F 03 | LAR/LSL | 286 | unimplemented | `.exit_loop` | Not implemented. |
 | 0F 04 | (reserved) / LOADALL | 286 | unimplemented | `.exit_loop` | Not implemented. |
@@ -507,7 +507,7 @@ project; the slot is nevertheless accounted for individually.
 | 0F AC | SHRD | 386 | unimplemented | `.exit_loop` | Not implemented. |
 | 0F AD | SHRD | 386 | unimplemented | `.exit_loop` | Not implemented. |
 | 0F AE | Grp15 (FXSAVE etc.) | P2+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F AF | IMUL Gv,Ev | 386 | unimplemented | `.exit_loop` | Not implemented. Two-operand IMUL is emitted by every 32-bit C compiler and by some 16-bit ones. |
+| 0F AF | IMUL Gv,Ev | 386 | implemented | `.op_0f_imul_AF` (dual) | **EPIC PINBALL's wall** (docs/13). Low half only, like the `69`/`6B` forms; CF/OF unset, which is the same known gap all three share. `tests/test_opcodes.py` 281-283. |
 | 0F B0 | CMPXCHG | 486 | out of scope | `.exit_loop` | Out of scope. |
 | 0F B1 | CMPXCHG | 486 | out of scope | `.exit_loop` | Out of scope. |
 | 0F B2 | LSS Gv,Mp | 386 | unimplemented | `.exit_loop` | Not implemented. LES/LDS exist; LSS does not. |
@@ -690,22 +690,32 @@ with a real-mode-only core.
 
 ### `0F 01` — Grp7
 
-Handler `.op_0f_01`; `CMP` chain on `/reg` with only two arms.
+Handler `.op_0f_01`. **A GROUP IS NOT AN OPCODE, and the exit says so**: the
+`/0`, `/1` and `/7` arms carry the ModRM byte into `exit_info`'s high half, so a
+refusal reads `0xMM0F01` and names the member. It reported a bare `0x0F` for
+years — see the retraction in [`docs/13`](13_title_status.md).
+
+**The two members with a REGISTER form (`/4` SMSW, `/6` LMSW) are decided BEFORE
+the ModRM walk.** LGDT/LIDT are memory-only, so the walk used to be
+unconditional and a `mod=11` encoding fell straight through the group into
+`.exit_loop`. That single structural detail cost two titles their startup
+(`SMSW AX` for Mortal Kombat's C runtime) and two more their entry into
+protected mode (`LMSW AX`).
 
 | /reg | Op | Status |
 |---|---|---|
-| /0 | SGDT Ms | **missing** — falls to `.exit_loop` |
-| /1 | SIDT Ms | **missing** |
-| /2 | LGDT Ms | **STUB** — checks CR0.PE and CPL, then branches to the fetch loop **without loading GDTR at all**. It succeeds silently and does nothing. |
-| /3 | LIDT Ms | implemented: reads the 16-bit limit and 32-bit base through the ModRM effective address and stores them at `[R8,#44]` / `[R8,#40]`. Note those are hard-coded literals rather than `x86_offsets.inc` symbols. |
-| /4 | SMSW Ew | **missing** |
+| /0 | SGDT Ms | **missing** — `.exit_loop`, reporting `0xMM0F01` |
+| /1 | SIDT Ms | **missing** — same |
+| /2 | LGDT Ms | implemented — shares `L(LXXX_OPERAND)` with LIDT. (The "STUB that loads nothing" recorded here previously is fixed.) |
+| /3 | LIDT Ms | implemented: 16-bit limit and 32-bit base through the ModRM effective address. |
+| /4 | SMSW Ew | implemented, register **and** memory form. Unprivileged. |
 | /5 | (invalid) | correctly unreachable |
-| /6 | LMSW Ew | **missing** |
+| /6 | LMSW Ew | **implemented** — `cr0 = (cr0 & ((~0xf)\|1)) \| (src & 0xf)`, i.e. PE/MP/EM/TS only and **PE is set-only** (tiny386 `i386.c:3292`, DOSBox-X `cpu.cpp:2788`, which agree). CPL 0 in protected mode only. Shares MOV CR0's PE-transition tail, so `x86_pmode_sync_mode()` runs on the edge. **This is the instruction that puts a DOS extender into protected mode** — it uses the 286 sequence, not `MOV CR0`, so nothing else here substitutes for it. `tests/test_opcodes.py` 276-278. |
 | /7 | INVLPG | **missing** (486 anyway) |
 
-Also: `.op_0f_01` calls `L(DECODE_MODRM_32)` **by symbol** rather than through
-`[R2, #REC_MODRM_FN]`, so it uses the decoder matching the *pass* (operand size) instead
-of the live *address* size — a `0x67` prefix is ignored.
+Also: `.op_0f_01` reaches the decoder through `[R2, #REC_MODRM_FN]`, so `0x67` is
+honoured. (An earlier note here said it called `L(DECODE_MODRM_32)` by symbol
+and ignored the prefix; that is fixed.)
 
 ### `0F BA` — Grp8
 
@@ -753,7 +763,7 @@ Segment override coverage on the *destination* of string ops is correctly refuse
 | 386 bit instructions `0F A3/AB/B3/BB`, `0F BA`, `0F BC/BD` | 7 | Unimplemented: BT/BTS/BTR/BTC/BSF/BSR. |
 | 386 double shifts `0F A4/A5/AC/AD` | 4 | Unimplemented: SHLD/SHRD. |
 | 386 segment loads `0F B2/B4/B5` | 3 | Unimplemented: LSS/LFS/LGS. |
-| 386 `0F AF` IMUL Gv,Ev | 1 | Unimplemented. |
+| 386 `0F AF` IMUL Gv,Ev | 0 | Implemented. |
 | 386 `0F A0/A1/A8/A9` PUSH/POP FS,GS | 4 | Unimplemented. |
 | 386 control/debug regs `0F 20`–`0F 27` | 8 | Unimplemented — consistent with a real-mode-only core. |
 | 286 protected mode `0F 00`, `0F 02`, `0F 03`, `0F 06` | 4 | Unimplemented. |
@@ -767,6 +777,18 @@ Ordered by likely impact on real DOS software. These matter more than the unimpl
 opcodes because an unimplemented opcode stops the interpreter loudly with
 `X86_EXIT_UNIMPLEMENTED` and the offending byte in `exit_info`, whereas everything below
 produces a wrong answer and keeps running.
+
+**HOW TO READ `exit_info`** — it is not always one byte, and it used to lie:
+
+| value | means |
+|---|---|
+| `0x00`–`0xFF` | a one-byte opcode |
+| `0x0Fnn` | the TWO-byte opcode `0F nn`. The 0F escape keeps the second byte in R1 and `.exit_loop` reports R0, so R0 is now loaded with `0x0F00\|nn` at the second dispatch. **Before that, every unimplemented two-byte opcode reported a bare `0x0F`**, which made three unrelated titles look like they shared one blocker for several passes ([`docs/13`](13_title_status.md)). |
+| `0xMM0F01` | group 7 member: `MM` is the ModRM byte, so `/reg` names which. |
+
+Read it with `scripts/probe_report.py`, which now derefs `cpu_state_ptr` and
+prints `cpu_exit_info` alongside `cpu_cs_sel`/`cpu_eip`/`cpu_cr0` — the reported
+`CS` used to come from somewhere else entirely.
 
 ### P0 — silent wrong answers on ubiquitous instructions
 
@@ -889,7 +911,7 @@ Ordered by what will bite first when a real binary is pointed at this core.
   linked in, and anything that probes for a coprocessor. There is no partial credit here
   — an FPU is a substantial subsystem. Deciding early whether the target set is
   integer-only matters more than any individual opcode.
-- **`0F AF` IMUL Gv,Ev and `0F BC/BD` BSF/BSR.** Standard compiler output.
+- **`0F BC/BD` BSF/BSR.** Standard compiler output. (`0F AF` IMUL Gv,Ev is now implemented.)
 - **`0F B2/B4/B5` LSS/LFS/LGS.** `LSS` in particular is how 32-bit-aware code switches
   stacks atomically.
 - **`27/2F/37/3F` DAA/DAS/AAA/AAS.** Old-school BCD arithmetic; rarer in games, common in

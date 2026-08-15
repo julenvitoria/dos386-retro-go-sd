@@ -133,9 +133,12 @@ TITLES = {
                 "(CF=0) and the child lands whole -- 83,912 B, "
                 "x86_dos_load_short=0, x86_pg_exhausted=0, evictions=0. It now "
                 "reaches mode 13h and dies past it on "
-                "X86_EXIT_UNIMPLEMENTED with exit_info=0x0F, after 620,904 "
-                "instructions and 64,000 reads of the Sound Blaster port "
-                "0x22A. Those two are the open questions for this title.",
+                "X86_EXIT_UNIMPLEMENTED. Its blocker is a plain missing "
+                "two-byte OPCODE and has nothing to do with the other two "
+                "titles that were once reported as sharing its exit: 0F AF "
+                "(IMUL Gv,Ev) is now built, and it stops on 0F A0 (PUSH FS) "
+                "next. Read cpu_exit_info, which names the opcode; the bare "
+                "0x0F it used to report was the 0F ESCAPE. docs/13.",
     },
     "alleycat": {
         "rom": f"{ROM_DIR}/ALLEYCAT.dsk",
@@ -294,6 +297,53 @@ CONTEXT = ["core_ready", "core_dtcm_ok", "hle_calls_seen", "x86_hle_calls",
 LIVENESS_WINDOW_S = 1.5
 
 
+# THE DEATH SITE. `guest_exit_reason` says the guest stopped; it does not say
+# WHERE or ON WHAT, and every one of those questions used to need a separate
+# hand-rolled probe.py invocation against offsets copied out of x86_offsets.inc
+# by hand. Three titles were reported as "converging on one address" partly
+# because nobody could cheaply read the rest of the state next to it.
+#
+# These come from cpu_state_ptr, which is a POINTER to the DTCM context, so the
+# read is a deref and not a symbol read. Offsets are x86_offsets.inc; they are
+# asserted against it by tests/test_probe_offsets.py (8 checks, no target needed) so a struct change breaks
+# the test rather than silently reporting a neighbouring field.
+#
+# cpu_exit_info is the one to read first on guest_exit_reason=4: >= 0x100 means
+# a TWO-BYTE opcode and the low byte is the second byte (0x0F is the escape,
+# not the instruction). cpu_cr0 bit 0 answers "did it enter protected mode"
+# without a build flag.
+CPU_FIELDS = {
+    "cpu_eip":         0,
+    "cpu_esp":        24,
+    "cpu_cs_sel":     60,      # 16-bit
+    "cpu_cs_base":    64,
+    "cpu_ss_sel":     72,      # 16-bit
+    "cpu_cr0":       120,
+    "cpu_exit_reason": 2196,
+    "cpu_exit_info":  2200,
+}
+CPU_FIELDS_16 = ("cpu_cs_sel", "cpu_ss_sel")
+
+
+def _read_death_site(backend, syms, ctx):
+    if "cpu_state_ptr" not in syms:
+        return
+    try:
+        base = backend.read_uint32(syms["cpu_state_ptr"])
+    except Exception:
+        return
+    if not base:
+        return
+    for name, off in CPU_FIELDS.items():
+        try:
+            v = backend.read_uint32(base + off)
+        except Exception:
+            continue
+        ctx[name] = (v & 0xFFFF) if name in CPU_FIELDS_16 else v
+    if "cpu_cs_base" in ctx and "cpu_eip" in ctx:
+        ctx["cpu_lin_eip"] = (ctx["cpu_cs_base"] + ctx["cpu_eip"]) & 0xFFFFFFFF
+
+
 def health(ctx, blk):
     """-> (fatal, stopped). Fatal reasons refuse the report outright; stopped
     reasons band it and still print, because the table is the evidence.
@@ -412,6 +462,7 @@ def collect(args, title):
                     pass
         if insns0 is not None:
             ctx["guest_insns_delta"] = (insns1 - insns0) & 0xFFFFFFFF
+        _read_death_site(target.backend, syms, ctx)
         target.backend.resume()
         return {"block": block, "context": ctx,
                 "run_s": settle + (LIVENESS_WINDOW_S if insns0 is not None

@@ -174,7 +174,7 @@
     .word .exit_loop + 1 // 0xac
     .word .exit_loop + 1 // 0xad
     .word .exit_loop + 1 // 0xae
-    .word .exit_loop + 1 // 0xaf
+    .word .op_0f_imul_AF + 1 // 0xaf
     .word .exit_loop + 1 // 0xb0
     .word .exit_loop + 1 // 0xb1
     .word .exit_loop + 1 // 0xb2

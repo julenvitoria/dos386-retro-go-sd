@@ -12,6 +12,26 @@ OP .op_0f_0F
        and the 0F table -- so the macro gets R0/R4/R5/R12, all dead here. */
     PROF_DISPATCH R1, R12, R0, R4, R5, bias=256
 #endif
+    /* NAME THE OPCODE, NOT THE ESCAPE.
+     *
+     * .exit_loop reports CPU_EXIT_INFO from R0, and R0 still held 0x0F here --
+     * so EVERY unimplemented two-byte opcode reported the identical
+     * exit_info=0x0F, and three unrelated titles "converged" on one byte that
+     * was never the byte any of them executed. The escape is not the
+     * instruction. (They really were on three different opcodes: 0F 01 /6,
+     * 0F 01 /6 and 0F AF. docs/13.)
+     *
+     * R0 is dead across the whole 0F path -- the contract's "R0 is the opcode"
+     * ends at this second dispatch, PROF_DISPATCH already takes R0 as scratch,
+     * and every 0F handler writes R0 before reading it -- so it costs one
+     * instruction to make it carry the truth: 0x0Fnn, the escape in the high
+     * byte and the SECOND byte in the low one. exit_info > 0xFF therefore reads
+     * as "two-byte opcode 0F nn" with no ambiguity against the one-byte table.
+     *
+     * The reported EIP is likewise PAST the whole two-byte opcode: R10 was
+     * advanced by the dispatch and again just above, so the instruction that
+     * exited starts at EIP-2. */
+    ORR.W R0, R1, #0x0F00
     LDR.W PC, [R3, R1, LSL #2]
 L(opcode_0f_dispatch_target):
 
@@ -97,6 +117,12 @@ OP .op_0f_01
     UBFX R3, R1, #3, #3
     CMP R3, #4
     BEQ.W L(OP_SMSW)
+    /* LMSW (/6) is decided here for the SAME reason SMSW is: it has a register
+     * form, `0F 01 F0` = LMSW AX, and that is the encoding a DOS extender
+     * actually issues. Deciding it after the memory-only walk would send the
+     * mod=11 form into .exit_loop exactly as SMSW's used to go. */
+    CMP R3, #6
+    BEQ.W L(OP_LMSW)
     /* The ADDRESS-SIZE decoder from the mode record, not a hardwired 32-bit
        one. `BL L(DECODE_MODRM_32)` was unconditional here, so in a 16-bit
        guest -- which is every guest in this tree -- `LIDT [disp16]` (ModRM
@@ -111,6 +137,12 @@ OP .op_0f_01
     BEQ.N L(OP_LGDT)
     CMP R3, #3
     BEQ.N L(OP_LIDT)
+    /* A GROUP OPCODE IS NOT AN OPCODE. "0F 01 is unimplemented" is not a
+       reportable fact -- /2, /3, /4 and /6 are implemented and /0, /1, /7 are
+       not, and which one a guest issued is the entire question. R1 is the
+       ModRM byte and is still live, so the exit carries it in the high half:
+       exit_info reads 0xMM0F01. Cold path, one instruction. */
+    ORR.W R0, R0, R1, LSL #16
     B.W .exit_loop
 
 /* SMSW: store the low 16 bits of CR0. Unprivileged at every CPL on a 286 and
@@ -132,6 +164,72 @@ L(OP_SMSW_MEM):
     LDR.W R5, [R8, #CPU_CR0]
     MEM_GET_PTR R3, R7
     VGA_ST_H R5, R3, R12
+    B.W .fetch_decode_loop
+
+/* LMSW -- 0F 01 /6. THE INSTRUCTION THAT TURNS PROTECTED MODE ON, and the one
+ * that was really stopping Dark Forces and Mortal Kombat.
+ *
+ * Both were reported as "unimplemented opcode 0x0F" at one address shared with
+ * a third title, which was an artefact of the exit reporting twice over:
+ * .exit_loop named the ESCAPE byte rather than the opcode, and "0F 01" names a
+ * GROUP rather than a member. Both are fixed above; what they were really
+ * executing is `0F 01 F0` = LMSW AX -- the 286 entry sequence, which is what a
+ * DOS extender uses because it must also run on a 286.
+ *
+ * SEMANTICS, and the two references AGREE here (they do not always):
+ *   references/tiny386/i386.c:3292-3294  cr0 = (cr0 & ((~0xf) | 1)) | (src & 0xf)
+ *   references/dosbox-x/src/cpu/cpu.cpp:2788-2795  same, with the rule spelled
+ *   out: "low 4 bits only, cannot change PE ... stuck on, cannot exit
+ *   protected mode, 286 style".
+ * So it writes PE/MP/EM/TS and NOTHING above bit 3, and PE is SET-ONLY: the
+ * `BIC #0xE` below keeps bit 0 of the old CR0, which is exactly tiny386's
+ * `(~0xf)|1` mask. Clearing PE is MOV CR0's job, not this one.
+ *
+ * The operand is 16 bits in BOTH operand sizes -- LMSW has no 32-bit form --
+ * so this is deliberately NOT written against the width macros.
+ *
+ * CPL 0, but only in protected mode: L(LXXX_CPL_CHECK) is the same predicate
+ * LGDT/LIDT/LLDT use, and it is DOSBox-X's rule (`cpu.pmode && cpu.cpl>0`)
+ * rather than tiny386's unconditional one -- in real mode there is no CPL.
+ *
+ * The PE-transition tail is MOV CR0's, byte for byte and for its reasons: the
+ * segment caches are deliberately NOT reloaded (the far jump that follows is
+ * what installs a real descriptor and flushes the pipeline), and
+ * x86_pmode_sync_mode() is called only when PE actually MOVED, because the
+ * interpreter picks its dispatch tables once from CS.D. */
+L(OP_LMSW):
+    BL L(LXXX_CPL_CHECK)
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(OP_LMSW_MEM)
+    AND.W R3, R1, #7
+    ADD.W R3, R8, R3, LSL #2
+    LDRH.W R5, [R3, #CPU_REGS]
+    B.N L(OP_LMSW_APPLY)
+L(OP_LMSW_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN]
+    BLX R12
+    /* A HALFWORD load is a multi-byte fold site, so it needs SEAM_CHECK --
+       CLAUDE.md's rule, and the reason is that the two bytes can straddle a
+       4 KB granule whose neighbour is not the host memory after it. */
+    SEAM_CHECK R2, R7
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    MEM_TRAP_R R2
+    LDRH R5, [R2, #0]
+L(OP_LMSW_APPLY):
+    LDR.W R4, [R8, #CPU_CR0]
+    AND.W R5, R5, #0xF             @ PE, MP, EM, TS -- nothing else
+    BIC.W R3, R4, #0xE             @ keep everything above bit 3, AND old PE
+    ORR.W R5, R3, R5
+    STR.W R5, [R8, #CPU_CR0]
+    EOR.W R4, R4, R5
+    TST.W R4, #1                   @ did PE actually move?
+    BEQ.W .fetch_decode_loop
+    PUSH {R0-R3, R12, LR}
+    MOV R0, R8
+    BL x86_pmode_sync_mode
+    POP {R0-R3, R12, LR}
     B.W .fetch_decode_loop
 
 /* LGDT and LIDT read the SAME six-byte operand -- a 16-bit limit then a 32-bit
@@ -685,6 +783,49 @@ L(OP_0F_MOVSX_GV_EW_WRITE):
     ADD.W R3, R3, #8
     STR.W R4, [R8, R3]
     B.W .fetch_decode_loop
+
+/* 0F AF /r -- IMUL Gv, Ev. The two-operand form: Gv = Gv * Ev, low half only.
+ *
+ * MEASURED on EPIC_PINBALL (docs/13), and it is the whole reason that title's
+ * "same exit as the other two" reading was wrong -- with the exit naming the
+ * opcode instead of the 0F escape, its exit_info reads 0x0FAF where Dark
+ * Forces and Mortal Kombat read 0x0F01. Three titles, three different walls.
+ *
+ * Structurally .op_imul_imm32_69 with the immediate replaced by the
+ * destination register's own current value, and it makes the same flag choice
+ * the 69/6B forms already make: CF and OF are architecturally defined for
+ * IMUL, and none of the three sets them. That is a KNOWN, SHARED gap for
+ * docs/07 rather than something new here -- a guest that branches on the
+ * overflow of a multiply is wrong on all three today, and fixing it is one
+ * change across all three, not a rider on this one. */
+OP .op_0f_imul_AF
+    CODE_PTR R1
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
+    BLO.N L(IMULAF_MEM)
+    AND.W R2, R1, #7
+    ADD.W R2, R8, R2, LSL #2
+    ADD.W R2, R2, #8
+    LD_V R3, R2
+    B.N L(IMULAF_DO)
+L(IMULAF_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    SEAM_CHECK R2, R7
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    MEM_TRAP_R R2
+    LD_V R3, R2
+L(IMULAF_DO):
+    UBFX R4, R1, #3, #3
+    MOV.W R4, R4, LSL #2
+    ADD.W R4, R4, #8
+    LDREG_V R5, R4
+    MUL.W R3, R3, R5
+    STREG_V R3, R4
+    B.W .fetch_decode_loop
 #ifndef USE_16_BIT
 
 .align 2
@@ -702,6 +843,7 @@ L(OP_0F_MOVSX_GV_EW_WRITE):
 .set .op_0f_movzx_gv_ew, .op_0f_movzx_gv_ew_32
 .set .op_0f_movsx_gv_eb, .op_0f_movsx_gv_eb_32
 .set .op_0f_movsx_gv_ew, .op_0f_movsx_gv_ew_32
+.set .op_0f_imul_AF, .op_0f_imul_AF_32
 .set .op_alu_ev_gv, .op_alu_ev_gv_32
 .set .op_alu_gv_ev, .op_alu_gv_ev_32
 .set .op_alu_eax_imm32, .op_alu_eax_imm32_32
@@ -794,6 +936,7 @@ opcode_table_0f_32:
 .set .op_0f_movzx_gv_ew, .op_0f_movzx_gv_ew_16
 .set .op_0f_movsx_gv_eb, .op_0f_movsx_gv_eb_16
 .set .op_0f_movsx_gv_ew, .op_0f_movsx_gv_ew_16
+.set .op_0f_imul_AF, .op_0f_imul_AF_16
 .set .op_alu_ev_gv, .op_alu_ev_gv_16
 .set .op_alu_gv_ev, .op_alu_gv_ev_16
 .set .op_alu_eax_imm32, .op_alu_eax_imm32_16

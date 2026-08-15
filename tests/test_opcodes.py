@@ -3245,6 +3245,122 @@ def run_test(args):
                 "regs_expected": {},
                 "expected_eip": 6,
             },
+            # --------------------------------------------------------------
+            # LMSW, and the EXIT REPORTING that hid it.
+            #
+            # Three unrelated titles (Dark Forces, Mortal Kombat, Epic
+            # Pinball) were recorded as dying on "unimplemented opcode 0x0F"
+            # at one shared address. Two reporting defects made that reading:
+            # the 0F escape handler left R0 = 0x0F, so .exit_loop named the
+            # ESCAPE rather than the opcode; and 0F 01 is a GROUP, so even the
+            # right byte would not have said which member. What two of the
+            # three were really executing is 0F 01 F0, LMSW AX -- the 286
+            # entry into protected mode. docs/13.
+            #
+            # These arms therefore grade BOTH: that LMSW does what the
+            # references say, and that an exit NAMES what it refused.
+            # --------------------------------------------------------------
+            {
+                "name": "LMSW: 0F 01 F0 writes the low 4 bits of CR0",
+                # MOV AX,0x000A ; LMSW AX ; SMSW BX ; HLT
+                "code": bytes([0xB8, 0x0A, 0x00, 0x0F, 0x01, 0xF0,
+                               0x0F, 0x01, 0xE3, 0xF4]),
+                "mode": 16,
+                "regs_initial": {0: 0, 3: 0},
+                "regs_expected": {0: 0x000A, 3: 0x000A},
+                "expected_eip": 10,
+            },
+            {
+                # tiny386 i386.c:3292 and DOSBox-X cpu.cpp:2790 both mask the
+                # source to 4 bits. 0xFFFE, not 0xFFFF, so this arm does not
+                # also turn PE on -- that is the arm below.
+                "name": "LMSW: everything above bit 3 of the source is discarded",
+                # MOV AX,0xFFFE ; LMSW AX ; SMSW BX ; HLT
+                "code": bytes([0xB8, 0xFE, 0xFF, 0x0F, 0x01, 0xF0,
+                               0x0F, 0x01, 0xE3, 0xF4]),
+                "mode": 16,
+                "regs_initial": {0: 0, 3: 0},
+                "regs_expected": {0: 0xFFFE, 3: 0x000E},
+                "expected_eip": 10,
+            },
+            {
+                # "PE bit, stuck on, cannot exit protected mode, 286 style"
+                # (DOSBox-X cpu.cpp:2792). tiny386's mask `(~0xf)|1` says the
+                # same thing. Clearing PE is MOV CR0's job, not LMSW's.
+                "name": "LMSW: PE is SET-ONLY -- a second LMSW of 0 cannot clear it",
+                # MOV AX,1 ; LMSW AX ; XOR AX,AX ; LMSW AX ; SMSW BX ; HLT
+                "code": bytes([0xB8, 0x01, 0x00, 0x0F, 0x01, 0xF0,
+                               0x31, 0xC0, 0x0F, 0x01, 0xF0,
+                               0x0F, 0x01, 0xE3, 0xF4]),
+                "mode": 16,
+                "regs_initial": {0: 0, 3: 0},
+                "regs_expected": {3: 0x0001},
+                "expected_eip": 15,
+            },
+            {
+                # THE REPORTING ARM. Without the fix this reads 0x0F for every
+                # unimplemented two-byte opcode there is, which is exactly how
+                # three titles appeared to share one blocker.
+                "name": "EXIT NAMES THE OPCODE: an unimplemented 0F nn reports 0x0Fnn",
+                "code": bytes([0x0F, 0x0A, 0xF4]),
+                "regs_initial": {},
+                "regs_expected": {},
+                "expected_exit_reason": 4,
+                "expected_exit_info": 0x0F0A,
+                "expected_eip": 2,
+            },
+            {
+                # ...and a GROUP member carries its ModRM, because "0F 01 is
+                # unimplemented" is false -- /2, /3, /4 and now /6 are not.
+                "name": "EXIT NAMES THE GROUP MEMBER: 0F 01 /7 reports the ModRM too",
+                # INVLPG [0x0300] -- mod=00 rm=110, still unimplemented
+                "code": bytes([0x0F, 0x01, 0x3E, 0x00, 0x03, 0xF4]),
+                "mode": 16,
+                "regs_initial": {},
+                "regs_expected": {},
+                "expected_exit_reason": 4,
+                "expected_exit_info": 0x3E0F01,
+                "expected_eip": 5,
+            },
+            # --------------------------------------------------------------
+            # 0F AF -- IMUL Gv,Ev. EPIC PINBALL's actual wall, and the proof
+            # that the three titles never shared one: with the exit naming the
+            # opcode it reports 0x0FAF where the other two report 0x0F01.
+            # --------------------------------------------------------------
+            {
+                "name": "IMUL Gv,Ev: 0F AF register form multiplies into the destination",
+                # MOV AX,7 ; MOV BX,6 ; IMUL AX,BX ; HLT
+                "code": bytes([0xB8, 0x07, 0x00, 0xBB, 0x06, 0x00,
+                               0x0F, 0xAF, 0xC3, 0xF4]),
+                "mode": 16,
+                "regs_initial": {0: 0, 3: 0},
+                "regs_expected": {0: 42, 3: 6},
+                "expected_eip": 10,
+            },
+            {
+                "name": "IMUL Gv,Ev: 0F AF memory form, disp16",
+                # MOV AX,9 ; IMUL AX,[0x0300] ; HLT
+                "code": bytes([0xB8, 0x09, 0x00, 0x0F, 0xAF, 0x06,
+                               0x00, 0x03, 0xF4]),
+                "mode": 16,
+                "ram_setup": [(0x300, bytes([0x05, 0x00]))],
+                "regs_initial": {0: 0},
+                "regs_expected": {0: 45},
+                "expected_eip": 9,
+            },
+            {
+                # Two's complement through the low half: -3 * 5 = -15 = 0xFFF1
+                # in 16 bits. The handler zero-extends its loads, which is
+                # correct precisely because only the LOW half is written back.
+                "name": "IMUL Gv,Ev: 0F AF is correct in the low half for a NEGATIVE result",
+                # MOV AX,0xFFFD ; MOV BX,5 ; IMUL AX,BX ; HLT
+                "code": bytes([0xB8, 0xFD, 0xFF, 0xBB, 0x05, 0x00,
+                               0x0F, 0xAF, 0xC3, 0xF4]),
+                "mode": 16,
+                "regs_initial": {0: 0, 3: 0},
+                "regs_expected": {0: 0xFFF1, 3: 5},
+                "expected_eip": 10,
+            },
             {
                 "name": "x87 ABSENT: DB E3 (FNINIT) is ignored, not #UD",
                 "code": bytes([0xDB, 0xE3, 0xF4]),
