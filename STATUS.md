@@ -66,8 +66,8 @@ mid-`REP`, so the decision is resolvable once), aperture reads (~4.5%), the
 | | value | note |
 |---|---|---|
 | ITCM | ~**12.7 KB** free of 65,536 | `__CORE_ITCM_CODE_END__` = 0xCD08 (52,488 B used). The protected-mode walk cost **+912 B**, all of it cold: the out-of-line `SET_SREG_PMODE`, group 6/7 (`LLDT`/`SLDT`/`LGDT`/`LIDT`) and the `MOV CRn` transition |
-| DTCM | **63,268 B** free above a bump at `0x2000A8DC` | the pool ends at `__dtc_padding_end__` = `0x2001A000`, NOT `0x20020000` — the 24 KB above it is the main stack. `core_dtcm_headroom_max` over-reported by exactly that for the whole project until now ([`docs/12`](docs/12_memory_tiers.md) §8) |
-| RAM_EMU | `arm-none-eabi-nm build/core/dos_core.elf \| grep __CORE_BSS_END__` = **0x2405E960** (+704 B for `x86_pmode.c`) | **exhaustion is SILENT**: `guest_ram` returns NULL, `core_ready` stays 0, no message. Core TEXT is in this region too |
+| DTCM | **5,856 B** free — `core_dtcm_headroom_max`, MEASURED on the shipping core, not the pre-aperture 63,268 that is still quoted around the tree | the pool ends at `__dtc_padding_end__` = `0x2001A000`, NOT `0x20020000` — the 24 KB above it is the main stack ([`docs/12`](docs/12_memory_tiers.md) §8). **DTCM is not an escape hatch for instrument storage**: 5,856 B is the whole of it, and `.dtcm_bss` is a `TEST.ld` section only — the shipping core reaches DTCM through runtime `dtc_malloc` + a pointer, never a static |
+| RAM_EMU | `arm-none-eabi-nm build/core/dos_core.elf \| grep __CORE_BSS_END__` = **0x2405EB78**. **659,456 B free at the `guest_ram` claim; the 160-frame pool wants 656,640 (stride 4,104) — 2,816 B of slack, i.e. LESS THAN ONE FRAME** | **Exhaustion is no longer silent.** The pool is sized to the free space and publishes `guest_ram_pages` / `guest_ram_pages_short` / `guest_ram_free_at_claim`. **Read `guest_ram_pages_short` after adding any RAM_EMU storage** — one frame per 4,104 B comes out of the guest. `X86_PROBE=1` costs exactly one frame (159, evictions 0) |
 | arena | 143,360 B | check `x86_arena_largest`, not just `_free` — claims fragment |
 
 ## What is broken right now
@@ -82,7 +82,7 @@ mid-`REP`, so the decision is resolvable once), aperture reads (~4.5%), the
 | **KEEN4 gives 60 of 160 pager frames to the arena** once 0Dh is up, so runs on 100; EMS pins 16 more — tighter than the 144 the EMS work assumed | [`docs/12`](docs/12_memory_tiers.md) |
 | Retro-go's Pause overlay is unreadable over 256-colour modes | [`docs/08`](docs/08_vga_mode13h.md) §1 |
 | **INT 21h AH=4Bh (EXEC) is built but OFF in the shipping core** (`X86_DOS_EXEC`). WOLF3D calls it with a loadable image and honouring it kills the title: `guest_exit_reason`=5 (MEM_FAULT), `guest_insns_total`=0. The load, not the transfer — the pager has nowhere to put ~30 untouched guest pages mid-run | `PLAN.md` Queue C3 |
-| **`scripts/probe_report.py` is VOID on every title tried** — `core_ready`=0, `guest_insns_total`=0 under `X86_PROBE=1`, on MASTER as well as this branch. The project's "what did this title ask for" instrument does not currently work | `CLAUDE.md`, the X86_PROBE trap |
+| **Dark Forces never reaches DOS4GW.** With `X86_DOS_EXEC=1` it dies at `INT 21h AH=4Bh` **AL=03h (load OVERLAY)**, which is refused — only AL=00h is implemented. Also unanswered: `AH=52h` (list of lists) and `AH=29h`. It asks NOTHING about DPMI/VCPI/XMS: 67 events, 17 probes, then `guest_exit_reason=4`. The memory wall Wolf3D hit is not reached | [`docs/13`](docs/13_title_status.md) |
 | **Interpreter gaps**: seg override before `REP` survives one element; `moffs` uses operand not ADDRESS size; `MOV SS,x` does not inhibit interrupts; 5 handlers ignore `0x67`; 13 slots exit (x87, `BOUND`/`ARPL`, `XLAT`, `WAIT`, `INT1`) | [`docs/07`](docs/07_opcode_coverage.md) |
 
 ## Protected mode — the descriptor walk is IN, real mode pays NOTHING

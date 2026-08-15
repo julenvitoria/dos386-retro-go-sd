@@ -60,6 +60,29 @@
  * scripts/probe_report.py, because RAM_EMU headroom has gone negative silently
  * in this tree before and a claimed cost is not a measured one.
  *
+ * AND IT DID GO NEGATIVE, THROUGH THIS FILE. MEASURED: with the accumulator in,
+ * RAM_EMU had 655,360 B free at the guest_ram claim and the 160-frame pager
+ * pool wants 656,640 (stride 4,104), so the claim -- the LAST one out of that
+ * pool -- returned NULL. x86_pg_frames_total was 0, every guest access was
+ * X86_EXIT_MEM_FAULT, the guest halted before its first instruction, and
+ * core_dtcm_ok/pgf_result/x86_xms_total_kb all still read healthy. The report
+ * said "every service this title touched was answered" about a guest that had
+ * never run, for Dark Forces and then for WOLF3D as a control.
+ *
+ * Two things changed and BOTH matter:
+ *   * src/main.c sizes the pool to the free space instead of taking it
+ *     all-or-nothing, and publishes guest_ram_pages / guest_ram_pages_short.
+ *     The instrumented build now runs on 159 frames (x86_pg_evictions 0 on
+ *     WOLF3D) instead of on none.
+ *   * probe_report.py REFUSES to print a table when core_ready is 0,
+ *     x86_pg_frames_total is 0, or guest_insns_total is not advancing.
+ * X86_PROBE_ENTS=64 saves exactly the 1,280 B and buys the frame back if the
+ * pager is what is under investigation; see Makefile.core.
+ *
+ * THE GENERAL RULE FOR THE NEXT INSTRUMENT: RAM_EMU .bss is taken from the
+ * guest's page pool, one frame per 4,104 bytes. Do not add storage here
+ * without reading guest_ram_pages_short afterwards.
+ *
  * The per-call cost is one hash probe on paths that already cost hundreds of
  * cycles (an INT service, a port access). It is NOT on the guest instruction
  * dispatch path, which is what keeps it two orders of magnitude cheaper than

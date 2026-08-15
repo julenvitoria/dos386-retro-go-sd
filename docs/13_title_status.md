@@ -98,7 +98,35 @@ Two errors produced the wrong verdict, and both are the same shape:
 > hardware.** Re-measure before concluding anything is impossible. This cost a
 > wrong "impossible" once and a wrong "38% idle" the same day.
 
-## Star Wars: Dark Forces — BLOCKED on the pagefile, not out of scope
+## Star Wars: Dark Forces — MEASURED 2026-08-15: it blocks at EXEC AL=03h, long before memory
+
+The first measurement of this title with a working instrument
+(`probe_report.py`, `X86_PROBE=1 X86_DOS_EXEC=1`, gwemu, 30 s;
+`build/artifacts/probe_darkforces_exec.md`). It ran, made **67 recorded events
+across 17 probes**, and stopped: `guest_exit_reason=4` (UNIMPLEMENTED),
+`guest_halted=1`.
+
+**DOS4GW.EXE never loads, and the memory wall is never reached.** What it asked
+for and did not get:
+
+| probe | × | what it is |
+|---|---:|---|
+| `INT 21h AH=4Bh AL=03h` | 1 | **LOAD OVERLAY.** `X86_DOS_EXEC=1` implements AL=00h only; AL=01h/03h are refused by design (`x86_dos.c`). **This is the blocker** |
+| `INT 21h AH=52h` | 1 | get the DOS list-of-lists — a DOS-internals probe |
+| `INT 21h AH=29h` | 2 | parse filename into an FCB |
+
+Everything else it touched was answered: 30 × `AH=40h` (write — an error
+message), 15 × `AH=4Ah`, 3 × `AH=48h`, the open/read/close set, and 2 ×
+`AH=4Ch` (terminate).
+
+**It asks NOTHING about DPMI, VCPI or XMS.** No `INT 2Fh AX=1687h`, no
+`AX=DE00h`, no port access at all. So the prerequisite chain below is not
+what gates this title today, and **`X86_DOS_EXEC=1` does not change its
+outcome**: the next thing to build is EXEC AL=03h (overlay load), and only then
+is there a memory question to measure. It did NOT hit Wolf3D's
+`guest_exit_reason=5` wall — it never got far enough to be given the chance.
+
+## Star Wars: Dark Forces — BLOCKED on the pagefile, not out of scope (SUPERSEDED by the measurement above)
 
 > **RETRACTED, 2026-08-14: the "out of scope" verdict below is wrong.** It reads
 > the zero-read-only-pages measurement as condemning *all* backing stores. It

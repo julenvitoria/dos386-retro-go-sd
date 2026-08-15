@@ -429,23 +429,45 @@ reset — the startup probes *are* the subject), and writes one report to
 Presets: `keen4`, `wolf3d`, `topbench`, `alleycat`, `darkforces`,
 `epicpinball`.
 
-##### `X86_PROBE=1` CAN TAKE THE PAGER TO ZERO FRAMES — check the run ran
+##### `X86_PROBE=1` USED TO TAKE THE PAGER TO ZERO FRAMES — FIXED, BOTH ENDS
 
-The accumulator costs ~3.5 KB of RAM_EMU and **`guest_ram` is the last claim out
-of that pool**, so the instrumented build can push it over the edge:
-`ram_malloc()` returns NULL, `x86_pg_frames_total` reads **0**, every guest
-access is `X86_EXIT_MEM_FAULT` and the guest halts before its first instruction.
-`core_dtcm_ok`, `pgf_result` and `x86_xms_total_kb` are all still healthy —
-that is the trap. Measured on `darkforces` and reproduced on `wolf3d` as a
-control, both dead with `core_ready=0`; the same core with `X86_PROBE=0` runs
-WOLF3D at 160 frames and 190 M instructions.
+The accumulator is ~2.8 KB of RAM_EMU and **`guest_ram` is the last claim out of
+that pool**, so the instrumented build pushed it over the edge: `ram_malloc()`
+returned NULL, `x86_pg_frames_total` read **0**, every guest access was
+`X86_EXIT_MEM_FAULT` and the guest halted before its first instruction, while
+`core_dtcm_ok`, `pgf_result` and `x86_xms_total_kb` all still read healthy. That
+is the trap. Measured on `darkforces` and reproduced on `wolf3d` as a control,
+both dead with `core_ready=0`.
 
-The report used to print "Nothing. Every service and port this title touched was
-answered" on exactly that run, which is true and completely misleading. It now
-leads with **THIS REPORT IS VOID — THE GUEST NEVER RAN** whenever `core_ready`
-or `guest_insns_total` is 0. When you see it, re-measure with the rings against
-a build without the accumulator: `probe.py --dos-log --io-log --watch …` answers
-the same question and costs no RAM_EMU.
+MEASURED, and the numbers are why the fix is what it is: RAM_EMU has **655,360 B**
+free at that claim with the accumulator in, and a 160-frame pool wants **656,640**
+(stride 4,104, not 4,096) — **1,280 B short, exactly one frame.**
+
+* **`src/main.c` now sizes the pool to the free space** instead of taking it
+  all-or-nothing, and publishes `guest_ram_pages`, `guest_ram_pages_short` and
+  `guest_ram_free_at_claim`. The instrumented build runs on **159** frames with
+  `x86_pg_evictions=0` (WOLF3D) rather than on none. The shipping build is
+  unchanged: 160 pages, `guest_ram_pages_short=0`, 659,456 B free.
+  **`guest_ram_pages_short` is the counter to read after adding ANY RAM_EMU
+  storage** — one frame per 4,104 B comes straight out of the guest.
+* **`X86_PROBE_ENTS`** (`Makefile.core`, default 128) is the other lever: 64
+  saves exactly the 1,280 B and buys the frame back, at 64 keys against the 60 a
+  real title used.
+* **`probe_report.py` REFUSES to print a table** — no rows, exit status **2** —
+  when `core_ready` is 0, `x86_pg_frames_total` is 0, or `guest_insns_total` is
+  not advancing *and the accumulator is empty*. It samples that counter twice
+  across 1.5 s, because a guest that faulted at instruction 1 has a non-zero
+  count that never moves.
+* A guest that ran, **asked things and then died** is a different state and is
+  NOT refused: the table is printed under a **THE GUEST IS STOPPED — THIS IS A
+  POST-MORTEM** banner (still exit 2), because what it asked for before it died
+  is the whole diagnosis. `guest_insns_total` only accrues while the guest is
+  not halted, so a title that dies inside its first frame reads 0 however much
+  it did first — `darkforces` reads 0 with 67 recorded events.
+
+When you see a refusal, re-measure with the rings against a build without the
+accumulator: `probe.py --dos-log --io-log --watch …` answers the same question
+and costs no RAM_EMU.
 
 **The report leads with what we did NOT answer**, then with the hardware we
 answered *absent*, and only then lists everything that worked. The column that
