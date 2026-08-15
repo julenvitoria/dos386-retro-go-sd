@@ -211,8 +211,18 @@ X86_DSK_OPEN_PER_CALL ?= 0
 # it WOLF3D goes back to never probing 0x22x.
 X86_ISA_IO_TICKS ?= 1
 
+# HOST-SIDE AUDIO PARTITION TEST. 1 replaces every emulated source with a
+# 440 Hz square wave written straight into the firmware's DMA half-buffer, so
+# what reaches the speaker depends on NOTHING in the SB/speaker model. Audible
+# = the host chain (odroid_audio_init -> audio_start_playing -> SAI DMA ->
+# amplifier -> volume) is sound and any silence is the guest's. Silent = the
+# bug is entirely host-side and no amount of DMA-engine work can be heard.
+# Measurement only, never shipped at 1.
+X86_AUDIO_TONE ?= 0
+
 CORE_C_DEFS := \
 -DX86_ISA_IO_TICKS=$(X86_ISA_IO_TICKS)u \
+-DX86_AUDIO_TONE=$(X86_AUDIO_TONE) \
 -DX86_MODEY_EXTRA_PAGES=$(X86_MODEY_EXTRA_PAGES) \
 -DX86_PGF_BENCH=$(X86_PGF_BENCH) \
 -DX86_DSK_OPEN_PER_CALL=$(X86_DSK_OPEN_PER_CALL) \

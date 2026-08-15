@@ -1824,7 +1824,7 @@ static void sound_test_run(void)
 #define SBD_RATE    48000u
 
 volatile uint32_t run_sbdma_flag = 0;
-volatile uint32_t sbd_r[24];
+volatile uint32_t sbd_r[28];
 /* The first 64 rendered samples, PACKED TWO PER WORD. This harness has a few
    hundred bytes of RAM_EMU and an int32 per sample overflows the region -- see
    TEST.ld. Low half is the even sample. */
@@ -1874,6 +1874,27 @@ static const uint8_t sbdma_code[] = {
     0x24, 0xDF,                   /* AND AL,DFh                            */
     0xE6, 0x21,                   /* OUT 21h,AL                            */
     0xFB,                         /* STI                                   */
+    /* -- DSP F2h: ASK FOR AN IRQ WITH NO TRANSFER BEHIND IT.
+          This is how a driver finds which vector the card is wired to, and it
+          is a LATENCY test, not just a delivery test: the window below is TEN
+          iterations of a five-instruction loop, about the few hundred
+          microseconds a real detect routine allows before it re-masks the
+          line. The host loop under this harness only offers IRQ 5 when the
+          interpreter EXITS (every 1,200 PIT ticks), so an F2 that is merely
+          queued for the next slice boundary CANNOT be seen here -- which is
+          the point. PRINCE OF PERSIA's entire DSP conversation is E0 E0 E1 F2
+          and then silence, because the answer arrived after it had given up. */
+    0xBA, 0x2C, 0x02,             /* MOV DX,022Ch                          */
+    0xB0, 0xF2, 0xEE,             /* MOV AL,F2h / OUT DX,AL                */
+    0xB9, 0x0A, 0x00,             /* MOV CX,10       the SHORT window      */
+    0xA0, 0x08, 0x33,             /* f2w: MOV AL,[3308h]  the ISR's count  */
+    0x84, 0xC0,                   /*      TEST AL,AL                       */
+    0x75, 0x02,                   /*      JNZ f2done                       */
+    0xE2, 0xF7,                   /*      LOOP f2w                         */
+    0x89, 0x0E, 0x11, 0x33,       /* f2done: MOV [3311h],CX  polls left    */
+    0xA0, 0x08, 0x33,             /* MOV AL,[3308h]                        */
+    0xA2, 0x10, 0x33,             /* MOV [3310h],AL   the ISR entry count  */
+    0xC6, 0x06, 0x08, 0x33, 0x00, /* MOV BYTE [3308h],0  rearm for the DMA */
     /* -- program 8237 channel 1 for a 256-byte read at 0:4000 ------------ */
     0xB0, 0x05, 0xE6, 0x0A,       /* MOV AL,05h / OUT 0Ah,AL   mask ch1    */
     0xB0, 0x00, 0xE6, 0x0C,       /* MOV AL,00h / OUT 0Ch,AL   clear ff    */
@@ -1997,6 +2018,11 @@ static void sbdma_test_run(void)
     sbd_r[7]  = test_ram[SBD_RES + 11];                 /* mixer 0x82      */
     sbd_r[8]  = test_ram[SBD_RES + 12];                 /* mixer 0x80      */
     sbd_r[9]  = test_ram[SBD_RES + 13];                 /* mixer 0x81      */
+    sbd_r[24] = test_ram[SBD_RES + 0x10];               /* F2: ISR count   */
+    sbd_r[25] = (uint32_t)(test_ram[SBD_RES + 0x11] |
+                           (test_ram[SBD_RES + 0x12] << 8)); /* polls left */
+    sbd_r[26] = x86_sb_irq_requests;
+    sbd_r[27] = x86_sb_cmds_unknown;
     sbd_r[10] = x86_sb_starts;
     sbd_r[11] = x86_sb_blocks;
     sbd_r[12] = x86_sb_dma_bytes;

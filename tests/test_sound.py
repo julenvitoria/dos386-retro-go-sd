@@ -88,11 +88,12 @@ def playback(args, runner):
         print("FAIL: the playback arm never completed")
         return False
 
-    r = [b.read_uint32(syms["sbd_r"] + 4 * i) for i in range(24)]
+    r = [b.read_uint32(syms["sbd_r"] + 4 * i) for i in range(28)]
     (aa, major, minor, polls_left, isr_count, dma_status, dsp_stat,
      mix82, mix80, mix81, starts, blocks, dma_bytes, samples, irqs,
      delivered, acked, eois, underruns, rate, maps, guard, captured,
-     reason) = r
+     reason) = r[0:24]
+    f2_isr, f2_polls, f2_requests, f2_unknown = r[24:28]
     # Packed two samples per word: this harness has no RAM_EMU to spare.
     pcm = []
     for i in range(32):
@@ -117,6 +118,8 @@ def playback(args, runner):
     print(f"audio      {samples} samples rendered, underruns {underruns}, "
           f"first 64 captured {captured}")
     print(f"           " + " ".join(f"{v:6d}" for v in pcm[:16]))
+    print(f"DSP F2h    ISR entered {f2_isr}x with {f2_polls} of 10 polls left"
+          f"   irq_requests {f2_requests}  cmds_unknown {f2_unknown}")
     print(f"host loop  {guard} iterations, exit reason {reason} (6 = HLT)")
 
     ok = True
@@ -125,6 +128,26 @@ def playback(args, runner):
         nonlocal ok
         print("FAIL: " + msg)
         ok = False
+
+    # ---- DSP F2h: THE IRQ A DRIVER ASKS FOR, AND HOW FAST -------------
+    if f2_unknown:
+        fail(f"the DSP counted {f2_unknown} UNKNOWN commands. F2h is a real "
+             f"SB command -- request an 8-bit interrupt -- and answering "
+             f"'unknown' is what makes a driver conclude the card's IRQ is "
+             f"dead and fall back to the PC speaker")
+    if f2_requests != 1:
+        fail(f"x86_sb_irq_requests is {f2_requests}, expected 1: the F2h "
+             f"command was not recognised as an IRQ request at all")
+    if f2_isr != 1:
+        fail(f"the guest's IRQ 5 handler ran {f2_isr} times after F2h, "
+             f"expected exactly 1. THIS IS A LATENCY TEST: the window is ten "
+             f"iterations, and this harness offers the interrupt from its host "
+             f"loop only every 1,200 PIT ticks, so an F2h whose interrupt is "
+             f"merely QUEUED for the next slice boundary cannot arrive in "
+             f"time -- which is precisely how a real detect routine misses it")
+    if f2_polls == 0:
+        fail("the F2h wait ran its whole ten-iteration window without the "
+             "handler running -- the interrupt was late, not absent")
 
     # ---- identity: 4.05 is a PROMISE, and the rest of this arm is it ----
     if aa != 0xAA:
@@ -389,6 +412,19 @@ MUTATE_RATE = ("    uint32_t step = (uint32_t)(((uint64_t)sbp.rate << 16) "
                "/ sample_rate);\n")
 MUTATE_RATE_TO = "    uint32_t step = 0x10000u;\n"
 
+# THE F2h IRQ REQUEST ITSELF. Without it the command falls through to default
+# and is counted unknown, which is the state PRINCE OF PERSIA meets today.
+MUTATE_F2 = """    case 0xF2:
+    case 0xF3: {"""
+MUTATE_F2_TO = """    case 0xF2u & 0u:              /* never matches 0xF2 */
+    case 0xF3u & 1u: {"""
+
+# THE IMMEDIATE DELIVERY, and NOT the assert. Every counter stays green -- the
+# line is raised, the kind bits are right, the request is counted -- and only
+# the guest's ten-iteration window catches that it arrived too late.
+MUTATE_F2_NOW = "            x86_pit_counter_forced(1);\n        break;\n    }\n"
+MUTATE_F2_NOW_TO = "            (void)0;\n        break;\n    }\n"
+
 
 def _mutate_and_require_failure(args, target, what, replacement=""):
     import pathlib
@@ -403,7 +439,8 @@ def _mutate_and_require_failure(args, target, what, replacement=""):
         verb = "REPLACED" if replacement else "DELETED"
         print(f"-- negative control: rebuilt with {what} {verb} --")
         for a in ("negative", "negative_opl", "negative_tc",
-                  "negative_irq", "negative_rate"):
+                  "negative_irq", "negative_rate", "negative_f2",
+                  "negative_f2_now"):
             setattr(args, a, False)
         failed = not main(args)
     finally:
@@ -430,6 +467,12 @@ if __name__ == "__main__":
                    help="rebuild with IRQ 5 delivery deleted")
     p.add_argument("--negative-rate", action="store_true",
                    help="rebuild with the resampler step forced to 1:1")
+    p.add_argument("--negative-f2", action="store_true",
+                   help="rebuild with the DSP's F2h IRQ request removed")
+    p.add_argument("--negative-f2-now", action="store_true",
+                   help="rebuild with F2h's IMMEDIATE delivery removed -- the "
+                        "line is still asserted, so every counter stays green "
+                        "and only the guest's short window catches it")
     args = p.parse_args()
     if args.negative:
         sys.exit(0 if _mutate_and_require_failure(
@@ -446,4 +489,12 @@ if __name__ == "__main__":
     if args.negative_rate:
         sys.exit(0 if _mutate_and_require_failure(
             args, MUTATE_RATE, "the RESAMPLER STEP", MUTATE_RATE_TO) else 1)
+    if args.negative_f2:
+        sys.exit(0 if _mutate_and_require_failure(
+            args, MUTATE_F2, "the DSP's F2h IRQ REQUEST",
+            MUTATE_F2_TO) else 1)
+    if args.negative_f2_now:
+        sys.exit(0 if _mutate_and_require_failure(
+            args, MUTATE_F2_NOW, "F2h's IMMEDIATE DELIVERY",
+            MUTATE_F2_NOW_TO) else 1)
     sys.exit(0 if main(args) else 1)

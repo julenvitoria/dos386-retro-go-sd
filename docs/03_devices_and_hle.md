@@ -262,10 +262,79 @@ keeping because they are the cheap ones anyone would reach for:
   Sound Blaster digitised sound. `ReadConfig()` downgrades `sds` to `sds_Off`
   when `SoundBlasterPresent` is false, which is what was happening.
 
-**Still not observed: a transfer.** `x86_sb_starts` is 0 across 50 s of
-hardware gameplay. Detection is not playback, and WL1 reaches its digitised
-sounds only for the events that have them; that is the next thing to grade, and
-it is separate from this.
+**WOLF3D still does not start a transfer, and the reason is now NAMED rather
+than suspected.** `x86_sb_cmd_hist_lo`/`_hi` record the last eight DSP command
+bytes, and across a full gameplay run WOLF3D's ENTIRE conversation with the
+card is **`D1 40`** -- speaker on, then a time constant that comes back out as
+`x86_sb_rate` = **7042 Hz**, i.e. `256 - 1000000/7000`, which is `SDL_StartSB()`
+and its 7,000 Hz `SBSampleRate` exactly. And `x86_dma_writes` is **0**: the
+8237 is never touched. So the driver is fully initialised and armed, and
+`SDL_SBPlaySeg()` -- which programs channel 1 and issues `14h` -- is never
+called. Nothing between the port and the speaker is implicated; the title never
+asks. The remaining question is upstream of the card entirely (`DigiMap` /
+`NumDigi`, i.e. `SDL_SetupDigi()` and the VSWAP sound pages), and it is a
+WOLF3D question, not a Sound Blaster one.
+
+### 4e-bis. `F2h` -- THE IRQ A DRIVER ASKS FOR, AND HOW LATE IT ARRIVED
+
+**PRINCE OF PERSIA now plays digitised sound on silicon**, and the whole fix
+was one command and its timing.
+
+Its entire DSP conversation used to be `E0 E0 E1 F2` and then nothing, ever
+again. `F2h` is "assert the 8-bit interrupt, with no transfer behind it" --
+how a driver FINDS which vector the card is wired to. We answered `unknown`
+(`x86_sb_cmds_unknown` = 1), so the line never rose, so PoP concluded the
+card's interrupt was dead and fell back to the PC speaker.
+
+Implementing it was not enough, and the second half is the interesting one.
+`x86_sb_irqs_delivered` stayed **0** while `x86_sb_irqs_masked` climbed past
+68,000: the assert was queued for the frame loop's retry at the next sub-slice
+boundary, thousands of guest instructions away, and PoP had unmasked IRQ 5,
+sent `F2h`, spun a short delay and RE-MASKED long before that. `x86_pic_imr_ever`
+(every value written to 0x21, ANDed) reads **0x10**, which proves the unmask
+happened -- without it, "never delivered" and "never unmasked" are the same
+number.
+
+So `F2h` is delivered AT THE PORT WRITE. One catch, and it is the reserved-
+register contract: `x86_sb_raise_irq()` drops `pit_counter` to arm the next
+instruction boundary only `if (cpu->eflags & 0x200)`, and **`cpu->eflags` is
+stale inside a slice** -- IF lives in `R11`. The check that matters is
+`.handle_pit_or_irq`'s own `TST R11, #(1<<9)`, so the boundary is armed
+unconditionally and the interpreter decides; being wrong costs one early timer
+exit, once per `F2h`.
+
+MEASURED ON SILICON, PRINCE OF PERSIA, 36 s: `x86_sb_starts` **0 -> 18**,
+`x86_sb_cmds` 4 -> 42 (`D1 D1 40 14`, then `40 14` repeating -- set rate,
+single-cycle 8-bit playback), `x86_sb_samples` **92,981**, `x86_sb_underruns`
+**0**, rates 8,264 and 11,111 Hz, and `x86_audio_peak_max` **991** where it had
+been 0 for the card. `tests/test_sound.py` grades both halves and
+`--negative-f2` / `--negative-f2-now` are the controls; the second leaves every
+counter green and is caught only by the guest's ten-iteration window.
+
+### 4e-ter. THE HOST CHAIN WAS NEVER THE BUG, AND IT WAS 12 dB TOO QUIET
+
+`x86_audio_submits` / `_peak_last` / `_peak_max` / `_volume` (src/main.c) close
+the half of this that had never been checked: one buffer submitted per frame,
+the loudest sample in it, and the launcher's own volume. Measured at tier 2 on
+stock master with WOLF3D: `submits` climbed in step with `frames_rendered`,
+the firmware's `dma_counter` climbed with it -- and `peak_max` was **0**. The
+chain runs; it was being handed silence. `X86_AUDIO_TONE=1` is the standalone
+partition (a 440 Hz square straight into the half-buffer, every emulated source
+bypassed).
+
+What that instrument then caught is an amplitude bug worth 12 dB:
+
+* `common_emu_sound_get_volume()` returns `volume_tbl[level]`, which is
+  ALREADY a fraction of full scale, and the launcher's default level is 4 of 9
+  = **31**. Scaling it again by `>> 11` gave 31/2048 = **1.5% of full scale**.
+  tama's `main_tama.c` uses `>> 10` with the comment "adjust max volume to 25%
+  as 100% is REALLY, REALLY loud" and is the core that documented the choice.
+  Now `>> 10`.
+* The Sound Blaster was then halved AGAIN, to keep a beep audible under the
+  music. **There is no music** -- FM is not built (4f) -- so that was 6 dB paid
+  for a collision that cannot happen. Gone.
+
+Peak on silicon for the same PoP workload: **248 -> 991**.
 
 ### 4f. What is STILL not here: FM synthesis, and what it would take
 
