@@ -231,6 +231,19 @@ static uint8_t *dtcm_aperture;
 /* Host-readable so a failure to place either block is visible rather than a
    black screen. */
 volatile uint32_t guest_ram_bytes = 0;
+/* THE POOL IS SIZED AT RUNTIME, SO ITS SIZE IS A MEASUREMENT.
+ *
+ * guest_ram is the last big claim out of RAM_EMU, so it is what any growth in
+ * the core -- an instrument's .bss above all -- comes out of. Publishing the
+ * three numbers is what turns "the guest silently never ran" into a reading:
+ *   guest_ram_pages        frames the pager actually got (160 = full 640 KB)
+ *   guest_ram_pages_short  how many it did NOT get. NON-ZERO IS THE ALARM.
+ *   guest_ram_free_at_claim RAM_EMU free bytes at the moment of the claim.
+ * A short pool still runs -- it pages -- but nothing that reads a counter off
+ * this build may treat it as equivalent to the shipping one. */
+volatile uint32_t guest_ram_pages = 0;
+volatile uint32_t guest_ram_pages_short = 0;
+volatile uint32_t guest_ram_free_at_claim = 0;
 volatile uint32_t guest_vram_ok = 0;
 volatile uint32_t upper_filler_ok = 0;   /* 0xA0000-0xFFFFF backed at all */
 /* Both allocations that can fail QUIETLY and cost a whole feature. The VGA
@@ -934,7 +947,8 @@ static void run_benchmark(void)
        16-bit code segment, which is now genuinely different. */
     cpu_state_ptr->segs[1].flags |= X86_DESC_D_FLAG;
 
-    memset(guest_ram, 0, GUEST_RAM_SIZE);
+    /* guest_ram_bytes, not GUEST_RAM_SIZE: the pool is sized at runtime. */
+    memset(guest_ram, 0, guest_ram_bytes);
     guest_ram[0] = 0x48;   /* DEC EAX      */
     guest_ram[1] = 0x75;   /* JNZ  -3      */
     guest_ram[2] = 0xFD;
@@ -946,7 +960,7 @@ static void run_benchmark(void)
     for (uint32_t i = 0; i < FOLD_ENTRIES; i++) {
         guest_page_table_ptr[i] = FOLD_INVALID;
     }
-    for (uint32_t i = 0; i < GUEST_RAM_SIZE / 4096u; i++) {
+    for (uint32_t i = 0; i < guest_ram_pages; i++) {
         guest_page_table_ptr[i] = FOLD_K((uint32_t)guest_ram + i * 4096, i);
     }
 
@@ -1080,27 +1094,61 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
        ~660 KB in it. That left us 488 bytes short and guest_ram came back NULL:
        core_ready 0, black screen, no error. So PAY ONLY THE REAL PADDING: one
        1-byte probe reveals where the bump pointer is, and the pad after it is
-       whatever alignment actually costs (792 bytes as measured, not 4,096). */
+       whatever alignment actually costs (792 bytes as measured, not 4,096).
+
+       AND IT IS NOW SIZED TO WHAT IS THERE, NOT TO WHAT WE WANT.
+       ------------------------------------------------------------------
+       All-or-nothing was the second half of the same bug. Any instrument that
+       adds a few kilobytes of RAM_EMU .bss -- X86_PROBE=1 costs ~2.8 KB --
+       pushes this, the LAST claim in the pool, past the free space. The
+       full-size request then returned NULL, x86_pg_frames_total was 0, every
+       guest access was X86_EXIT_MEM_FAULT and the guest halted before its
+       first instruction, while core_dtcm_ok, pgf_result and x86_xms_total_kb
+       all still read healthy. probe_report.py duly reported "every service
+       this title touched was answered" about a guest that had never run.
+
+       So ASK how much is free and take what fits. A pool one frame short of
+       160 is an honest, measurable degradation -- the pager evicts to the
+       pagefile, which is what it is for. ZERO frames is a lie. The shortfall
+       is published in guest_ram_pages_short, which is the number to read when
+       an instrumented build behaves differently from the shipping one.
+
+       GW_MEM_OP_FREE_SIZE is documented "RAM only today" and RAM is exactly
+       the pool this claim comes from, so it is answerable here (unlike DTCM).
+       A zero answer from an older firmware falls through to asking for the
+       full size -- i.e. precisely the old behaviour. */
     {
         uint8_t *probe = (uint8_t *)abi->mem_ctl(GW_MEM_OP_ALLOC,
                                                  GW_MEM_RAM, 1, 1);
         uint8_t *raw = NULL;
+        uint32_t pages = GUEST_RAM_SIZE / 4096u;
         if (probe) {
             /* ram_malloc() rounds its bump up to 4, so the next block starts
                here; pad that up to the frame boundary and take it. */
             uint32_t next = ((uint32_t)(uintptr_t)probe + 1u + 3u) & ~3u;
             uint32_t pad  = (0u - next) & 4095u;
-            if (!pad || abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM, 1, pad))
-                raw = (uint8_t *)abi->mem_ctl(
-                    GW_MEM_OP_ALLOC, GW_MEM_RAM, 1,
-                    X86_PG_POOL_BYTES(GUEST_RAM_SIZE / 4096u));
+            if (!pad || abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM, 1, pad)) {
+                /* Read AFTER the pad, so it is the space this request can
+                   really have rather than an over-estimate by up to a frame. */
+                uint32_t freeb = (uint32_t)abi->mem_ctl(GW_MEM_OP_FREE_SIZE,
+                                                        GW_MEM_RAM, 0, 0);
+                guest_ram_free_at_claim = freeb;
+                if (freeb && freeb < X86_PG_POOL_BYTES(pages))
+                    pages = freeb / X86_PG_STRIDE;
+                if (pages)
+                    raw = (uint8_t *)abi->mem_ctl(
+                        GW_MEM_OP_ALLOC, GW_MEM_RAM, 1,
+                        X86_PG_POOL_BYTES(pages));
+            }
         }
         /* The align-up is a no-op when the pad worked and the only recovery
            when it did not, so it stays. */
         guest_ram = raw ? (uint8_t *)(((uint32_t)(uintptr_t)raw + 4095u)
                                       & ~4095u) : NULL;
+        guest_ram_pages = guest_ram ? pages : 0;
+        guest_ram_pages_short = (GUEST_RAM_SIZE / 4096u) - guest_ram_pages;
     }
-    guest_ram_bytes = guest_ram ? GUEST_RAM_SIZE : 0;
+    guest_ram_bytes = guest_ram_pages * 4096u;
 
     /* The open-bus filler comes from the BONUS POOL, not from RAM_EMU.
      *
@@ -1852,8 +1900,10 @@ static void guest_reset(void)
            guest space plus the eight the seam writes into (x86_pager.h). Handing
            this GUEST_RAM_SIZE would yield 159 frames for 160 pages and quietly
            turn a pool that cannot evict into one that must. */
-        x86_pager_add_frames(guest_ram,
-                             X86_PG_POOL_BYTES(GUEST_RAM_SIZE / 4096u));
+        /* guest_ram_pages, NOT GUEST_RAM_SIZE/4096: the pool is sized to the
+           RAM_EMU that was actually free (see the claim). Handing this the
+           nominal count would describe frames that do not exist. */
+        x86_pager_add_frames(guest_ram, X86_PG_POOL_BYTES(guest_ram_pages));
     /*
      * The FILE tier. Without this call there is no backing store at all: the
      * victim picker may then only ever evict a page it can DROP, donation is
@@ -2328,6 +2378,14 @@ static void nor_snapshot_run(void)
     /* Only now, and x86_nor_attach() still reads the flash back and compares
        it byte for byte before it touches the fold table. If anything above was
        wrong the guest is still running, unchanged, out of AXI. */
+    /* The COW pool x86_nor_attach() takes over is the AXI block itself, so it
+       must BE GUEST_RAM_SIZE bytes. A runtime-shortened pool (see the claim)
+       is not, and handing it the nominal size would walk off the end. Refuse,
+       loudly, rather than attach to memory we do not own. */
+    if (guest_ram_pages != GUEST_RAM_SIZE / 4096u) {
+        nor_snap_result = NOR_SNAP_NO_RAM;
+        return;
+    }
     if (x86_nor_attach(xip, size, guest_ram, GUEST_RAM_SIZE, 0) != 0) {
         nor_snap_result = NOR_SNAP_ATTACH;
         return;

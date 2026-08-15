@@ -115,6 +115,24 @@ X86_VPROF ?= 0
 # builds with it and prints the measured link delta in every report.
 X86_PROBE ?= 0
 
+# How many distinct (kind, id, AH, sub) keys the accumulator holds. 128 keys is
+# 2,848 B of RAM_EMU .bss all in; the busiest title measured here claimed 60.
+#
+# THIS IS A KNOB BECAUSE THE POOL IT COMES OUT OF IS EXACTLY FULL. MEASURED:
+# RAM_EMU has 655,360 B free at the guest_ram claim with the accumulator in,
+# and the 160-frame pool wants 656,640 (stride 4,104, not 4,096) -- 1,280 B
+# short, i.e. ONE FRAME. The core no longer turns that into zero frames (it
+# sizes the claim to the free space and publishes guest_ram_pages_short), and
+# 159 frames measured x86_pg_evictions=0 on WOLF3D, so the default is to keep
+# all 128 keys and pay the frame.
+#
+# X86_PROBE_ENTS=64 saves exactly 1,280 B and buys the 160th frame back, for
+# titles where the pager is the thing under investigation. It is not the
+# default because 64 keys is close to the 60 a real title used, and the
+# accumulator SATURATES: the report says how many keys it refused, but a
+# refused key is a question you cannot see the title asking.
+X86_PROBE_ENTS ?= 128
+
 # CS / interrupt-vector trace rings (x86_cs_log, x86_int_vec_log). Diagnostic,
 # and they live inside L(SET_SREG) -- the path EVERY far CALL, RETF, IRET and
 # interrupt takes. See the Makefile for the measured cost. Off by default;
@@ -161,6 +179,7 @@ CORE_C_DEFS := \
 -DX86_ZONES=$(X86_ZONES) \
 -DX86_VPROF=$(X86_VPROF) \
 -DX86_PROBE=$(X86_PROBE) \
+-DX86_PROBE_ENTS=$(X86_PROBE_ENTS) \
 -DX86_CS_LOG=$(X86_CS_LOG) \
 -DX86_TEXT_AA=$(X86_TEXT_AA) \
 -DX86_TEXT_BILEVEL_FONT=$(X86_TEXT_BILEVEL_FONT) \

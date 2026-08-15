@@ -232,7 +232,104 @@ CONTEXT = ["core_ready", "core_dtcm_ok", "hle_calls_seen", "x86_hle_calls",
            # the ratio. guest_ticks/guest_uptime_ms must read back as
            # 1193182/guest_tick_divisor.
            "guest_tick_divisor", "x86_pit0_writes", "guest_ticks",
-           "guest_ticks_dropped", "guest_tick_irq_lost", "guest_uptime_ms"]
+           "guest_ticks_dropped", "guest_tick_irq_lost", "guest_uptime_ms",
+           # THE LIVENESS SET. Everything above describes what the guest did;
+           # these four say whether there WAS a guest. x86_pg_frames_total is
+           # the one that catches this instrument killing its own subject: the
+           # accumulator's .bss comes out of RAM_EMU and guest_ram is the last
+           # claim in that pool, so an instrumented build can hand the pager
+           # zero frames. guest_ram_pages_short is the target's own alarm for
+           # a pool that was shortened rather than refused.
+           "x86_pg_frames_total", "guest_ram_pages", "guest_ram_pages_short",
+           "guest_ram_free_at_claim"]
+
+# How long to watch guest_insns_total to decide it is ADVANCING. A guest that
+# halted at instruction 1 has a non-zero count forever, so a single sample
+# cannot tell "running" from "died after the first instruction" -- and that is
+# exactly the state this guard exists to catch.
+LIVENESS_WINDOW_S = 1.5
+
+
+def health(ctx, blk):
+    """-> (fatal, stopped). Fatal reasons refuse the report outright; stopped
+    reasons band it and still print, because the table is the evidence.
+
+    THE TWO STATES ARE NOT THE SAME AND CONFLATING THEM COSTS EITHER WAY.
+
+    A guest that never ran has an EMPTY accumulator, and printing its table is
+    what produced "every service this title touched was answered" about Dark
+    Forces -- true, worthless, and read as a clean bill of health. That is a
+    refusal.
+
+    A guest that ran, asked 67 things and then latched on an unimplemented
+    opcode has a FULL accumulator and guest_insns_total = 0 all the same (the
+    counter only accrues while !guest_halted, src/main.c). Refusing there
+    throws away the only record of what it asked for before it died -- which is
+    precisely what the tool is for. That is a banner, not a refusal.
+
+    Either way the exit status is non-zero: neither is a healthy run.
+    """
+    bad = []
+    stopped = []
+    if not ctx.get("core_ready"):
+        bad.append(f"`core_ready` = {ctx.get('core_ready')} — the core never "
+                   f"finished coming up. `core_dtcm_ok`="
+                   f"{ctx.get('core_dtcm_ok')}, `guest_ram_pages`="
+                   f"{ctx.get('guest_ram_pages')}.")
+    if ctx.get("x86_pg_frames_total") == 0:
+        bad.append("`x86_pg_frames_total` = 0 — the demand pager owns NO "
+                   "frames, so every guest access is X86_EXIT_MEM_FAULT. This "
+                   "is the RAM_EMU exhaustion signature.")
+    if not ctx.get("guest_insns_delta"):
+        why = (f"`guest_insns_total` = {ctx.get('guest_insns_total', 0):,} and "
+               f"did not move over {LIVENESS_WINDOW_S:.1f}s — THE GUEST IS "
+               f"STOPPED (`guest_exit_reason`="
+               f"{ctx.get('guest_exit_reason')}, `guest_halted`="
+               f"{ctx.get('guest_halted')}). Note that counter only accrues "
+               f"while the guest is not halted, so a title that died inside "
+               f"its first frame reads 0 however much it did first.")
+        # Did it ask anything before it stopped? That is what decides whether
+        # there is a report to write at all.
+        if blk.get("calls"):
+            stopped.append(why + f" It recorded {blk['calls']:,} events across "
+                                 f"{blk.get('used', 0)} probes BEFORE it "
+                                 f"stopped, and those are real.")
+        else:
+            bad.append(why + " The accumulator is EMPTY, so it stopped before "
+                             "asking for anything: there is nothing to report.")
+    return bad, stopped
+
+
+def render_void(doc, bad):
+    """The whole report when the run cannot support one. Deliberately short:
+    there is one finding, and burying it under 200 rows of probe table is how
+    this failed silently for three investigations."""
+    m = doc["meta"]
+    ctx = doc["context"]
+    L = [f"# Probe report: {m['title']} on {m['target']} — **REFUSED**", "",
+         f"Generated {m['generated']} by `scripts/probe_report.py`.", "",
+         "## THIS RUN CANNOT BE REPORTED ON. THE GUEST DID NOT RUN.", "",
+         "No probe table is printed, because one would be evidence about "
+         "nothing. An empty \"what we did NOT answer\" section from a dead "
+         "guest means nobody asked anything — not that we answered "
+         "everything.", ""]
+    for b in bad:
+        L.append(f"* {b}")
+    L += ["",
+          "### First suspect: `X86_PROBE=1` itself", "",
+          "The accumulator is ~2.8 KB of RAM_EMU `.bss`, and `guest_ram` is "
+          "the LAST claim out of that pool. The core now sizes that claim to "
+          "the free space instead of taking it all-or-nothing, so a squeezed "
+          "pool shows as `guest_ram_pages_short` > 0 rather than as zero "
+          "frames — check it below. If it IS zero and the guest still did not "
+          "run, the cause is elsewhere: `scripts/probe.py --watch` the "
+          "counters, and re-measure with the rings (`--dos-log`, `--io-log`) "
+          "against a build WITHOUT the accumulator.", "",
+          "| counter | value |", "|---|---:|"]
+    for k, v in sorted(ctx.items()):
+        L.append(f"| `{k}` | {v:,} |")
+    L.append("")
+    return "\n".join(L)
 
 
 def collect(args, title):
@@ -249,6 +346,16 @@ def collect(args, title):
         print(f"  running {settle:.1f}s (probes from the FIRST instruction)")
         time.sleep(settle)
 
+        # LIVENESS, before anything else is read. Two samples of
+        # guest_insns_total across a wall-clock window: a guest that faulted at
+        # its first instruction has a non-zero count that never moves, and a
+        # single sample cannot tell that from a healthy run.
+        insns0 = insns1 = None
+        if "guest_insns_total" in syms:
+            insns0 = target.backend.read_uint32(syms["guest_insns_total"])
+            time.sleep(LIVENESS_WINDOW_S)
+            insns1 = target.backend.read_uint32(syms["guest_insns_total"])
+
         target.backend.halt()
         addr = acc.block_address(target.backend, syms)
         block = acc.read(target.backend, addr)
@@ -259,8 +366,12 @@ def collect(args, title):
                     ctx[n] = target.backend.read_uint32(syms[n])
                 except Exception:
                     pass
+        if insns0 is not None:
+            ctx["guest_insns_delta"] = (insns1 - insns0) & 0xFFFFFFFF
         target.backend.resume()
-        return {"block": block, "context": ctx, "run_s": settle}
+        return {"block": block, "context": ctx,
+                "run_s": settle + (LIVENESS_WINDOW_S if insns0 is not None
+                                   else 0.0)}
     finally:
         target.stop()
 
@@ -308,22 +419,28 @@ def render(doc):
     # machine. This report then printed "Nothing. Every service and port this
     # title touched was answered", which is TRUE and completely misleading.
     # Measured on Dark Forces and reproduced on WOLF3D as a control.
-    if not ctx.get("core_ready") or not ctx.get("guest_insns_total"):
-        a("> # THIS REPORT IS VOID -- THE GUEST NEVER RAN.")
+    # The liveness banner that used to live here is now a REFUSAL: health()
+    # gates render() entirely and render_void() is what a dead run produces.
+    # One source of truth -- a banner above a full table was still read as a
+    # report, which is how this failed three times.
+    if doc.get("stopped"):
+        a("> # THE GUEST IS STOPPED. THIS IS A POST-MORTEM.")
         a(">")
-        a(f"> `core_ready`={ctx.get('core_ready')}, "
-          f"`guest_insns_total`={ctx.get('guest_insns_total')}, "
-          f"`guest_exit_reason`={ctx.get('guest_exit_reason')}. Nothing below "
-          "is evidence about this title -- an empty 'what we did NOT answer' "
-          "section here means nobody asked anything, not that we answered "
-          "everything.")
+        for s in doc["stopped"]:
+            a(f"> {s}")
         a(">")
-        a("> **First suspect: `X86_PROBE=1` itself.** It costs ~3.5 KB of "
-          "RAM_EMU and `guest_ram` is the last claim out of that pool, so the "
-          "instrumented build can take the pager's frames to zero. Check "
-          "`x86_pg_frames_total` with `scripts/probe.py` -- a 0 there is this "
-          "failure -- and re-measure with the rings (`--dos-log`, `--io-log`, "
-          "`--watch`) against a build WITHOUT the accumulator.")
+        a("> Everything below is what it asked for BEFORE it stopped, which is "
+          "the useful part -- but it is not a picture of the title running, "
+          "and the last rows are where it died, not where it settled.")
+        a("")
+
+    if ctx.get("guest_ram_pages_short"):
+        a(f"> **THE GUEST RAM POOL IS {ctx['guest_ram_pages_short']} FRAMES "
+          f"SHORT** ({ctx.get('guest_ram_pages')} of 160). RAM_EMU could not "
+          f"fund the whole pool -- the accumulator's own `.bss` is the usual "
+          f"reason -- so this guest pages more than the shipping build does. "
+          f"The COUNTS below are still the guest's own; anything about "
+          f"TIMING or memory pressure is not comparable to a shipping run.")
         a("")
 
     if blk.get("never_ran"):
@@ -339,7 +456,13 @@ def render(doc):
     # ---- lead with the answer -------------------------------------------
     a("## What we did NOT answer")
     a("")
-    if not actionable:
+    if not actionable and doc.get("stopped"):
+        a("Nothing — of what it ASKED. Read that against the banner above: "
+          "this guest stopped, so it died on something it did not ask us for "
+          "at all (an unimplemented opcode, a fault, a wall it hit directly). "
+          "The absence of an unanswered probe is not the absence of a "
+          "problem here; it narrows where the problem is.")
+    elif not actionable:
         a("Nothing. Every service and port this title touched was answered by "
           "a handler the expectations table has vetted. That is a strong "
           "statement and it is worth distrusting once: check that the run "
@@ -635,7 +758,12 @@ def main():
     base = args.out or os.path.join(
         OUT_DIR, f"probe_{name}_{doc['meta']['target']}")
     os.makedirs(os.path.dirname(base) or ".", exist_ok=True)
-    md = render(doc)
+    # THE GUARD. It runs before render(), and it EXITS NON-ZERO -- a caller
+    # scripting this must not be able to treat a dead guest as a clean result.
+    bad, stopped = health(r["context"], blk)
+    doc["void"] = bad
+    doc["stopped"] = stopped
+    md = render_void(doc, bad) if bad else render(doc)
     with open(base + ".md", "w") as fh:
         fh.write(md + "\n")
     with open(base + ".json", "w") as fh:
@@ -644,7 +772,16 @@ def main():
     print("")
     print(md)
     print(f"\nwrote {base}.md and {base}.json")
-    return 0
+    if bad:
+        sys.stderr.write("\nprobe_report: REFUSED to report -- the guest did "
+                         "not run:\n")
+    elif stopped:
+        sys.stderr.write("\nprobe_report: the table is real but THE GUEST IS "
+                         "STOPPED -- read it as a post-mortem, not as a "
+                         "steady state:\n")
+    for b in bad + stopped:
+        sys.stderr.write("  * " + b.replace("`", "") + "\n")
+    return 2 if (bad or stopped) else 0
 
 
 if __name__ == "__main__":
