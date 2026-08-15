@@ -101,11 +101,19 @@ Also live here, measured and sized, unblocked whenever a slot frees:
    four 16 KB windows at `E000:0000` must be folded and pinned on map / released
    on unmap. Logical pages are pager pages at linear 4 MB. Advertises 1024 KB,
    **0 with no pagefile**. `tests/test_ems.py`, `x86_ems.h`.
-3. **INT 21h AH=4Bh EXEC** — THE NEXT BLOCKER, and it is not protected mode.
-   `x86_dos_exec()` already loads the FIRST program; this is the same work made
-   re-entrant: allocate an MCB block, build the child PSP with a parent link,
-   load and relocate, stack the parent's registers, restore them on the child's
-   AH=4Ch. Nothing here needs a descriptor.
+3. ~~**INT 21h AH=4Bh EXEC**~~ — BUILT (AL=00; AL=01/03 refused loudly), and
+   **OFF in the shipping core** (`X86_DOS_EXEC`, `Makefile.core`). Shares
+   `dos_load_mz()` with the first program; the parent resumes through its OWN
+   stacked INT 21h frame, so the stub's IRET is the only transfer. Real parent
+   and child in `tests/test_dos.py`, three negative controls seen to fail.
+   **WHY IT IS OFF: WOLF3D CALLS AH=4Bh AL=00 WITH A LOADABLE IMAGE** and
+   honouring it kills it — `guest_insns_total`=0, `guest_exit_reason`=**5
+   (MEM_FAULT)**, golden gate: no picture. Bisected at tier 2: refusing first
+   PASSES, doing the LOAD then undoing it FAILS, and the old AX=0001 on a
+   failed load still FAILS — so the load SUCCEEDS and it is the load that
+   kills. **EXEC's blocker is MEMORY, not DOS semantics**: ~30 untouched guest
+   pages, mid-run, with the pool already full. Queue A, and it gates the flag.
+
 4. **DPMI** (INT 2Fh AX=1687h, INT 31h) — needs 1 and the descriptor walk from
    5. This is what DOS/4GW actually asks for; VCPI is the fallback it tries
    first. **INT 2Fh answers only AX=43xx today**, so 1687h and DE00h both
@@ -147,6 +155,12 @@ Also live here, measured and sized, unblocked whenever a slot frees:
    `x86_xms_detects`=0, `x86_ems_device_opens`=0, and no INT 2Fh 1687h/DE00h.
    Its only memory refusal is `AH=4Ah` grow-past-a-neighbour returning error 8,
    which is real DOS semantics (A1).
+
+**The Dark Forces re-measure after EXEC is NOT DONE, and the reason is
+tooling**: `probe_report.py` reports `core_ready`=0 / `guest_insns_total`=0 for
+`darkforces` AND `wolf3d` — the `X86_PROBE=1` RAM_EMU trap in `CLAUDE.md`,
+VERIFIED ON MASTER with this branch stashed. There is no working "what did it
+ask for" instrument until that is fixed.
 
 **Measure at each step, not at the end.** Twice now this chain has been judged
 on an artefact: first a 640 KB denominator that existed only because no

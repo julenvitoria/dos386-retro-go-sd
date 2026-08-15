@@ -1320,8 +1320,13 @@ zero). Needs `pip install unicorn`; it SKIPs cleanly without it.
 python3 tests/test_benchmark.py
 python3 tests/test_game.py
 python3 tests/test_dos.py                # MCB arena, walked from the host, plus
-python3 tests/test_dos.py --negative     # 4 controls: rollback, largest,
-                                         # coalesce, owner -- each rebuilds
+python3 tests/test_dos.py --negative     # 7 controls: rollback, largest,
+                                         # coalesce, owner, and the three EXEC
+                                         # ones -- pspparent (the child's
+                                         # PSP:0016 link zeroed), reloc (the MZ
+                                         # relocation table not applied) and
+                                         # resume (the parent's registers not
+                                         # restored) -- each rebuilds
                                          # x86_dos.c with ONE fix mutated back
                                          # to its defective form and requires a
                                          # FAIL; source restored in a finally.
@@ -1356,6 +1361,26 @@ python3 tests/test_dos.py --negative     # 4 controls: rollback, largest,
                                          # cannot see corruption that depends
                                          # on 4 KB granule alignment; that
                                          # class still needs a picture.
+                                         # ALSO the EXEC arm (INT 21h AH=4Bh):
+                                         # a real PARENT.EXE the test builds
+                                         # EXECs a real CHILD.EXE, and every
+                                         # claim is a byte one of them wrote.
+                                         # The child reports its own PSP, the
+                                         # PARENT LINK at PSP:0016, its
+                                         # environment segment and the word its
+                                         # RELOCATION entry fixed up, then exits
+                                         # with a code the RESUMED parent reads
+                                         # back with AH=4Dh. The parent also
+                                         # reports the FLAGS, DS, SP and BP it
+                                         # came back with -- the child's stack
+                                         # and BP are deliberately unlike the
+                                         # parent's, or a core that restores
+                                         # nothing still lands on a plausible
+                                         # frame. Needs X86_DOS_EXEC=1, the
+                                         # default everywhere EXCEPT the
+                                         # shipping core (Makefile.core sets 0;
+                                         # honouring AH=4Bh kills WOLF3D --
+                                         # see the flag's comment there).
 python3 tests/test_pit.py                # PIT channel 0 -- the SYSTEM TIMER's
                                          # divisor -- programmed by GUEST OUTs:
                                          # the real Wolf3D sequence (0x214B =

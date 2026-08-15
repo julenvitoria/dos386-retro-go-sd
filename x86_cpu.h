@@ -534,6 +534,17 @@ int x86_kb_peek(uint16_t *key);
 int x86_bios_time(uint8_t func);
 int x86_dos_int21(uint8_t func);
 int x86_dos_terminate(void);
+/* Terminate with a return code, which AH=4Dh reports to the parent. Plain
+   x86_dos_terminate() is this with code 0 -- what INT 20h and AH=00h mean. */
+int x86_dos_terminate_code(uint16_t code);
+/* EXEC (AH=4Bh) counters. "Did the EXEC happen at all" is the first question
+   asked of any run that gets this far, and it must be answerable from the host
+   without a trace. x86_dos_exec_last_err carries the DOS error of the last
+   refusal, or 0x1xx for an unimplemented SUBfunction (AL). */
+extern volatile uint32_t x86_dos_execs;
+extern volatile uint32_t x86_dos_exec_fails;
+extern volatile uint32_t x86_dos_exec_depth_max;
+extern volatile uint32_t x86_dos_exec_last_err;
 void x86_dos_arena_init(void);
 void x86_disk_set_memory(const void *base, uint32_t bytes);
 void x86_disk_set_reader(int (*rd)(void *, void *, uint32_t, uint32_t),
