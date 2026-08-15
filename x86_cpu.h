@@ -697,6 +697,19 @@ extern volatile uint32_t x86_kb_peek_hits;
 extern volatile uint32_t x86_kbd_port60_reads;
 extern volatile uint32_t x86_kbd_read_log[32];
 extern volatile uint32_t x86_kbd_read_log_idx;
+/* SOUND -- DETECTION ONLY, NO AUDIO. See the sound block in x86_io.c: the OPL2
+   timer registers and the SB DSP reset handshake are modelled so a probe gets a
+   truthful answer instead of a floating 0xFF; nothing here produces a sample.
+   x86_sb_dma_refused is the honest count of "a title asked for digitised audio
+   and got silence" -- read it before believing any title is audio-clean. */
+extern volatile uint32_t x86_opl_writes;
+extern volatile uint32_t x86_opl_status_reads;
+extern volatile uint32_t x86_opl_timer_expiry;
+extern volatile uint32_t x86_sb_resets;
+extern volatile uint32_t x86_sb_cmds;
+extern volatile uint32_t x86_sb_cmds_unknown;
+extern volatile uint32_t x86_sb_dma_refused;
+extern volatile uint32_t x86_sb_reads_empty;
 
 #define X86_MODE_REC_STRIDE     2048
 #define X86_MODE_REC_TABLE_OFF  1024

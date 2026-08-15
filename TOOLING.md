@@ -1520,6 +1520,19 @@ python3 tests/test_dos.py --negative     # 13 controls: rollback, largest,
                                          # x86_dos_execs stays 0 and the arena
                                          # is untouched -- an overlay is not a
                                          # process and allocates nothing.
+python3 tests/test_sound.py              # SOUND CARD DETECTION, not audio: the
+                                         # SB DSP reset handshake (write 1 then
+                                         # 0 to 0x226, poll 0x22E, read 0xAA off
+                                         # 0x22A), the 0x22C write-ready bit,
+                                         # DSP command E1h returning 2.01, and
+                                         # the AdLib timer test (status &0xE0
+                                         # 0 -> 0xC0 -> 0) -- all run as GUEST
+                                         # instructions, and all shapes measured
+                                         # off our own titles (docs/03 §4a).
+python3 tests/test_sound.py --negative    # rebuilds with the DSP's 0xAA push
+python3 tests/test_sound.py --negative-opl # / the OPL timer-1 flag DELETED and
+                                         # requires a FAIL; source restored in a
+                                         # finally. Both seen to fail.
 python3 tests/test_pit.py                # PIT channel 0 -- the SYSTEM TIMER's
                                          # divisor -- programmed by GUEST OUTs:
                                          # the real Wolf3D sequence (0x214B =
