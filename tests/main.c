@@ -167,7 +167,7 @@ volatile uint32_t run_arena_flag = 0;
 volatile uint32_t arena_r[32];
 
 volatile uint32_t run_pager_flag = 0;
-volatile uint32_t pager_r[72];
+volatile uint32_t pager_r[80];
 
 /* The pagefile, as a plain RAM buffer.
  *
@@ -2841,9 +2841,82 @@ static void arena_test_run(void)
 #define PGT_PAGES  8u
 #define PGT_FRAMES 4u
 #define PGT_MEM_OFF (700u * 1024u)      /* page-aligned inside test_ram */
+
+/*
+ * KEEN4's measured peak, in frames, out of the 160 the shipping pool has. It
+ * is quoted in docs/13 and in x86_pager.h's donation comment, and it is the
+ * number X86_PG_DONATE_RESERVE has to clear -- see pager_donate_working_set()
+ * below for why a reserve under it is a HANG and not a slow frame.
+ */
+#define KEEN4_PEAK_FRAMES 134u
+
+/*
+ * ---- A DONATION MAY NOT BE FUNDED OUT OF THE WORKING SET -------------------
+ *
+ * Donate with `reserve` frames held back, then run a `wset`-page working set
+ * that is DIRTY -- every page written, twice round, exactly what a title does
+ * between frames -- and return how many pagefile writes it cost.
+ *
+ * The answer must be ZERO. A reserve at or above the working set means every
+ * page stays resident and nothing is ever written; a reserve below it means
+ * each pass round the set evicts and re-reads, and each of those evictions is
+ * a 4 KB SD write. Under gwemu, and here, that write is free and the run looks
+ * healthy -- which is exactly how the shipping reserve of 100 against KEEN4's
+ * 134-frame peak survived: x86_pg_exhausted stayed 0, the title reached its
+ * MAIN MENU, and the only witness was a counter nobody was reading.
+ *
+ * On silicon the same write costs up to 433,509 us (x86_pg_wb_us_worst,
+ * measured on hardware), it happens inside the emulator slice with no return
+ * to the frame loop, and MAX_SLICE_CEIL cannot bound it because it bounds
+ * INSTRUCTIONS and this time is spent in f_write. At reserve 100 KEEN4 paid 84
+ * evictions and 82 such writes in its first 15 seconds; at 134 it pays none,
+ * on hardware as well as under gwemu.
+ *
+ * This does NOT fix KEEN4's watchdog wedge -- that was tested on silicon with
+ * the pagefile provably untouched and the wedge still happens. See
+ * x86_pager.h. What it fixes is the guest running 34 frames short of its own
+ * measured working set, which is a defect whether or not anything else is.
+ *
+ * So this returns a WRITE COUNT and not a pass/fail: the caller asserts 0 for
+ * a reserve that covers the set and NON-ZERO for one that does not, and the
+ * second is the negative control for the first inside the same test.
+ */
+static uint32_t pager_donate_working_set(uint32_t pool, uint32_t wset,
+                                         uint32_t reserve, uint32_t ask)
+{
+    uint32_t wf0;
+
+    x86_arena_reset();
+    x86_pager_reset();
+    x86_livemap_clear();
+    x86_pager_set_donate_reserve(reserve);
+    x86_pager_set_backing(pgf_read, pgf_write);
+    pgf_first_slot = PGT_FIRST;
+    x86_pager_own(PGT_FIRST, PGT_PAGES);
+    x86_pager_add_frames(test_ram + PGT_MEM_OFF, X86_PG_POOL_BYTES(pool));
+    for (uint32_t i = 0; i < PGT_PAGES; i++)
+        guest_page_table[PGT_FIRST + i] = FOLD_INVALID;
+
+    /* The donation the 0Dh mode set makes: take what the reserve allows. */
+    x86_pager_donate_upto(ask, X86_PG_SIZE);
+
+    /* Now the working set, dirty, twice. One pass could be served by frames
+       that happened to be free; two cannot. */
+    wf0 = x86_pg_wb_file;
+    for (uint32_t pass = 0; pass < 2u; pass++) {
+        for (uint32_t p = 0; p < wset; p++) {
+            uint32_t h = x86_pager_fault(0xC0000u + (p << 12), 1);
+            x86_livemap_clear();
+            if (h)
+                *(uint8_t *)(uintptr_t)(h + 4095u) = (uint8_t)(p + 1u);
+        }
+    }
+    return x86_pg_wb_file - wf0;
+}
+
 static void pager_test_run(void)
 {
-    for (uint32_t i = 0; i < 72; i++)
+    for (uint32_t i = 0; i < 80; i++)
         pager_r[i] = 0;
 
     x86_pager_reset();
@@ -3179,6 +3252,32 @@ static void pager_test_run(void)
     pager_r[69] = (x86_pager_donate_to_arena(8192u) == 16384u);
     pager_r[70] = (x86_pager_reclaim_from_arena() == 0);
     pager_r[71] = x86_pg_frames_total;                   /* still 5 */
+
+    /*
+     * ---- THE RESERVE IS THE WORKING SET, NOT A CARD SIZE -------------------
+     *
+     * The KEEN4 wedge, scaled to what test_ram can hold: 8 frames, a 6-page
+     * dirty working set, and a donation that asks for everything. The pool is
+     * small and the numbers are not KEEN4's, but the RATIO is and so is the
+     * failure -- a reserve under the working set turns every pass round it
+     * into pagefile writes, which cost nothing here and up to 433 ms each on
+     * silicon. See pager_donate_working_set().
+     */
+    pager_r[72] = pager_donate_working_set(8u, 6u, 6u, 200000u);   /* 0 */
+    pager_r[73] = x86_pg_frames_total;                             /* 8 */
+    /* THE NEGATIVE CONTROL, in the test rather than in a reviewer's head: the
+       same pool and the same working set, with the reserve set BELOW it the
+       way the shipping constant used to be. If this reads 0 the arm above is
+       measuring nothing. */
+    pager_r[74] = (pager_donate_working_set(8u, 6u, 4u, 200000u) > 0u);  /* 1 */
+    pager_r[75] = (x86_pg_frames_total < 6u);                      /* 1 */
+    /*
+     * And the SHIPPING constant against the title that reaches this path. This
+     * is the check that was absent: everything above passed with
+     * X86_PG_DONATE_RESERVE at 100 because nothing compared it to the peak
+     * recorded three paragraphs away from it in x86_pager.h.
+     */
+    pager_r[76] = (X86_PG_DONATE_RESERVE >= KEEN4_PEAK_FRAMES);    /* 1 */
 
     x86_pager_set_backing(NULL, NULL);
     x86_pager_set_donate_reserve(X86_PG_DONATE_RESERVE);

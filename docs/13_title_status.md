@@ -69,6 +69,66 @@ Offset `0x20` (64 B/row, a 512-pixel virtual row), so a 200-row window spans
 discarded and the plane dump was all zeros — an honest black frame, not a blit
 defect. Growing the card from the arena moved this; the remaining gap is below.
 
+### The WEDGE: measured on silicon, and it is NOT the pagefile
+
+Reproducible on HARDWARE every run. Both `guest_insns_total` **and**
+`frames_rendered` freeze together, WWDG fires (`boot_magic=0xbad00005`), the
+device reboots into KEEN4 and does it again. The freeze point VARIES between
+runs -- 14.9 M insns/347 frames, 19.9 M/352, 31.4 M/640 -- so the reported
+"34.7 M over 944 frames" is one sample of a spread, not a landmark. **Under
+gwemu the same core reaches the MAIN MENU and runs indefinitely** (153 M insns,
+2,081 frames, screenshots in `build/artifacts/keen4*/`), so nothing below tier 3
+can see it.
+
+**The pagefile-thrash hypothesis is DISPROVEN, on silicon.** The tidy story was:
+0Dh donates 60 of 160 frames, Keen's 134-frame working set overflows the
+remaining 100, and a storm of 4 KB pagefile writes at up to 433 ms each stalls
+the frame loop past the watchdog. It is wrong. With `X86_PG_DONATE_RESERVE`
+raised to 134 the donation is refused outright and the pagefile is never
+touched -- `x86_pg_donated=0`, `x86_pg_frames_total=160`, `x86_pg_evictions=0`,
+`x86_pg_wb_file=0`, `x86_pg_wb_us_worst=0`, measured on the device -- **and it
+still wedges.**
+
+> `x86_pg_exhausted == 0` is consistent with thrash AND with a completely
+> unrelated hang. Only the eviction and writeback counters separate them, and
+> they say: no I/O anywhere near the freeze.
+
+That both counters freeze together says the FRAME LOOP stopped, not the guest --
+so this is host-side, and `MAX_SLICE_CEIL` (which bounds a slice in
+instructions) cannot be the guard.
+
+**Open lead, n=2 and NOT confirmed.** The last live PC before two of three
+freezes was inside `ega_read_byte`, i.e. the `ega_shadow_rebuild()` path in
+`x86_video_planar.c`. That function's own comment records that it "went
+unnoticed at 8 KB and then wedged a device run at 64 KB", it rebuilds
+`EGA_SHADOW_OFFSETS` = 16,384 bytes on every write that changes what a read
+returns, and `probe.py --io-log` shows Keen's scroll loop writing Graphics
+Controller index 5 (`OUT 0x3ce/0x3cf`) continuously -- the register whose bit 3
+is read mode, which is exactly one of the rebuild triggers. In read mode 1 each
+of the 16,384 bytes is a four-plane loop. PC sampling over SWD is halt-biased
+and two samples are not a finding; the next step is a rebuild COUNTER and a
+DWT bracket around the rebuild, not more sampling.
+
+### The EGA card, and what the intro costs
+
+| | plane offsets | four planes |
+|---|---:|---:|
+| card fitted NOW (arena alone, reserve 134) | **35,840** | 143,360 B |
+| card when the donation fired (reserve 100) | 61,440 | 245,760 B |
+| 200 rows at `crtc_start=15360`, pitch 64 | 28,160 | 112,640 B |
+
+`x86_vga_planar_lost` still reads **102,195** at 35,840 offsets, so the panning
+intro drives `crtc_start` well past the 15,360 the static figure was taken at:
+covering a pan that reaches start S costs `S + 12,800` offsets.
+
+**The donation cannot close that gap for this title, structurally.** An arena
+claim may not span regions, so the card is the best SINGLE run -- the arena's
+143,360 B or the donated run, never their sum. Beating the arena therefore takes
+~35 frames, and 160 minus Keen's 134-frame peak leaves 26. Above a reserve that
+respects the working set the mechanism is inert here; below one, it buys card at
+the price of SD writes in the frame loop. Growing the card for Keen means
+growing the ARENA, not borrowing frames.
+
 ### The "levels are not fixable" verdict is RETRACTED
 
 It reasoned from `x86_arena_free = 0` to *"no allocation, policy or eviction
