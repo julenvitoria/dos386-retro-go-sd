@@ -1029,6 +1029,7 @@ EGA_PLANE = 0x2000      # X86_EGA_PLANE_OFFSETS: 8,192 -> a 32 KB card
 EGA_BAND = EGA_PITCH * 50
 EGA_PROBE = 0x5000      # a window offset above the 16 KB CPU-visible shadow
 EGA_PROBE_SLOT = 0x2F00  # guest DS:offset the read-back is parked in
+EGA_READ_SLOT = 0x2F10   # six read-path answers, one byte each (see below)
 
 
 def ega_program():
@@ -1079,6 +1080,58 @@ def ega_program():
     emit(0xBA, 0xC2, 0x03)                  # mov dx,3C2h
     emit(0xB0, 0xFF)                        # mov al,0FFh
     emit(0xEE)                              # out dx,al
+
+    # =======================================================================
+    # THE READ PATH, which the four bands below do not touch and which nothing
+    # in this file asserted before. It runs FIRST, at plane offset 0 -- below
+    # the display start, so the picture never sees it -- and it exists because
+    # the read shadow is rebuilt under a GUARD, and a guard is exactly the kind
+    # of thing that can be wrong in only one of its arms.
+    #
+    # plane 0 = 0xF0, plane 1 = 0x0F, planes 2/3 = 0 at offset 0. Then, in
+    # order, with the answer parked in guest memory each time:
+    #
+    #   [0] Read Map Select 0        -> 0xF0    plane select
+    #   [1] Read Map Select 1        -> 0x0F    ... and it CHANGED the answer
+    #   [2] read mode 1, DC=3 CMP=1  -> 0xF0    p0 & ~p1
+    #   [3]      ... CMP=2           -> 0x0F    ~p0 & p1     Colour Compare
+    #   [4]      ... DC=1  CMP=2     -> 0x0F    ~p0          Colour Don't Care
+    #   [5] back to read mode 0      -> 0x0F    Read Map Select 1 again
+    #
+    # Every one of the four registers the rebuild guard keys on moves an answer
+    # here, so a guard that drops any of them is caught by a VALUE and not by a
+    # timing. scripts/run_planar_controls.py drives the negative controls.
+    # =======================================================================
+    def rd_probe(slot):
+        emit(0x26, 0xA0, 0x00, 0x00)        # mov al,[es:0000]
+        emit(0xA2, slot & 0xFF, slot >> 8)  # mov [slot],al
+
+    wout(0x3C4, 0x02, 0x01)                 # Map Mask = plane 0
+    emit(0x31, 0xFF)                        # xor di,di
+    emit(0xB0, 0xF0)                        # mov al,0F0h
+    emit(0x26, 0x88, 0x05)                  # mov [es:di],al
+    wout(0x3C4, 0x02, 0x02)                 # Map Mask = plane 1
+    emit(0xB0, 0x0F)                        # mov al,0Fh
+    emit(0x26, 0x88, 0x05)                  # mov [es:di],al
+    wout(0x3C4, 0x02, 0x0F)                 # Map Mask back to all four
+
+    wout(0x3CE, 0x04, 0x00)                 # Read Map Select = plane 0
+    rd_probe(EGA_READ_SLOT + 0)
+    wout(0x3CE, 0x04, 0x01)                 # Read Map Select = plane 1
+    rd_probe(EGA_READ_SLOT + 1)
+    wout(0x3CE, 0x07, 0x03)                 # Colour Don't Care = planes 0,1
+    wout(0x3CE, 0x02, 0x01)                 # Colour Compare = plane 0 set
+    wout(0x3CE, 0x05, 0x08)                 # Mode = READ MODE 1
+    rd_probe(EGA_READ_SLOT + 2)
+    wout(0x3CE, 0x02, 0x02)                 # Colour Compare = plane 1 set
+    rd_probe(EGA_READ_SLOT + 3)
+    wout(0x3CE, 0x07, 0x01)                 # Colour Don't Care = plane 0 only
+    rd_probe(EGA_READ_SLOT + 4)
+    wout(0x3CE, 0x05, 0x00)                 # back to read mode 0 (Read Map 1)
+    rd_probe(EGA_READ_SLOT + 5)
+    wout(0x3CE, 0x04, 0x00)                 # Read Map Select back to plane 0
+    wout(0x3CE, 0x07, 0x0F)                 # Colour Don't Care back to default
+    wout(0x3CE, 0x02, 0x00)                 # Colour Compare back to default
 
     def fill(mapmask, base, count, value):
         wout(0x3C4, 0x02, mapmask)          # Sequencer Map Mask
@@ -1247,6 +1300,26 @@ def ega_checks(b, syms):
               f"sitting where the blit will render it.")
         return False
     print(f"PASS: a write above the 16 KB window is discarded and reads back 0")
+
+    # The read path. See the block in ega_program() for what each answer is and
+    # which of the four guard registers it pins down.
+    want_rd = [0xF0, 0x0F, 0xF0, 0x0F, 0x0F, 0x0F]
+    why_rd = ["Read Map Select 0 -> plane 0",
+              "Read Map Select 1 -> plane 1 (the SELECT itself)",
+              "read mode 1, DC=3 CMP=1 -> p0 & ~p1",
+              "read mode 1, CMP=2 -> ~p0 & p1 (Colour Compare)",
+              "read mode 1, DC=1 CMP=2 -> ~p0 (Colour Don't Care)",
+              "back to read mode 0 -> plane 1 again (leaving read mode 1)"]
+    got_rd = list(b.read_memory(syms["test_ram"] + EGA_READ_SLOT, 6))
+    for i, (g, w, why) in enumerate(zip(got_rd, want_rd, why_rd)):
+        if g != w:
+            print(f"FAIL: EGA read path [{i}] got {g:#04x} want {w:#04x} -- {why}. "
+                  f"A guest read of A000:0 comes from the READ SHADOW, so this "
+                  f"is either ega_read_byte() or the guard that decides when to "
+                  f"rebuild the shadow.")
+            return False
+    print("PASS: EGA read path 6/6 (Read Map Select, read mode 1, Colour "
+          "Compare, Colour Don't Care, and the return to read mode 0)")
 
     b.write_uint32(syms["run_video_flag"], 3)
     if not wait_flag(b, syms["run_video_flag"], 0, "EGA blit did not finish"):
@@ -1666,6 +1739,12 @@ def main(args):
             # and its own video buffers, so nothing has to run before it.
             time.sleep(0.5)
             return modeyfit_checks(b, syms)
+        if getattr(args, "ega_only", False):
+            # The 0Dh arm alone, for the EGASIG/EGAMODE controls in
+            # scripts/run_planar_controls.py. It arms its own mode and draws
+            # its own picture, so nothing has to run before it.
+            time.sleep(0.5)
+            return ega_checks(b, syms)
         if getattr(args, "modey_only", False):
             # The single arm scripts/run_planar_controls.py builds and re-runs
             # once per control. Nothing else runs, so a control's verdict is
@@ -1755,6 +1834,8 @@ if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser(description=__doc__)
     add_runner_args(p)
+    p.add_argument("--ega-only", action="store_true",
+                   help="only the EGA 0Dh arm (the read-shadow-guard controls)")
     p.add_argument("--modey-only", action="store_true",
                    help="run only the Mode Y arm (the controls driver uses this)")
     p.add_argument("--present-only", action="store_true",

@@ -915,6 +915,31 @@ python3 scripts/probe.py --retrogo --timeline timelines/start-preselected-game.t
     --watch x86_dma2d_selftest,x86_dma2d_blits,x86_dma2d_fallback
 ```
 
+#### `X86_EGA_SHPROF=1` — the EGA read-shadow rebuild
+
+```bash
+make -f Makefile.core clean && make -f Makefile.core pack X86_EGA_SHPROF=1
+python3 scripts/deploy_device.py --no-firmware --preselect KEEN4.dsk
+python3 scripts/probe.py --retrogo --target hardware --no-flash --hard-reset \
+    --timeline timelines/keen4-keypress.tl --interval 1 --samples 60 \
+    --watch guest_insns_total,frames_rendered,x86_ega_shadow_rebuilds,\
+x86_ega_shadow_gc_writes,x86_ega_shadow_cyc,x86_ega_shadow_worst
+```
+
+Five words of bss and one DWT bracket around `ega_shadow_rebuild()`, the 16 KB
+read-shadow rebuild. `x86_ega_shadow_rebuilds` is the count,
+`_gc_writes` the writes to a read-affecting GC register that changed it (so
+`gc_writes - rebuilds` is what the guard saves), `_cyc`/`_hi` the 64-bit total
+and `_worst` the worst single rebuild.
+
+**IT IS NOT PART OF `X86_VPROF`, AND THAT IS THE POINT.** `X86_VPROF=1` no
+longer fits: it adds ~1,080 B to RAM_EMU, `guest_ram` comes back NULL,
+`core_ready` stays 0 and the frame loop runs painting nothing, with every other
+counter reading a plausible zero — the same silent shape as the `X86_PROBE`
+trap. Reproduced on STOCK master at tier 2 on KEEN4. So one function could not
+be measured by switching the whole instrument on, and this is the five-word
+version. Measured cost on silicon: one rebuild is **846,000 cycles = 3.0 ms**.
+
 #### `X86_VPROF=1` — where the cycles go INSIDE the video path
 
 ```bash
@@ -1465,12 +1490,18 @@ python3 tests/test_video.py              # CGA mode 4 blitter, pixel-exact, plus
                                          # which is the case the device hits
                                          # and the 20-frame model missed.
                                          # --present-only runs just that arm
-python3 scripts/run_planar_controls.py   # grades those arms: FIVE negative
+python3 scripts/run_planar_controls.py   # grades those arms: EIGHT negative
                                          # controls that must FAIL (chain-4
                                          # inert, a 40-offset blit stride, four
                                          # FLAT planes, the fixed 16 KB page
-                                         # mask, and the presentation escape
-                                         # hatch back on a plain TIMER) and one
+                                         # mask, the fixed 8,192-offset cache,
+                                         # the presentation escape hatch back
+                                         # on a plain TIMER, and the two EGA
+                                         # read-shadow guard mutations --
+                                         # -DX86_EGA_SIG_NEGCTL=1 a CONSTANT
+                                         # signature, =2 the read-MODE bit
+                                         # dropped -- graded by the 0Dh arm's
+                                         # six read-path probes) and one
                                          # POSITIVE control --
                                          # -DX86_MODEY_PAGE0=16384 must still
                                          # produce the same 64,000 pixels,

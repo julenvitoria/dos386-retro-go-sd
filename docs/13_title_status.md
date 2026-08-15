@@ -97,17 +97,45 @@ That both counters freeze together says the FRAME LOOP stopped, not the guest --
 so this is host-side, and `MAX_SLICE_CEIL` (which bounds a slice in
 instructions) cannot be the guard.
 
-**Open lead, n=2 and NOT confirmed.** The last live PC before two of three
-freezes was inside `ega_read_byte`, i.e. the `ega_shadow_rebuild()` path in
-`x86_video_planar.c`. That function's own comment records that it "went
-unnoticed at 8 KB and then wedged a device run at 64 KB", it rebuilds
-`EGA_SHADOW_OFFSETS` = 16,384 bytes on every write that changes what a read
-returns, and `probe.py --io-log` shows Keen's scroll loop writing Graphics
-Controller index 5 (`OUT 0x3ce/0x3cf`) continuously -- the register whose bit 3
-is read mode, which is exactly one of the rebuild triggers. In read mode 1 each
-of the 16,384 bytes is a four-plane loop. PC sampling over SWD is halt-biased
-and two samples are not a finding; the next step is a rebuild COUNTER and a
-DWT bracket around the rebuild, not more sampling.
+**THE `ega_shadow_rebuild()` LEAD IS DEAD AS A CAUSE.** It was measured with a
+counter and a DWT bracket (`X86_EGA_SHPROF=1`, `x86_video_planar.c`), on
+silicon, over five KEEN4 runs, and the numbers refuse it:
+
+| | measured, hardware |
+|---|---:|
+| one rebuild | **846,000 cycles = 3.0 ms** at 280 MHz |
+| rebuilds in a whole pre-wedge run | **10** (~0.15/s), not "continuous" |
+| burst coincident with the wedge | 76-86, ~230 ms of cycles |
+| the wedging stall | **seconds** -- the WWDG window is ~472 ms |
+
+So the rebuild is extravagant and it is a MARKER of the wedging code path (the
+burst appears in 3 of 3 wedging runs and in neither non-wedging run), but it is
+a passenger. Proven by fixing it: the precise read-state guard below cuts
+steady-state rebuilds 10 -> 2 and the burst is UNCHANGED at 76-79, because
+those are genuine read-state changes -- **and KEEN4 wedges exactly as before,
+twice in a 60 s run, at 31.5 M/638 and 22.5 M/468.**
+
+**What the instrument found instead, and it supersedes "the frame loop stops".**
+Across the wedge the rebuild counter KEEPS ADVANCING -- 54 -> 79 in the second
+after `guest_insns_total` and `frames_rendered` had already frozen at
+31,519,564/638. The guest is still executing. So the frame loop has not
+stopped: **one emulator SLICE never returns**, and the guest spins inside it
+hammering the Graphics Controller's read state ~25 changes a second (against
+0.15/s in normal play). That is where to look next -- what bounds a slice, and
+what guest loop this is -- not at the video path.
+
+### The read-shadow guard, which is a real fix and is NOT this fix
+
+`x86_vga_planar_gc_write()` rebuilt the 16 KB shadow whenever one of GC 2/4/5/7
+changed VALUE. "The register changed" is not "what a read returns changed":
+under read mode 0 Colour Compare and Don't Care are never consulted, under read
+mode 1 Read Map Select is not, and only bit 3 of GC 5 is read state at all --
+bits 0-1 are the WRITE mode, which is what a latch-copy loop toggles. So
+`ega_read_sig()` reduces the four registers to what a read actually depends on
+and the rebuild fires only when THAT moves. Graded by six read-path probes in
+`tests/test_video.py`'s 0Dh arm (Read Map Select, read mode 1, Colour Compare,
+Colour Don't Care, and the return to read mode 0) and by two negative controls
+in `scripts/run_planar_controls.py`, both seen to fail.
 
 ### The EGA card, and what the intro costs
 
