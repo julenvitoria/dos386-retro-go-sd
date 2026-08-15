@@ -904,6 +904,12 @@ volatile uint32_t x86_opl_timer_expiry;  /* times a timer flag came up set  */
 volatile uint32_t x86_opl_t1_gap;        /* longest wait seen for timer 1   */
 volatile uint32_t x86_sb_resets;         /* completed 1-then-0 handshakes   */
 volatile uint32_t x86_sb_cmds;           /* DSP command bytes accepted      */
+volatile uint32_t x86_pic_imr_now = 0xB8u;
+volatile uint32_t x86_pic_imr_ever = 0xFFu;
+volatile uint32_t x86_pic_imr_writes;
+volatile uint32_t x86_sb_irq_requests;   /* 0xF2/0xF3: IRQ with no transfer */
+volatile uint32_t x86_sb_cmd_hist_lo;    /* last 4 command bytes, newest low */
+volatile uint32_t x86_sb_cmd_hist_hi;    /* the 4 before those              */
 volatile uint32_t x86_sb_cmds_unknown;   /* accepted, no reply, no effect   */
 volatile uint32_t x86_sb_dma_refused;    /* transfers we CANNOT run at all  */
 volatile uint32_t x86_sb_reads_empty;    /* data reads with nothing queued  */
@@ -1673,6 +1679,54 @@ static void dsp_exec(uint8_t c)
            computed from an INVENTED one, which is why there is not one here. */
         dsp_push(0);
         break;
+    /*
+     * 0xF2 / 0xF3 -- REQUEST AN INTERRUPT, with no transfer behind it. This is
+     * how a driver FINDS its IRQ: it hooks several vectors, asks the card to
+     * assert its line, and sees which handler runs. Answering "unknown" here
+     * is not a missing frill -- the driver concludes the card's interrupt does
+     * not work and falls back to the PC speaker, which is exactly what PRINCE
+     * OF PERSIA does (its whole DSP conversation is E0 E0 E1 F2 and then it
+     * never touches 0x22x again).
+     *
+     * The line is asserted through sb_irq_assert() so it goes through the same
+     * 8259 path, the same IMR enforcement and the same mixer-0x82 kind bits as
+     * a real terminal count -- the driver's handler acknowledges it the normal
+     * way and nothing here is a special case downstream. 0xF3 is the 16-bit
+     * line; sbp.bits16 is what sb_irq_assert() reads, so it is set for the
+     * assert and put back, rather than duplicating the function.
+     */
+    case 0xF2:
+    case 0xF3: {
+        uint8_t saved = sbp.bits16;
+        sbp.bits16 = (uint8_t)(c == 0xF3u);
+        sb_irq_assert();
+        sbp.bits16 = saved;
+        x86_sb_irq_requests++;
+        /* AND DELIVER IT NOW, not at the next sub-slice boundary. A detect
+           routine unmasks IRQ 5, sends this byte, spins a few hundred
+           microseconds and RE-MASKS; a sub-slice is thousands of guest
+           instructions, so a retry from the frame loop arrives after the
+           window has closed and reads as "the card's interrupt does not
+           work". This is the one interrupt whose latency the guest measures,
+           so it is taken at the next instruction boundary -- which is what the
+           hardware does. Everything else about delivery (the IMR, the ISR
+           latch, the mixer kind bits) is x86_sb_raise_irq()'s, unchanged. */
+        if (x86_sb_raise_irq(cpu_state_ptr))
+            /* AND MAKE THE INTERPRETER LOOK. x86_sb_raise_irq() drops
+               pit_counter only when cpu->eflags says IF is set, which is
+               right at its usual call site (the frame loop, where the state
+               has been saved) and WRONG here: this runs INSIDE an
+               instruction, and IF lives in R11 for the whole slice, so
+               cpu->eflags is whatever it was at the last exit. The check
+               that matters is .handle_pit_or_irq's own TST on R11 -- it
+               gates delivery on the live IF and falls through to a timer
+               exit if the guest has interrupts off. So arm the boundary
+               unconditionally and let the interpreter decide; the cost of
+               being wrong is one early slice exit, once per F2h. */
+            x86_pit_counter_forced(1);
+        break;
+    }
+
     case 0xD1: dsp.speaker_on = 1; break;
     case 0xD3: dsp.speaker_on = 0; break;
     case 0xD8: dsp_push(dsp.speaker_on ? 0xFFu : 0x00u); break;
@@ -1781,6 +1835,13 @@ static void dsp_write_cmd(uint8_t v)
         return;
     }
     x86_sb_cmds++;
+    /* WHICH commands, not just how many. Eight bytes in two words: a shift
+       register, oldest byte falling out of the top of _hi. "cmds=2" says the
+       guest stopped after the probe; only this says WHICH two, and that is the
+       difference between "never asked to play" and "asked in a shape we
+       refused". Two stores on a path that runs a few dozen times a title. */
+    x86_sb_cmd_hist_hi = (x86_sb_cmd_hist_hi << 8) | (x86_sb_cmd_hist_lo >> 24);
+    x86_sb_cmd_hist_lo = (x86_sb_cmd_hist_lo << 8) | v;
     dsp.cmd = v;
     dsp.nargs = dsp.args_left = dsp_cmd_args(v);
     if (!dsp.args_left) {
@@ -2152,6 +2213,15 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
         break;
     case 0x21:                       /* IMR: stored and read back, not enforced */
         pic_imr = (uint8_t)value;
+        /* WHAT THE GUEST EVER UNMASKED. x86_pic_imr_now is the live value;
+           x86_pic_imr_ever is every value ANDed together, so a zero bit there
+           means that line was unmasked at least once in the session. "IRQ 5
+           was never delivered" has two causes -- the guest never unmasked it,
+           or it unmasked it and we were too slow -- and only this separates
+           them. Two stores on a port written a handful of times. */
+        x86_pic_imr_now = (uint32_t)(uint8_t)value;
+        x86_pic_imr_ever &= (uint32_t)(uint8_t)value;
+        x86_pic_imr_writes++;
         break;
 
     /*

@@ -1043,6 +1043,49 @@ and `x86_sb_resets`/`_cmds` **1/2 -> 0/0** — i.e. WOLF3D stops probing the
 Sound Blaster entirely, which is the owner-reported symptom, reproduced on
 demand. `docs/03` §4e.
 
+#### `X86_AUDIO_TONE=1` — is ANYTHING we write ever heard?
+
+```bash
+make -f Makefile.core clean && make -f Makefile.core pack X86_AUDIO_TONE=1
+python3 scripts/deploy_device.py --no-firmware --preselect WOLF3D.dsk
+python3 scripts/probe.py --retrogo --target hardware --no-flash --hard-reset \
+    --timeline timelines/wolf3d-hw.tl --interval 12 --samples 4 \
+    --watch x86_audio_submits,x86_audio_peak_last,x86_audio_peak_max,\
+x86_audio_volume,dma_counter
+```
+
+Replaces every emulated source with a 440 Hz square written straight into the
+firmware's DMA half-buffer, so what reaches the speaker depends on nothing in
+the SB or PC-speaker model. **It partitions the whole problem in one run**:
+audible means the host chain (`odroid_audio_init` -> `audio_start_playing` ->
+SAI DMA -> amplifier -> volume) is sound and any silence is the guest's; silent
+means no amount of DMA-engine work can ever be heard. Never ship 1.
+
+The four counters it exercises are in the SHIPPING core and are the cheap
+version of the same question: `x86_audio_submits` (buffers handed to the DMA,
+one per frame), `x86_audio_peak_last`/`_peak_max` (the loudest sample in the
+newest buffer / the session), `x86_audio_volume` (the launcher's own 0..255,
+which is `volume_tbl[level]` and ALREADY a fraction of full scale). Read them
+with the firmware's own `dma_counter`: submits climbing with peak 0 means the
+chain runs and the sources are silent; submits stuck at 0 means the frame loop
+never reaches the audio phase.
+
+#### Sound Blaster: which commands, and did the guest unmask its IRQ?
+
+`x86_sb_cmd_hist_lo` / `_hi` are the last EIGHT DSP command bytes, newest in
+the low byte of `_lo`. "`x86_sb_cmds`=2" says the guest stopped after the
+probe; only this says WHICH two. WOLF3D reads `0xD140` (speaker on, time
+constant) and PRINCE OF PERSIA `0xD1D14014` once it is playing.
+
+`x86_pic_imr_now` / `_ever` / `_writes` are the 8259 mask: `_ever` is every
+value written to port 0x21 ANDed together, so a ZERO bit there means that line
+was unmasked at least once. This is what separates "IRQ 5 was never delivered
+because the guest never unmasked it" from "...because we were too slow", and
+those two have completely different fixes.
+
+`x86_sb_irq_requests` counts DSP `F2h`/`F3h` -- an interrupt with no transfer
+behind it, which is how a driver finds its vector. See `docs/03` 4e-bis.
+
 #### `X86_DSK_OPEN_PER_CALL=1` — the `.dsk` handle A/B
 
 Puts the read path back on `rg_storage_copy_file_range_to_ram`, which f_opens
@@ -1616,13 +1659,19 @@ python3 tests/test_sound.py --negative-opl # the OPL timer-1 flag
 python3 tests/test_sound.py --negative-tc  # the 8237's TERMINAL COUNT
 python3 tests/test_sound.py --negative-irq # IRQ 5 DELIVERY
 python3 tests/test_sound.py --negative-rate # the resampler step forced to 1:1
+python3 tests/test_sound.py --negative-f2  # the DSP's F2h IRQ REQUEST
+python3 tests/test_sound.py --negative-f2-now # F2h's IMMEDIATE delivery -- the
+                                         # line is still asserted, so every
+                                         # counter stays green and only the
+                                         # guest's ten-iteration window sees it
                                          # Each rebuilds with that one link
                                          # broken and requires a FAIL; source
-                                         # restored in a finally. ALL FIVE SEEN
-                                         # TO FAIL. --negative-rate is the one
-                                         # that matters most: it leaves every
-                                         # counter green and only the SAMPLES
-                                         # say so.
+                                         # restored in a finally. ALL SEVEN
+                                         # SEEN TO FAIL. --negative-rate and
+                                         # --negative-f2-now are the two
+                                         # that matter most: each leaves every
+                                         # counter green, and only the SAMPLES
+                                         # (or the F2h window) say so.
 python3 tests/test_pit.py                # PIT channel 0 -- the SYSTEM TIMER's
                                          # divisor -- programmed by GUEST OUTs:
                                          # the real Wolf3D sequence (0x214B =

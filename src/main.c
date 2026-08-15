@@ -274,6 +274,14 @@ volatile uint32_t x86_vga_aperture_dtcm = 0;
 volatile uint32_t x86_vga_aperture_dtcm_fail = 0;
 volatile uint32_t disk_cache_mem = 0;    /* the AHB pointer itself, or 0 */
 volatile uint32_t frames_rendered = 0;
+
+/* THE HOST AUDIO CHAIN'S OWN INSTRUMENTS. See the audio phase in the frame
+   loop for why each exists; between them they say whether a buffer was
+   submitted, whether it had anything in it, and at what volume. */
+volatile uint32_t x86_audio_submits = 0;   /* buffers handed to the SAI DMA  */
+volatile uint32_t x86_audio_peak_last = 0; /* loudest sample, newest buffer  */
+volatile uint32_t x86_audio_peak_max = 0;  /* loudest sample, whole session  */
+volatile uint32_t x86_audio_volume = 0;    /* the launcher's own 0..255      */
 /*
  * ===========================================================================
  * THREE CLOCKS, and the fact that they are three.
@@ -4324,17 +4332,43 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
 
         /* Audio: one buffer of speaker output per frame.
          *
-         * Amplitude follows the launcher's volume (0..255) rather than a fixed
-         * 6000, so the user's volume keys reach the speaker at all. >> 11 is
-         * ~12.5% of full scale at maximum, one binary step below the 25% the
-         * tama core uses for its own square wave -- a PC-speaker square is
-         * full-swing with no envelope, so it carries more energy than that. */
+         * Amplitude follows the launcher's volume rather than a fixed 6000, so
+         * the user's volume keys reach the speaker at all.
+         *
+         * >> 10 IS THE REFERENCE CORE'S SHIFT, AND THE >> 11 THAT WAS HERE WAS
+         * 6 dB BELOW EVERY OTHER CORE ON THE DEVICE. The argument for the
+         * extra halving -- "a PC-speaker square is full-swing, so it carries
+         * more energy" -- ignored what common_emu_sound_get_volume() actually
+         * returns: it is volume_tbl[level], ALREADY a fraction of full scale,
+         * and the launcher's DEFAULT level is 4 of 9, i.e. 31. The two
+         * attenuations compounded to 31/2048 = 1.5% of full scale at the
+         * setting the device ships on, about -36 dBFS into a tiny mono
+         * speaker. tama's main_tama.c uses >> 10 with the comment "adjust max
+         * volume to 25% as 100% is REALLY, REALLY loud", and it is the core
+         * that documented the choice, so match it rather than second-guess it.
+         * MEASURED, not argued: x86_audio_peak_max reads 495 at >> 11 and 991
+         * at >> 10 for the same PRINCE OF PERSIA speaker workload. */
         FRAME_PHASE(X86_PHASE_AUDIO);
         X86_ZONE_ENTER(X86_ZONE_AUDIO);             /* ZONES */
         int16_t *abuf = abi->audio_get_active_buffer();
         if (abuf && audio_frames) {
             int16_t amp = (int16_t)(((int32_t)abi->common_emu_sound_get_volume()
-                                     * INT16_MAX) >> 11);
+                                     * INT16_MAX) >> 10);
+#if X86_AUDIO_TONE
+            /* THE PARTITION TEST. Every emulated source is bypassed: a 440 Hz
+               square at the launcher's own volume, written straight into the
+               half-buffer the SAI DMA is reading. Nothing downstream of here
+               is ours, so this separates "the guest never played anything"
+               from "nothing we write is ever heard". */
+            {
+                static uint32_t phase;              /* 16.16, survives frames */
+                uint32_t step = (uint32_t)(((uint64_t)440u << 16) / SAMPLE_RATE);
+                for (unsigned i = 0; i < audio_frames; i++) {
+                    abuf[i] = (phase & 0x8000u) ? amp : (int16_t)-amp;
+                    phase = (phase + step) & 0xFFFFu;
+                }
+            }
+#else
             x86_speaker_render(abuf, audio_frames, SAMPLE_RATE, amp);
             /* THE SOUND BLASTER IS MIXED ON TOP, AND THIS CALL IS ALSO WHAT
                ADVANCES THE DMA TRANSFER -- there is no per-instruction engine
@@ -4342,9 +4376,39 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                guest bytes this frame's samples needed, so the transfer runs at
                the sample clock, which is what the hardware does. A card at half
                amplitude against the speaker keeps a beep audible under music
-               rather than being swamped by it. */
-            x86_sb_render_mix(abuf, audio_frames, SAMPLE_RATE,
-                              (int16_t)(amp >> 1));
+               rather than being swamped by it.
+
+               THE >> 1 THAT WAS HERE IS GONE, and the reason it was here is
+               the reason it had to go: it ducked the card under the music, and
+               THERE IS NO MUSIC -- FM synthesis is not built (docs/03 4f), so
+               the only other source in this buffer is the PC speaker, which a
+               title using the card is not driving at the same time. Halving
+               cost 6 dB for a collision that cannot happen, on top of the 6 dB
+               the amp shift was already giving away. MEASURED on silicon,
+               PRINCE OF PERSIA: x86_audio_peak_max 495 -> 991 for the same
+               18 transfers. If a title ever does play both at once, the mix
+               already clamps, and ducking is then a judgement to make with a
+               title in front of you rather than pre-emptively. */
+            x86_sb_render_mix(abuf, audio_frames, SAMPLE_RATE, amp);
+#endif
+            /* WHAT WE ACTUALLY SUBMITTED, on every tier and every build. One
+               pass over the buffer we just wrote: how many frames were handed
+               to the DMA, and the loudest sample in the newest of them. A peak
+               of 0 with submits climbing says the chain runs and the sources
+               are silent; submits stuck at 0 says the frame loop never reaches
+               the audio phase at all. Neither is inferable from the SB
+               counters, and the difference is the whole question. */
+            x86_audio_submits++;
+            int32_t pk = 0;
+            for (unsigned i = 0; i < audio_frames; i++) {
+                int32_t s = abuf[i];
+                if (s < 0) s = -s;
+                if (s > pk) pk = s;
+            }
+            x86_audio_peak_last = (uint32_t)pk;
+            if ((uint32_t)pk > x86_audio_peak_max)
+                x86_audio_peak_max = (uint32_t)pk;
+            x86_audio_volume = (uint32_t)abi->common_emu_sound_get_volume();
         }
         X86_ZONE_EXIT();                            /* ZONES: end AUDIO */
 
