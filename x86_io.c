@@ -122,6 +122,48 @@ uint32_t x86_pit_ticks(void)
     return pit_now;
 }
 
+/*
+ * ISA BUS TIME, AND WHY A PORT ACCESS CANNOT COST WHAT AN ADD COSTS.
+ *
+ * Every clock above converts INSTRUCTIONS into guest time at one rate, which
+ * is right for code that computes and wrong for code that talks to a card. An
+ * 8-bit I/O cycle on the ISA bus is four bus clocks at 8.33 MHz plus the
+ * command-delay wait states -- ~1 us, one PIT tick -- and it does NOT get
+ * faster when the CPU does. That is why every DOS-era short delay is written
+ * as a run of `IN`s against a port nobody wants the value of: the loop is
+ * calibrated in BUS cycles, and a 286 and a 486 both take about a microsecond
+ * per access.
+ *
+ * Charging those accesses at the instruction rate is WHAT BROKE THE ADLIB
+ * PROBE, and through it the whole Sound Blaster path. Wolfenstein 3D's
+ * SDL_DetectAdLib() starts timer 1 at preset FFh -- 80 us, 96 PIT ticks -- and
+ * then waits by reading the FM status port ~135 times (id's alOut() alone
+ * spends 6 reads after the address byte and 35 after the data byte, and the
+ * detect adds a loop of 100 on top). On the real part that is ~135 us and the
+ * flag is up. Charged as 135 ordinary instructions at ~5,500 kips it is 24 us,
+ * the flag never comes up, WOLF3D and KEEN4 conclude "no AdLib", and WOLF3D's
+ * SB probe is DOWNSTREAM of that conclusion -- which is the whole reason it
+ * touched no 0x22x port at all (docs/03 4a/4e). MEASURED ON SILICON, so the
+ * "silicon is slower, it should get there" prediction in 4e is now disproved
+ * rather than outstanding: x86_opl_timer_expiry read 0 on the device too.
+ *
+ * WHY THIS IS THE OPL'S OWN CLOCK AND NOT THE MACHINE'S. Charging every port
+ * access into pit_now is the more general model and it was measured: it is
+ * physically right, costs nothing on the non-I/O path, and moves the machine's
+ * clock by +11% on WOLF3D (1.16 M of 10.4 M ticks over 48 M instructions),
+ * because a retrace spin on 0x3DA really does cost bus time. An 11% faster
+ * clock retimes every title's intro -- the WOLF3D golden lands on the title
+ * screen instead of the credits -- so it is a MACHINE-PACING change that has
+ * to be graded as one, not a rider on a sound fix. What the OPL timer needs is
+ * only the time spent on ITS bus, so that is what it counts: the FM ports are
+ * the ones the delay loop hammers, the timer runs off its own crystal, and no
+ * other device's pacing moves at all.
+ */
+#ifndef X86_ISA_IO_TICKS
+#define X86_ISA_IO_TICKS 1u
+#endif
+volatile uint32_t x86_io_isa_ticks;     /* bus ticks charged on the FM ports */
+
 /* Per-channel counter state. Channel 1 (DRAM refresh) is carried so the array
    indexes by channel number and nothing has to remember that 2 is really 1. */
 static uint32_t pit_ch_start[3];    /* pit_now when the count was loaded   */
@@ -859,6 +901,7 @@ static uint8_t kbd_read_data(void)
 volatile uint32_t x86_opl_writes;        /* register writes accepted        */
 volatile uint32_t x86_opl_status_reads;  /* status-port reads answered      */
 volatile uint32_t x86_opl_timer_expiry;  /* times a timer flag came up set  */
+volatile uint32_t x86_opl_t1_gap;        /* longest wait seen for timer 1   */
 volatile uint32_t x86_sb_resets;         /* completed 1-then-0 handshakes   */
 volatile uint32_t x86_sb_cmds;           /* DSP command bytes accepted      */
 volatile uint32_t x86_sb_cmds_unknown;   /* accepted, no reply, no effect   */
@@ -1065,9 +1108,25 @@ static int dma_page_decode(uint32_t port, unsigned *ch)
     return 0;
 }
 
+/* The FM card's own clock: machine time PLUS the ISA bus time the guest has
+   spent talking to this card. See the ISA BUS TIME block above -- the delay a
+   detection routine spends is nearly all bus, and none of it is visible in an
+   instruction count. */
+static uint32_t opl_now(void)
+{
+    return x86_pit_ticks() + x86_io_isa_ticks;
+}
+
+/* One 8-bit ISA cycle, charged on every access to an FM port -- index write,
+   data write and status read alike, because each is one bus cycle. */
+static void opl_bus_cycle(void)
+{
+    x86_io_isa_ticks += X86_ISA_IO_TICKS;
+}
+
 static void opl_push_status(void)
 {
-    uint32_t now = x86_pit_ticks();
+    uint32_t now = opl_now();
     uint8_t  f   = 0;
 
     /* A timer's flag comes up when its period has elapsed AND it is unmasked:
@@ -1082,6 +1141,16 @@ static void opl_push_status(void)
         (uint32_t)(now - opl.t2_start) >=
             (uint32_t)(256u - opl.t2_preset) * OPL_T2_STEP)
         f |= 0x20u;
+    /* THE NUMBER THAT SETTLES "IS THE PROBE'S DELAY LONG ENOUGH". The flag
+       needs 96 ticks at preset FFh; this is the longest a guest was ever
+       observed to have waited for it. A run that ends with expiry=0 and a gap
+       well under 96 is a CLOCK result, not a device one -- see the ISA bus
+       time block above, which is what moved it from ~24 to ~160. */
+    if (opl.t1_run) {
+        uint32_t gap = now - opl.t1_start;
+        if (gap > x86_opl_t1_gap)
+            x86_opl_t1_gap = gap;
+    }
     if (f && !(opl.status_sticky & f))
         x86_opl_timer_expiry++;
     opl.status_sticky |= f;
@@ -1090,6 +1159,7 @@ static void opl_push_status(void)
 static uint32_t opl_read_status(void)
 {
     x86_opl_status_reads++;
+    opl_bus_cycle();
     opl_push_status();
     /* Bit 7 mirrors "some timer fired". The low bits read 0x06 on a YM3812 and
        0x00 on a YMF262 -- that pair IS the OPL2/OPL3 test, and we are an OPL2,
@@ -1099,6 +1169,7 @@ static uint32_t opl_read_status(void)
 
 static void opl_write(uint32_t port, uint8_t v)
 {
+    opl_bus_cycle();
     if (!(port & 1u)) {              /* 0x388 / 0x220 / 0x228: index latch */
         opl.idx = v;
         return;
@@ -1113,8 +1184,8 @@ static void opl_write(uint32_t port, uint8_t v)
             return;
         }
         opl.ctrl = v;
-        if ((v & 0x01u) && !opl.t1_run) opl.t1_start = x86_pit_ticks();
-        if ((v & 0x02u) && !opl.t2_run) opl.t2_start = x86_pit_ticks();
+        if ((v & 0x01u) && !opl.t1_run) opl.t1_start = opl_now();
+        if ((v & 0x02u) && !opl.t2_run) opl.t2_start = opl_now();
         opl.t1_run = (uint8_t)(v & 0x01u);
         opl.t2_run = (uint8_t)((v >> 1) & 0x01u);
         break;

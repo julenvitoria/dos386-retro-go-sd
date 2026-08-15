@@ -204,7 +204,15 @@ X86_PGF_BENCH ?= 0
 # A/B arm for holding the handle -- measurement only, never shipped at 1.
 X86_DSK_OPEN_PER_CALL ?= 0
 
+# ISA bus time charged to an FM-port access, in PIT ticks (x86_io.c). 1 = one
+# ~0.84 us 8-bit ISA cycle, which is what the AdLib detect's delay loop is
+# calibrated in. 0 is the NEGATIVE CONTROL: the OPL timer then measures the
+# delay in instructions again and WOLF3D/KEEN4 go back to "no AdLib", and with
+# it WOLF3D goes back to never probing 0x22x.
+X86_ISA_IO_TICKS ?= 1
+
 CORE_C_DEFS := \
+-DX86_ISA_IO_TICKS=$(X86_ISA_IO_TICKS)u \
 -DX86_MODEY_EXTRA_PAGES=$(X86_MODEY_EXTRA_PAGES) \
 -DX86_PGF_BENCH=$(X86_PGF_BENCH) \
 -DX86_DSK_OPEN_PER_CALL=$(X86_DSK_OPEN_PER_CALL) \
