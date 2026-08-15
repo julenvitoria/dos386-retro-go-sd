@@ -22,6 +22,18 @@
 #include "x86_ems.h"          /* x86_ems_present() -- gates the EMMXXXX0 open */
 #include "lib/FatFs/ff.h"
 
+/*
+ * Perform INT 21h AH=4Bh, or refuse it as an unimplemented function.
+ *
+ * DEFAULT 1 here and 0 in Makefile.core: the mechanism is built and tested at
+ * tier 1 on every run, and the SHIPPING core keeps the behaviour it had until
+ * the memory cost of a mid-run program load is solved. dos_exec_child() below
+ * carries the measurement that decided it.
+ */
+#ifndef X86_DOS_EXEC
+#define X86_DOS_EXEC 1
+#endif
+
 #define SEG(x)          ((uint32_t)(x) << 4)
 #define PARA(bytes)     (((bytes) + 15u) >> 4)
 
@@ -324,7 +336,26 @@ uint16_t dos_test_walk(void)
 static uint16_t psp_seg;
 static uint32_t dta_lin;            /* disk transfer area, default PSP:0080 */
 
-static void psp_build(uint16_t seg, uint16_t mem_top, const char *tail)
+/*
+ * Build a PSP.
+ *
+ * `parent` is the PSP segment of the program that started this one, and it is
+ * not decoration: AH=4Ch finds the process to resume through PSP:0016, so a
+ * child whose link is wrong resumes the wrong program and one with a zero link
+ * resumes segment 0 -- the interrupt vector table. That is the exact shape of
+ * the derail Dark Forces produced when its EXEC went unanswered. The root
+ * program is its own parent, which is what real DOS records too.
+ * (MS-DOS 2.11 PSP layout; references/dosbox-x src/dos/dos_execute.cpp,
+ * DOS_Execute() -> DOS_PSP::SetParent, and src/dos/dos_programs.cpp.)
+ *
+ * `tail` is passed with an explicit LENGTH rather than as a C string: the tail
+ * an EXEC caller supplies comes out of guest memory verbatim and DOS copies
+ * the byte count it was given, not up to the first NUL.
+ */
+static void psp_build(uint16_t seg, uint16_t mem_top,
+                      const char *tail, unsigned tail_len,
+                      uint16_t parent, uint16_t env_seg,
+                      const uint8_t *fcbs)
 {
     /* Built in a local and copied granule-aware: a PSP is placed at an
        arbitrary PARAGRAPH, so 256 bytes from it straddles a 4 KB granule
@@ -339,10 +370,33 @@ static void psp_build(uint16_t seg, uint16_t mem_top, const char *tail)
     p[3] = (uint8_t)(mem_top >> 8);
     p[5] = 0x9A;                                /* far call to the dispatcher */
     p[0x0A] = 0x00; p[0x0B] = 0x00;             /* INT 22h terminate vector */
-    p[0x2C] = 0x00; p[0x2D] = 0x00;             /* no environment block */
+    p[0x16] = (uint8_t)parent;                  /* parent PSP -- see above */
+    p[0x17] = (uint8_t)(parent >> 8);
+    p[0x2C] = (uint8_t)env_seg;                 /* environment block */
+    p[0x2D] = (uint8_t)(env_seg >> 8);
     p[0x50] = 0xCD; p[0x51] = 0x21; p[0x52] = 0xCB;  /* INT 21h / RETF */
 
-    unsigned n = tail ? (unsigned)strlen(tail) : 0;
+    /* Job file table. Twenty entries, 0xFF = closed, with the five standard
+       devices already open, plus the far pointer at 0x34 that a runtime reads
+       to find it. Ours is not a real SFT index table -- handles are resolved by
+       handle_get() -- but a program that inspects the table to count its free
+       handles must not read 256 open files. */
+    memset(p + 0x18, 0xFF, 20);
+    p[0x18] = 0x01; p[0x19] = 0x01; p[0x1A] = 0x01;  /* stdin/out/err */
+    p[0x1B] = 0x00; p[0x1C] = 0x00;                  /* AUX, PRN */
+    p[0x32] = 20;   p[0x33] = 0;
+    p[0x34] = 0x18; p[0x35] = 0x00;
+    p[0x36] = (uint8_t)seg; p[0x37] = (uint8_t)(seg >> 8);
+
+    /* The two parsed FCBs an EXEC caller hands us. Nothing here parses a
+       command tail into an FCB, so with no caller-supplied pair they stay
+       zeroed rather than being invented. */
+    if (fcbs) {
+        memcpy(p + 0x5C, fcbs, 16);
+        memcpy(p + 0x6C, fcbs + 16, 16);
+    }
+
+    unsigned n = tail_len;
     if (n > 126) n = 126;
     p[0x80] = (uint8_t)n;
     if (n) memcpy(p + 0x81, tail, n);
@@ -701,7 +755,27 @@ typedef struct {
     uint16_t ss, sp, checksum, ip, cs, reloc_off, overlay;
 } mz_header_t;
 
-int x86_dos_exec(const char *path, const char *cmdline)
+/* What a load produced: where the program went and how it must be entered.
+   The loader does NOT touch the CPU -- the first program and an EXEC'd child
+   need the same bytes in memory and completely different transfers into them,
+   and a loader that also drove the CPU is what would have had to be written
+   twice. */
+typedef struct {
+    uint16_t psp, load_seg, mem_top;
+    uint16_t cs, ip, ss, sp;
+} dos_prog_t;
+
+/*
+ * Load an MZ .EXE and build its PSP. Nothing else: no CPU state, no arena
+ * bookkeeping beyond the block itself.
+ *
+ * .COM images are NOT handled here and are refused with error 0x0B, the same
+ * as any other non-MZ file. Adding the .COM path is a separate, small change;
+ * saying so is better than a loader that half-does it.
+ */
+static int dos_load_mz(const char *path, const char *tail, unsigned tail_len,
+                       uint16_t parent, uint16_t env_seg, const uint8_t *fcbs,
+                       dos_prog_t *out)
 {
     FIL f;
     if (f_open(&f, path, FA_READ) != FR_OK) {
@@ -798,6 +872,21 @@ int x86_dos_exec(const char *path, const char *cmdline)
     uint16_t psp = block;
     uint16_t load_seg = (uint16_t)(psp + PARA(256));
 
+    /* The block belongs to the PROCESS, which is only known now -- mcb_alloc()
+       above could not name a PSP that did not exist yet. This is what real DOS
+       records, it is what AH=48h already records for a program's own
+       allocations, and it is what lets a terminating child give its memory
+       back by owner. Left as MCB_OWNER_DOS, an EXEC'd child would leak its
+       entire block on exit and the second EXEC would find no memory. */
+    {
+        mcb_t hm;
+        uint16_t hseg = (uint16_t)(block - 1u);
+        if (mcb_read(hseg, &hm)) {
+            hm.owner = psp;
+            mcb_write(hseg, &hm);
+        }
+    }
+
     /* Copy the image in, a page at a time so it can cross granules. */
     f_lseek(&f, hdr_bytes);
     uint32_t done = 0;
@@ -833,37 +922,207 @@ int x86_dos_exec(const char *path, const char *cmdline)
     /* Top of memory as the program sees it: the end of what it was GRANTED,
        not of what it minimally needed. A Borland startup compares its own top
        against this field and refuses to run if it does not fit. */
-    psp_build(psp, (uint16_t)(psp + granted), cmdline);
+    out->mem_top = (uint16_t)(psp + granted);
+    psp_build(psp, out->mem_top, tail, tail_len, parent, env_seg, fcbs);
 
-    /* Entry state, exactly as the header specifies. */
-    /* Segment arithmetic wraps at 16 bits; the base must be built from the
-       wrapped value or it can land above 1 MB. */
-    cpu_state_ptr->segs[1].sel  = (uint16_t)(load_seg + h.cs);
-    cpu_state_ptr->segs[1].base = SEG((uint16_t)(load_seg + h.cs));
-    cpu_state_ptr->segs[1].limit = 0xFFFF;
-    cpu_state_ptr->eip = h.ip;
-
-    cpu_state_ptr->segs[2].sel  = (uint16_t)(load_seg + h.ss);
-    cpu_state_ptr->segs[2].base = SEG((uint16_t)(load_seg + h.ss));
-    cpu_state_ptr->segs[2].limit = 0xFFFF;
-    cpu_state_ptr->regs[4] = h.sp;
-
-    /* DS and ES point at the PSP on entry, which is where a program looks for
-       its command tail. */
-    for (int i = 0; i < 6; i += 3) {            /* ES (0) and DS (3) */
-        cpu_state_ptr->segs[i].sel  = psp;
-        cpu_state_ptr->segs[i].base = SEG(psp);
-        cpu_state_ptr->segs[i].limit = 0xFFFF;
-    }
-    cpu_state_ptr->regs[0] = 0;
+    /* Entry state, exactly as the header specifies. Segment arithmetic wraps
+       at 16 bits; a base must be built from the wrapped value or it can land
+       above 1 MB. */
+    out->psp = psp;
+    out->load_seg = load_seg;
+    out->cs = (uint16_t)(load_seg + h.cs);
+    out->ip = h.ip;
+    out->ss = (uint16_t)(load_seg + h.ss);
+    out->sp = h.sp;
     return 0;
 }
 
-/* --------------------------------------------------------------------------
- * INT 21h
- */
-int x86_dos_terminate(void)
+/* The half of "enter a program" that is the same either way: its stack, and
+   DS/ES on the PSP, which is where a program looks for its command tail. */
+static void dos_prog_enter_data(const dos_prog_t *p)
 {
+    cpu_state_ptr->segs[2].sel  = p->ss;
+    cpu_state_ptr->segs[2].base = SEG(p->ss);
+    cpu_state_ptr->segs[2].limit = 0xFFFF;
+    cpu_state_ptr->regs[4] = p->sp;
+
+    for (int i = 0; i < 6; i += 3) {            /* ES (0) and DS (3) */
+        cpu_state_ptr->segs[i].sel  = p->psp;
+        cpu_state_ptr->segs[i].base = SEG(p->psp);
+        cpu_state_ptr->segs[i].limit = 0xFFFF;
+    }
+    cpu_state_ptr->regs[0] = 0;
+}
+
+/*
+ * The FIRST program is entered by setting CS:EIP outright -- there is no
+ * interrupt in flight to return from, so nothing else could do it.
+ *
+ * An EXEC'd child must NOT be entered this way. It is reached from inside an
+ * INT 21h, whose stub has not IRETed yet; overwriting CS there discards the
+ * stub and the return path with it. dos_exec_child() leaves CS:EIP alone and
+ * lets the IRET do the transfer. See the block comment above DOS_EXEC_DEPTH.
+ */
+static void dos_prog_enter(const dos_prog_t *p)
+{
+    dos_prog_enter_data(p);
+    cpu_state_ptr->segs[1].sel  = p->cs;
+    cpu_state_ptr->segs[1].base = SEG(p->cs);
+    cpu_state_ptr->segs[1].limit = 0xFFFF;
+    cpu_state_ptr->eip = p->ip;
+}
+
+/* The FIRST program. Its parent is itself, as it is under real DOS -- there is
+   no process above it to resume, and AH=4Ch at depth zero really does stop the
+   machine. */
+int x86_dos_exec(const char *path, const char *cmdline)
+{
+    dos_prog_t p;
+    unsigned n = cmdline ? (unsigned)strlen(cmdline) : 0;
+    uint16_t psp_guess = 0;
+
+    /* The parent link has to name the block the loader is about to hand out,
+       and only the loader knows which one that is. It fills PSP:0016 with the
+       value passed here, so the root case is patched afterwards rather than
+       predicted. */
+    if (dos_load_mz(path, cmdline, n, psp_guess, 0, NULL, &p) != 0)
+        return -1;
+    {
+        uint8_t *q = x86_guest_ptr(SEG(p.psp) + 0x16u, 2);
+        if (q) { q[0] = (uint8_t)p.psp; q[1] = (uint8_t)(p.psp >> 8); }
+    }
+    dos_prog_enter(&p);
+    return 0;
+}
+
+/* ==========================================================================
+ * EXEC -- INT 21h AH=4Bh, and the AH=4Ch that comes back out of it.
+ *
+ * The load is dos_load_mz() above, unchanged and shared with the first
+ * program. What is new here is only the RE-ENTRANCY: a second program running
+ * inside the first one's machine, and a way back.
+ *
+ * THE WAY BACK IS THE PARENT'S OWN STACK. The INT 21h that reached us was
+ * taken through the stub at 0060:xxxx (x86_hle.c), so the parent's SS:SP
+ * already holds IP, CS, FLAGS and the stub ends in an IRET. Save SS:SP with
+ * the rest of the parent's registers, hand the CPU to the child, and when the
+ * child's AH=4Ch arrives put SS:SP back: the very same IRET then pops the
+ * PARENT's frame and the parent resumes after its own INT 21h. Nothing has to
+ * synthesise a return address, and no second control-transfer mechanism
+ * exists to drift out of step with the first.
+ *
+ * The child is entered the same way, through that IRET, by building a frame on
+ * ITS stack -- six bytes below the SS:SP its header asked for, which is its
+ * own stack space and nobody else's.
+ *
+ * References: MS-DOS 2.11 (EXEC in MSDOS.ASM), and references/dosbox-x
+ * src/dos/dos_execute.cpp DOS_Execute() / DOS_Terminate().
+ */
+#define DOS_EXEC_DEPTH 4
+
+static void fail(uint16_t code);
+static void dos_log_path(const char *p);
+
+typedef struct {
+    uint32_t regs[8];
+    uint16_t sel[6];
+    uint16_t psp;               /* the parent's PSP, and our psp_seg  */
+    uint32_t dta;               /* the parent's DTA                   */
+    uint16_t child_psp;
+    uint16_t child_env;         /* the env block WE allocated, or 0   */
+    uint16_t files;             /* handle slots the parent held       */
+} dos_exec_frame_t;
+
+static dos_exec_frame_t dos_exec_stack[DOS_EXEC_DEPTH];
+static unsigned dos_exec_depth;
+static uint16_t dos_ret_code;   /* what AH=4Dh reports, once          */
+
+/* Host-visible, because "did the EXEC happen" is the first question asked of
+   any run that reaches this code. */
+volatile uint32_t x86_dos_execs;
+volatile uint32_t x86_dos_exec_fails;
+volatile uint32_t x86_dos_exec_depth_max;
+volatile uint32_t x86_dos_exec_last_err;
+
+/* Free every block the terminating process owns. DOS does this on exit and it
+   is not optional here: the child's block is the largest thing in the arena
+   and a parent that EXECs in a loop would otherwise run out on the second
+   pass. */
+static void mcb_free_owner(uint16_t owner)
+{
+    uint16_t seg = ARENA_FIRST_MCB;
+    mcb_t m;
+    while (mcb_read(seg, &m)) {
+        if (m.owner == owner) {
+            m.owner = MCB_FREE;
+            mcb_write(seg, &m);
+        }
+        if (m.type == MCB_LAST)
+            break;
+        seg = (uint16_t)(seg + m.size + 1u);
+    }
+    mcb_coalesce();
+}
+
+#if X86_DOS_EXEC
+static uint16_t dos_file_mask(void)
+{
+    uint16_t m = 0;
+    for (int i = 0; i < DOS_MAX_FILES; i++)
+        if (dos_file_used[i])
+            m |= (uint16_t)(1u << i);
+    return m;
+}
+#endif
+
+int x86_dos_terminate_code(uint16_t code)
+{
+    if (dos_exec_depth) {
+        /* A CHILD is exiting. Give the parent its machine back. */
+        dos_exec_frame_t *fr = &dos_exec_stack[--dos_exec_depth];
+
+        /* Close what the CHILD opened and nothing else. The parent's handles
+           are still its own, and closing them here is the failure that would
+           surface as the parent's next read returning "invalid handle" long
+           after the EXEC. */
+        for (int i = 0; i < DOS_MAX_FILES; i++)
+            if (dos_file_used[i] && !(fr->files & (1u << i))) {
+                f_close(&dos_files[i]);
+                dos_file_used[i] = 0;
+            }
+
+        /* ONE call frees both: the child's program block and the environment
+           block are both OWNED by the child's PSP, which is the only reason
+           freeing by owner works at all. */
+        mcb_free_owner(fr->child_psp);
+
+        for (int i = 0; i < 8; i++)
+            cpu_state_ptr->regs[i] = fr->regs[i];
+        /* EVERY segment except CS. We are inside the child's INT 21h stub and
+           its IRET has not run yet; that IRET is the transfer back, and it
+           pops the parent's CS:IP off the stack we are restoring below. Write
+           CS here and the next instruction is fetched from the parent's code
+           segment at the STUB's offset -- which is how this first shipped, and
+           it derails exactly the way an unanswered EXEC does. */
+        for (int i = 0; i < 6; i++) {
+            if (i == 1)
+                continue;
+            cpu_state_ptr->segs[i].sel  = fr->sel[i];
+            cpu_state_ptr->segs[i].base = SEG(fr->sel[i]);
+            cpu_state_ptr->segs[i].limit = 0xFFFF;
+        }
+        psp_seg = fr->psp;
+        dta_lin = fr->dta;
+        dos_ret_code = code;
+
+        /* SS:SP is the parent's again, so THIS is now the parent's stacked
+           FLAGS -- the frame its own INT 21h pushed. A successful EXEC returns
+           with CF clear. */
+        x86_set_ax(0);
+        x86_hle_set_cf(0);
+        return 1;                       /* keep running: as the parent */
+    }
+
     /* Real DOS closes the process's handles on exit, and it matters here:
        FatFs is built FF_FS_TINY, so the last sector of a file the guest wrote
        is still sitting in the filesystem window until something flushes it. */
@@ -872,9 +1131,237 @@ int x86_dos_terminate(void)
             f_close(&dos_files[i]);
             dos_file_used[i] = 0;
         }
+    dos_ret_code = code;
     cpu_state_ptr->exit_reason = X86_EXIT_TERMINATE;
     return 1;
 }
+
+int x86_dos_terminate(void) { return x86_dos_terminate_code(0); }
+
+/*
+ * Build the child's environment block when the caller did not supply one.
+ *
+ * The layout is not ours to choose: strings, an extra NUL, a word of 1, then
+ * the program's own full path. A protected-mode extender reads that path to
+ * re-open the file it was loaded from, so an environment without it is worse
+ * than none at all. Owned by the CHILD's PSP so it is freed with the child.
+ */
+#if X86_DOS_EXEC
+static uint16_t dos_env_build(const char *path, uint16_t owner)
+{
+    uint8_t env[96];
+    unsigned n = 0;
+    static const char base[] = "PATH=\0COMSPEC=C:\\COMMAND.COM\0";
+    memcpy(env, base, sizeof(base) - 1);
+    n = sizeof(base) - 1;
+    env[n++] = 0;                       /* end of the strings */
+    env[n++] = 1; env[n++] = 0;         /* one trailing item follows */
+    env[n++] = 'C'; env[n++] = ':'; env[n++] = '\\';
+    for (unsigned i = 0; path[i] && n < sizeof(env) - 1; i++)
+        env[n++] = (uint8_t)dos_up(path[i]);
+    env[n++] = 0;
+
+    uint16_t largest = 0;
+    uint16_t seg = mcb_alloc(PARA(n), owner, &largest);
+    if (!seg)
+        return 0;
+    x86_guest_copy_in(SEG(seg), env, n);
+    return seg;
+}
+#endif
+
+/*
+ * AH=4Bh. ES:BX is the parameter block:
+ *
+ *   +0  dw  environment segment, 0 = inherit the parent's
+ *   +2  dd  far pointer to the command tail (a length byte, then the bytes)
+ *   +6  dd  far pointer to the first  FCB
+ *   +10 dd  far pointer to the second FCB
+ *
+ * AL=00 (load and execute) is implemented. AL=01 (load, do not execute) and
+ * AL=03 (overlay) are NOT -- they are refused loudly through the same
+ * unhandled-function path as any other missing service, because a program
+ * whose overlay was silently not loaded fails somewhere unrelated.
+ */
+static int dos_exec_child(void)
+{
+    uint32_t *r = cpu_state_ptr->regs;
+    uint8_t al = (uint8_t)r[0];
+
+#if !X86_DOS_EXEC
+    /*
+     * MEASURED, AND THE REASON THIS IS A FLAG.
+     *
+     * WOLFENSTEIN 3-D CALLS AH=4Bh AL=00 WITH A LOADABLE IMAGE, and honouring
+     * it kills the title outright: `guest_insns_total` 0, `guest_halted` 1,
+     * `guest_exit_reason` 5 (MEM_FAULT), golden gate 0.000% -> no picture at
+     * all. Bisected at tier 2 against the WOLF3D golden, one behaviour per
+     * run: refusing AH=4Bh before doing anything PASSES; performing the LOAD
+     * and then freeing it and refusing FAILS. So it is the load, not the
+     * control transfer and not the error code (returning the old AX=0001 for
+     * a failed load still fails, which also proves the load SUCCEEDS).
+     *
+     * The mechanism is memory, not DOS semantics: a child image is copied into
+     * ~30 guest pages that have never been touched, mid-run, with the pager's
+     * pool already full of the parent's working set. A machine with 160 frames
+     * and no pagefile has nowhere to put them, so the next guest access faults
+     * unresolvably. That is Queue A territory, not Queue C's.
+     *
+     * Everything above this point is real, tested (tests/test_dos.py, three
+     * negative controls) and unchanged by the flag; only the SWITCH is gated,
+     * and gated off it returns exactly what the default arm returned before
+     * this work -- CF=1, AX=0001 -- so the shipping core behaves as it did.
+     */
+    x86_hle_unhandled_vector = 0x21;
+    x86_hle_unhandled_func = 0x4B;
+    x86_dos_exec_last_err = 0x200u | al;
+    x86_dos_exec_fails++;
+    fail(0x01);
+    return 0;
+#else
+    if (al != 0x00) {
+        x86_hle_unhandled_vector = 0x21;
+        x86_hle_unhandled_func = 0x4B;
+        x86_dos_exec_last_err = 0x100u | al;    /* the SUBfunction, not 4B */
+        fail(0x01);
+        return 0;
+    }
+    if (dos_exec_depth >= DOS_EXEC_DEPTH) {
+        x86_dos_exec_fails++;
+        x86_dos_exec_last_err = 0x08;
+        fail(0x08);
+        return 1;
+    }
+
+    char path[64];
+    dos_path_from_guest(cpu_state_ptr->segs[3].base + (uint16_t)r[2],
+                        path, sizeof(path));
+    strncpy(x86_dos_last_path, path, sizeof(x86_dos_last_path) - 1);
+    dos_log_path(path);
+
+    /* The parameter block. Read granule-aware: ES:BX is an address the GUEST
+       chose and 14 bytes from it can straddle a 4 KB boundary, which
+       x86_guest_ptr() refuses outright. */
+    uint8_t pb[14];
+    uint32_t pb_lin = cpu_state_ptr->segs[0].base + (uint16_t)r[3];
+    if (x86_guest_copy_out(pb, pb_lin, sizeof(pb)) != sizeof(pb)) {
+        x86_dos_exec_fails++;
+        x86_dos_exec_last_err = 0x0B;
+        fail(0x0B);
+        return 1;
+    }
+    uint16_t env_seg = (uint16_t)(pb[0] | (pb[1] << 8));
+    uint32_t tail_lin = ((uint32_t)(pb[4] | (pb[5] << 8)) << 4)
+                      + (uint16_t)(pb[2] | (pb[3] << 8));
+    uint32_t fcb1_lin = ((uint32_t)(pb[8] | (pb[9] << 8)) << 4)
+                      + (uint16_t)(pb[6] | (pb[7] << 8));
+    uint32_t fcb2_lin = ((uint32_t)(pb[12] | (pb[13] << 8)) << 4)
+                      + (uint16_t)(pb[10] | (pb[11] << 8));
+
+    uint8_t tail[128];
+    unsigned tail_len = 0;
+    if (x86_guest_copy_out(tail, tail_lin, 1) == 1) {
+        tail_len = tail[0];
+        if (tail_len > 126)
+            tail_len = 126;
+        if (tail_len &&
+            x86_guest_copy_out(tail, tail_lin + 1, tail_len) != tail_len)
+            tail_len = 0;
+    }
+
+    uint8_t fcbs[32];
+    memset(fcbs, 0, sizeof(fcbs));
+    (void)x86_guest_copy_out(fcbs, fcb1_lin, 16);
+    (void)x86_guest_copy_out(fcbs + 16, fcb2_lin, 16);
+
+    /* Inherit the parent's environment when the caller passed 0, which is what
+       the field means. Only build one if there is nothing to inherit. */
+    uint16_t built_env = 0;
+    if (!env_seg) {
+        uint8_t *pe = x86_guest_ptr(SEG(psp_seg) + 0x2Cu, 2);
+        if (pe)
+            env_seg = (uint16_t)(pe[0] | (pe[1] << 8));
+    }
+
+    /*
+     * ORDER MATTERS: save the parent BEFORE the load. dos_load_mz() builds the
+     * child's PSP, and psp_build() moves psp_seg and dta_lin to it -- so by the
+     * time the load returns, the parent's own values are already gone.
+     */
+    dos_exec_frame_t *fr = &dos_exec_stack[dos_exec_depth];
+    for (int i = 0; i < 8; i++)
+        fr->regs[i] = cpu_state_ptr->regs[i];
+    for (int i = 0; i < 6; i++)
+        fr->sel[i] = cpu_state_ptr->segs[i].sel;
+    fr->psp = psp_seg;
+    fr->dta = dta_lin;
+    fr->files = dos_file_mask();
+
+    dos_prog_t p;
+    if (dos_load_mz(path, (const char *)tail, tail_len, fr->psp, env_seg,
+                    fcbs, &p) != 0) {
+        /* Nothing was saved that needs undoing -- the frame is not committed
+           until dos_exec_depth moves, and a failed load never reached
+           psp_build(). x86_dos_last_error carries the DOS code the loader
+           chose (2 = not found, 8 = no memory, 0x0B = bad format). */
+        x86_dos_exec_fails++;
+        x86_dos_exec_last_err = x86_dos_last_error;
+        fail((uint16_t)x86_dos_last_error);
+        return 1;
+    }
+    if (!env_seg) {
+        built_env = dos_env_build(path, p.psp);
+        uint8_t *q = x86_guest_ptr(SEG(p.psp) + 0x2Cu, 2);
+        if (q) { q[0] = (uint8_t)built_env; q[1] = (uint8_t)(built_env >> 8); }
+    }
+    fr->child_psp = p.psp;
+    fr->child_env = built_env;
+
+    /*
+     * The child's entry frame, six bytes below the stack its header asked for.
+     * Granule-aware for the same reason as everything else that writes an
+     * address the guest picked. FLAGS = 0x0200 (IF set, CF clear), which is
+     * what a program entered from DOS finds.
+     */
+    uint16_t sp = (uint16_t)(p.sp - 6u);
+    uint8_t frame[6] = {
+        (uint8_t)p.ip, (uint8_t)(p.ip >> 8),
+        (uint8_t)p.cs, (uint8_t)(p.cs >> 8),
+        0x00, 0x02,
+    };
+    if (x86_guest_copy_in(SEG(p.ss) + sp, frame, 6) != 6) {
+        /* The child's own stack is unreachable, so there is no way to enter
+           it. Undo the allocation rather than leave a block owned by a process
+           that will never run. */
+        mcb_free_owner(p.psp);      /* the env block is owned by it too */
+        psp_seg = fr->psp;
+        dta_lin = fr->dta;
+        x86_dos_exec_fails++;
+        x86_dos_exec_last_err = 0x0B;
+        fail(0x0B);
+        return 1;
+    }
+
+    /* Stack, DS and ES only. CS:EIP still address the INT 21h stub, whose
+       IRET is one instruction away and is what actually enters the child --
+       off the frame written just above. */
+    dos_prog_enter_data(&p);
+    cpu_state_ptr->regs[4] = sp;        /* below the frame we just pushed */
+
+    dos_exec_depth++;
+    if (dos_exec_depth > x86_dos_exec_depth_max)
+        x86_dos_exec_depth_max = dos_exec_depth;
+    x86_dos_execs++;
+    /* No CF to clear: the stacked FLAGS now belong to the CHILD's frame, and
+       it was pushed with CF already clear. The parent's frame is untouched on
+       its own stack, waiting for the AH=4Ch that will pop it. */
+    return 1;
+#endif /* X86_DOS_EXEC */
+}
+
+/* --------------------------------------------------------------------------
+ * INT 21h
+ */
 
 static void ok_clear_cf(void)   { x86_hle_set_cf(0); }
 static void fail(uint16_t code) { x86_set_ax(code); x86_hle_set_cf(1); }
@@ -923,6 +1410,8 @@ static int dos_func_is_file(uint8_t f)
     case 0x23: case 0x27: case 0x28: case 0x29: case 0x2F:
     case 0x39: case 0x3A: case 0x3B: case 0x3C: case 0x3D: case 0x3E:
     case 0x3F: case 0x40: case 0x41: case 0x42: case 0x43: case 0x45:
+    case 0x4B:                  /* EXEC opens a file, and the path log is the
+                                   first thing asked for when one fails */
     case 0x46: case 0x47: case 0x4E: case 0x4F: case 0x56: case 0x57:
     case 0x5A: case 0x5B: case 0x68: case 0x6C:
         return 1;
@@ -979,8 +1468,26 @@ static int dos_int21_dispatch(uint8_t func)
 
     switch (func) {
     case 0x00:
+        return x86_dos_terminate_code(0);
     case 0x4C:
-        return x86_dos_terminate();
+        /* AL is the return code, and it is the whole point of AH=4Dh below:
+           a parent that EXECs a child reads it to find out whether the child
+           worked. Discarding it here made 4Dh unimplementable. */
+        return x86_dos_terminate_code((uint16_t)(r[0] & 0xFFu));
+
+    case 0x4B:                                  /* EXEC */
+        return dos_exec_child();
+
+#if X86_DOS_EXEC
+    case 0x4D:                                  /* get child return code */
+        /* AH is the exit TYPE (0 = a normal AH=4Ch), AL the code. DOS returns
+           it ONCE and then forgets it, so a second AH=4Dh reports 0 -- a
+           parent that polls must not see the same child exit twice. */
+        x86_set_ax(dos_ret_code);
+        dos_ret_code = 0;
+        ok_clear_cf();
+        return 1;
+#endif
 
     case 0x02:                                  /* character output */
         x86_video_teletype((uint8_t)dx);

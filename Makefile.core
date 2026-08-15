@@ -78,6 +78,16 @@ endif
 # See x86_dos.c and tests/test_seam.py.
 X86_DOS_PSP_SHIFT ?= 0
 
+# INT 21h AH=4Bh (EXEC). Built and tested at tier 1 on every run; OFF in the
+# SHIPPING core because honouring it kills Wolfenstein 3-D -- it calls AH=4Bh
+# AL=00 with a loadable image, and copying a child into ~30 untouched guest
+# pages mid-run leaves the pager nowhere to put them (guest_exit_reason=5,
+# MEM_FAULT, golden gate: no picture). Bisected at tier 2, one behaviour per
+# run; the measurement is in dos_exec_child(). Turn it on with
+#   make -f Makefile.core clean && make -f Makefile.core X86_DOS_EXEC=1 pack
+# -- a changed -D is NOT a dependency in this tree, so the clean is required.
+X86_DOS_EXEC ?= 0
+
 X86_SEAM_FIX ?= 1
 X86_CODE_THREAD_UNSAFE ?= 0
 
@@ -146,6 +156,7 @@ CORE_C_DEFS := \
 -DX86_SEAM_FIX=$(X86_SEAM_FIX) \
 -DX86_CODE_THREAD_UNSAFE=$(X86_CODE_THREAD_UNSAFE) \
 -DX86_DOS_PSP_SHIFT=$(X86_DOS_PSP_SHIFT) \
+-DX86_DOS_EXEC=$(X86_DOS_EXEC) \
 -DX86_PROFILE=$(X86_PROFILE) \
 -DX86_ZONES=$(X86_ZONES) \
 -DX86_VPROF=$(X86_VPROF) \

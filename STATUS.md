@@ -81,6 +81,8 @@ mid-`REP`, so the decision is resolvable once), aperture reads (~4.5%), the
 | **ONE 4 KB PAGEFILE WRITEBACK COSTS UP TO 433 ms ON SILICON** (`x86_pg_wb_us_worst`) vs 23 ms for a sector read, and GROWS over a session. The per-page `fopen`/`fclose` is fixed; `pgf_us_seek` vs `_us_write` says what the rest is, `FF_USE_FASTSEEK 0` the suspect. Gates Keen and anything EMS/XMS-backed | `src/main.c` |
 | **KEEN4 gives 60 of 160 pager frames to the arena** once 0Dh is up, so runs on 100; EMS pins 16 more — tighter than the 144 the EMS work assumed | [`docs/12`](docs/12_memory_tiers.md) |
 | Retro-go's Pause overlay is unreadable over 256-colour modes | [`docs/08`](docs/08_vga_mode13h.md) §1 |
+| **INT 21h AH=4Bh (EXEC) is built but OFF in the shipping core** (`X86_DOS_EXEC`). WOLF3D calls it with a loadable image and honouring it kills the title: `guest_exit_reason`=5 (MEM_FAULT), `guest_insns_total`=0. The load, not the transfer — the pager has nowhere to put ~30 untouched guest pages mid-run | `PLAN.md` Queue C3 |
+| **`scripts/probe_report.py` is VOID on every title tried** — `core_ready`=0, `guest_insns_total`=0 under `X86_PROBE=1`, on MASTER as well as this branch. The project's "what did this title ask for" instrument does not currently work | `CLAUDE.md`, the X86_PROBE trap |
 | **Interpreter gaps**: seg override before `REP` survives one element; `moffs` uses operand not ADDRESS size; `MOV SS,x` does not inhibit interrupts; 5 handlers ignore `0x67`; 13 slots exit (x87, `BOUND`/`ARPL`, `XLAT`, `WAIT`, `INT1`) | [`docs/07`](docs/07_opcode_coverage.md) |
 
 ## Protected mode — the descriptor walk is IN, real mode pays NOTHING

@@ -553,6 +553,312 @@ def exec_test(b, syms):
     return ok
 
 
+# ---------------------------------------------------------------------------
+# The EXEC test -- INT 21h AH=4Bh.
+#
+# WHY IT EXISTS. Dark Forces died with x86_hle_unhandled_func = 0x4B: DARK.EXE's
+# stub EXECs DOS4GW.EXE, got "invalid function", printed its own generic "Bad
+# format on exec" and derailed into the interrupt vector table. AH=4Bh did not
+# exist in this tree at all.
+#
+# What the MZ LOAD test above cannot say anything about is RE-ENTRANCY. A child
+# that loads perfectly and never gives the machine back looks, from the host,
+# exactly like one that works -- the load counters are identical and the guest
+# is still executing instructions. So both halves run as REAL GUEST PROGRAMS
+# and every claim below is a byte one of them wrote:
+#
+#   PARENT.EXE  marks 0x1111, fills in the runtime segments of an EXEC
+#               parameter block, EXECs CHILD.EXE, and -- only if it is resumed
+#               -- records the FLAGS and AX it came back with, its restored DS
+#               and SP, and the child's return code from AH=4Dh.
+#   CHILD.EXE   marks 0x2222 and reports its own PSP, the PARENT PSP LINK at
+#               PSP:0016, its environment segment, the word its RELOCATION
+#               entry should have fixed up, its command tail and its CS.
+#               Exits AH=4Ch with AL=0x5A.
+#
+# The child's reported reloc word and parent link are what the two negative
+# controls at the bottom of this file mutate.
+# ---------------------------------------------------------------------------
+EXEC2_MARK = 0x0500              # DOS scratch, below the arena at 0x700
+EXEC2_TAIL = b" -k"
+EXEC2_RETCODE = 0x5A
+EXEC2_FCB1 = bytes([0x00]) + b"CHILD   EXE" + bytes(4)
+EXEC2_FCB2 = bytes([0x02]) + b"SECOND  FCB" + bytes(4)
+# Where each program's data lives inside its own image, and therefore what the
+# hand-assembled displacements below mean.
+E2_PBLK, E2_FNAME, E2_TAIL, E2_FCB1, E2_FCB2 = 0x200, 0x210, 0x220, 0x230, 0x240
+E2_RELOC = 0x200                 # the child's relocated word
+E2_IMAGE = 0x500                 # parent image length; its SS:SP is 0x40:0x100
+E2_SS, E2_SP = 0x0040, 0x0100
+# The CHILD's stack and BP are deliberately NOTHING like the parent's. With the
+# same SS:SP in both, a core that forgets to restore the parent's registers
+# still lands on a correct-looking frame and the 'resume' negative control
+# passes with the defect present -- which is how this test first shipped.
+E2_CHILD_SS, E2_CHILD_SP, E2_CHILD_IMAGE = 0x0060, 0x0080, 0x0700
+E2_PARENT_BP, E2_CHILD_BP = 0xBEEF, 0x1234
+
+
+def _mz(body, relocs=(), ss=E2_SS, sp=E2_SP):
+    """A real MZ .EXE. hdr_paras is 2, so 28 bytes of header leave exactly one
+    4-byte relocation entry at 0x1C -- which is all either program needs."""
+    import struct
+    assert len(relocs) <= 1
+    hdr_paras = 2
+    total = hdr_paras * 16 + len(body)
+    pages = (total + 511) // 512
+    h = struct.pack("<14H", 0x5A4D, total % 512, pages, len(relocs), hdr_paras,
+                    0x0060, 0x0080, ss, sp, 0, 0x0000, 0x0000, 0x001C, 0)
+    for off in relocs:
+        h += struct.pack("<2H", off, 0)
+    return h + bytes(hdr_paras * 16 - len(h)) + body
+
+
+def build_parent_exe():
+    """DS=ES=PSP on entry; CS=DS=the image after the first two instructions."""
+    code = bytes([
+        0x8C, 0xC8,                          # mov ax,cs
+        0x8E, 0xD8,                          # mov ds,ax
+        # The EXEC parameter block's three far pointers name segments only the
+        # running program knows, so it fills them in itself.
+        0xA3, (E2_PBLK + 4) & 0xFF, E2_PBLK >> 8,             # mov [pblk+4],ax   tail seg
+        0xA3, (E2_PBLK + 8) & 0xFF, E2_PBLK >> 8,             # mov [pblk+8],ax   fcb1 seg
+        0xA3, (E2_PBLK + 12) & 0xFF, E2_PBLK >> 8,            # mov [pblk+12],ax  fcb2 seg
+        0xB8, 0x50, 0x00,                    # mov ax,0050
+        0x8E, 0xC0,                          # mov es,ax
+        0x26, 0xC7, 0x06, 0x00, 0x00, 0x11, 0x11,   # mov es:[0000],1111
+        0x8C, 0xC8,                          # mov ax,cs
+        0x8E, 0xC0,                          # mov es,ax
+        0xBA, E2_FNAME & 0xFF, E2_FNAME >> 8,                # mov dx,fname    DS:DX = path
+        0xBB, E2_PBLK & 0xFF, E2_PBLK >> 8,                 # mov bx,pblk     ES:BX = block
+        0xBD, E2_PARENT_BP & 0xFF, E2_PARENT_BP >> 8,   # mov bp,BEEF
+        0xB8, 0x00, 0x4B,                    # mov ax,4B00
+        0xCD, 0x21,                          # int 21h
+        # Everything from here on only executes if the EXEC came back.
+        0x9C, 0x59,                          # pushf ; pop cx   FLAGS
+        0x89, 0xC6,                          # mov si,ax
+        0x8C, 0xDA,                          # mov dx,ds        restored DS
+        0x89, 0xE3,                          # mov bx,sp        restored SP
+        0xB8, 0x50, 0x00,                    # mov ax,0050
+        0x8E, 0xC0,                          # mov es,ax
+        0x26, 0x89, 0x0E, 0x0A, 0x00,        # mov es:[000A],cx
+        0x26, 0x89, 0x36, 0x0C, 0x00,        # mov es:[000C],si
+        0x26, 0x89, 0x16, 0x10, 0x00,        # mov es:[0010],dx
+        0x26, 0x89, 0x1E, 0x12, 0x00,        # mov es:[0012],bx
+        0x26, 0x89, 0x2E, 0x16, 0x00,        # mov es:[0016],bp  restored BP
+        0xB4, 0x4D,                          # mov ah,4D        child's code
+        0xCD, 0x21,                          # int 21h
+        0x26, 0xA3, 0x0E, 0x00,              # mov es:[000E],ax
+        0xB8, 0x00, 0x4C,                    # mov ax,4C00
+        0xCD, 0x21,                          # int 21h
+    ])
+    img = bytearray(E2_IMAGE)
+    img[:len(code)] = code
+    import struct
+    img[E2_PBLK:E2_PBLK + 14] = struct.pack(
+        "<7H", 0, E2_TAIL, 0, E2_FCB1, 0, E2_FCB2, 0)
+    img[E2_FNAME:E2_FNAME + 10] = b"CHILD.EXE\0"
+    img[E2_TAIL] = len(EXEC2_TAIL)
+    img[E2_TAIL + 1:E2_TAIL + 1 + len(EXEC2_TAIL)] = EXEC2_TAIL
+    img[E2_TAIL + 1 + len(EXEC2_TAIL)] = 0x0D
+    img[E2_FCB1:E2_FCB1 + 16] = EXEC2_FCB1
+    img[E2_FCB2:E2_FCB2 + 16] = EXEC2_FCB2
+    return _mz(bytes(img))
+
+
+def build_child_exe():
+    code = bytes([
+        0xBD, E2_CHILD_BP & 0xFF, E2_CHILD_BP >> 8,     # mov bp,1234
+        0xB8, 0x50, 0x00,                    # mov ax,0050
+        0x8E, 0xC0,                          # mov es,ax
+        0x26, 0xC7, 0x06, 0x02, 0x00, 0x22, 0x22,   # mov es:[0002],2222
+        0x8C, 0xD8,                          # mov ax,ds        = our PSP
+        0x26, 0xA3, 0x04, 0x00,              # mov es:[0004],ax
+        0xA1, 0x16, 0x00,                    # mov ax,[0016]    parent link
+        0x26, 0xA3, 0x06, 0x00,              # mov es:[0006],ax
+        0xA1, 0x2C, 0x00,                    # mov ax,[002C]    environment
+        0x26, 0xA3, 0x08, 0x00,              # mov es:[0008],ax
+        0x2E, 0xA1, E2_RELOC & 0xFF, E2_RELOC >> 8,          # mov ax,cs:[reloc]
+        0x26, 0xA3, 0x14, 0x00,              # mov es:[0014],ax
+        0xA1, 0x80, 0x00,                    # mov ax,[0080]    tail len+char
+        0x26, 0xA3, 0x1A, 0x00,              # mov es:[001A],ax
+        0x8C, 0xC8,                          # mov ax,cs
+        0x26, 0xA3, 0x1C, 0x00,              # mov es:[001C],ax
+        0xB8, EXEC2_RETCODE, 0x4C,           # mov ax,4C5A
+        0xCD, 0x21,                          # int 21h
+    ])
+    img = bytearray(E2_CHILD_IMAGE)
+    img[:len(code)] = code
+    # The relocated word starts at ZERO. The loader must add load_seg to it, so
+    # the child reading it back is reading the relocation itself.
+    img[E2_RELOC:E2_RELOC + 2] = b"\0\0"
+    return _mz(bytes(img), relocs=(E2_RELOC,),
+               ss=E2_CHILD_SS, sp=E2_CHILD_SP)
+
+
+def exec2_test(b, syms):
+    from scripts.common.fat12 import build_image
+
+    for n in ("run_dosexec2_flag", "dosexec2_r", "dosfile_img", "test_ram"):
+        if n not in syms:
+            print(f"missing symbol {n} -- rebuild tests/main.c")
+            return False
+    ram = syms["test_ram"]
+    parent, child = build_parent_exe(), build_child_exe()
+    b.write_memory(syms["dosfile_img"],
+                   build_image([("PARENT.EXE", parent),
+                                ("CHILD.EXE", child)]))
+
+    b.write_uint32(syms["run_dosexec2_flag"], 1)
+    for _ in range(400):
+        if b.read_uint32(syms["run_dosexec2_flag"]) == 0:
+            break
+        time.sleep(0.05)
+    else:
+        print("FAIL: the EXEC test never completed")
+        return False
+
+    r = [b.read_uint32(syms["dosexec2_r"] + 4 * i) for i in range(16)]
+    (mount, rc, ppsp, exit_reason, execs, fails, last_err,
+     depth_max, nblocks, psp_after, largest_after) = r[:11]
+
+    m = bytes(b.read_memory(ram + EXEC2_MARK, 32))
+    w = lambda o: m[o] | (m[o + 1] << 8)
+    parent_mark, child_mark = w(0x00), w(0x02)
+    child_psp, child_parent, child_env = w(0x04), w(0x06), w(0x08)
+    back_flags, back_ax, child_code = w(0x0A), w(0x0C), w(0x0E)
+    back_ds, back_sp = w(0x10), w(0x12)
+    child_reloc, child_tail, child_cs = w(0x14), w(0x1A), w(0x1C)
+    back_bp = w(0x16)
+
+    print("\nEXEC (AH=4Bh):")
+    print(f"  mount {mount}   x86_dos_exec(PARENT.EXE) {rc}   "
+          f"parent PSP 0x{ppsp:04x}")
+    print(f"  exit_reason {exit_reason} (1 = the PARENT terminated)")
+    print(f"  execs {execs}  fails {fails}  last_err 0x{last_err:04x}  "
+          f"depth_max {depth_max}")
+    print(f"  parent mark 0x{parent_mark:04x}   child mark 0x{child_mark:04x}")
+    print(f"  child PSP 0x{child_psp:04x}  parent link 0x{child_parent:04x}  "
+          f"env 0x{child_env:04x}  CS 0x{child_cs:04x}")
+    print(f"  child reloc word 0x{child_reloc:04x}  "
+          f"tail len {child_tail & 0xFF} first {child_tail >> 8:#04x}")
+    print(f"  back: FLAGS 0x{back_flags:04x} AX 0x{back_ax:04x} "
+          f"DS 0x{back_ds:04x} SP 0x{back_sp:04x}  "
+          f"BP 0x{back_bp:04x}  AH=4Dh 0x{child_code:04x}")
+    print(f"  PSP after 0x{psp_after:04x}  chain {nblocks} blocks  "
+          f"largest free after 0x{largest_after:04x}")
+
+    # The service conversation, in order. When an EXEC goes wrong the question
+    # is always "what did the guest ask for next", and one counter cannot say.
+    if "x86_hle_log" in syms and "x86_hle_log_idx" in syms:
+        idx = b.read_uint32(syms["x86_hle_log_idx"])
+        raw = [b.read_uint32(syms["x86_hle_log"] + 4 * i) for i in range(32)]
+        seq = [raw[i & 31] for i in range(max(0, idx - 32), idx)]
+        print("  services: " + " ".join(
+            f"{(v >> 8) & 0xFF:02X}/{v & 0xFF:02X}{'!' if v & 0x10000 else ''}"
+            for v in seq))
+
+    ok = True
+
+    def fail(msg):
+        nonlocal ok
+        print("FAIL: " + msg)
+        ok = False
+
+    if mount != 0 or rc != 0:
+        print("FAIL: PARENT.EXE did not load at all")
+        return False
+    if parent_mark != 0x1111:
+        fail("the parent never ran; nothing below means anything")
+        return False
+    if execs != 1:
+        fail(f"x86_dos_execs is {execs}, expected exactly 1 "
+             f"(fails {fails}, last_err 0x{last_err:04x})")
+    if child_mark != 0x2222:
+        fail("THE CHILD NEVER RAN. The EXEC was refused or transferred "
+             "control somewhere else")
+        return False
+
+    # THE PARENT-PSP LINK. A program reads PSP:0016 to find who started it, and
+    # a zero there is a pointer at the interrupt vector table.
+    if child_parent != ppsp:
+        fail(f"the child's parent link at PSP:0016 is 0x{child_parent:04x}, "
+             f"expected the parent's PSP 0x{ppsp:04x}")
+    if child_psp == 0 or child_psp == ppsp:
+        fail(f"the child's PSP is 0x{child_psp:04x}; it must be its own block, "
+             f"not the parent's 0x{ppsp:04x}")
+
+    # THE RELOCATION. The word shipped as zero and must now name the segment
+    # the child was actually loaded at -- which the child also reports as CS.
+    expect_reloc = (child_psp + 0x10) & 0xFFFF
+    if child_reloc != expect_reloc:
+        fail(f"the child's relocated word is 0x{child_reloc:04x}, expected its "
+             f"load segment 0x{expect_reloc:04x} -- the relocation table was "
+             f"not applied")
+    if child_cs != expect_reloc:
+        fail(f"the child's CS is 0x{child_cs:04x}, expected 0x{expect_reloc:04x}")
+
+    # THE RETURN. Everything from here proves the parent got its machine back.
+    if back_flags == 0 and back_ax == 0 and back_ds == 0:
+        fail("THE PARENT NEVER RESUMED -- it wrote nothing after its INT 21h")
+        return False
+    if back_flags & CF:
+        fail(f"the parent resumed with CF SET (FLAGS 0x{back_flags:04x}); a "
+             f"successful EXEC returns CF clear")
+    if back_ds != ppsp + 0x10:
+        fail(f"the parent's DS came back as 0x{back_ds:04x}, expected its own "
+             f"code segment 0x{ppsp + 0x10:04x} -- registers were not restored")
+    if back_sp != E2_SP:
+        fail(f"the parent's SP came back as 0x{back_sp:04x}, expected "
+             f"0x{E2_SP:04x} -- its own stack, with its own INT 21h frame "
+             f"popped by the stub's IRET and nothing else left behind")
+    if back_bp != E2_PARENT_BP:
+        fail(f"the parent's BP came back as 0x{back_bp:04x}, expected "
+             f"0x{E2_PARENT_BP:04x} -- the child left 0x{E2_CHILD_BP:04x} in "
+             f"it, so the general registers were not restored")
+    if child_code != EXEC2_RETCODE:
+        fail(f"AH=4Dh reported 0x{child_code:04x}, expected 0x{EXEC2_RETCODE:04x} "
+             f"(exit type 0, the code the child passed to AH=4Ch)")
+    if exit_reason != 1:
+        fail(f"the run stopped with exit_reason {exit_reason}, expected 1 -- "
+             f"the PARENT's AH=4Ch is the one that stops the machine")
+    if psp_after != ppsp:
+        fail(f"the current PSP is 0x{psp_after:04x} after the child exited, "
+             f"expected the parent's 0x{ppsp:04x}")
+
+    # The command tail and the FCBs, read out of the child's own PSP.
+    p = bytes(b.read_memory(ram + child_psp * 16, 256))
+    tail = p[0x81:0x81 + p[0x80]]
+    if p[0x80] != len(EXEC2_TAIL) or tail != EXEC2_TAIL:
+        fail(f"the child's command tail is {tail!r} (len {p[0x80]}), expected "
+             f"{EXEC2_TAIL!r}")
+    if (child_tail & 0xFF) != len(EXEC2_TAIL):
+        fail(f"the child read tail length {child_tail & 0xFF} from its own PSP")
+    if p[0x5C:0x5C + 16] != EXEC2_FCB1:
+        fail(f"the child's first FCB is {p[0x5C:0x5C + 16]!r}")
+    if p[0x6C:0x6C + 16] != EXEC2_FCB2:
+        fail(f"the child's second FCB is {p[0x6C:0x6C + 16]!r}")
+
+    # The environment. We built one because the parent had none to inherit; it
+    # must exist, be owned separately and not overlap the child's image.
+    if child_env == 0:
+        fail("the child has no environment segment")
+    else:
+        top = p[2] | (p[3] << 8)
+        if child_psp <= child_env < top:
+            fail(f"the environment 0x{child_env:04x} is inside the child's own "
+                 f"block (0x{child_psp:04x}..0x{top:04x})")
+
+    # The child's memory must be BACK. A leaked block is invisible until the
+    # second EXEC, which is a place no test would ever look.
+    if largest_after < 0x60:
+        fail(f"only 0x{largest_after:04x} paragraphs are free after the child "
+             f"exited -- its block was not returned to the arena")
+    if nblocks == 0:
+        fail("the MCB chain is malformed after the EXEC")
+
+    return ok
+
+
 def main(args):
     runner = build_and_create_runner(args)
     try:
@@ -677,6 +983,9 @@ def main(args):
         if not exec_test(b, syms):
             ok = False
 
+        if not exec2_test(b, syms):
+            ok = False
+
         print("\nPASS" if ok else "\nFAIL")
         return ok
     finally:
@@ -717,6 +1026,30 @@ MUTATIONS = {
          "        }\n", ""),
         ("    mcb_write(seg, &m);\n    mcb_coalesce();\n    return 1;\n}",
          "    mcb_write(seg, &m);\n    return 1;\n}"),
+    ]),
+    # EXEC. The child's parent link is what a program reads to find who started
+    # it; zero there points at the interrupt vector table, and it is the field
+    # whose absence Dark Forces derailed into.
+    "pspparent": ("the child's PSP:0016 parent link is left at zero", [
+        ("    p[0x16] = (uint8_t)parent;                  "
+         "/* parent PSP -- see above */\n"
+         "    p[0x17] = (uint8_t)(parent >> 8);",
+         "    p[0x16] = 0;\n    p[0x17] = 0;"),
+    ]),
+    # An MZ image loaded without its relocations applied runs, and computes
+    # every far address from segment zero. DOS4GW.EXE is exactly this shape.
+    "reloc": ("the MZ relocation table is not applied", [
+        ("            uint16_t *w = (uint16_t *)x86_guest_ptr(lin, 2);\n"
+         "            if (w)\n"
+         "                *w = (uint16_t)(*w + load_seg);",
+         "            uint16_t *w = (uint16_t *)x86_guest_ptr(lin, 2);\n"
+         "            (void)w;"),
+    ]),
+    # The way back. Without the saved SS:SP the stub's IRET pops the CHILD's
+    # stack, so the parent resumes at whatever happens to be on it.
+    "resume": ("the parent's registers and SS:SP are not restored", [
+        ("        for (int i = 0; i < 8; i++)\n"
+         "            cpu_state_ptr->regs[i] = fr->regs[i];\n", ""),
     ]),
     "owner": ("owner 0 is recorded as-is: live memory on the free list", [
         ("    if (owner == MCB_FREE)\n"

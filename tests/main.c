@@ -129,6 +129,23 @@ volatile uint32_t dosfile_r[40];
 volatile uint32_t run_dosexec_flag = 0;
 volatile uint32_t dosexec_r[16];
 
+/* EXEC self-test: INT 21h AH=4Bh, driven by a real parent program that EXECs a
+   real child, both built by the host on dosfile_img.
+
+   Nothing may be asserted from the host here except by reading what the GUESTS
+   wrote. The load half is already covered above; what this arm exists for is
+   the half that cannot be checked without running both programs -- that the
+   child gets its own PSP with the parent's segment in it, that the child's
+   relocations were applied, and above all THAT THE PARENT COMES BACK. A
+   re-entrant exec that loads perfectly and never returns looks identical from
+   the host to one that works, right up until the title derails into the IVT.
+
+   The two programs leave their evidence at linear 0x500 -- the DOS scratch
+   area, below the arena at 0x700, so no allocation can ever land on it. */
+#define DOSEXEC2_MARK  0x0500u
+volatile uint32_t run_dosexec2_flag = 0;
+volatile uint32_t dosexec2_r[16];
+
 volatile uint32_t run_nor_flag = 0;
 volatile uint32_t nor_r[40];
 
@@ -475,8 +492,17 @@ static uint32_t kbd_test_run_to_halt(void)
     for (int guard = 0; guard < 200; guard++) {
         x86_cpu_interp_asm();
         if (cpu_state_dtcm.exit_reason == X86_EXIT_HLE_INT) {
-            x86_hle_service();
+            /* CLEARED FIRST, exactly as the shipping frame loop does it
+               (src/main.c). A service is allowed to set exit_reason itself --
+               INT 21h AH=4Ch does, that is how a program stops the machine --
+               and clearing it AFTERWARDS threw that away. The guest then ran
+               straight past its own terminate into whatever followed it. No
+               arm noticed because every other guest here ends in HLT; the EXEC
+               arm ends in AH=4Ch, and saw its parent run a second time. */
             cpu_state_dtcm.exit_reason = 0;
+            x86_hle_service();
+            if (cpu_state_dtcm.exit_reason != 0)
+                return cpu_state_dtcm.exit_reason;
             continue;
         }
         if (cpu_state_dtcm.exit_reason == X86_EXIT_TIMER) {
@@ -4242,6 +4268,58 @@ static void dosexec_test_run(void)
     dosexec_r[10] = cpu_state_dtcm.segs[1].base;
 }
 
+/*
+ * AH=4Bh, end to end: PARENT.EXE EXECs CHILD.EXE, the child writes its
+ * sentinels and exits with a code, and the parent has to resume after its own
+ * INT 21h to read that code back with AH=4Dh.
+ *
+ * Run to HALT, once: the child's AH=4Ch must NOT stop the machine (it returns
+ * to the parent), and the parent's must. A run that stops on the first AH=4Ch
+ * reports exit_reason 1 with the parent's sentinels still zero, which is
+ * exactly the failure this arm is for.
+ */
+static void dosexec2_test_run(void)
+{
+    static const uint8_t hle_vectors[] = {
+        0x08, 0x09, 0x10, 0x16, 0x1A, 0x20, 0x21,
+    };
+    for (int i = 0; i < 16; i++)
+        dosexec2_r[i] = 0;
+    memset(&test_ram[DOSEXEC2_MARK], 0, 64);
+
+    x86_video_init(cga_test_vram, cga_test_palette);
+    x86_video_set_aperture(vga_test_aperture, vga_test_pal);
+    x86_bios_init();
+    x86_hle_install(hle_vectors, sizeof(hle_vectors));
+
+    x86_disk_set_memory(dosfile_img, DOSFILE_IMG_BYTES);
+    dosexec2_r[0] = (uint32_t)f_mount(&dosfile_fs, "", 1);
+
+    kbd_test_reset_cpu(0);
+    x86_dos_arena_init();
+    x86_dos_execs = 0;
+    x86_dos_exec_fails = 0;
+    x86_dos_exec_depth_max = 0;
+    x86_dos_exec_last_err = 0;
+
+    dosexec2_r[1] = (uint32_t)x86_dos_exec("PARENT.EXE", "");
+    dosexec2_r[2] = x86_dos_psp();              /* the parent's PSP */
+    dosexec2_r[3] = kbd_test_run_to_halt();     /* 1 = the PARENT terminated */
+    dosexec2_r[4] = x86_dos_execs;
+    dosexec2_r[5] = x86_dos_exec_fails;
+    dosexec2_r[6] = x86_dos_exec_last_err;
+    dosexec2_r[7] = x86_dos_exec_depth_max;
+    dosexec2_r[8] = dos_test_walk();            /* chain still consistent */
+    dosexec2_r[9] = x86_dos_psp();              /* the PARENT's again */
+    /* The arena after the child is gone. A child that leaks its block leaves
+       this well below what the same chain offered before the EXEC. */
+    {
+        uint16_t largest = 0;
+        (void)dos_test_alloc(0xFFFF, &largest);
+        dosexec2_r[10] = largest;
+    }
+}
+
 // External arrays from x86_cpu.c
 extern uint32_t (*io_port_read_table[1024])(void *opaque, uint32_t offset, int size_log2);
 extern void *io_port_opaque_table[1024];
@@ -4624,6 +4702,11 @@ void Reset_Handler(void) {
         if (run_dosexec_flag == 1) {
             dosexec_test_run();
             run_dosexec_flag = 0;
+        }
+
+        if (run_dosexec2_flag == 1) {
+            dosexec2_test_run();
+            run_dosexec2_flag = 0;
         }
 
         if (run_video_flag == 1) {
