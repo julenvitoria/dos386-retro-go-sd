@@ -21,6 +21,7 @@ x86_io.c \
 x86_mem.c \
 x86_arena.c \
 x86_pager.c \
+x86_pgfile.c \
 x86_seam.c \
 x86_pmode.c \
 x86_nor.c \
@@ -191,8 +192,23 @@ X86_VIDEO_DMA2D ?= 0
 # That is the trade this knob exists to make visible.
 X86_MODEY_EXTRA_PAGES ?= 1
 
+# Pager donation floor (x86_pager.h). Overridable ONLY so a measurement build
+# can force the pager to evict; the shipping default lives in the header.
+X86_PG_DONATE_RESERVE ?=
+
+# Pagefile write-shape micro-benchmark (src/main.c, pgf_bench). One second at
+# title load, and it truncates the pagefile afterwards -- measurement only.
+X86_PGF_BENCH ?= 0
+
+# The .dsk read path, as it was: one f_open/f_close per 512-byte sector. The
+# A/B arm for holding the handle -- measurement only, never shipped at 1.
+X86_DSK_OPEN_PER_CALL ?= 0
+
 CORE_C_DEFS := \
 -DX86_MODEY_EXTRA_PAGES=$(X86_MODEY_EXTRA_PAGES) \
+-DX86_PGF_BENCH=$(X86_PGF_BENCH) \
+-DX86_DSK_OPEN_PER_CALL=$(X86_DSK_OPEN_PER_CALL) \
+$(if $(X86_PG_DONATE_RESERVE),-DX86_PG_DONATE_RESERVE=$(X86_PG_DONATE_RESERVE)u) \
 -DX86_VIDEO_DMA2D=$(X86_VIDEO_DMA2D) \
 -DX86_SEAM_FIX=$(X86_SEAM_FIX) \
 -DX86_CODE_THREAD_UNSAFE=$(X86_CODE_THREAD_UNSAFE) \

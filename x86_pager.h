@@ -283,7 +283,12 @@ void x86_pager_set_nor(const void *base, uint32_t bytes, uint32_t first_page);
  * already known-bad for one); a card funded out of the working set is SD I/O
  * the frame loop pays for. Raise this only against a re-measured peak.
  */
+#ifndef X86_PG_DONATE_RESERVE
+/* -D-overridable ONLY so a measurement build can force eviction (the pagefile
+   I/O investigation needs a workload that actually evicts). The DEFAULT is
+   unchanged and remains the sized value below. */
 #define X86_PG_DONATE_RESERVE 134u   /* frames guest RAM keeps, come what may */
+#endif
 /* Change the floor. The default is sized for THIS part (160 frames, KEEN4's
    134-frame peak); the tier-1 harness sets its own so the arms below are
    arithmetic the test can state rather than the shipping constant. */

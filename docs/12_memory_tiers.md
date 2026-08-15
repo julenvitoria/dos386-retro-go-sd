@@ -31,24 +31,91 @@ firmware.
 ### 1a. The pagefile — `src/main.c`, and it is wired
 
 `pgf_read()` / `pgf_write()` in `src/main.c`, handed to `x86_pager_set_backing()`
-from `guest_reset()`. `slot` IS the guest page number, so a slot is `slot*4096`
-into one file and there is no allocator. The file is `x86page.swp` next to the
-`.dsk` — the one directory this core has demonstrated it can write — and it is
-truncated at every guest reset.
+from `guest_reset()`. The file is `x86page.swp` next to the `.dsk` — the one
+directory this core has demonstrated it can write — and it is truncated at every
+guest reset. **ONE handle, held open for the life of the title, shared with
+XMS**; `xms_opens` is 1 for a run and is the witness. `pgf_ready` /
+`pgf_result` / `pgf_writes` / `pgf_reads` / `pgf_errors` are the rest.
 
-**Open-per-call**, exactly like `sd_sector_write()`: there is no ranged SD write
-in the ABI, and `x86_pg_wb_opens` counts these because the counter's name *is*
-this design. `pgf_ready` / `pgf_result` / `pgf_writes` / `pgf_reads` /
-`pgf_errors` are the host-visible witnesses.
+**The slot is NOT the guest page number** — it comes from a ring
+(`x86_pgfile.c`), and that is the whole of §1b.
 
-**MEASURED, WOLF3D gameplay under gwemu: `x86_pg_wb_us_worst` = 24,593 µs.**
-One writeback is ~25 ms — one and a half frames, and `docs/09` explains why
-overrunning a frame costs a whole frame rather than the overrun. It is paid 39
-times at level load and then never again in a 42 s run, so it reads as a
-one-off hitch and not a per-frame cost; a title with a working set that does not
-settle would be a different story, and a write-behind queue is the answer if one
-appears. gwemu timing is not to be trusted (`docs/04`) — carry the number to
-silicon, do not bank it.
+### 1b. What a 4 KB writeback costs, and why the slot moved
+
+`x86_pg_wb_us_worst` reached **433,509 µs** on silicon and grew across a
+session. Under gwemu the same write reads ~25 ms, which is why this was carried
+to tier 3 before anything was designed against it.
+
+**The split says where it goes.** `pgf_us_seek` / `pgf_us_write` and their
+worsts, KEEN4 on hardware, 86 writebacks in one run:
+
+| | total | worst |
+|---|---|---|
+| `f_lseek` | 340 ms over 86 seeks | 14 ms |
+| `f_write` | **4.04 s over 86 writes** | **405 ms** |
+
+**So it is not the cluster-chain walk, and `FF_USE_FASTSEEK` is not the fix.**
+85 of the 86 writes landed in *already-allocated* clusters (`pgf_inp_writes`
+against `pgf_ext_writes`), so no chain was being stretched. `f_expand()` and a
+CLMT would have bought the 340 ms. They are also not reachable: the pagefile
+goes through the ABI's **stdio**, so the `ffconf.h` that governs it is
+retro-go's, which is upstream and not ours; our `lib/FatFs` interprets the
+*guest* filesystem inside the `.dsk` and has nothing to do with the SD card.
+
+**`X86_PGF_BENCH=1`** (`pgf_bench()`, one second at title load) then asked the
+card directly, every arm 4 KB at a time and every shape run twice in opposite
+order so warm-up cannot explain it:
+
+| arm | per 4 KB |
+|---|---|
+| appended past EOF | **12.2 – 13.8 ms** |
+| rewritten in place | **60.1 – 67.3 ms** |
+| 32 KB rewritten in ONE call | 60.4 ms |
+| 512 B × 64 over the same 32 KB | 62.0 ms |
+| read | 3.8 ms |
+
+Three findings, and they close three doors:
+
+- **Call size and call count are irrelevant.** 32 KB in one write costs what 64
+  writes of 512 B cost. **A write-behind queue would buy nothing**, so it is not
+  here and its ordering hazard is not taken.
+- **Rewriting recently-written sectors is 5×.** That is the card's own garbage
+  collection; the only thing a core above the ABI chooses is *where* a page
+  lands.
+- Reads are 16× cheaper than writes per byte. Refills are not the problem.
+
+**The fix is the slot ring** (`x86_pgfile.c`, and its header is the argument).
+A page's slot comes from a cursor sweeping `X86_PGF_RING_SLOTS` (512 = 2 MB),
+so a writeback lands on space untouched for a whole revolution, and `pgf_map`
+remembers where each page's copy went. Two rules keep it honest: the map moves
+**only on a write that succeeded** (a failed writeback now leaves the previous
+copy readable instead of half-overwriting the only one), and a **live slot is
+never handed out** (the ring is bigger than the 416 pages that can ever be
+live; `x86_pgf_slot_full` says so if that is ever wrong). Ordering is unchanged
+— every writeback is still synchronous and still completes before its frame is
+reused.
+
+The ring is **bounded for the seek's sake, not the card's**: the card would
+rather the log grew forever, but with `FF_USE_FASTSEEK 0` a refill's backward
+seek walks the chain from byte zero, so the file has to stay small.
+
+`tests/test_paging.py` proves the ring at tier 1 — a page written, evicted and
+read back byte-identical; a rewrite landing on a *different* slot with the old
+one freed; a full wrap in which no live slot is ever handed out — with both
+negative controls **seen to fail**: corrupting the writeback, and reading the
+copy the page had before its last write (what a read that overtook a pending
+write would get).
+
+### 1c. The `.dsk` path had the same defect, and a worse one
+
+`x86_disk.c` was reading through `rg_storage_copy_file_range_to_ram`, which
+**opens and closes the image on every call** — `f_open` is a directory walk with
+LFN on, and only then does the chain walk and the 512 bytes happen. The `.dsk`
+handle is now held open too (`dsk_opens` is the witness, and it is 1 per title),
+and one handle serves reads *and* writes, which also removes the duplicate open
+`FF_FS_LOCK 0` was not refusing. `dsk_us_open` / `dsk_us_seek` / `dsk_us_read`
+split it the way `pgf_us_*` does. `f_expand()` is **not** an option here: `.dsk`
+files are copied onto the card from a PC and are fragmented below us.
 
 ## 2. Eviction — built, and the header is now a description
 
@@ -339,8 +406,8 @@ something outside the interpreter is reading.
 Logical pages **are pager pages**, at guest page 1024 (linear 4 MB) in a SECOND
 owned window (`x86_pager_own_aux`). Three arithmetic properties make that safe:
 no real-mode `seg:off` can name it (`FFFF:FFFF` = 0x10FFEF), it is far above
-guest RAM's pages 0..159, and its pagefile slots land at 4–5 MB, below the XMS
-store at 8 MB. A window is widened rather than shared so that nothing between
+guest RAM's pages 0..159, and (since §1b) it is mapped through the same slot
+ring, whose 2 MB sits below the XMS store at 8 MB. A window is widened rather than shared so that nothing between
 640 KB and 4 MB becomes ownable by accident.
 
 An UNMAPPED logical page is cold by definition: an ordinary pager page that may

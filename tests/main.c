@@ -7,6 +7,7 @@
 #include "../x86_arena.h"
 #include "../x86_video_planar.h"
 #include "../x86_pager.h"
+#include "../x86_pgfile.h"
 #include "../x86_xms.h"
 #include "../x86_ems.h"
 #include "../x86_profile.h"
@@ -226,6 +227,157 @@ static int pgf_write(uint32_t slot, const void *src)
     memcpy(test_ram + PGF_OFF + (slot - pgf_first_slot) * 4096u, src, 4096u);
     pgf_writes++;
     return 0;
+}
+
+
+/* ===========================================================================
+ * THE PAGEFILE SLOT RING -- x86_pgfile.c, driven against a RAM file.
+ *
+ * The allocator that decides WHERE an evicted page's bytes land is the one
+ * part of the writeback path that used to live in src/main.c, where nothing
+ * below tier 3 can reach it. It is here now, and this arm drives it the way
+ * the pager does: claim a slot, write, commit -- and then read the page back
+ * and compare, which is the only check that matters.
+ *
+ * The store is a plain array of slots, so a slot number that is wrong shows up
+ * as WRONG BYTES rather than as a counter. THE TWO NEGATIVE CONTROLS ARE THE
+ * POINT: one corrupts the bytes under the mapped slot, the other reads the
+ * page from the slot it occupied BEFORE its last write -- exactly what a
+ * read that overtook a pending write would see -- and both must be caught by
+ * the same comparison that passes above them. A test that cannot fail is not
+ * evidence.
+ */
+volatile uint32_t run_pgfile_flag = 0;
+/* .test_bss (RAM_UC): this harness's RAM_EMU .bss has no room -- see TEST.ld. */
+volatile uint32_t pgfile_r[24] __attribute__((section(".test_bss")));
+
+#define PGR_SLOTS   X86_PGF_RING_SLOTS
+#define PGR_OWN     8u
+#define PGR_AUXF    64u
+#define PGR_AUXN    4u
+
+/* One byte per slot is enough to tell copies apart: every page writes a
+   distinct pattern and the comparison is over that byte. It lives in the same
+   corner of test_ram the pager arm's RAM pagefile uses -- .bss in this harness
+   is 176 bytes from overflowing and a new array is not free. */
+#define pgr_store  ((uint8_t *)(test_ram + PGF_OFF))
+static uint32_t pgr_write_fail;         /* forces the next write to fail */
+
+/* The writeback, exactly as src/main.c sequences it. */
+static int pgr_write(uint32_t page, uint8_t val)
+{
+    uint32_t slot = x86_pgf_slot_claim(page);
+    if (slot == X86_PGF_NO_SLOT)
+        return -1;
+    int ok = !pgr_write_fail;
+    if (ok)
+        pgr_store[slot] = val;          /* the 4 KB, in one byte */
+    x86_pgf_commit(page, slot, ok);
+    return ok ? (int)slot : -1;
+}
+
+/* The refill. -1 for a page with no copy at all. */
+static int pgr_read(uint32_t page)
+{
+    uint32_t slot = x86_pgf_slot_of(page);
+    if (slot == X86_PGF_NO_SLOT)
+        return -1;
+    return pgr_store[slot];
+}
+
+static void pgfile_test_run(void)
+{
+    for (uint32_t i = 0; i < 24; i++)
+        pgfile_r[i] = 0;
+    memset(pgr_store, 0, PGR_SLOTS);
+    pgr_write_fail = 0;
+    x86_pgf_map_init(PGR_OWN, PGR_AUXF, PGR_AUXN);
+
+    /* ---- a page written, evicted and read back is byte-identical -------- */
+    int s0 = pgr_write(3u, 0xA5);
+    pgfile_r[0] = (s0 >= 0);                                  /* 1 */
+    pgfile_r[1] = (pgr_read(3u) == 0xA5);                     /* 1 */
+
+    /* ---- a REWRITE APPENDS: a different slot, and the old one freed ----- */
+    int s1 = pgr_write(3u, 0x5A);
+    pgfile_r[2] = (s1 >= 0 && s1 != s0);                      /* 1 */
+    pgfile_r[3] = (x86_pgf_slot_live((uint32_t)s0) == 0);     /* 1 */
+    pgfile_r[4] = (x86_pgf_slot_live((uint32_t)s1) == 1);     /* 1 */
+    pgfile_r[5] = (pgr_read(3u) == 0x5A);                     /* 1 */
+
+    /* NEGATIVE CONTROL 1 -- the bytes under the mapped slot are corrupted.
+       If this does not read 1, the comparison above proves nothing. */
+    pgr_store[s1] ^= 0xFFu;
+    pgfile_r[6] = (pgr_read(3u) != 0x5A);                     /* 1 */
+    pgr_store[s1] ^= 0xFFu;
+    pgfile_r[7] = (pgr_read(3u) == 0x5A);                     /* 1: restored */
+
+    /* NEGATIVE CONTROL 2 -- READ THE OLD COPY. This is what a refill that
+       overtook a pending writeback would get, and it must NOT be what the map
+       hands back. The old slot still holds the previous generation. */
+    pgfile_r[8] = (pgr_store[s0] == 0xA5);                    /* 1 */
+    pgfile_r[9] = (pgr_store[s0] != pgr_store[s1]);           /* 1: caught */
+
+    /* ---- a FAILED write leaves the page on the copy it already had ------ */
+    pgr_write_fail = 1;
+    int sf = pgr_write(3u, 0x11);
+    pgr_write_fail = 0;
+    pgfile_r[10] = (sf < 0);                                  /* 1 */
+    pgfile_r[11] = (x86_pgf_slot_of(3u) == (uint32_t)s1);     /* 1: unmoved */
+    pgfile_r[12] = (pgr_read(3u) == 0x5A);                    /* 1: intact  */
+
+    /* ---- a live slot is NEVER handed out, all the way round the ring ---- */
+    /* Every pageable page gets a copy; then every page is rewritten four
+       times, which is comfortably more claims than the ring has slots, so the
+       cursor wraps and has to step over the live ones. */
+    uint32_t collisions = 0, live_pages = 0;
+    for (uint32_t pg = 0; pg < PGR_OWN; pg++)
+        if (pgr_write(pg, (uint8_t)(0x40u + pg)) >= 0) live_pages++;
+    for (uint32_t pg = 0; pg < PGR_AUXN; pg++)
+        if (pgr_write(PGR_AUXF + pg, (uint8_t)(0x80u + pg)) >= 0) live_pages++;
+    pgfile_r[13] = live_pages;                                /* 12 */
+
+    for (uint32_t round = 0; round < 4u; round++) {
+        for (uint32_t pg = 0; pg < PGR_OWN; pg++) {
+            uint32_t before = x86_pgf_slot_of(pg);
+            uint32_t claim = x86_pgf_slot_claim(pg);
+            /* The claim may only be a slot no OTHER page owns. */
+            for (uint32_t q = 0; q < PGR_OWN; q++)
+                if (q != pg && x86_pgf_slot_of(q) == claim)
+                    collisions++;
+            for (uint32_t q = 0; q < PGR_AUXN; q++)
+                if (x86_pgf_slot_of(PGR_AUXF + q) == claim)
+                    collisions++;
+            (void)before;
+            pgr_store[claim] = (uint8_t)(0x40u + pg);
+            x86_pgf_commit(pg, claim, 1);
+        }
+    }
+    pgfile_r[14] = collisions;                                /* 0 */
+    pgfile_r[15] = x86_pgf_slot_full;                         /* 0 */
+
+    /* Every page still reads back its own pattern after all that churn. */
+    uint32_t wrong = 0;
+    for (uint32_t pg = 0; pg < PGR_OWN; pg++)
+        if (pgr_read(pg) != (int)(0x40u + pg)) wrong++;
+    for (uint32_t pg = 0; pg < PGR_AUXN; pg++)
+        if (pgr_read(PGR_AUXF + pg) != (int)(0x80u + pg)) wrong++;
+    pgfile_r[16] = wrong;                                     /* 0 */
+
+    /* ---- the ring DID wrap, or the arm above proved nothing ------------- */
+    pgfile_r[17] = (x86_pgf_slot_reuses > 0u);                /* 1 */
+
+    /* ---- a page outside both windows is refused, loudly ----------------- */
+    uint32_t before_unp = x86_pgf_unpageable;
+    pgfile_r[18] = (x86_pgf_slot_claim(PGR_OWN + 1u) == X86_PGF_NO_SLOT);  /* 1 */
+    pgfile_r[19] = (x86_pgf_unpageable == before_unp + 1u);   /* 1 */
+    pgfile_r[20] = (x86_pgf_slot_of(PGR_OWN + 1u) == X86_PGF_NO_SLOT); /* 1 */
+
+    /* ---- reset forgets every copy -------------------------------------- */
+    x86_pgf_map_reset();
+    pgfile_r[21] = (x86_pgf_slot_of(3u) == X86_PGF_NO_SLOT);  /* 1 */
+    pgfile_r[22] = (pgr_read(3u) == -1);                      /* 1 */
+    pgfile_r[23] = x86_pgf_slot_live(0u) ? 0u : 1u;           /* 1 */
 }
 
 volatile uint32_t run_seam_flag = 0;
@@ -5709,6 +5861,11 @@ void Reset_Handler(void) {
         if (run_hma_flag == 1) {
             hma_test_run();
             run_hma_flag = 0;
+        }
+
+        if (run_pgfile_flag == 1) {
+            pgfile_test_run();
+            run_pgfile_flag = 0;
         }
 
         if (run_seam_flag == 1) {
