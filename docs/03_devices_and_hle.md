@@ -336,26 +336,149 @@ What that instrument then caught is an amplitude bug worth 12 dB:
 
 Peak on silicon for the same PoP workload: **248 -> 991**.
 
-### 4f. What is STILL not here: FM synthesis, and what it would take
+### 4f. FM SYNTHESIS: BUILT (emu8950), and the sizing in this section was wrong
 
-Digitised playback is built (4b). **OPL FM tone generation is not**, and the
-gap is visible: the OPL timers answer a detection probe and the register file is
-deliberately not stored, so a title whose MUSIC is AdLib is silent while its
-digitised effects play.
+**OPL2 FM tone generation exists.** The synthesiser is **emu8950**, vendored
+byte-identical from the owner's own G&W Doom port into `lib/emu8950/` (its
+`README-tinyemu.md` carries the provenance, the exact `-D` set and the
+measurements); `x86_opl.c` is the adapter. `x86_io.c` still owns the register
+index latch, the TIMERS, the status byte and the ISA bus charge, and now
+forwards every accepted (index, value) pair to `x86_opl_write()`.
 
-Sizing it, so nobody re-derives it: an OPL2 is nine channels of two operators,
-and each operator is a phase accumulator, an exponential envelope generator in
-four stages, a sine/waveform table lookup and a level multiply -- **per output
-sample**, plus feedback and FM modulation routing between the pair. At the
-48,000 Hz this core renders at, that is 18 operators x 48,000 = 864,000 operator
-updates per second of audio, against ~2.8 M insn/s of TOTAL hardware budget of
-which 29.4% is already ordinary guest opcodes. It does not fit at full rate.
-What might: rendering FM at a lower internal rate and upsampling through the
-same accumulator the DMA path already uses, and only while a channel's key is
-on. That is a project with its own measurement, not an increment on this one.
+Nine channels, two operators each, four waveforms, the ADSR envelope, key
+scaling of level and rate, vibrato/tremolo, feedback and both connection modes.
+**Percussion mode is NOT synthesised** (`EMU8950_NO_PERCUSSION_MODE`, following
+the owner's Doom configuration); `x86_opl_rhythm_muted` counts a guest that
+asks for it. No OPL3 register exists here -- we report YM3812 and emu8950 IS a
+YM3812, which is half the reason it was chosen.
 
-The register file would also have to start being STORED, which 4b explains is
-currently and correctly not the case.
+#### IT WAS WRITTEN TWICE, AND THE FIRST ONE IS WHY THE SECOND IS BETTER
+
+The first implementation was Nuked-OPL3 cut down to an OPL2 by hand. It worked
+-- WOLF3D played its music at tier 2 with the golden at 0.000% -- and it was
+replaced on measurement. Both `-O2`, same nine-voice patch, same 49,716 Hz,
+994,320 chip samples:
+
+| | 9 channels | 5 channels (a real tune) | RAM_EMU |
+|---|---|---|---|
+| **emu8950** | 36.5 ns/sample | 26.6 ns/sample | 22,951 B |
+| hand-reduced Nuked | 88.0 ns/sample | 48.8 ns/sample | 4,679 B |
+| | **2.41x faster** | **1.84x faster** | **+18,272 B** |
+
+confirmed independently at tier 1 on the target: **18.0 cycles per operator
+update against 36.4**, same harness, same programme. A 2.4x on the axis that
+made FM "does not fit" in the first place is not a close call, and the RAM was
+paid deliberately -- see the cost below, and `x86_pg_evictions` for what it did
+NOT cost.
+
+#### THE OLD SIZING WAS IN THE WRONG UNIT
+
+The previous text read "18 operators x 48,000 Hz = 864,000 operator updates per
+second against ~2.8 M insn/s... it does not fit at full rate", and concluded a
+reduced internal rate was required. **It compared operator updates against
+guest INSTRUCTIONS.** A guest instruction costs ~57 cycles, so 2.8 M insn/s is
+~160 M cycles/s of a 280 MHz part. In cycles the budget was never tight, and
+the core runs at the chip's own 49,716 Hz with no quality loss at all.
+
+#### THE RESAMPLER IS LINEAR, AND THAT IS THE OWNER'S FINDING, NOT A PREFERENCE
+
+49,716 Hz -> 48,000 Hz on a 16.16 accumulator carried across frame boundaries,
+with the two bracketing chip samples **LINEARLY INTERPOLATED**. Taken whole
+from `opl_gnw.c`, which records what the cheap version sounds like:
+
+> nearest-neighbour resampling produced an audible ~1.7 kHz buzz on held notes
+
+The first version of this core used a zero-order hold -- exactly that scheme --
+because `x86_sb_render_mix()` next door uses one. It is not the same problem:
+the SB path holds a 6-11 kHz sample stream where the ear is forgiving, and a
+sustained FM note is where it is not. One multiply-add per output sample.
+
+#### MIXING
+
+`src/main.c`'s audio phase runs speaker, then Sound Blaster, then FM, all
+MIXING into the same buffer, because a title can sound all three at once. The
+FM gain is `(sample * amp) >> 14` -- the **"music * 2" balance the owner's own
+port settled on**, taken rather than re-derived. One operator at total level 0
+lands near 1,012 of full scale and a nine-voice chord near 8,000, against the
+~4,080 a full-scale SB sample reaches at maximum volume. Clipping is possible
+and the mix CLAMPS; `x86_opl_clips` counts it and read 0 across a WOLF3D run.
+
+#### WHAT IT COST
+
+| | |
+|---|---|
+| `__CORE_BSS_END__` | `0x24062990` -> **`0x24067F00`**, **+21,872 B** |
+| `__CORE_ITCM_CODE_END__` | **`0xD580`, unchanged** -- nothing here is on the interpreter's hot path |
+| `guest_ram_pages` | 156 -> **150** |
+| `guest_ram_pages_short` | 4 -> **10** |
+| **`x86_pg_evictions`** | **0**, at tier 2 AND on silicon |
+
+**Six guest page frames, and the last row is why it was judged payable**: the
+pager never evicted once across a full WOLF3D run at 150 frames, on either
+tier. The frames were spare. `X86_OPL_FM=0` returns every byte with the
+detection answer untouched, which is the lever if a title is ever found that
+needs them.
+
+### 4g. THE COST ON SILICON -- MEASURED, in the real core
+
+`X86_OPL_BENCH=1` keys all nine channels on at core start with a sustaining
+full-level patch and brackets the render with DWT->CYCCNT into
+`x86_opl_frame_cycles`. That is the chip's **worst case, 18 operator updates
+every chip sample**, measured in the shipping core with its code in RAM_EMU and
+the firmware's caches on. WOLF3D, hardware, oc level 0 (280 MHz):
+
+| | cycles/frame | % of wall |
+|---|---|---|
+| worst case, menus/intro (~34.5 fps) | **848,000** | **10.4%** |
+| worst case, in gameplay | **1,117,000** | **13.8%** |
+| **WOLF3D's REAL music** (10.11 operators/sample, measured) | **~475,000** | **~5.9%** |
+
+`x86_opl_slots_run / x86_opl_chip_steps` read exactly **18.0** in the bench, so
+the worst case really is the worst case. The gameplay row is 32% dearer for the
+same work: the planar-store hook is thrashing the D-cache that emu8950's 8 KB
+wave table lives in, which is a real effect and not measurement noise.
+
+**The hand-reduced Nuked core would have been twice these numbers** -- ~21-28%
+of wall worst case -- which is what the switch bought.
+
+TWO NUMBERS THAT LOOK LIKE MEASUREMENTS AND ARE NOT, recorded so nobody quotes
+them: gwemu reports 18.0 "cycles" per operator (it does not model timing; read
+it as an instruction count), and the bare-metal harness on silicon reports far
+more, because `TEST.ld` puts its C in INTFLASH and `tests/main.c` never enables
+the caches. Only the `X86_OPL_BENCH` number above is the core's.
+
+### 4h. WHAT PLAYS AND WHAT DOES NOT
+
+**WOLF3D: MUSIC PLAYS, on silicon.** Shipping core, hardware, WOLF3D preselected:
+`x86_opl_writes` 253 -> **1,261**, `x86_opl_keyons` **48**, `x86_opl_slots_run`
+**1,905,408**, and `x86_audio_peak_max` **0 -> 337** -- the FM reaches the DMA
+buffer. Music starts at ~124 M guest instructions, i.e. ~33 s in, which is why
+earlier hardware runs that stopped at 62 M saw nothing. Golden **0.000%**.
+
+This also closes the 4e follow-up: an earlier hardware run reached 450 M
+instructions with `writes=253, keyons=0`, and the cause was the device's own
+`CONFIG.WL1` -- Wolf3D rewrites its config into its `.dsk` -- carrying sound
+OFF from before the AdLib timer worked. The owner enabled sound in the title's
+own setup and it now plays. **A title's stored config is part of the machine.**
+
+**KEEN4: NO MUSIC, and the cause is NOT the synthesiser.** Tier 2, 338 M guest
+instructions: `x86_opl_writes` **264**, `x86_opl_keyons` **0**,
+`x86_opl_chip_steps` **0**. 264 is the AdLib detect plus id's 245-register zero
+pass and nothing after it -- the music driver never writes a note, so there is
+nothing for the synthesiser to render. Three things are ruled out:
+
+* **Its config is not the problem.** `CONFIG.CK4` read out of the shipped `.dsk`
+  has `SoundMode=2` (`sdm_AdLib`) and `MusicMode=1` (`smm_AdLib`): the title
+  ASKS for AdLib music.
+* **Detection is not the problem.** `x86_opl_timer_expiry=1` in the same run.
+* **The synthesiser is not the problem.** WOLF3D drives the identical path.
+
+So the failure is upstream, in id's `SDL_t0Service` music path. The one lead
+worth following first: `probe_report.py --title keen4` shows `INT 08h AH=00h`
+reaching OUR BIOS stub **398 times in 25 s (~16/s)**, which is the 18.2 Hz
+chained-BIOS rate -- consistent with Keen having hooked INT 8 and chaining, but
+NOT with its 140 Hz music tick ever being programmed. **Keen's music ISR rate,
+not FM synthesis, is the next thing to grade.**
 
 **Also unmodelled and larger than everything sound-related combined:** WOLF3D
 issues **2.3 M reads of the game port `IN 0x201`** (measured, tier 2), which

@@ -1658,7 +1658,28 @@ python3 tests/test_dos.py --negative     # 13 controls: rollback, largest,
                                          # x86_dos_execs stays 0 and the arena
                                          # is untouched -- an overlay is not a
                                          # process and allocates nothing.
-python3 tests/test_sound.py              # TWO ARMS, both driven by GUEST code.
+python3 tests/test_sound.py              # THREE ARMS, all driven by GUEST code.
+                                         # The third is FM SYNTHESIS: guest code
+                                         # programs one voice through OUT
+                                         # 0x388/0x389 and the arm grades the
+                                         # SAMPLES -- zero-crossing pitch AND a
+                                         # host-side Goertzel against the chip's
+                                         # own f = f_num * 49716 / 2^(20-block),
+                                         # never against a second copy of our
+                                         # synthesis -- plus the envelope at
+                                         # both ends (a held note's level, and
+                                         # silence 20 frames after key-off).
+                                         # It also prints the DWT cost per
+                                         # operator update; on gwemu read that
+                                         # as an instruction count only.
+                                         # Build knobs: X86_OPL_FM=0 compiles
+                                         # the synthesis out (the off switch and
+                                         # the cost control in one);
+                                         # X86_OPL_BENCH=1 holds all nine
+                                         # channels sounding and publishes
+                                         # x86_opl_frame_cycles, which is how
+                                         # the SILICON per-frame cost in
+                                         # docs/03 4g was measured.
                                          # DETECTION: the SB DSP reset handshake
                                          # (write 1 then 0 to 0x226, poll 0x22E,
                                          # read 0xAA off 0x22A), the 0x22C
@@ -1687,6 +1708,8 @@ python3 tests/test_sound.py --negative-opl # the OPL timer-1 flag
 python3 tests/test_sound.py --negative-tc  # the 8237's TERMINAL COUNT
 python3 tests/test_sound.py --negative-irq # IRQ 5 DELIVERY
 python3 tests/test_sound.py --negative-rate # the resampler step forced to 1:1
+python3 tests/test_sound.py --negative-fm-env  # the FM envelope's RELEASE
+python3 tests/test_sound.py --negative-fm-freq # the FM frequency multiple
 python3 tests/test_sound.py --negative-f2  # the DSP's F2h IRQ REQUEST
 python3 tests/test_sound.py --negative-f2-now # F2h's IMMEDIATE delivery -- the
                                          # line is still asserted, so every

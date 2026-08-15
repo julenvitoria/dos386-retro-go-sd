@@ -12,6 +12,7 @@
 #include "../x86_ems.h"
 #include "../x86_profile.h"
 #include "../x86_osk.h"
+#include "../x86_opl.h"
 
 // Address-translation fold. Entries are OFFSETS (host = guest_linear + k), and
 // every index the 12-bit lookup can produce must exist -- a short table meant
@@ -2037,6 +2038,172 @@ static void sbdma_test_run(void)
     sbd_r[21] = (uint32_t)guard;
     sbd_r[22] = captured;
     sbd_r[23] = reason;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * OPL2 FM SYNTHESIS -- and this arm grades the SAMPLES, not a counter.
+ *
+ * The guest programs one voice through its own OUT instructions to 0x388 /
+ * 0x389, so the whole chain is under test: the port decode in x86_io.c, the
+ * forward into x86_opl.c, the register parse, the envelope, the phase
+ * generator and the resampler. Then the host loop renders, exactly as
+ * src/main.c's audio phase does, and 512 output samples are shipped back for
+ * tests/test_sound.py to measure.
+ *
+ * THE VOICE IS CHOSEN SO THE ANSWER IS ARITHMETIC. Operator 1's total level is
+ * 63 (silent), so with CON=0 the carrier is modulated by nothing and the
+ * output is a pure sine at the channel's own frequency:
+ *
+ *     f = f_num * 49716 / 2^(20 - block) = 512 * 49716 / 2^13 = 3107.25 Hz
+ *
+ * which the test computes from the register bytes IT chose and NOT from a
+ * second copy of this core's synthesis. EG-TYPE is 1 (sustaining) so the note
+ * holds instead of decaying out from under the measurement, and the release
+ * rate is 15 so the key-off half of the arm completes inside twenty frames.
+ */
+#define FM_CODE      0x3000u
+#define FM_CODE_OFF  0x3100u
+#define FM_FRAMES    512u
+#define FM_RATE      48000u
+#define FM_FNUM      0x200u
+#define FM_BLOCK     7u
+
+/* emu8950 (lib/emu8950/, vendored BYTE-IDENTICAL -- see its README) names
+   free(), puts() and __assert_func() from three paths this build never takes:
+   OPL_delete(), its OPL_DEBUG slot dump, and its assert()s. They are satisfied
+   HERE rather than edited out of the vendored file, because newlib's free()
+   drags in _sbrk and a heap and TEST.ld deliberately provides neither -- the
+   bare-metal harness having no heap is a property worth keeping, and patching
+   a vendored file is how it stops being the file that was tested on the
+   owner's hardware. The CORE build needs none of this: it links against
+   retro-go's libc. */
+void free(void *p) { (void)p; }
+int puts(const char *s) { (void)s; return 0; }
+void __assert_func(const char *file, int line, const char *fn, const char *e)
+{
+    (void)file; (void)line; (void)fn; (void)e;
+    for (;;) { }
+}
+
+volatile uint32_t run_fm_flag = 0;
+volatile uint32_t fm_r[12];
+/* Cycles and operator updates for the ONE captured render call; see below. */
+volatile uint32_t fm_cycles = 0, fm_slots = 0;
+/* 512 samples, PACKED TWO PER WORD, for the same RAM reason sbd_pcm is. */
+volatile uint32_t fm_pcm[FM_FRAMES / 2] __attribute__((section(".test_bss")));
+static int16_t fm_audio[FM_FRAMES] __attribute__((section(".test_bss")));
+
+/* MOV DX,388h then, per register, MOV AL,reg / OUT DX,AL / MOV AL,val /
+   INC DX / OUT DX,AL / DEC DX. Written out rather than looped so the bytes
+   below ARE the register list and can be read against the comment. */
+static const uint8_t fm_code[] = {
+    0xBA, 0x88, 0x03,                                /* MOV DX,0388h       */
+    0xB0, 0x01, 0xEE, 0xB0, 0x20, 0x42, 0xEE, 0x4A,  /* 01 <- 20 wavesel   */
+    0xB0, 0x20, 0xEE, 0xB0, 0x21, 0x42, 0xEE, 0x4A,  /* 20 <- 21 op1 EGT/M1*/
+    0xB0, 0x23, 0xEE, 0xB0, 0x21, 0x42, 0xEE, 0x4A,  /* 23 <- 21 op2 EGT/M1*/
+    0xB0, 0x40, 0xEE, 0xB0, 0x3F, 0x42, 0xEE, 0x4A,  /* 40 <- 3F op1 SILENT*/
+    0xB0, 0x43, 0xEE, 0xB0, 0x00, 0x42, 0xEE, 0x4A,  /* 43 <- 00 op2 FULL  */
+    0xB0, 0x60, 0xEE, 0xB0, 0xF0, 0x42, 0xEE, 0x4A,  /* 60 <- F0 AR15 DR0  */
+    0xB0, 0x63, 0xEE, 0xB0, 0xF0, 0x42, 0xEE, 0x4A,  /* 63 <- F0           */
+    0xB0, 0x80, 0xEE, 0xB0, 0x0F, 0x42, 0xEE, 0x4A,  /* 80 <- 0F SL0 RR15  */
+    0xB0, 0x83, 0xEE, 0xB0, 0x0F, 0x42, 0xEE, 0x4A,  /* 83 <- 0F           */
+    0xB0, 0xC0, 0xEE, 0xB0, 0x00, 0x42, 0xEE, 0x4A,  /* C0 <- 00 FB0 CON0  */
+    0xB0, 0xA0, 0xEE, 0xB0, 0x00, 0x42, 0xEE, 0x4A,  /* A0 <- 00 fnum lo   */
+    0xB0, 0xB0, 0xEE, 0xB0, 0x3E, 0x42, 0xEE, 0x4A,  /* B0 <- 3E KEY ON,   */
+                                                     /*    block 7, fnum hi*/
+    0xF4,                                            /* HLT                */
+};
+
+/* KEY OFF: the same B0h byte with bit 5 clear. */
+static const uint8_t fm_code_off[] = {
+    0xBA, 0x88, 0x03,                                /* MOV DX,0388h       */
+    0xB0, 0xB0, 0xEE, 0xB0, 0x1E, 0x42, 0xEE, 0x4A,  /* B0 <- 1E KEY OFF   */
+    0xF4,                                            /* HLT                */
+};
+
+static uint32_t fm_render_peak(unsigned frames)
+{
+    uint32_t peak = 0;
+    for (unsigned i = 0; i < frames && i < FM_FRAMES; i++)
+        fm_audio[i] = 0;
+    x86_opl_render_mix(fm_audio, frames, FM_RATE, 4080);
+    for (unsigned i = 0; i < frames && i < FM_FRAMES; i++) {
+        int32_t a = fm_audio[i] < 0 ? -fm_audio[i] : fm_audio[i];
+        if ((uint32_t)a > peak)
+            peak = (uint32_t)a;
+    }
+    return peak;
+}
+
+static void fm_test_run(void)
+{
+    static const uint8_t hle_vectors[] = { 0x08, 0x09, 0x10, 0x16, 0x1A, 0x20, 0x21 };
+
+    x86_video_init(cga_test_vram, cga_test_palette);
+    x86_video_set_aperture(vga_test_aperture, vga_test_pal);
+    x86_bios_init();
+    x86_hle_install(hle_vectors, sizeof(hle_vectors));
+
+    /* Independent of whatever the detection arm left in the chip. */
+    x86_opl_reset();
+    for (unsigned i = 0; i < FM_FRAMES / 2; i++)
+        fm_pcm[i] = 0;
+
+    memcpy(&test_ram[FM_CODE], fm_code, sizeof(fm_code));
+    memcpy(&test_ram[FM_CODE_OFF], fm_code_off, sizeof(fm_code_off));
+
+    kbd_test_reset_cpu(FM_CODE);
+    fm_r[0] = kbd_test_run_to_halt();
+
+    /* Four frames of warm-up so the attack is over, then ONE captured block.
+       Capturing during the attack would grade the envelope's ramp as if it
+       were the tone. */
+    for (unsigned f = 0; f < 4; f++)
+        (void)fm_render_peak(800u > FM_FRAMES ? FM_FRAMES : 800u);
+
+    for (unsigned i = 0; i < FM_FRAMES; i++)
+        fm_audio[i] = 0;
+    /* THE COST, IN CYCLES, ON WHATEVER THIS IS RUNNING ON. Bracketing the
+       render with DWT->CYCCNT is the only way to get a cycles-per-operator
+       number that is the DEVICE's rather than the host's: gwemu will report
+       something here and it must not be quoted (CLAUDE.md). Divided by the
+       operator updates the same call performed, it is the one number the FM
+       rate decision rests on -- see docs/03 4g. */
+    {
+        uint32_t s0 = x86_opl_slots_run;
+        uint32_t c0 = DWT_CYCCNT;
+        fm_r[1] = x86_opl_render_mix(fm_audio, FM_FRAMES, FM_RATE, 4080);
+        fm_cycles = DWT_CYCCNT - c0;
+        fm_slots = x86_opl_slots_run - s0;
+    }
+    {
+        uint32_t peak = 0;
+        for (unsigned i = 0; i < FM_FRAMES; i++) {
+            int32_t a = fm_audio[i] < 0 ? -fm_audio[i] : fm_audio[i];
+            if ((uint32_t)a > peak)
+                peak = (uint32_t)a;
+        }
+        fm_r[2] = peak;
+        for (unsigned i = 0; i < FM_FRAMES / 2; i++)
+            fm_pcm[i] = (uint32_t)(uint16_t)fm_audio[i * 2] |
+                        ((uint32_t)(uint16_t)fm_audio[i * 2 + 1] << 16);
+    }
+    fm_r[3] = (uint32_t)x86_opl_active();
+
+    /* KEY OFF, then twenty frames for a release rate of 15 to finish. */
+    kbd_test_reset_cpu(FM_CODE_OFF);
+    fm_r[4] = kbd_test_run_to_halt();
+    for (unsigned f = 0; f < 20; f++)
+        (void)fm_render_peak(FM_FRAMES);
+    fm_r[5] = fm_render_peak(FM_FRAMES);
+    fm_r[6] = (uint32_t)x86_opl_active();
+
+    fm_r[7]  = x86_opl_keyons;
+    fm_r[8]  = x86_opl_chip_steps;
+    fm_r[9]  = x86_opl_slots_run;
+    fm_r[10] = x86_opl_rhythm_muted;
+    fm_r[11] = x86_opl_writes;
 }
 
 static void kbd_test_run(void)
@@ -6053,6 +6220,11 @@ void Reset_Handler(void) {
         if (run_sbdma_flag == 1) {
             sbdma_test_run();
             run_sbdma_flag = 0;
+        }
+
+        if (run_fm_flag == 1) {
+            fm_test_run();
+            run_fm_flag = 0;
         }
 
         if (run_sysinfo_flag == 1) {

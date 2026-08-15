@@ -18,6 +18,8 @@ CORE_C_SOURCES := \
 src/main.c \
 x86_cpu.c \
 x86_io.c \
+x86_opl.c \
+lib/emu8950/emu8950.c \
 x86_mem.c \
 x86_arena.c \
 x86_pager.c \
@@ -50,7 +52,7 @@ hw_accel.S
 # Two-segment layout: RAM_EMU + ITCM (the interpreter hot loop).
 CORE_LDSCRIPT := dos_core.ld
 
-CORE_C_INCLUDES := -I. -Ilib/FatFs
+CORE_C_INCLUDES := -I. -Ilib/FatFs -Ilib/emu8950
 
 # Match the template's release-firmware layout. COVERFLOW fields sit BEFORE
 # cheat_* in retro_emulator_file_t, so CHEAT_CODES with COVERFLOW=0 misaligns
@@ -220,9 +222,50 @@ X86_ISA_IO_TICKS ?= 1
 # Measurement only, never shipped at 1.
 X86_AUDIO_TONE ?= 0
 
+# OPL2 FM TONE GENERATION (x86_opl.c). 1 ships. 0 is the COST CONTROL and the
+# off-switch in one: the register writes are still parsed and the detection
+# answer is unchanged, but x86_opl_render_mix() is not called, so the frame
+# does none of the synthesis. That is the A/B the tier-3 cost number in
+# docs/03 4g was taken from -- the same core, the same workload, one call.
+X86_OPL_FM ?= 1
+
+# FM COST MEASUREMENT (x86_opl.h). 0 ships. 1 keys all nine channels on at core
+# start and brackets the render with DWT->CYCCNT into x86_opl_frame_cycles, so
+# the WORST-CASE per-frame cost can be read on SILICON with probe.py --watch,
+# in the real core, with its code in RAM_EMU and the caches on. It is not a
+# sound setting: at 1 the guest's own music is inaudible under it.
+X86_OPL_BENCH ?= 0
+
+# emu8950's configuration, transcribed from the owner's gnw-doom/Makefile
+# (lines 133-192) and explained in lib/emu8950/README-tinyemu.md. These are
+# NOT ours to tune casually: this exact set is what runs OPL music on this part
+# under retro-go in the G&W Doom port. DOOMX=1 is the one that matters most
+# here -- it gives emu8950 a single STATIC OPL instance instead of calloc(),
+# and this core has no malloc to offer it.
+#
+# -fms-extensions rides along in this list because CORE_C_DEFS is the only
+# hook the SDK makefile offers into CFLAGS and it is pasted in verbatim. It is
+# not optional and it is not a taste: OPL_SLOT embeds `struct SLOT_RENDER`
+# ANONYMOUSLY, which is an MS/plan9 extension and a hard error in plain C11.
+# Enabling it changes nothing for any other file in the build.
+EMU8950_DEFS := \
+-fms-extensions \
+-DUSE_EMU8950_OPL=1 \
+-DDOOMX=1 \
+-DEMU8950_LINEAR=1 \
+-DEMU8950_LINEAR_SKIP=1 \
+-DEMU8950_NO_RATECONV=1 \
+-DEMU8950_NO_TLL=1 \
+-DEMU8950_NO_TIMER=1 \
+-DEMU8950_NO_TEST_FLAG=1 \
+-DEMU8950_NO_PERCUSSION_MODE=1
+
 CORE_C_DEFS := \
 -DX86_ISA_IO_TICKS=$(X86_ISA_IO_TICKS)u \
 -DX86_AUDIO_TONE=$(X86_AUDIO_TONE) \
+-DX86_OPL_FM=$(X86_OPL_FM) \
+-DX86_OPL_BENCH=$(X86_OPL_BENCH) \
+$(EMU8950_DEFS) \
 -DX86_MODEY_EXTRA_PAGES=$(X86_MODEY_EXTRA_PAGES) \
 -DX86_PGF_BENCH=$(X86_PGF_BENCH) \
 -DX86_DSK_OPEN_PER_CALL=$(X86_DSK_OPEN_PER_CALL) \
