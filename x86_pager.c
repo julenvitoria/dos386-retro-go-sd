@@ -17,6 +17,10 @@
 #include "x86_arena.h"
 #include "x86_cpu.h"
 
+#ifndef X86_HMA_NEGCTL
+#define X86_HMA_NEGCTL 0        /* see the Makefile; 0 ships */
+#endif
+
 volatile uint32_t x86_pg_frames_total = 0;
 volatile uint32_t x86_pg_frames_free  = 0;
 volatile uint32_t x86_pg_resident     = 0;
@@ -109,7 +113,10 @@ static x86_pg_read_fn  backing_read;
 static x86_pg_write_fn backing_write;
 
 static uint32_t own_first, own_count;
-static uint32_t aux_first, aux_count;   /* the second window; see x86_pager.h */
+/* The extra windows; see x86_pager.h. Two of them: EMS at linear 4 MB and the
+   HMA at 1 MB, which comes and goes with the A20 gate. */
+#define AUX_WINDOWS 2
+static struct { uint32_t first, count; } aux_win[AUX_WINDOWS];
 
 /* The clock hand. One index, not a list: see the policy note in x86_pager.h. */
 static uint32_t victim_hand;
@@ -142,7 +149,7 @@ void x86_pager_reset(void)
     memset(extents, 0, sizeof(extents));
     extent_count = frame_count = free_count = 0;
     own_first = own_count = 0;
-    aux_first = aux_count = 0;
+    memset(aux_win, 0, sizeof(aux_win));
     victim_hand = 0;
     donated_base = NULL;
     donated_frames = donated_lo = 0;
@@ -201,8 +208,31 @@ void x86_pager_own(uint32_t first_page, uint32_t count)
 
 void x86_pager_own_aux(uint32_t first_page, uint32_t count)
 {
-    aux_first = first_page;
-    aux_count = count;
+    if (!count) {
+        if (!first_page) {
+            memset(aux_win, 0, sizeof(aux_win));   /* drop them all */
+            return;
+        }
+        for (uint32_t i = 0; i < AUX_WINDOWS; i++)
+            if (aux_win[i].count && aux_win[i].first == first_page)
+                aux_win[i].count = 0;
+        return;
+    }
+    for (uint32_t i = 0; i < AUX_WINDOWS; i++)
+        if (aux_win[i].count && aux_win[i].first == first_page) {
+            aux_win[i].count = count;              /* re-register, not a dup */
+            return;
+        }
+    for (uint32_t i = 0; i < AUX_WINDOWS; i++)
+        if (!aux_win[i].count) {
+            aux_win[i].first = first_page;
+            aux_win[i].count = count;
+            return;
+        }
+    /* Out of windows. Silently dropping one would make a whole region of guest
+       memory un-ownable with no counter to say so, so this refuses the NEW
+       window and leaves the established ones alone -- the failure then shows
+       up as x86_pg_unmapped on the region that was just asked for. */
 }
 
 void x86_pager_set_nor(const void *base, uint32_t bytes, uint32_t first_page)
@@ -228,7 +258,34 @@ static int owns(uint32_t page)
         return 0;
     if (own_count && page >= own_first && page < own_first + own_count)
         return 1;
-    return aux_count && page >= aux_first && page < aux_first + aux_count;
+    for (uint32_t i = 0; i < AUX_WINDOWS; i++)
+        if (aux_win[i].count && page >= aux_win[i].first
+            && page < aux_win[i].first + aux_win[i].count)
+            return 1;
+    return 0;
+}
+
+/*
+ * IS THIS FOLD ENTRY THE WRAP'S RATHER THAN OURS?
+ *
+ * While A20 is masked the sixteen entries at 1 MB hold the ALIAS onto low
+ * memory, and that is the guest-visible truth for those addresses. A page of
+ * the HMA may still be RESIDENT from an earlier open window -- its frame holds
+ * the guest's HMA data and must survive the toggle -- but its fold entry is
+ * not the pager's to write while the gate is shut. Without this, evicting such
+ * a page writes FOLD_INVALID over a live alias and the real-mode wrap stops
+ * working at one address in sixteen, silently.
+ */
+static int fold_is_wrapped(uint32_t page)
+{
+#if X86_HMA_NEGCTL == 1
+    (void)page;
+    return 0;                       /* NEGATIVE CONTROL: the wrap owns nothing */
+#else
+    return !x86_io.a20_open
+           && page >= X86_HMA_FIRST_PAGE
+           && page <  X86_HMA_FIRST_PAGE + X86_HMA_PAGES;
+#endif
 }
 
 /*
@@ -242,7 +299,8 @@ static int owns(uint32_t page)
  */
 static void fold_install(uint32_t page, uint8_t *host)
 {
-    guest_page_table_ptr[page] = FOLD_K(host, page);
+    if (!fold_is_wrapped(page))
+        guest_page_table_ptr[page] = FOLD_K(host, page);
     if (page < X86_HMA_PAGES && !x86_io.a20_open) {
         uint32_t a = X86_HMA_FIRST_PAGE + page;
         if (a < FOLD_ENTRIES)
@@ -252,12 +310,28 @@ static void fold_install(uint32_t page, uint8_t *host)
 
 static void fold_clear(uint32_t page)
 {
-    guest_page_table_ptr[page] = FOLD_INVALID;
+    if (!fold_is_wrapped(page))
+        guest_page_table_ptr[page] = FOLD_INVALID;
     if (page < X86_HMA_PAGES && !x86_io.a20_open) {
         uint32_t a = X86_HMA_FIRST_PAGE + page;
         if (a < FOLD_ENTRIES)
             guest_page_table_ptr[a] = FOLD_INVALID;
     }
+}
+
+void x86_pager_refold(uint32_t page)
+{
+    if (!guest_page_table_ptr || page >= X86_PG_PAGES)
+        return;
+    if (pg_flags && (pg_flags[page] & PG_RESIDENT)
+        && pg_frame[page] != NO_FRAME) {
+        uint8_t *host = frame_addr(pg_frame[page]);
+        if (host) {
+            fold_install(page, host);
+            return;
+        }
+    }
+    fold_clear(page);
 }
 
 static void hot_bump(uint32_t page)
@@ -772,6 +846,14 @@ int x86_pager_reclaim_from_arena(void)
 
 uint8_t *x86_pager_slack(uint32_t page)
 {
+#if X86_HMA_NEGCTL == 2
+    /* NEGATIVE CONTROL: no slack over the HMA, so a straddling access inside
+       it cannot be served. The seam counts the refusal and the guest gets the
+       wrong high byte -- which is exactly what the shipping build must not do
+       now that those sixteen pages hold real, separately-framed memory. */
+    if (page >= X86_HMA_FIRST_PAGE && page < X86_HMA_FIRST_PAGE + X86_HMA_PAGES)
+        return NULL;
+#endif
     if (!pg_flags || page >= X86_PG_PAGES || !(pg_flags[page] & PG_RESIDENT))
         return NULL;
     uint8_t *host = frame_addr(pg_frame[page]);

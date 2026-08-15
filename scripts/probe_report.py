@@ -109,6 +109,19 @@ TITLES = {
                 "which memory manager it asks for (XMS, EMS, VCPI, DPMI) "
                 "before it refuses to start.",
     },
+    "mortalkombat": {
+        "rom": f"{ROM_DIR}/MORTAL_KOMBAT.dsk",
+        "timeline": "timelines/start-preselected-game.tl",
+        "settle": 22.0, "cmdtail": 1,
+        "what": "Mortal Kombat. Its C-runtime startup probes the machine "
+                "before it draws anything -- SMSW, the x87 detection, CPUID -- "
+                "and then runs the classic A20 WRAP TEST (REPE CMPSW at "
+                "FFFF:0030 against 0000:0020, linear 0x100020). On a 286+ with "
+                "the gate open the two locations must DIFFER, which needs the "
+                "HMA to be backed rather than merely unmapped. It had a preset "
+                "added when that landed, because a title diagnosed once by hand "
+                "gets re-measured badly.",
+    },
     "epicpinball": {
         "rom": f"{ROM_DIR}/EPIC_PINBALL.dsk",
         "timeline": "timelines/start-preselected-game.tl",

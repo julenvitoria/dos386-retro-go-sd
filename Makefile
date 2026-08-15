@@ -95,6 +95,15 @@ CFLAGS += -DX86_CS_LOG=$(X86_CS_LOG)
 # Driven by scripts/run_pmode_controls.py; see the table in x86_pmode.c.
 X86_PMODE_NEGCTL ?= 0
 CFLAGS += -DX86_PMODE_NEGCTL=$(X86_PMODE_NEGCTL)
+
+# HMA NEGATIVE CONTROLS. 1 breaks the A20 gating (the HMA window is left
+# registered while the gate is masked, so the guest sees its HMA data instead
+# of the low-memory alias -- silent corruption); 2 breaks the seam over the HMA
+# (x86_pager_slack() refuses those pages, so a 16-bit access straddling a page
+# boundary inside the HMA is served wrong and counted). Driven by
+# scripts/run_hma_controls.py. 0 ships.
+X86_HMA_NEGCTL ?= 0
+CFLAGS += -DX86_HMA_NEGCTL=$(X86_HMA_NEGCTL)
 # Negative control for tests/test_nor_wdog.py: compiles the watchdog heartbeat
 # out of x86_nor_attach()'s readback loop, which is the defect the fix removes.
 X86_NOR_WDOG_NEGCTL ?= 0

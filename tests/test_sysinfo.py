@@ -27,8 +27,10 @@ Covered:
     a CGA-class colour adapter and not a mono one.
   * INT 12h returns 640 KB, and it is the SAME 640 the BDA word at 0040:0013
     holds -- a program is free to peek instead of call.
-  * INT 15h AH=88h returns AX=0 with CF CLEAR: no extended memory, reported
-    successfully, which is what an AT with nothing above 1 MB does.
+  * INT 15h AH=88h returns AX=64 with CF CLEAR: the HMA, and nothing else, is
+    backed above 1 MB (x86_mem_wrap_1mb() gives the sixteen pages at 0x100000
+    real frames whenever A20 is open), so 64 KB is the honest figure. It read 0
+    while that memory did not exist; the number moved because the memory did.
   * INT 15h AH=C0h returns CF SET with AH=86h -- the honest "this BIOS does not
     have that call", which is a real answer and not silence.
   * 0040:0010 equipment, 0040:0013 memory size, 0040:0063 CRTC base port
@@ -49,7 +51,7 @@ CF = 1 << 0
 # 10b), no game adapter, no serial, no parallel.
 EXPECT_EQUIP = 0x0021
 EXPECT_CONV_KB = 640
-EXPECT_EXT_KB = 0
+EXPECT_EXT_KB = 64      # the HMA: 16 pages x 4 KB, and nothing above it
 EXPECT_CRTC = 0x3D4
 
 

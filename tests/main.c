@@ -176,6 +176,14 @@ volatile uint32_t norwd_r[12];
 volatile uint32_t run_a20_flag = 0;
 volatile uint32_t a20_r[24];
 
+/* IN DTCM, NOT .bss, AND THAT IS NOT A PREFERENCE. The harness's RAM_EMU has
+   no slack at all -- 128 bytes of new result array overflowed it by 176 the
+   first time this arm was built, the same 176 the pager's own table note
+   records. DTCM is where the harness keeps its page table and CPU state and it
+   has room; a result block is host-readable wherever it lives. */
+volatile uint32_t run_hma_flag __attribute__((section(".dtcm_bss")));
+volatile uint32_t hma_r[32] __attribute__((section(".dtcm_bss")));
+
 /* The arena runs against a region of the harness's OWN choosing -- 40 pages,
    so every expected number below is arithmetic this test can state, not
    whatever the LCD bonus pool happened to release.
@@ -2981,7 +2989,11 @@ static void a20_test_run(void)
         a20_r[i] = 0;
 
     /* Start from the state a machine boots in: gate masked, low memory mapped,
-       everything above the HMA unmapped. */
+       everything above the HMA unmapped -- and NO PAGER, so the arms below see
+       the HMA with nothing behind it. The HMA is backed now (hma_test_run());
+       what this arm still grades is the WRAP, and a pool left over from
+       another arm would hand it a frame and change the question. */
+    x86_pager_reset();
     x86_io.a20_open = 0;
     x86_io.kbd_cmd = 0;
     x86_io.port92 = 0;
@@ -3682,6 +3694,230 @@ static void pager_test_run(void)
     x86_arena_reset();
     x86_pager_reset();
 }
+
+/* ==========================================================================
+ * THE HMA, AND WHO OWNS IT ACROSS AN A20 TOGGLE.
+ *
+ * x86_mem_wrap_1mb() used to write FOLD_INVALID over the sixteen pages at 1 MB
+ * whenever the gate was OPEN -- the HMA existed as an address range and as
+ * nothing else. Two shipped titles stop exactly there: DOS4GW's memory hunt
+ * opens A20 itself and reads through ES=0xFFFF, and Mortal Kombat's C runtime
+ * runs the classic wrap test (REPE CMPSW against FFFF:0030) which on a 286+
+ * with the gate open REQUIRES the two locations to differ. Both took
+ * X86_EXIT_MEM_FAULT.
+ *
+ * What is graded here is not "the HMA is readable" -- that is one arm of six.
+ * It is the OWNERSHIP RULE, which is the part that corrupts memory silently if
+ * it is wrong:
+ *
+ *   gate OPEN    the sixteen pages are the pager's, through the same second
+ *                window EMS uses. Ordinary pageable pages, filled from the
+ *                ZERO tier on first touch, evictable, NOT pinned.
+ *   gate MASKED  the ALIAS is the truth and the pager may not touch those
+ *                entries at all -- not even to unmap a page it is evicting.
+ *                The frames keep their HMA data behind the alias.
+ *   reopened     every page that was resident goes back to ITS OWN frame.
+ *
+ * A guest that writes the HMA, masks A20 and reads low memory must see the
+ * ALIAS. Getting that backwards is not a fault, it is wrong data, so the arm
+ * that grades it reads a byte the two stories disagree about.
+ *
+ * AND THE SEAM APPLIES INSIDE THE HMA. Sixteen pages in FAULT order are
+ * sixteen unrelated frames, so a 16-bit access straddling a boundary inside
+ * the window is exactly docs/10's defect. The 1 MB line ITSELF is the other
+ * half: page 255 is a FIXED mapping with no slack of its own, so a straddle
+ * there is REFUSED and counted in x86_seam_overflow rather than served -- the
+ * honest degradation, and the arm below proves the counter moves rather than
+ * the access being silently wrong.
+ * ========================================================================== */
+#define HMA_FRAMES 4u
+
+static uint32_t hma_run(const uint8_t *prog, uint32_t len)
+{
+    memcpy(test_ram, prog, len);
+    memset(&cpu_state_dtcm, 0, sizeof(cpu_state_dtcm));
+    for (int i = 0; i < 6; i++)
+        cpu_state_dtcm.segs[i].limit = 0xFFFFFFFF;
+    cpu_state_dtcm.pit_reload = 0xFFFFFFFF;
+    cpu_state_dtcm.pit_counter = 0xFFFFFFFF;
+    x86_cpu_interp_asm();
+    return cpu_state_dtcm.exit_reason;
+}
+
+static void hma_test_run(void)
+{
+    for (uint32_t i = 0; i < 32; i++)
+        hma_r[i] = 0;
+
+    /* A machine at boot: gate masked, low memory identity-mapped, nothing
+       above the HMA mapped at all. */
+    x86_io.a20_open = 0;
+    x86_io.kbd_cmd = 0;
+    x86_io.port92 = 0;
+    for (uint32_t i = X86_HMA_FIRST_PAGE; i < FOLD_ENTRIES; i++)
+        guest_page_table[i] = FOLD_INVALID;
+
+    x86_pager_reset();
+    x86_livemap_clear();
+    pgf_first_slot = X86_HMA_FIRST_PAGE;
+    pgf_writes = pgf_reads = pgf_fail = 0;
+    x86_pager_set_backing(pgf_read, pgf_write);
+    /* Low memory stays the harness's fixed identity mapping; only the HMA is
+       the pager's here, which is what the shipping wiring does too (the 640 KB
+       window is x86_pager_own()'s and is not what this arm is about). */
+    x86_pager_add_frames(test_ram + PGT_MEM_OFF, X86_PG_POOL_BYTES(HMA_FRAMES));
+    x86_mem_wrap_1mb();
+
+    uint32_t fw0 = x86_pg_faults_w, fz0 = x86_pg_fill_zero;
+
+    /*
+     *   MOV AL,11h / MOV [200h],AL      the low-memory marker -- and it is at
+     *                                   0x200 because that is the byte
+     *                                   0x100200 ALIASES ONTO when the gate is
+     *                                   masked. The two arms must name the
+     *                                   same byte through the two routes or
+     *                                   the corruption arm grades nothing.
+     *   MOV AL,2   / OUT 92h,AL         open the gate
+     *   MOV AX,0FFFFh / MOV ES,AX
+     *   MOV AL,22h / MOV ES:[210h],AL   linear 0x100200 -- the HMA
+     *   MOV AL,ES:[210h] / MOV [201h],AL read it back
+     *   HLT
+     */
+    static const uint8_t prog_open[] = {
+        0xB0, 0x11,  0xA2, 0x00, 0x02,
+        0xB0, 0x02,  0xE6, 0x92,
+        0xB8, 0xFF, 0xFF,  0x8E, 0xC0,
+        0xB0, 0x22,  0x26, 0xA2, 0x10, 0x02,
+        0x26, 0xA0, 0x10, 0x02,  0xA2, 0x01, 0x02,
+        0xF4,
+    };
+    hma_r[0] = hma_run(prog_open, sizeof(prog_open));      /* 6 = HLT, not 5 */
+    hma_r[1] = test_ram[0x201];                            /* 0x22: it stuck */
+    /* THE CORRUPTION ARM. If the HMA were still aliased with the gate OPEN,
+       this byte would now be 0x22 instead of the 0x11 the guest wrote. */
+    hma_r[2] = test_ram[0x200];                            /* 0x11 */
+    hma_r[3] = x86_pg_faults_w - fw0;                      /* 1 */
+    hma_r[4] = x86_pg_fill_zero - fz0;                     /* 1: ZERO tier */
+    hma_r[5] = x86_pg_resident;                            /* 1 */
+    hma_r[6] = (guest_page_table[X86_HMA_FIRST_PAGE] != FOLD_INVALID);
+    hma_r[7] = x86_a20_state;                              /* 1 */
+
+    /*
+     * Mask the gate again. The alias must be back -- and a write through it
+     * must land in LOW memory, not in the HMA frame sitting behind it.
+     *
+     *   MOV AL,0 / OUT 92h,AL
+     *   MOV AX,0FFFFh / MOV ES,AX
+     *   MOV AL,ES:[210h] / MOV [202h],AL    must read 0x11, the ALIAS
+     *   MOV AL,33h / MOV ES:[210h],AL       write through the alias
+     *   MOV AL,[200h] / MOV [203h],AL       must read 0x33: it went to low RAM
+     *   HLT
+     */
+    fw0 = x86_pg_faults_w;
+    static const uint8_t prog_mask[] = {
+        0xB0, 0x00,  0xE6, 0x92,
+        0xB8, 0xFF, 0xFF,  0x8E, 0xC0,
+        0x26, 0xA0, 0x10, 0x02,  0xA2, 0x02, 0x02,
+        0xB0, 0x33,  0x26, 0xA2, 0x10, 0x02,
+        0xA0, 0x00, 0x02,  0xA2, 0x03, 0x02,
+        0xF4,
+    };
+    hma_r[8]  = hma_run(prog_mask, sizeof(prog_mask));     /* 6 = HLT */
+    hma_r[9]  = test_ram[0x202];                           /* 0x11 -- the ALIAS */
+    hma_r[10] = test_ram[0x203];                           /* 0x33 */
+    hma_r[11] = x86_pg_faults_w - fw0;                     /* 0: nothing faulted */
+    hma_r[12] = x86_pg_resident;                           /* 1: the frame stays */
+
+    /*
+     * Reopen. The HMA page goes back to ITS OWN frame with the byte still in
+     * it -- not refilled, not lost, and not the 0x33 the alias took.
+     *
+     *   MOV AL,2 / OUT 92h,AL / ES=0FFFFh / MOV AL,ES:[210h] / MOV [204h],AL
+     */
+    fz0 = x86_pg_fill_zero;
+    static const uint8_t prog_reopen[] = {
+        0xB0, 0x02,  0xE6, 0x92,
+        0xB8, 0xFF, 0xFF,  0x8E, 0xC0,
+        0x26, 0xA0, 0x10, 0x02,  0xA2, 0x04, 0x02,
+        0xF4,
+    };
+    hma_r[13] = hma_run(prog_reopen, sizeof(prog_reopen));
+    hma_r[14] = test_ram[0x204];                           /* 0x22, still */
+    hma_r[15] = x86_pg_fill_zero - fz0;                    /* 0: never refilled */
+    hma_r[16] = test_ram[0x200];                           /* 0x33 -- low RAM kept
+                                                              what the alias wrote */
+
+    /*
+     * THE SEAM, INSIDE THE HMA. A 16-bit access at linear 0x100FFF spans pages
+     * 256 and 257, which hold two unrelated frames (frames come off the free
+     * list from the top, so 257's host is BELOW 256's -- genuinely not
+     * contiguous, which is the only condition under which the seam is visible).
+     *
+     *   ES=0FFFFh / MOV AX,1234h / MOV ES:[100Fh],AX     -> 0x100FFF
+     *   MOV AX,0 / MOV AX,ES:[100Fh] / MOV [205h],AX
+     *   MOV AL,ES:[1010h] / MOV [207h],AL                -> 0x101000, page 257
+     */
+    uint32_t s0 = x86_seam_syncs, o0 = x86_seam_overflow;
+    static const uint8_t prog_seam[] = {
+        0xB8, 0xFF, 0xFF,  0x8E, 0xC0,
+        0xB8, 0x34, 0x12,  0x26, 0xA3, 0x0F, 0x10,
+        0xB8, 0x00, 0x00,  0x26, 0xA1, 0x0F, 0x10,  0xA3, 0x05, 0x02,
+        0x26, 0xA0, 0x10, 0x10,  0xA2, 0x07, 0x02,
+        0xF4,
+    };
+    hma_r[17] = hma_run(prog_seam, sizeof(prog_seam));
+    hma_r[18] = (uint32_t)(test_ram[0x205] | (test_ram[0x206] << 8)); /* 0x1234 */
+    /* The high byte physically in the NEXT page's frame, read back through a
+       separate byte access: a straddle "served" out of the low frame's slack
+       and never pushed would pass the arm above and fail this one. */
+    hma_r[19] = test_ram[0x207];                           /* 0x12 */
+    hma_r[20] = (x86_seam_syncs > s0);                     /* it was SERVED */
+    hma_r[21] = x86_seam_overflow - o0;                    /* 0: and not refused */
+    hma_r[22] = x86_pg_resident;                           /* 2 */
+
+    /*
+     * THE 1 MB LINE ITSELF. Page 255 is a FIXED mapping on the real machine
+     * (BIOS/open-bus), so it has no slack of its own and its neighbour is not
+     * the seam's to write. A 16-bit read at 0xFFFFF is therefore REFUSED and
+     * COUNTED -- the honest degradation docs/10 specifies, and the arm exists
+     * so that "counted" is a fact rather than an assumption.
+     */
+    guest_page_table[255] = FOLD_K((uint32_t)test_ram + 100u * 4096u, 255);
+    test_ram[100u * 4096u + 0xFFFu] = 0xA5;
+    o0 = x86_seam_overflow;
+    static const uint8_t prog_line[] = {
+        0xB8, 0x00, 0xF0,  0x8E, 0xC0,
+        0x26, 0xA1, 0xFF, 0xFF,  0xA3, 0x08, 0x02,
+        0xF4,
+    };
+    hma_r[23] = hma_run(prog_line, sizeof(prog_line));     /* 6 = HLT, degraded */
+    hma_r[24] = x86_seam_overflow - o0;                    /* 1: refused, LOUDLY */
+    hma_r[25] = test_ram[0x208];                           /* 0xA5: the low byte
+                                                              is still right */
+
+    /* The window itself, asked directly. Open: the HMA is ours. Masked: it is
+       not, and a fault there is x86_pg_unmapped, not a frame. */
+    hma_r[26] = (x86_pager_fault(0x101000u, 0) != 0);      /* 1 */
+    x86_a20_set(0);
+    uint32_t um0 = x86_pg_unmapped;
+    hma_r[27] = (x86_pager_fault(0x101000u, 0) == 0);      /* 1 */
+    hma_r[28] = x86_pg_unmapped - um0;                     /* 1 */
+    /* And the alias survived every one of those transitions. */
+    hma_r[29] = (guest_page_table[X86_HMA_FIRST_PAGE]
+                 == guest_page_table[0] - (X86_HMA_FIRST_PAGE << FOLD_SHIFT));
+
+    /* Put the machine back the way the rest of the harness expects it. */
+    guest_page_table[255] = FOLD_INVALID;
+    x86_pager_reset();
+    x86_livemap_clear();
+    x86_pager_set_backing(NULL, NULL);
+    for (uint32_t i = X86_HMA_FIRST_PAGE; i < FOLD_ENTRIES; i++)
+        guest_page_table[i] = FOLD_INVALID;
+    x86_mem_wrap_1mb();
+    hma_r[30] = x86_io.a20_open;                           /* 0 */
+    hma_r[31] = x86_a20_state;                             /* 0 */
+}
+
 
 /* ===========================================================================
  * XMS, driven by GUEST CODE doing the real sequence.
@@ -5083,6 +5319,11 @@ void Reset_Handler(void) {
         if (run_pager_flag == 1) {
             pager_test_run();
             run_pager_flag = 0;
+        }
+
+        if (run_hma_flag == 1) {
+            hma_test_run();
+            run_hma_flag = 0;
         }
 
         if (run_seam_flag == 1) {

@@ -20,6 +20,10 @@
 #include "x86_cpu.h"
 #include "x86_arena.h"
 #include "x86_pager.h"
+
+#ifndef X86_HMA_NEGCTL
+#define X86_HMA_NEGCTL 0
+#endif
 #include "x86_video_planar.h"
 
 #define PAGE_SIZE 4096u
@@ -268,20 +272,65 @@ volatile uint32_t x86_a20_state = 0;
 
 void x86_mem_wrap_1mb(void)
 {
+    if (x86_io.a20_open) {
+        /*
+         * THE GATE IS OPEN, SO THE HMA IS ITS OWN MEMORY -- AND IT IS BACKED.
+         *
+         * It used to be left FOLD_INVALID, on the reasoning that nothing owned
+         * it. Something does now: the pager's second-window mechanism, the one
+         * EMS already uses for its logical pages at linear 4 MB. Sixteen
+         * ordinary pageable guest pages, filled from the ZERO tier on first
+         * touch and evictable like any other -- 64 KB of a 640 KB pool, and
+         * only if the guest actually touches it.
+         *
+         * The old comment argued a clean fault was the honest answer. It was
+         * honest about the implementation and WRONG about the machine: a 286+
+         * with A20 open HAS memory there, and two shipped titles ask. DOS4GW's
+         * memory hunt opens A20 itself and reads through ES=0xFFFF; Mortal
+         * Kombat's C runtime runs the classic A20 wrap test (REPE CMPSW against
+         * FFFF:0030) and requires the two locations to DIFFER. Both got
+         * X86_EXIT_MEM_FAULT instead of an answer.
+         *
+         * WHO OWNS THESE PAGES ACROSS A TOGGLE. The window, and only the
+         * window, while the gate is open. Masking it drops the window and
+         * writes the alias back over these entries, so a guest that writes the
+         * HMA, masks A20 and reads low memory sees the ALIAS -- the frames keep
+         * their HMA data untouched behind it, and x86_pager_refold() points the
+         * entries back at them when the gate reopens. The pager is told not to
+         * write these entries while masked (fold_is_wrapped(), x86_pager.c),
+         * which is what stops an eviction from erasing a live alias.
+         */
+        x86_pager_own_aux(X86_HMA_FIRST_PAGE, X86_HMA_PAGES);
+        for (uint32_t i = 0; i < X86_HMA_PAGES; i++) {
+            uint32_t dst = X86_HMA_FIRST_PAGE + i;
+            if (dst >= FOLD_ENTRIES)
+                break;
+            /* Resident from an earlier open window -> back to its frame;
+               otherwise FOLD_INVALID, which is a demand fault, not a refusal. */
+            x86_pager_refold(dst);
+        }
+        x86_a20_state = 1u;
+        return;
+    }
+
+#if X86_HMA_NEGCTL == 1
+    /* NEGATIVE CONTROL: the window is left registered and the entries are left
+       pointing at the HMA's own frames. A guest that masks A20 then reads low
+       memory through a wrapped address gets its HMA data instead of the alias,
+       which is the silent corruption the gating exists to prevent. */
+    for (uint32_t i = 0; i < X86_HMA_PAGES; i++)
+        x86_pager_refold(X86_HMA_FIRST_PAGE + i);
+    x86_a20_state = 0u;
+    return;
+#endif
+    /* Masked: the wrap owns these entries. Drop the window FIRST so a fault
+       inside it cannot hand out a frame while the alias is what the guest
+       sees. */
+    x86_pager_own_aux(X86_HMA_FIRST_PAGE, 0);
     for (uint32_t i = 0; i < X86_HMA_PAGES; i++) {
         uint32_t dst = X86_HMA_FIRST_PAGE + i;
         if (dst >= FOLD_ENTRIES)
             break;
-        if (x86_io.a20_open) {
-            /* The gate is open: the HMA is its own memory. Nothing here owns
-             * it yet -- there is no XMS driver and no pager stage behind this
-             * one -- so it is left UNMAPPED rather than aliased. A guest that
-             * opens A20 and then reads the HMA takes a clean fault that
-             * x86_map_failures/the trap counters can name, instead of silently
-             * reading the interrupt vector table and believing it. */
-            guest_page_table_ptr[dst] = FOLD_INVALID;
-            continue;
-        }
         uint32_t k = guest_page_table_ptr[i];
         if (k == FOLD_INVALID) {
             guest_page_table_ptr[dst] = FOLD_INVALID;

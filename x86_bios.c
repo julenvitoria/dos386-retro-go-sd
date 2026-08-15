@@ -57,11 +57,24 @@
    harness gives it. */
 uint32_t x86_bios_conv_kb = 640;
 
-/* Extended memory (above 1 MB) in KB. There is none: the fold table maps 640 KB
-   of guest RAM plus VRAM plus an open-bus filler, and nothing above the first
-   megabyte is backed. INT 15h AH=88h reports it as zero SUCCESSFULLY, which is
-   a different statement from refusing the call. */
-#define EXT_MEM_KB   0u
+/* Extended memory (above 1 MB) in KB, and it is now 64 rather than 0.
+ *
+ * THIS NUMBER IS BACKED, WHICH IS THE ONLY REASON IT CHANGED. The sixteen
+ * pages at 1 MB -- the HMA, 0x100000-0x110000 -- are real pageable guest pages
+ * whenever the A20 gate is open (x86_mem_wrap_1mb()). Nothing above 0x110000
+ * is, so 64 is the whole of it and reporting more would be the lie this
+ * comment used to be protecting against.
+ *
+ * A20 IS NOT PART OF THE ANSWER. The memory exists; the gate is the guest's to
+ * open, and a BIOS that reported 0 KB while masked would tell a program the
+ * machine has no extended memory at the exact moment the program is deciding
+ * whether to go looking for it. Real BIOSes size it once at POST too.
+ *
+ * The other half of the interface stays refused, and honestly: AH=87h (move
+ * block to extended memory) and AH=89h (switch to protected mode) are not
+ * built, so they still answer CF=1/AH=86h. A program told "64 KB, and I cannot
+ * move a block into it" is told the truth twice. */
+#define EXT_MEM_KB   (X86_HMA_PAGES * 4u)   /* 16 pages x 4 KB = 64 KB */
 
 static uint8_t bda_r8(uint32_t lin)
 {

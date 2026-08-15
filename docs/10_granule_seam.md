@@ -89,6 +89,23 @@ the one harness with a deliberately non-contiguous fold (two frames from extents
 48 KB apart, low frame's slack painted `0xEE`) and is the template for anything
 testing this class.
 
+## 4b. The 1 MB line, now that the HMA is backed
+
+The sixteen pages at 1 MB are ordinary pager pages whenever A20 is open
+(`x86_mem_wrap_1mb()`, `docs/13`). They are handed frames in FAULT order like
+everything else, so a 16-bit access straddling a boundary INSIDE the window is
+this defect exactly, and it is served by the ordinary slack mechanism —
+`tests/test_paging.py` grades both halves of the value landing in the right
+frames.
+
+**The line ITSELF is the refusal case, and a title reads it.** The low granule
+of the `0x0FFFFF` boundary is page 255, a FIXED mapping with no eight bytes of
+its own, so the pull cannot happen: `x86_seam_sync()` refuses and counts
+`x86_seam_overflow`. Both Dark Forces and Mortal Kombat read **1** there — one
+refused straddle each, in code that is testing the A20 gate. That is the
+designed degradation, not a defect to chase, and the arm in `test_paging.py`
+exists so "counted" stays a fact.
+
 ## 5. Cost
 
 `tests/test_benchmark.py`, a pure `DEC`/`JNZ` loop — the most flush-check-
