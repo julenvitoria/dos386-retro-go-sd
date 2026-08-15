@@ -381,6 +381,7 @@ loop and say nothing. Read `x86_frame_phase` instead.
 | `x86_dos_overlays` / `x86_dos_overlay_seg` / `x86_dos_overlay_reloc` | `AH=4Bh AL=03h` (LOAD OVERLAY). An overlay is not a process -- nothing is allocated and nothing will terminate -- so the `x86_dos_exec*` counters cannot describe it. `_seg` and `_reloc` are the TWO WORDS of the AL=03h parameter block as the core read them: the load segment and the relocation factor, which are separate and need not be equal. Dark Forces passes them equal (both 0x81) |
 | `x86_dos_sysvars_calls` / `x86_dos_parse_calls` | `AH=52h` (list of lists) and `AH=29h` (parse filename into FCB). Call counts ONLY, and deliberately so: the SysVars block is ordinary guest memory reached through the fold table, so **which OFFSETS a title reads cannot be seen without faulting the granule**, and the pager has no read-side mechanism for that -- the seam machinery is write-side and code-side. Knowing which fields matter is worth more than implementing all of them, so if a title ever needs that answer the way to get it is to put the block on its own granule and fault it, which is a pager change. What the counts DO settle is whether the call happened at all: Dark Forces reads 2 and 2 |
 | `x86_dos_file_log` / `x86_dos_path_log` | The **first 96** file-family INT 21h calls, four words each -- `(func << 8) \| AL`, `(CF << 16) \| AX`, `BX`, `CX:DX` -- plus the last sixteen paths. Read it with **`probe.py --dos-log`**, which decodes it to one line per call. It **SATURATES rather than wrapping**, and that is the point: a guest stuck in a loop overwrote a 32-slot ring with the loop body in milliseconds, so the call that ISSUED the handle the loop was failing on was always gone -- WOLF3D's 32 identical AH=42h slots said nothing, and with 96 saturating slots the answer was in entry 2. The old two-word form also could not say WHICH handle, which is the only question a failing seek raises. `x86_dos_file_calls` counts every call whether recorded or not; write 0 to `x86_dos_file_log_idx` to re-arm for a later phase. `x86_hle_log` cannot answer a file question at all: a guest polling the keyboard fills all 32 of its slots between one open and the next. **The MEMORY calls `48h`/`49h`/`4Ah` also take a slot** -- an arena that refuses an allocation is unreadable as a bare count, which is exactly how Dark Forces' 15 `4Ah` calls sat unexplained -- but they are NOT counted in `x86_dos_file_calls`, and for them slot+3 is `(ES << 16) \| DX`, since ES is the block for `49h`/`4Ah` and DX means nothing there. `--dos-log` prints those as `BX=... paras ES=...` |
+| `x86_opl_t1_gap` | **the AdLib probe's delay, in PIT ticks** -- the longest wait ever observed for OPL timer 1, read against the 96 that preset FFh needs. It is what separates "the card refused" from "the guest's wait was too short for our clock", and it is what named the Sound Blaster non-detection (`docs/03` §4e). `x86_io_isa_ticks` beside it is the ISA bus time charged to FM-port accesses; 0 means the negative control is built |
 | `x86_io_log` | Every port access, **coalesced by (direction, port)** into 32 runs, decoded by **`probe.py --io-log`**. Coalescing is what makes it useful: a mode-13h palette upload is 768 consecutive writes to 0x3C9 and would flush every other port out of a raw ring. What it shows is the SHAPE of a guest's hardware conversation -- which register files it programs, in what order -- and that named WOLF3D's wall in one run: `OUT 3D4,0F / OUT 3D5,66 / IN 3D5` reading back 0xFF, i.e. a CRTC write-then-read-back probe against a register file that did not exist. It also caught the FIX overshooting -- answering the 0x3B4/0x3B5 mono alias too made the guest conclude MONO and poll 0x3BA 32,000 times |
 | `x86_vga_planar_stores` / `_cls_plane` / `_cls_copy` / `_cls_general` | Guest stores that took the planar hook, split by WRITE CLASS -- the class is decided at `OUT` time, not per store. `_plane` is the CPU byte straight into the enabled planes (write mode 0, no Set/Reset, Bit Mask 0xFF, no rotate, no ALU); `_copy` is the write-mode-1 latched page copy; `_general` is everything else and is the only class still paying the full pipeline. **The MIX is the number that says whether a fast path is earning its risk**, and `_general` is the one to watch: WOLF3D in Mode Y gameplay reads 0 there, so the fast paths cover its whole frame. The class counters count PER BYTE while `_stores` counts per store, so a guest doing word stores makes them exceed it -- that is not a discrepancy. Read the set with `probe.py --watch planar` |
 | `x86_disk_reads` / `x86_disk_backend_reads` | guest-side `disk_read()` calls and how many of them reached the SD card. The RATIO is the sector cache's whole point, it is exact under gwemu, and it is the number to quote — TOPBENCH boots on 115 / 7 |
@@ -1021,6 +1022,26 @@ for a result. ~1 s at title load and it truncates the pagefile afterwards, so
 it is a build flag and never a default. It is what proved the cost is
 **rewriting recently-written sectors** (60–67 ms/4 KB) rather than appending
 (12–14 ms), the call size, or the cluster-chain walk — see `docs/12` §1b.
+
+#### `X86_ISA_IO_TICKS=0` — the AdLib probe's negative control
+
+```bash
+make -f Makefile.core clean && make -f Makefile.core pack X86_ISA_IO_TICKS=0
+python3 scripts/deploy_device.py --no-firmware --preselect WOLF3D.dsk
+python3 scripts/probe.py --retrogo --target hardware --hard-reset \
+    --timeline timelines/wolf3d-hw.tl --interval 6 --samples 3 \
+    --watch x86_opl_t1_gap,x86_opl_timer_expiry,x86_opl_writes,\
+x86_io_isa_ticks,x86_sb_resets,x86_sb_cmds
+```
+
+The shipping value is 1: one ~0.84 us PIT tick charged to every FM-port access,
+which is what an 8-bit ISA I/O cycle costs on a real machine **whatever the CPU
+is**. `0` charges nothing, so the OPL timer measures a bus-calibrated delay loop
+in instructions again. SEEN TO FAIL on hardware: `x86_opl_t1_gap` **200 -> 56**
+against the 96 an 80 us timer needs, `expiry` 1 -> 0, `opl_writes` 253 -> 6,
+and `x86_sb_resets`/`_cmds` **1/2 -> 0/0** — i.e. WOLF3D stops probing the
+Sound Blaster entirely, which is the owner-reported symptom, reproduced on
+demand. `docs/03` §4e.
 
 #### `X86_DSK_OPEN_PER_CALL=1` — the `.dsk` handle A/B
 

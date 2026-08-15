@@ -284,7 +284,8 @@ CONTEXT = ["core_ready", "core_dtcm_ok", "hle_calls_seen", "x86_hle_calls",
            "x86_sb_blocks", "x86_sb_dma_bytes", "x86_sb_samples",
            "x86_sb_rate", "x86_sb_irqs", "x86_sb_irqs_delivered",
            "x86_sb_irqs_masked", "x86_sb_irqs_acked", "x86_sb_underruns",
-           "x86_sb_adpcm_silenced", "x86_opl_timer_expiry"]
+           "x86_sb_adpcm_silenced", "x86_opl_timer_expiry",
+           "x86_opl_t1_gap", "x86_io_isa_ticks"]
 
 # How long to watch guest_insns_total to decide it is ADVANCING. A guest that
 # halted at instruction 1 has a non-zero count forever, so a single sample

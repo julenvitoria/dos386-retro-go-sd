@@ -719,6 +719,8 @@ extern volatile uint32_t x86_kbd_read_log_idx;
 extern volatile uint32_t x86_opl_writes;
 extern volatile uint32_t x86_opl_status_reads;
 extern volatile uint32_t x86_opl_timer_expiry;
+extern volatile uint32_t x86_opl_t1_gap;
+extern volatile uint32_t x86_io_isa_ticks;
 extern volatile uint32_t x86_sb_resets;
 extern volatile uint32_t x86_sb_cmds;
 extern volatile uint32_t x86_sb_cmds_unknown;

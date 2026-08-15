@@ -149,6 +149,8 @@ render, because between two calls the pager may move any page.
 | `x86_sb_adpcm_silenced` | a block that ran but could not be decoded |
 | `x86_sb_dma_refused` | **narrowed**: only what this model CANNOT run (record, direct DAC). It is no longer "asked for audio and got silence" |
 | `x86_dos_env_seg` | whether `BLASTER` was reachable at all |
+| `x86_opl_t1_gap` vs 96 | **the AdLib probe's delay, in ticks.** Under 96 means the guest's wait was too short for our clock, not that the card refused -- 4e |
+| `x86_io_isa_ticks` | ISA bus time charged to FM-port accesses (0 = the negative control is built) |
 
 All of them are in `probe_report.py`'s health table.
 
@@ -190,18 +192,80 @@ The safe side of that result is that setting `BLASTER` left WOLF3D bit-identical
   (CLAUDE.md), so the per-frame cost of the render is a tier-3 question and is
   stated here as unmeasured rather than estimated.
 
-### 4e. THE OPEN PROBLEM: our CPU is too fast for an 80 µs timer
+### 4e. SOLVED: the delay loop is calibrated in BUS CYCLES, not instructions
 
-**WOLF3D and KEEN4's AdLib probe still concludes "no card" under gwemu**
-(`x86_opl_timer_expiry=0` across a whole run, measured on the shipping core).
-The card is answering; the guest's *delay* is too short. Timer 1 at preset FFh
-needs 96 PIT ticks, and guest time is instructions ÷ `x86_pit_kips`: under gwemu
-the guest runs at ~11.9 M insn/s, so the few hundred instructions of Wolf3D's
-delay loop — a loop calibrated for a 286 — elapse only ~30–70 ticks. At silicon's
-~2.8 M insn/s the same loop elapses ~130 and the flag *should* come up. **That is
-arithmetic, not a measurement: it is a tier-3 check nobody has run.** Do not
-"fix" it by shortening the OPL period — the period is right and the clock model
-is the subject. This is the same three-clock question as `docs/09`.
+**This was "our CPU is too fast for an 80 us timer" and the arithmetic offered
+for it was wrong.** The prediction was that silicon's ~2.8 M insn/s would
+elapse ~130 of the 96 ticks the timer needs where gwemu's ~11.9 M elapsed only
+30-70. It was finally MEASURED ON THE DEVICE and it read
+`x86_opl_timer_expiry=0` there too -- same 348 status reads, same 6 FM writes,
+same "no card". gwemu was never the variable.
+
+**What the guest is actually doing.** Wolfenstein 3D's `SDL_DetectAdLib()`
+starts timer 1 at preset FFh (80 us, 96 PIT ticks) and then waits by READING
+THE FM STATUS PORT: id's `alOut()` spends 6 reads after the address byte and 35
+after the data byte, and the detect adds a loop of 100 on top -- ~135 accesses,
+which is exactly the 348 status reads and 6 register writes the counters show.
+On a real machine an 8-bit ISA I/O cycle is ~1 us **whatever the CPU is**, so
+that loop is ~135 us and the flag is up. That is why the code is written as
+port reads and not as a counted NOP loop: it is calibrated in BUS cycles.
+
+Our clock converted those 135 accesses at the INSTRUCTION rate, so they bought
+24 us. The instrument that says so is `x86_opl_t1_gap`, the longest wait ever
+observed for timer 1: **56 ticks against the 96 needed**, on hardware.
+
+**The fix is to charge the bus.** `x86_io.c` gives the FM card its own clock --
+machine ticks plus one PIT tick per access to an FM port (`X86_ISA_IO_TICKS`,
+`x86_io_isa_ticks`). Measured on silicon, WOLF3D:
+
+| | `X86_ISA_IO_TICKS=0` | `=1` (shipping) |
+|---|---|---|
+| `x86_opl_t1_gap` / needed | 56 / 96 | **200** / 96 |
+| `x86_opl_timer_expiry` | 0 | **1** |
+| `x86_opl_writes` | 6 | **253** -- the detect's 245-register zero pass |
+| `x86_sb_resets` / `_cmds` | 0 / 0 | **1 / 2**, `cmds_unknown=0` |
+
+The last row is the owner's complaint. **WOLF3D's Sound Blaster probe is
+DOWNSTREAM of the AdLib conclusion**, so "it never touches 0x22x" was never an
+SB defect at all; the card, the `BLASTER` string and the PSP link were all
+correct and all irrelevant while the OPL timer said "no card".
+
+**Why the OPL's clock and not the machine's.** Charging every port access into
+`pit_now` is the more general model and it was built and measured first: it is
+physically right and costs nothing off the I/O path, but it moves the machine's
+clock by **+11%** (1.16 M bus ticks against 10.4 M instruction ticks over 48 M
+instructions on WOLF3D) because a retrace spin on 0x3DA really does cost bus
+time. An 11% faster clock retimes every title's intro -- the WOLF3D golden
+landed on the title screen instead of the credits -- so it is a machine-pacing
+change to be graded as one, not a rider on a sound fix. It is left as the
+obvious next step, not as this change.
+
+**The golden moved anyway, for a different and correct reason.** With sound
+detected, WOLF3D takes its sound-present startup path and its intro sequence is
+further along at the golden's fixed 250 M-instruction capture point. `WOLF3D.png`
+was re-blessed to the title screen with that stated, after `repeat --runs 3`
+proved three identical frames. **Do NOT read the re-bless as "the picture
+changed": the picture is the same machine one screen later.**
+
+**Two candidates were tested first and both are innocent**, which is worth
+keeping because they are the cheap ones anyone would reach for:
+
+* **PSP:002C.** Read out of guest memory ON HARDWARE, not inferred: the root
+  PSP is at linear 0x770, `[0x79C]` = 0x0071, and 0x71 is `x86_dos_env_seg`;
+  the block at 0x710 holds `PATH=`, `COMSPEC=` and `BLASTER=A220 I5 D1 H5 T6`
+  followed by the `01 00` count and `C:\WOLF3D.EXE`. The link is sound, and the
+  guest's own Borland startup at 0x870 is visibly `8B 1E 2C 00`, `mov bx,[2Ch]`.
+* **The title's stored configuration.** The shipped image is Wolf3D SHAREWARE
+  (`WL1`, not `WL6`), and `CONFIG.WL1` is present, 522 B. Its three mode words
+  after the seven high-score records read `sd=2` (`sdm_AdLib`), `sm=1`
+  (`smm_AdLib`) and **`sds=3` (`sds_SoundBlaster`)** -- the title ASKS for
+  Sound Blaster digitised sound. `ReadConfig()` downgrades `sds` to `sds_Off`
+  when `SoundBlasterPresent` is false, which is what was happening.
+
+**Still not observed: a transfer.** `x86_sb_starts` is 0 across 50 s of
+hardware gameplay. Detection is not playback, and WL1 reaches its digitised
+sounds only for the events that have them; that is the next thing to grade, and
+it is separate from this.
 
 ### 4f. What is STILL not here: FM synthesis, and what it would take
 
