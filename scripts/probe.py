@@ -49,6 +49,10 @@ WATCH_GROUPS = {
     "nor": [
         # did the snapshot happen, and what did the firmware's flash cache do
         "nor_snap_result", "nor_snap_ms", "nor_snap_addr", "nor_snap_cb_bytes",
+        # the watchdog question: worst stretch with no kick, against ~472 ms
+        "nor_snap_wdog_gap_ms", "x86_nor_heartbeats",
+        # and what the slice regulator was handed back at (watchdog, post-attach)
+        "guest_max_slice", "guest_exec_ms",
         # is the guest actually running out of NOR
         "x86_nor_attached", "x86_nor_attach_err",
         # the measurement: how much of guest RAM is genuinely read-only

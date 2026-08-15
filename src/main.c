@@ -2311,6 +2311,35 @@ volatile uint32_t nor_snap_addr     = 0;  /* XIP address the firmware chose   */
 
 static char nor_snap_path[sizeof(dsk_path) + 32];
 
+/*
+ * The watchdog heartbeat for the whole snapshot, and the instrument that says
+ * whether it was needed.
+ *
+ * nor_snap_wdog_gap_ms is the WORST interval between two kicks over one
+ * snapshot. That is the measurement the watchdog question actually turns on:
+ * with the kicks in, it reports the longest stretch that WOULD have been
+ * un-kicked without them, so it is read against the ~472 ms WWDG window
+ * directly. Anything approaching that window says this path can only run
+ * chunked, and says which chunk is the offender.
+ *
+ * The frame loop is not running while any of this happens -- the snapshot is a
+ * menu callback -- so its once-per-frame abi->wdog_refresh() is not covering
+ * us here.
+ */
+volatile uint32_t nor_snap_wdog_gap_ms = 0;   /* worst gap between kicks, ms */
+static uint32_t   nor_snap_last_kick_ms;
+
+static void nor_snap_kick(void)
+{
+    const gw_firmware_abi_t *abi = gw_firmware_abi();
+    uint32_t now = abi->HAL_GetTick();
+    uint32_t gap = now - nor_snap_last_kick_ms;
+    if (gap > nor_snap_wdog_gap_ms)
+        nor_snap_wdog_gap_ms = gap;
+    nor_snap_last_kick_ms = now;
+    abi->wdog_refresh();
+}
+
 static void nor_snap_fill(uint8_t *buf, uint32_t len, uint32_t off,
                           uint8_t *file_addr, uint32_t file_size)
 {
@@ -2331,6 +2360,20 @@ static void nor_snap_fill(uint8_t *buf, uint32_t len, uint32_t off,
      * compares flash against the same wrong pointer. x86_guest_copy_out()
      * resolves each granule properly and faults in anything not resident. */
     nor_snap_cb_bytes += x86_guest_copy_out(buf, off, n);
+    /* This callback is NOT the cheap in-place transform the relocate contract
+       has in mind (gw_flash_alloc.c: "last look at the data while it is still
+       in RAM"): resolving 16 KB through the fold can fault pages in, and a
+       fault can evict one, and an eviction is a pagefile write measured at up
+       to 433 ms on silicon. That is a whole WWDG window inside one callback,
+       between two of OSPI_Program()'s kicks. */
+    nor_snap_kick();
+}
+
+/* Installed as x86_nor_heartbeat for the duration of the attach: see x86_nor.c
+   on why that file takes a hook instead of calling the ABI itself. */
+static void nor_snap_wdog(void)
+{
+    nor_snap_kick();
 }
 
 /* A file of the right length and nothing else. 512 bytes of zeros pushed
@@ -2345,6 +2388,13 @@ static int nor_snap_make_placeholder(const gw_firmware_abi_t *abi,
     if (!f)
         return -1;
     for (uint32_t off = 0; off < GUEST_RAM_SIZE; off += sizeof(zeros)) {
+        /* 1,280 writes, and the frame loop -- the only thing that normally
+           kicks the watchdog -- is not running: this is a menu callback. The
+           SD driver does refresh inside its own busy-waits, so this loop is
+           probably survivable on its own, but "probably" is not a property to
+           rest a reset on and the kick costs nothing on a path that already
+           writes 640 KB. */
+        nor_snap_kick();
         if (abi->fwrite(zeros, 1, sizeof(zeros), f) != sizeof(zeros)) {
             abi->fclose(f);
             abi->remove(path);
@@ -2359,6 +2409,9 @@ static void nor_snapshot_run(void)
 {
     const gw_firmware_abi_t *abi = gw_firmware_abi();
     uint32_t t0 = abi->HAL_GetTick();
+
+    nor_snap_wdog_gap_ms = 0;
+    nor_snap_last_kick_ms = t0;
 
     if (x86_nor_attached)  { nor_snap_result = NOR_SNAP_ALREADY;  return; }
     if (!guest_ram)        { nor_snap_result = NOR_SNAP_NO_RAM;   return; }
@@ -2419,7 +2472,10 @@ static void nor_snapshot_run(void)
         nor_snap_result = NOR_SNAP_NO_RAM;
         return;
     }
-    if (x86_nor_attach(xip, size, guest_ram, GUEST_RAM_SIZE, 0) != 0) {
+    x86_nor_heartbeat = nor_snap_wdog;
+    int attached = x86_nor_attach(xip, size, guest_ram, GUEST_RAM_SIZE, 0);
+    x86_nor_heartbeat = NULL;
+    if (attached != 0) {
         nor_snap_result = NOR_SNAP_ATTACH;
         return;
     }
@@ -2429,6 +2485,40 @@ static void nor_snapshot_run(void)
        is dropped rather than migrated because after an attach there is nothing
        left for it to own -- every guest page is served from NOR. */
     x86_pager_reset();
+
+    /*
+     * Hand the slice regulator back to its floor, and forget the debt.
+     *
+     * THIS is the half of the watchdog story that survives the snapshot. The
+     * regulator (see max_slice, above) is an integrator: it moves max_slice by
+     * one eighth per frame to keep guest_exec_ms near 85% of the panel period,
+     * and MAX_SLICE_CEIL's own comment sizes it against the watchdog window.
+     * That works because the cost of an instruction changes slowly.
+     *
+     * An attach changes it in ONE STEP and by a large factor: every guest page
+     * is in NOR the instant this returns, so every access -- data AND
+     * instruction fetch -- fails the fold check, traps to C, and is served out
+     * of OCTOSPI instead of AXI. The first slice after the menu closes would
+     * otherwise run the max_slice that was tuned for AXI at the new NOR price,
+     * and an integrator that corrects by an eighth per frame cannot help with
+     * a frame it does not survive. Same for the debt: the menu blocked the
+     * frame loop for the whole snapshot, so dt on resume is enormous and the
+     * throttled path would ask for a GUEST_DEBT_MAX_MS catch-up burst as its
+     * opening move.
+     *
+     * Starting from the floor costs a few frames of ramp and lets the
+     * regulator discover what an instruction now costs, which is the number
+     * nobody has measured. It does not paper over a hang: the floor is a
+     * SMALLER slice, so the interpreter still has to return.
+     */
+    max_slice = MAX_SLICE_FLOOR;
+    guest_max_slice = max_slice;
+    guest_insn_debt = 0;
+
+    /* Closes the last interval, so nor_snap_wdog_gap_ms covers the tail after
+       the readback (the repoint pass and x86_pager_reset()) too. */
+    nor_snap_kick();
+
     nor_snap_result = NOR_SNAP_OK;
     nor_snap_ms = abi->HAL_GetTick() - t0;
 }

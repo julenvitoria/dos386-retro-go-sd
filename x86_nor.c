@@ -73,6 +73,41 @@ volatile uint32_t x86_nor_slow_cycles   = 0;  /* DWT cycles spent in here       
 volatile uint32_t x86_nor_unmapped      = 0;  /* traps that were a real fault   */
 volatile uint32_t x86_nor_attach_err    = 0;  /* why the last attach was refused */
 volatile uint32_t x86_nor_host_cow      = 0;  /* pull-backs forced by HOST writes */
+volatile uint32_t x86_nor_heartbeats    = 0;  /* heartbeat ticks the attach made */
+
+/*
+ * The watchdog heartbeat, and why it is a HOOK rather than a wdog_refresh().
+ *
+ * x86_nor_attach()'s readback loop is 640 KB of memcmp against the XIP window:
+ * 160 pages, and on silicon every byte of it is an OCTOSPI read rather than an
+ * AXI one. It is also the ONE long stretch of the whole snapshot with no
+ * incidental watchdog kick anywhere inside it -- the firmware's flash path
+ * refreshes per 256-byte program page (gw_flash.c OSPI_Program, whose comment
+ * names the ~472 ms WWDG window outright) and the SD driver refreshes in its
+ * busy-waits, but a memcmp out of memory-mapped flash touches neither driver.
+ * A loop that can outrun the window and cannot be interrupted is exactly what
+ * a window watchdog exists to shoot.
+ *
+ * It is a function pointer because this file deliberately does not know the
+ * firmware ABI (see the header comment): wdog_refresh() lives behind
+ * gw_firmware_abi(), and calling it from here would drag the whole ABI into a
+ * file whose entire testability argument is that it can be exercised at tier 1
+ * with no flash, no SD card and no firmware. src/main.c installs it; a NULL
+ * hook is the tier-1 case and is simply a no-op.
+ *
+ * The COUNTER is incremented whether or not a hook is installed, so a test can
+ * assert the coverage without owning a watchdog to observe.
+ */
+void (*x86_nor_heartbeat)(void);
+
+static void nor_heartbeat(void)
+{
+#if !X86_NOR_WDOG_NEGCTL
+    x86_nor_heartbeats++;
+    if (x86_nor_heartbeat)
+        x86_nor_heartbeat();
+#endif
+}
 
 /* The COW pool. It IS the block that used to be guest RAM: once every page is
  * in NOR that 640 KB is free, and the only useful thing to do with it is hand
@@ -174,7 +209,11 @@ int x86_nor_attach(void *nor, uint32_t nor_bytes, void *ram, uint32_t ram_bytes,
        that distinguishes a good program from an OCTOSPI that came back in the
        wrong mode. Either way it costs one pass and buys the whole invariant. */
     uint32_t pages = ram_bytes / PAGE_SIZE;
+    x86_nor_heartbeats = 0;
     for (uint32_t i = 0; i < pages; i++) {
+        /* Once per page, so the longest un-kicked stretch in the whole attach
+           is one 4 KB memcmp out of XIP rather than all 640 KB of them. */
+        nor_heartbeat();
         uint32_t idx = first_page + i;
         uint32_t k = guest_page_table_ptr[idx];
         /* Compare against what the guest can actually SEE at this page, which

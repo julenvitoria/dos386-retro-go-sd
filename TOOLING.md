@@ -423,6 +423,8 @@ than pasting seventeen symbols that go stale the moment a counter is added.
 | `x86_nor_cow_pulls` / `x86_nor_host_cow` | pages copied NOR → AXI, and how many of those were forced by a HOST write rather than a guest one. The host side (BDA tick, INT 21h filling a DTA, a disk read landing in a guest buffer) goes through `x86_guest_ptr()` and never touches the trap stubs; a `pages_axi` that is implausibly small is what exposes a host path storing straight at the XIP window, which gwemu makes look like it works |
 | `x86_nor_cow_failures` / `x86_nor_unmapped` | the loud failures: the COW pool empty (structurally impossible — it is exactly as large as the snapshot) and traps that were a genuine unmapped access. Both should be 0 |
 | `x86_nor_slow_cycles` | DWT cycles inside the slow path. Ranking only under gwemu |
+| `nor_snap_wdog_gap_ms` | **the WATCHDOG number.** The worst interval between two watchdog kicks over one snapshot, i.e. the longest stretch that would have been un-kicked without them. Read it against the **~472 ms WWDG window** — that constant is not ours, it is named in `references/game-and-watch-retro-go-sd/Core/Src/gw_flash.c`'s `OSPI_Program()`, which kicks per 256-byte page for exactly this reason. The snapshot is a MENU callback, so the frame loop's once-per-frame `wdog_refresh()` is not covering any of it. A value near the window says this path can only run chunked and says which chunk is the offender |
+| `x86_nor_heartbeats` | kicks made by `x86_nor_attach()`'s readback, one per page (160 for a full 640 KB snapshot). Counted whether or not a hook is installed, so tier 1 can assert coverage with no watchdog to observe. **0 after a snapshot means the hook was never wired** — the failure this counter exists to catch |
 
 #### The VRAM arena, A20, and the pin state
 
@@ -1678,6 +1680,38 @@ python3 tests/test_nor.py                # NOR cold-page backing and COW, driven
                                          # one page, a second write to that page
                                          # that does not trap at all, and the
                                          # NOR image byte-unchanged after both
+                                         # KNOWN-FAILING, PRE-EXISTING, and the
+                                         # cause is now named: the arm's opening
+                                         # store to 0x90000000 takes a PRECISE
+                                         # BUS FAULT (CFSR BFARVALID|PRECISERR,
+                                         # BFAR 0x90000000) because nothing in
+                                         # this bare-metal firmware configures
+                                         # OCTOSPI memory-mapped mode. The
+                                         # docstring's premise -- "ordinary
+                                         # memory under gwemu" -- is false
+                                         # WITHOUT that setup. It dies in
+                                         # Fault_Handler_C's spin, and the
+                                         # handler does not clear run_nor_flag,
+                                         # so the harness reports "target never
+                                         # ran" instead of a fault. Fixing it
+                                         # means setting OCTOSPI up in
+                                         # tests/main.c; until then this arm
+                                         # proves nothing
+python3 tests/test_nor_wdog.py           # the WATCHDOG half of the snapshot:
+                                         # x86_nor_attach()'s readback kicks the
+                                         # dog once per page. 12 checks, on the
+                                         # REFUSED path as well as the accepted
+                                         # one (refusal walks the whole readback
+                                         # before it can refuse, so it is the
+                                         # LONGER stretch). Deliberately does
+                                         # NOT use 0x90000000 -- it needs the
+                                         # readback LOOP, not the trap, so it is
+                                         # immune to test_nor.py's breakage
+                                         # above. Negative control:
+                                         #   make clean && \
+                                         #   make X86_NOR_WDOG_NEGCTL=1 \
+                                         #        test_core.elf
+                                         # then re-run: 5 of 12 FAIL (SEEN)
 python3 tests/test_video.py              # CGA mode 4 blitter, pixel-exact
 python3 tests/test_text.py               # CGA text mode 3, pixel-exact:
                                          # CP437 at 4x8 and 8x8, attributes,
