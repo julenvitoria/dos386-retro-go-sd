@@ -1544,6 +1544,376 @@ static int dos_exec_child(void)
 }
 
 /* --------------------------------------------------------------------------
+ * AH=52h -- the LIST OF LISTS (SysVars).
+ *
+ * WHY. A DOS extender does not ask what version we are and believe it; it asks
+ * for the kernel's own variables and computes from them. DOS/4GW's stub issues
+ * exactly one AH=52h before the far jump that took Dark Forces into unwritten
+ * memory at linear 0x3E0C3 -- refused, CF set, and then an address derived from
+ * whatever ES:BX happened to hold. A refusal here is not a no-op, it is a
+ * pointer the guest uses anyway.
+ *
+ * LAYOUT. MS-DOS 4.0 is the source of record: SYSINITVAR is declared at
+ * references/MS-DOS/v4.0/src/DOS/MSCONST.ASM:66-105 with the symbolic mirror at
+ * references/MS-DOS/v4.0/src/INC/SYSVAR.INC:4-29, and function 52h itself is
+ * references/MS-DOS/v4.0/src/DOS/MISC.ASM:145-155, which returns ES = the DOS
+ * data segment and BX = OFFSET SYSINITVAR. `arena_head`, the WORD at -2, is
+ * MSCONST.ASM:63. DOSBox-X agrees field for field from +0x00 to +0x45
+ * (references/dosbox-x/include/dos_inc.h:616-668, filled in
+ * src/dos/dos_classes.cpp:72-170, served at src/dos/dos.cpp:2433-2441), so the
+ * two references do NOT disagree in the range anything here populates. Where
+ * they do differ is +0x37/+0x3B -- MS-DOS 4.0 has the IFS chain, DOSBox-X the
+ * DOS 5 SETVER pointer -- and we report DOS 5 (AH=30h above), so those follow
+ * DOSBox-X and are zero either way. MS-DOS 2.0 (MSDATA.ASM:83-111) is a
+ * genuinely different and incompatible layout and is NOT what we build.
+ *
+ * WHAT IS REAL AND WHAT IS REFUSED. The rule for this block is that a field is
+ * either a value we can derive from something we actually have, or it is the
+ * documented END-OF-CHAIN / absent marker. Nothing here is plausible filler:
+ * the entire failure being fixed is a guest computing an address from a number
+ * that looked reasonable and was not.
+ *
+ *   REAL   -2   first MCB     ARENA_FIRST_MCB -- the chain mcb_write() built
+ *          0x10 max sector    512, the sector size x86_disk.c actually serves
+ *          0x20 block devices 1  -- matches AH=0Eh/AH=19h, which know of one
+ *          0x21 LASTDRIVE     1  -- likewise; A: is the only drive there is
+ *          0x43 boot drive    1 = A:
+ *          0x44 dword move    1  -- this is a 386 core
+ *          0x45 extended KB   x86_xms_total_kb, the number XMS really reports
+ *
+ *   ABSENT 0x00 DPB chain     ) We model no drive parameter blocks, no system
+ *          0x04 SFT chain     ) file tables, no disk buffers and no current
+ *          0x08 CLOCK$ hdr    ) directory structures. Handles live in a host
+ *          0x0C CON hdr       ) array and paths are resolved by FatFs, so there
+ *          0x12 buffer head   ) is no guest-visible structure to point at. Each
+ *          0x16 CDS array     ) is 0xFFFF:0xFFFF -- offset 0xFFFF is DOS's own
+ *          0x1A FCB table     ) end-of-chain marker, so a guest that WALKS one
+ *                               stops at once instead of dereferencing filler.
+ *                               A guest that INDEXES one (a CDS lookup) gets an
+ *                               unmapped segment and a clean fault, which is
+ *                               the visible failure we want, not a silent one.
+ *
+ * The NUL device header at +0x22 is real as a header and honest as a chain: the
+ * name, attribute word (DEVTYP OR ISNULL = 0x8004, MSCONST.ASM:81) and the
+ * 0xFFFFFFFF next-link are what MS-DOS plants, and 0xFFFFFFFF means the chain
+ * ends here -- which is true, because we have no loaded device drivers.
+ * KNOWN GAP: the EMS driver header x86_ems.c plants at INT 67h's segment is NOT
+ * linked in, so a guest that hunts EMMXXXX0 by walking this chain rather than
+ * by the INT 67h vector will not find it. No title has done that yet; linking
+ * it is a change to x86_ems.c, not here. Strategy and interrupt entries are 0,
+ * as DOSBox-X leaves them (dos_classes.cpp), because there is no driver to
+ * call: a guest that FARs to one gets a fault rather than a wrong answer.
+ *
+ * WHICH OFFSETS DOES THE GUEST ACTUALLY READ? Worth more than implementing all
+ * of them, and NOT cheap: the block is ordinary guest memory reached through
+ * the fold table, so seeing a read means trapping the granule, and the pager
+ * has no read-only state to express that with -- the seam machinery is a
+ * write-side and code-side mechanism. What IS cheap is the call count, so that
+ * is what x86_dos_sysvars_calls is; if a title needs the per-offset answer the
+ * way to get it is to place the block on its own granule and fault it, which is
+ * a pager change and a separate piece of work.
+ */
+#define SYSVARS_SEG   0x0050u   /* linear 0x500: DOS's own scratch area, above
+                                   the BIOS data area and below the HLE stubs */
+#define SYSVARS_OFF   0x0022u   /* ES:BX points HERE; -0x22 is the block start,
+                                   the same shape DOSBox-X uses so that the
+                                   negative offsets have somewhere to live */
+#define SYSVARS_BYTES 0x0070u   /* 0x500..0x56F; the DOS 5 block ends at +0x47 */
+
+/* Both ends are compile-time constants, so this is a compile-time check rather
+   than something a guest discovers. X86_DOS_STUB_SEG is where x86_hle.c puts
+   the vector stubs; running into them would make an interrupt execute SysVars. */
+_Static_assert((SYSVARS_SEG << 4) + SYSVARS_BYTES <= (X86_DOS_STUB_SEG << 4),
+               "the SysVars block must sit below the HLE stub block");
+
+volatile uint32_t x86_dos_sysvars_calls;
+volatile uint32_t x86_dos_parse_calls;
+
+/* Defined with the rest of the INT 21h layer below; used here because this
+   block reads as one piece next to the reference it is built from. */
+static void ok_clear_cf(void);
+static void fail(uint16_t code);
+/* The XMS pool's size, defined in the XMS section at the bottom of this file.
+   It is the honest answer for "extended memory, KB" and the only one we have. */
+extern volatile uint32_t x86_xms_total_kb;
+
+static void sv_w8(uint8_t *p, unsigned off, uint8_t v) { p[off] = v; }
+
+static void sv_w16(uint8_t *p, unsigned off, uint16_t v)
+{
+    p[off] = (uint8_t)v;
+    p[off + 1] = (uint8_t)(v >> 8);
+}
+
+static void sv_wfar(uint8_t *p, unsigned off, uint16_t seg, uint16_t o)
+{
+    sv_w16(p, off, o);
+    sv_w16(p, off + 2, seg);
+}
+
+/*
+ * Build the block and return ES:BX in the guest. Built on every call rather
+ * than once at init: firstMCB and the extended-memory size are live values, and
+ * a block stamped at boot would describe an arena that has since moved. DOSBox-X
+ * refreshes its block-device count the same way (src/dos/dos.cpp:2433-2436).
+ */
+static int dos_sysvars(void)
+{
+    uint8_t *p = x86_guest_ptr(SEG(SYSVARS_SEG), SYSVARS_BYTES);
+    if (!p) {
+        /* Low memory unbacked. Refusing is right: an ES:BX we did not write is
+           the exact failure this function exists to remove. */
+        fail(0x01);
+        return 0;
+    }
+    x86_dos_sysvars_calls++;
+
+    memset(p, 0, SYSVARS_BYTES);
+    unsigned b = SYSVARS_OFF;                   /* the returned BX, as an index */
+
+    /* -2: the first MCB. The one field every extender reads, and the one we can
+       answer without inventing anything -- x86_dos_arena_init() wrote a real
+       'Z' header at exactly this segment. */
+    sv_w16(p, b - 2, ARENA_FIRST_MCB);
+
+    /* The chains we do not model. 0xFFFF is DOS's end-of-chain offset. */
+    sv_wfar(p, b + 0x00, 0xFFFF, 0xFFFF);       /* DPB chain    */
+    sv_wfar(p, b + 0x04, 0xFFFF, 0xFFFF);       /* SFT chain    */
+    sv_wfar(p, b + 0x08, 0xFFFF, 0xFFFF);       /* CLOCK$       */
+    sv_wfar(p, b + 0x0C, 0xFFFF, 0xFFFF);       /* CON          */
+    sv_w16 (p, b + 0x10, 512);                  /* max sector size -- REAL */
+    sv_wfar(p, b + 0x12, 0xFFFF, 0xFFFF);       /* disk buffers */
+    sv_wfar(p, b + 0x16, 0xFFFF, 0xFFFF);       /* CDS array    */
+    sv_wfar(p, b + 0x1A, 0xFFFF, 0xFFFF);       /* FCB table    */
+    sv_w16 (p, b + 0x1E, 0);                    /* protected FCBs */
+    sv_w8  (p, b + 0x20, 1);                    /* block devices  -- REAL */
+    sv_w8  (p, b + 0x21, 1);                    /* LASTDRIVE      -- REAL */
+
+    /* The NUL device header. A real header, and a chain that really does end. */
+    sv_wfar(p, b + 0x22, 0xFFFF, 0xFFFF);       /* next driver: none */
+    sv_w16 (p, b + 0x26, 0x8004);               /* DEVTYP OR ISNULL  */
+    sv_w16 (p, b + 0x28, 0);                    /* strategy: no driver */
+    sv_w16 (p, b + 0x2A, 0);                    /* interrupt: no driver */
+    memcpy(p + b + 0x2C, "NUL     ", 8);
+
+    sv_w8  (p, b + 0x34, 0);                    /* no JOINed drives */
+    sv_w16 (p, b + 0x35, 0);                    /* no special-entry segment */
+    sv_wfar(p, b + 0x37, 0, 0);                 /* no SETVER list */
+    sv_w16 (p, b + 0x3B, 0);                    /* no A20 fix routine */
+    sv_w16 (p, b + 0x3D, 0);                    /* nothing in the HMA */
+    sv_w16 (p, b + 0x3F, 0);                    /* BUFFERS: we have none, and */
+    sv_w16 (p, b + 0x41, 0);                    /*   saying 50 would be filler */
+    sv_w8  (p, b + 0x43, 1);                    /* boot drive A:  -- REAL */
+    sv_w8  (p, b + 0x44, 1);                    /* 386 DWORD move -- REAL */
+    sv_w16 (p, b + 0x45, (uint16_t)x86_xms_total_kb);  /* extended KB -- REAL */
+
+    cpu_state_ptr->segs[0].sel  = SYSVARS_SEG;  /* ES */
+    cpu_state_ptr->segs[0].base = SEG(SYSVARS_SEG);
+    x86_set_bx(SYSVARS_OFF);
+    ok_clear_cf();
+    return 1;
+}
+
+/* --------------------------------------------------------------------------
+ * AH=29h -- PARSE FILENAME INTO FCB.
+ *
+ * DS:SI is a command line, ES:DI an FCB, AL four parse-control bits. On return
+ * AL is 0 (no wildcards), 1 (a `*` or `?` reached a field) or 0xFF (bad drive),
+ * and SI has advanced. Dark Forces' extender issues two of these before the far
+ * jump that lands in unwritten memory, and a refusal leaves SI where it was --
+ * so a caller that parses argument after argument off one line never moves.
+ *
+ * SOURCE OF RECORD. references/MS-DOS/v4.0/src/DOS/PARSE.ASM:53-61 is the whole
+ * of function 29h: it calls MakeFcb and writes the returned SI back into the
+ * caller's frame. The algorithm is MakeFcb,
+ * references/MS-DOS/v4.0/src/DOS/FCB.ASM:53-230 (v2.0's copy,
+ * references/MS-DOS/v2.0/source/FCB.ASM:30-165, is the same code). The
+ * character classes are the CharType table at v4.0 FCB.ASM:283-333, whose flags
+ * are declared in references/MS-DOS/v4.0/src/INC/DOSSYM.INC:145-148; v2.0's
+ * compare chain at FCB.ASM:422-476 agrees set for set. DOSBox-X's
+ * FCB_Parsename (references/dosbox-x/src/dos/dos_files.cpp:1641-1785, served at
+ * src/dos/dos.cpp:1510-1518) is the cross-check.
+ *
+ * WHERE THE TWO REFERENCES DISAGREE, AND WHICH ONE THIS FOLLOWS -- MS-DOS,
+ * except where our own file layer has already decided otherwise:
+ *
+ *  - SEPARATOR SET (bit 0). MS-DOS's DELIM is `: < | > + = ; ,` plus tab and
+ *    space (FCB.ASM:290-297,307,331); DOSBox-X's FCB_SEP is only `: ; , = +`
+ *    (dos_files.cpp:1623) and will not skip a leading `<`, `>` or `|`.
+ *    FOLLOWED: MS-DOS.
+ *  - WILDCARD FLAG PAST THE FIELD. MS-DOS's `OR DL,1` runs for a `?` at ANY
+ *    position, including one consumed and discarded past the 8th character
+ *    (FCB.ASM:168-178); DOSBox-X gates it on index < 8 (dos_files.cpp:1733), so
+ *    "ABCDEFGHI?.TXT" is AL=1 on MS-DOS and AL=0 on DOSBox-X. FOLLOWED: MS-DOS.
+ *  - CONSUMPTION AFTER A BAD DRIVE CHARACTER. DOSBox-X consumes two characters
+ *    and abandons the parse (dos_files.cpp:1691, carrying its own `//TODO check`);
+ *    MS-DOS never reaches the colon test and consumes NOTHING (FCB.ASM:94-95).
+ *    FOLLOWED: MS-DOS.
+ *  - WHICH DRIVE LETTERS ARE VALID. MS-DOS range-checks against NUMIO
+ *    (v2.0 FCB.ASM:75-80), which for this machine is 1 -- so "C:FOO" would come
+ *    back AL=0xFF. FOLLOWED: NEITHER, DELIBERATELY. This port's path layer
+ *    already strips ANY drive letter and resolves every one of them to the one
+ *    mounted volume (see dos_path_from_guest() above), so failing a letter here
+ *    that AH=3Dh will happily open is an inconsistency inside our own DOS, and
+ *    the more expensive of the two. Any alphabetic letter parses; 0xFF is
+ *    reserved for a non-alphabetic one, which is what `SUB AL,'@'` rejects.
+ *    NUMIO in the SysVars block above stays 1, because one block device is the
+ *    truth; the letter tolerance is a path-layer accommodation, not a claim
+ *    about the hardware.
+ *
+ * THE OVER-LONG-NAME BEHAVIOUR IS DELIBERATE AND BOTH REFERENCES HAVE IT.
+ * `JCXZ MUSTGETWORD` (FCB.ASM:168) keeps consuming characters after the field
+ * is full instead of stopping, so "AVERYLONGNAME.TXT" leaves SI past the name
+ * and still parses ".TXT". MS-DOS's own comment (FCB.ASM:151-154) calls it a
+ * horrible bug. Programs depend on it; it is reproduced, not fixed.
+ */
+
+/* The three character classes, spelled out rather than derived, because the
+   sets ARE the interface and a clever predicate hides which one it is. */
+static int pf_is_space(uint8_t c)   { return c == ' ' || c == '\t'; }
+
+/* DELIM: what one leading separator may be, with bit 0 set. FCB.ASM:290-297. */
+static int pf_is_delim(uint8_t c)
+{
+    return pf_is_space(c) || c == ':' || c == '<' || c == '|' || c == '>' ||
+           c == '+' || c == '=' || c == ';' || c == ',';
+}
+
+/* What ENDS a name or extension field: every DELIM, plus the path and quoting
+   characters, plus every control character. FCB.ASM:284-332. */
+static int pf_is_term(uint8_t c)
+{
+    return c < 0x20u || pf_is_delim(c) || c == '.' || c == '"' || c == '/' ||
+           c == '\\' || c == '[' || c == ']';
+}
+
+static uint8_t pf_upcase(uint8_t c)
+{
+    return (c >= 'a' && c <= 'z') ? (uint8_t)(c - 'a' + 'A') : c;
+}
+
+/* One byte of the command line, or a terminator if the guest page is not there.
+   Reporting an unbacked byte as end-of-input is right: it stops the parse where
+   the readable text stops instead of walking into whatever follows. */
+static uint8_t pf_peek(uint32_t base, uint16_t si)
+{
+    uint8_t *p = x86_guest_ptr(base + si, 1);
+    return p ? *p : 0;
+}
+
+/*
+ * MUSTGETWORD (FCB.ASM:155-211): fill one field, then pad it with blanks.
+ * `si` is advanced in place; `flag` accumulates the wildcard bit.
+ */
+static void pf_getword(uint32_t base, uint16_t *si, uint8_t *dst, unsigned n,
+                       uint8_t *flag)
+{
+    unsigned i = 0;
+    for (;;) {
+        uint8_t c = pf_upcase(pf_peek(base, *si));
+        if (pf_is_term(c))
+            break;
+        (*si)++;
+        if (c == '*') {
+            /* REP STOSB over the whole remainder, and keep consuming: the star
+               eats the rest of the field and everything after it. */
+            while (i < n)
+                dst[i++] = '?';
+            *flag |= 1u;
+            continue;
+        }
+        if (c == '?')
+            *flag |= 1u;                /* set even past the field -- see above */
+        if (i < n)
+            dst[i++] = c;
+    }
+    while (i < n)                       /* FILLNAM */
+        dst[i++] = ' ';
+}
+
+static int dos_parse_filename(void)
+{
+    uint32_t *r = cpu_state_ptr->regs;
+    uint8_t al = (uint8_t)r[0];
+    uint32_t src_base = cpu_state_ptr->segs[3].base;     /* DS */
+    uint32_t fcb_lin = cpu_state_ptr->segs[0].base + (uint16_t)r[7];  /* ES:DI */
+    uint16_t si = (uint16_t)r[6];
+    uint8_t fcb[16];
+
+    /* The FCB is 16 bytes and DI is wherever the caller put it, so it can
+       straddle a granule -- x86_guest_ptr() would refuse the span. Read, edit,
+       write back; the copy helpers walk granules. A short read is a genuinely
+       unbacked FCB and there is nothing honest to write into it. */
+    if (x86_guest_copy_out(fcb, fcb_lin, sizeof(fcb)) != sizeof(fcb)) {
+        fail(0x01);
+        return 0;
+    }
+
+    /* Field defaults. Bits 1/2/3 mean "leave what is already there". */
+    if (!(al & 0x02u))
+        fcb[0] = 0;                     /* default drive */
+    if (!(al & 0x04u))
+        memset(fcb + 1, ' ', 8);
+    if (!(al & 0x08u))
+        memset(fcb + 9, ' ', 3);
+    /* The undocumented pair MakeFcb always zeroes (FCB.ASM:81-84): cur_block
+       and rec_size. DOSBox-X does the same in ClearBlockRecsize()
+       (references/dosbox-x/src/dos/dos_classes.cpp:639-642) and labels it
+       "Undocumented bonus work" -- so both references agree it is not optional. */
+    memset(fcb + 12, 0, 4);
+
+    /* Bit 0: strip blanks, then AT MOST ONE separator (FCB.ASM:85-90). */
+    if (al & 0x01u) {
+        while (pf_is_space(pf_peek(src_base, si)))
+            si++;
+        if (pf_is_delim(pf_peek(src_base, si)))
+            si++;
+    }
+    /* SKPSPC: blanks are stripped again either way (FCB.ASM:91-92). */
+    while (pf_is_space(pf_peek(src_base, si)))
+        si++;
+
+    uint8_t flag = 0;
+
+    /* Drive. Only a non-terminator followed by ':' is one, and only then is
+       anything consumed -- FCB.ASM:94-117 and the NODRV path at :118-120. */
+    uint8_t c0 = pf_upcase(pf_peek(src_base, si));
+    if (!pf_is_term(c0) && pf_peek(src_base, (uint16_t)(si + 1u)) == ':') {
+        uint8_t d = (uint8_t)(c0 - '@');            /* 'A' -> 1 */
+        if (d < 1u || d > 26u)
+            flag = 0xFFu;                           /* BADDRV */
+        fcb[0] = d;                 /* stored either way, as MakeFcb does */
+        si = (uint16_t)(si + 2u);
+    }
+
+    /* GETWORD (FCB.ASM:147-150): a field that starts on a terminator is left
+       exactly as the defaults above left it, and nothing is consumed. */
+    if (!pf_is_term(pf_upcase(pf_peek(src_base, si))))
+        pf_getword(src_base, &si, fcb + 1, 8, &flag);
+
+    /* The extension is taken only after a literal '.' (FCB.ASM:126-137), and
+       MUSTGETWORD rather than GETWORD: "FOO." blanks the extension. */
+    if (pf_peek(src_base, si) == '.') {
+        si++;
+        pf_getword(src_base, &si, fcb + 9, 3, &flag);
+    }
+
+    if (x86_guest_copy_in(fcb_lin, fcb, sizeof(fcb)) != sizeof(fcb)) {
+        fail(0x01);
+        return 0;
+    }
+
+    x86_dos_parse_calls++;
+    r[6] = (r[6] & 0xFFFF0000u) | si;               /* SI, as PARSE.ASM:57-59 */
+    x86_set_al(flag);
+    /* DOS does not document CF here and MakeFcb does not touch it; clearing it
+       is what a successful call through our HLE must do, since the stub frame
+       arrives with whatever the caller pushed. */
+    ok_clear_cf();
+    return 1;
+}
+
+/* --------------------------------------------------------------------------
  * INT 21h
  */
 
@@ -1768,6 +2138,11 @@ static int dos_int21_dispatch(uint8_t func)
         }
         return 1;
     }
+
+    case 0x52:                                  /* get list of lists */
+        return dos_sysvars();
+    case 0x29:                                  /* parse filename into FCB */
+        return dos_parse_filename();
 
     case 0x30:                                  /* DOS version 5.00 */
         x86_set_ax(0x0005);
