@@ -15,6 +15,7 @@
 #include "x86_cpu.h"
 #include "x86_probe.h"
 #include "x86_video_planar.h"
+#include "x86_opl.h"
 #include "x86_audio_wave.h"   /* the generator; <stdint.h> only, host-testable */
 
 /* ---------------------------------------------------------------------------
@@ -1196,9 +1197,16 @@ static void opl_write(uint32_t port, uint8_t v)
         opl.t2_run = (uint8_t)((v >> 1) & 0x01u);
         break;
     default:
-        /* Write-only on the real part; see the header. Counted, not stored. */
         break;
     }
+    /* AND THE SYNTHESISER GETS EVERY WRITE. The register file is still not
+       stored HERE -- the port is write-only and x86_io.c keeps no copy it
+       could hand back -- but x86_opl.c parses each pair into voice state as it
+       arrives, which is what turns an accepted-and-discarded write into a
+       tone. The timer registers above are forwarded too and x86_opl.c ignores
+       them by name; splitting the decode across two files is how the two
+       copies of "which register is the timer" drift apart. */
+    x86_opl_write(opl.idx, v);
 }
 
 /* ---------------------------------------------------------------------------

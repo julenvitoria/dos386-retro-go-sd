@@ -250,6 +250,175 @@ def playback(args, runner):
     return ok
 
 
+
+# ---------------------------------------------------------------------------
+# THE FM ARM. The OPL2 tone generator, graded on the SAMPLES.
+#
+# Everything the expectation needs is computed HERE, from the register bytes
+# tests/main.c's fm_code[] writes, using the chip's published frequency
+# formula. Nothing below re-implements the synthesiser -- a test that carried a
+# second copy of x86_opl.c would agree with it however wrong both were.
+
+FM_FNUM = 0x200
+FM_BLOCK = 7
+FM_CHIP_HZ = 49716              # 14.31818 MHz / 288, the YM3812's sample clock
+FM_OUT_RATE = 48000
+FM_SAMPLES = 512
+# f = f_num * chip_rate / 2^(20 - block). Ritchie's formula, and the one every
+# AdLib note table is built from.
+FM_EXPECT_HZ = FM_FNUM * FM_CHIP_HZ / float(1 << (20 - FM_BLOCK))
+
+
+def _goertzel(x, freq, rate):
+    """Magnitude-squared of one DFT bin, no numpy on this host."""
+    import math
+    w = 2.0 * math.pi * freq / rate
+    coeff = 2.0 * math.cos(w)
+    s1 = s2 = 0.0
+    for v in x:
+        s0 = v + coeff * s1 - s2
+        s2, s1 = s1, s0
+    return s1 * s1 + s2 * s2 - coeff * s1 * s2
+
+
+def fm(args, runner):
+    """A known note in, that note out."""
+    b = runner.backend
+    syms = get_symbols("test_core.elf")
+    for n in ("run_fm_flag", "fm_r", "fm_pcm"):
+        if n not in syms:
+            print(f"missing symbol {n} -- rebuild tests/main.c")
+            return False
+
+    b.write_uint32(syms["run_fm_flag"], 1)
+    for _ in range(600):
+        if b.read_uint32(syms["run_fm_flag"]) == 0:
+            break
+        time.sleep(0.05)
+    else:
+        print("FAIL: the FM arm never completed")
+        return False
+
+    r = [b.read_uint32(syms["fm_r"] + 4 * i) for i in range(12)]
+    cyc = b.read_uint32(syms["fm_cycles"]) if "fm_cycles" in syms else 0
+    slots = b.read_uint32(syms["fm_slots"]) if "fm_slots" in syms else 0
+    (reason_on, rendered, peak_on, active_on, reason_off, peak_off,
+     active_off, keyons, chip_steps, slots_run, rhythm_muted, writes) = r
+
+    pcm = []
+    for i in range(FM_SAMPLES // 2):
+        w = b.read_uint32(syms["fm_pcm"] + 4 * i)
+        pcm.append(_s16(w & 0xFFFF))
+        pcm.append(_s16((w >> 16) & 0xFFFF))
+
+    zc = sum(1 for i in range(1, len(pcm)) if (pcm[i - 1] < 0) != (pcm[i] < 0))
+    zc_expect = 2.0 * FM_EXPECT_HZ * FM_SAMPLES / FM_OUT_RATE
+    m_fund = _goertzel(pcm, FM_EXPECT_HZ, FM_OUT_RATE)
+    m_oct_up = _goertzel(pcm, FM_EXPECT_HZ * 2, FM_OUT_RATE)
+    m_oct_dn = _goertzel(pcm, FM_EXPECT_HZ / 2, FM_OUT_RATE)
+
+    print()
+    print("=== OPL2 FM SYNTHESIS ===")
+    print(f"programmed f_num {FM_FNUM:#05x} block {FM_BLOCK} mult 1 -> "
+          f"{FM_EXPECT_HZ:.2f} Hz  ({writes} register writes accepted)")
+    print(f"key-on     guest exit {reason_on} (6 = HLT), {rendered} samples "
+          f"rendered, peak {peak_on}, chip active {active_on}")
+    print(f"pitch      {zc} zero crossings in {FM_SAMPLES} samples, "
+          f"expected {zc_expect:.1f}  ->  {zc * FM_OUT_RATE / (2.0 * FM_SAMPLES):.1f} Hz")
+    print(f"spectrum   |X(f)| {m_fund:.3e}   |X(2f)| {m_oct_up:.3e}   "
+          f"|X(f/2)| {m_oct_dn:.3e}")
+    print(f"key-off    guest exit {reason_off}, peak after 20 frames "
+          f"{peak_off}, chip active {active_off}")
+    print(f"counters   keyons {keyons} chip_steps {chip_steps} "
+          f"slot updates {slots_run} rhythm_muted {rhythm_muted}")
+    if cyc and slots:
+        # WOLF3D at tier 2 averages 10.11 operator updates per chip sample
+        # (12,738,872 / 1,259,455 -- about five of the nine channels sounding),
+        # and the chip runs at 49,716 Hz. One 60 fps frame at 280 MHz is
+        # 4,666,666 cycles.
+        per_op = cyc / float(slots)
+        frame = 49716.0 / 60.0 * 10.11 * per_op
+        print(f"COST       {cyc:,} cycles for {slots:,} operator updates = "
+              f"{per_op:.1f} cyc/operator")
+        print(f"           -> {frame:,.0f} cyc/frame at WOLF3D's measured 10.11 "
+              f"operators/sample = {100.0 * frame / 4666666.0:.2f}% of a "
+              f"280 MHz 60 fps frame")
+        print("           (a HARDWARE run's number is the only one to quote; "
+              "gwemu does not model timing)")
+    print("           " + " ".join(f"{v:6d}" for v in pcm[:16]))
+
+    ok = True
+
+    def fail(msg):
+        nonlocal ok
+        print("FAIL: " + msg)
+        ok = False
+
+    if reason_on != 6 or reason_off != 6:
+        fail(f"the guest exited with {reason_on} / {reason_off}, not 6 (HLT) -- "
+             f"it did not finish writing the register set")
+    if writes < 12:
+        fail(f"x86_opl_writes is {writes}: fewer than the 12 registers the "
+             f"guest program writes reached the card at all")
+    if rendered != FM_SAMPLES:
+        fail(f"x86_opl_render_mix returned {rendered}, not {FM_SAMPLES} -- "
+             f"NO TONE WAS PRODUCED. This is the whole point of the arm: the "
+             f"registers were accepted (see the count above) and discarded")
+    if not keyons:
+        fail("x86_opl_keyons is 0 -- register B0h's key-on bit never reached "
+             "the voice, so nothing was ever asked to sound")
+    if chip_steps < 1:
+        fail("x86_opl_chip_steps is 0: the synthesiser never advanced")
+    elif not (0 < slots_run <= 2 * chip_steps):
+        fail(f"{slots_run} slot updates over {chip_steps} chip samples. One "
+             f"channel is two operators, so this can never exceed twice the "
+             f"sample count -- more means a retired or unkeyed voice is being "
+             f"synthesised")
+    elif slots_run >= 2 * chip_steps:
+        fail(f"{slots_run} slot updates over {chip_steps} chip samples: the "
+             f"channel was synthesised on EVERY sample, including the ones "
+             f"after its release finished. The idle-channel skip is what makes "
+             f"the cycle budget work and it never engaged")
+    if rhythm_muted:
+        fail(f"x86_opl_rhythm_muted is {rhythm_muted}: percussion mode was "
+             f"entered, which this program never asks for")
+
+    # ---- THE PITCH. Two independent measures of the same claim. --------
+    if abs(zc - zc_expect) > 4:
+        fail(f"{zc} zero crossings against the {zc_expect:.1f} the programmed "
+             f"f_num and block require. That is "
+             f"{zc * FM_OUT_RATE / (2.0 * FM_SAMPLES):.1f} Hz where the chip's "
+             f"own formula f_num * {FM_CHIP_HZ} / 2^(20-block) says "
+             f"{FM_EXPECT_HZ:.1f} Hz -- an octave out is the classic missing "
+             f"or extra shift in the phase increment")
+    if not (m_fund > 4.0 * m_oct_up and m_fund > 4.0 * m_oct_dn):
+        fail(f"the strongest component is not the programmed note: |X(f)| "
+             f"{m_fund:.3e} against |X(2f)| {m_oct_up:.3e} and |X(f/2)| "
+             f"{m_oct_dn:.3e}. Zero crossings alone cannot tell a note from "
+             f"its octave when the envelope is noisy; this can")
+
+    # ---- THE ENVELOPE, both ends of it. --------------------------------
+    if not active_on:
+        fail("x86_opl_active() is 0 while the note is held")
+    if not (1500 <= peak_on <= 2600):
+        fail(f"the held note peaks at {peak_on}. One operator at total level 0 "
+             f"through this gain is 2,024 +- the resampler's hold, so a peak "
+             f"far under that is an envelope that decayed when EG-TYPE said "
+             f"sustain, and one far over is a level or a gain that is wrong")
+    if peak_off > 16:
+        fail(f"twenty frames after KEY OFF the note still peaks at {peak_off}. "
+             f"Release rate 15 is the fastest the chip has and must be over "
+             f"inside 333 ms -- a note that never releases is a stuck voice, "
+             f"and nine of them is the whole card jammed")
+    if active_off:
+        fail("the channel is still active after a completed release, so it is "
+             "being synthesised for ever and the idle-channel skip -- which is "
+             "what makes the cycle budget work -- never engages")
+
+    print("\nFM PASS" if ok else "\nFM FAIL")
+    return ok
+
+
 def main(args):
     runner = build_and_create_runner(args)
     try:
@@ -358,6 +527,7 @@ def main(args):
         # The playback arm runs on the SAME target: rebuilding for it would
         # double every negative control's cost for nothing.
         ok = playback(args, runner) and ok
+        ok = fm(args, runner) and ok
 
         print("\nPASS" if ok else "\nFAIL")
         return ok
@@ -426,12 +596,32 @@ MUTATE_F2_NOW = "            x86_pit_counter_forced(1);\n        break;\n    }\n
 MUTATE_F2_NOW_TO = "            (void)0;\n        break;\n    }\n"
 
 
-def _mutate_and_require_failure(args, target, what, replacement=""):
+# ---------------------------------------------------------------------------
+# THE FM CONTROLS. Both live in x86_opl.c, and each breaks ONE of the two
+# things the arm above measures independently.
+
+# THE ENVELOPE'S RELEASE. Without it a keyed-off operator never leaves whatever
+# stage it was in, so the note sustains for ever: the PITCH assertions still
+# pass, x86_opl_keyons still counts, and only the key-off peak says so.
+MUTATE_FM_ENV = """    if (!s->key)
+        s->eg_gen = EG_RELEASE;
+"""
+
+# THE FREQUENCY. Dropping the >> 1 from the phase increment puts every note an
+# octave up. Every counter stays green, the envelope is untouched, and the
+# tune is simply in the wrong key -- which is exactly the class of defect a
+# counter-only test cannot see.
+MUTATE_FM_FREQ = "    uint32_t base = ((uint32_t)c->f_num << c->block) >> 1;\n"
+MUTATE_FM_FREQ_TO = "    uint32_t base = ((uint32_t)c->f_num << c->block);\n"
+
+
+def _mutate_and_require_failure(args, target, what, replacement="",
+                                path="x86_io.c"):
     import pathlib
-    src = pathlib.Path("x86_io.c")
+    src = pathlib.Path(path)
     original = src.read_text()
     if target not in original:
-        print(f"FAIL: the mutation target ({what}) is not in x86_io.c -- this "
+        print(f"FAIL: the mutation target ({what}) is not in {path} -- this "
               f"control would pass without testing anything")
         return False
     try:
@@ -440,12 +630,12 @@ def _mutate_and_require_failure(args, target, what, replacement=""):
         print(f"-- negative control: rebuilt with {what} {verb} --")
         for a in ("negative", "negative_opl", "negative_tc",
                   "negative_irq", "negative_rate", "negative_f2",
-                  "negative_f2_now"):
+                  "negative_f2_now", "negative_fm_env", "negative_fm_freq"):
             setattr(args, a, False)
         failed = not main(args)
     finally:
         src.write_text(original)
-        print("-- x86_io.c restored --")
+        print(f"-- {path} restored --")
     if failed:
         print("\nPASS (negative control): the test rejects the defective core")
         return True
@@ -473,6 +663,10 @@ if __name__ == "__main__":
                    help="rebuild with F2h's IMMEDIATE delivery removed -- the "
                         "line is still asserted, so every counter stays green "
                         "and only the guest's short window catches it")
+    p.add_argument("--negative-fm-env", action="store_true",
+                   help="rebuild with the FM envelope's RELEASE deleted")
+    p.add_argument("--negative-fm-freq", action="store_true",
+                   help="rebuild with the FM phase increment an octave out")
     args = p.parse_args()
     if args.negative:
         sys.exit(0 if _mutate_and_require_failure(
@@ -497,4 +691,12 @@ if __name__ == "__main__":
         sys.exit(0 if _mutate_and_require_failure(
             args, MUTATE_F2_NOW, "F2h's IMMEDIATE DELIVERY",
             MUTATE_F2_NOW_TO) else 1)
+    if args.negative_fm_env:
+        sys.exit(0 if _mutate_and_require_failure(
+            args, MUTATE_FM_ENV, "the FM envelope's RELEASE",
+            path="x86_opl.c") else 1)
+    if args.negative_fm_freq:
+        sys.exit(0 if _mutate_and_require_failure(
+            args, MUTATE_FM_FREQ, "the FM PHASE INCREMENT", MUTATE_FM_FREQ_TO,
+            path="x86_opl.c") else 1)
     sys.exit(0 if main(args) else 1)

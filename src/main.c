@@ -40,6 +40,13 @@
 #include "x86_zones.h"   /* ZONES: frame-loop phase accounting, X86_ZONES=1 */
 #include "x86_vprof.h"   /* VPROF: video-path cycle attribution, X86_VPROF=1 */
 #include "x86_osk.h"
+#include "x86_opl.h"   /* OPL2 FM tone generation (x86_io.c owns the ports) */
+#ifndef X86_OPL_FM
+#define X86_OPL_FM 1      /* the harness builds do not pass the core's flags */
+#endif
+#ifndef X86_OPL_BENCH
+#define X86_OPL_BENCH 0
+#endif
 #include "x86_arena.h"
 #include "x86_video_planar.h"
 #include "x86_pager.h"
@@ -1341,6 +1348,12 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
     }
 
     core_ready = (core_dtcm_ok && guest_ram && guest_vram) ? 1 : 0;
+#if X86_OPL_BENCH
+    /* MEASUREMENT BUILD ONLY: hold the FM chip at its worst case for the whole
+       run so x86_opl_frame_cycles is a BOUND and not a sample of whatever the
+       title happened to be playing. Never ship at 1 -- it drowns the title. */
+    x86_opl_bench_all_on();
+#endif
 
     itcm_sum_pre_bench = itcm_sum();
     itcm_byte_120_pre = itcm_byte_120();
@@ -4380,16 +4393,38 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
 
                THE >> 1 THAT WAS HERE IS GONE, and the reason it was here is
                the reason it had to go: it ducked the card under the music, and
-               THERE IS NO MUSIC -- FM synthesis is not built (docs/03 4f), so
-               the only other source in this buffer is the PC speaker, which a
-               title using the card is not driving at the same time. Halving
-               cost 6 dB for a collision that cannot happen, on top of the 6 dB
-               the amp shift was already giving away. MEASURED on silicon,
-               PRINCE OF PERSIA: x86_audio_peak_max 495 -> 991 for the same
-               18 transfers. If a title ever does play both at once, the mix
-               already clamps, and ducking is then a judgement to make with a
-               title in front of you rather than pre-emptively. */
+               at the time THERE WAS NO MUSIC. There is now -- x86_opl.c --
+               so the collision it guarded against is real again; it is still
+               not reinstated, because the measurement that removed it stands
+               (silicon, PRINCE OF PERSIA: x86_audio_peak_max 495 -> 991 for
+               the same 18 transfers) and the FM gain below was chosen against
+               THIS card level rather than against the ducked one. The mix
+               clamps either way. */
             x86_sb_render_mix(abuf, audio_frames, SAMPLE_RATE, amp);
+#endif
+            /* AND THE FM SYNTHESISER ON TOP OF BOTH, on the same clock and for
+               the same reason: a title can play a digitised effect over its
+               AdLib music and the three must SUM, not replace one another.
+               It early-outs to nothing when no voice is sounding, so a title
+               with no music pays one load and a test. Placed BEFORE the peak
+               scan below on purpose -- x86_audio_peak_max is meant to answer
+               "did anything reach the DMA", and FM is now one of the things
+               that can. */
+#if X86_OPL_FM
+#if X86_OPL_BENCH
+            /* MEASUREMENT ONLY. The cost of the synthesis in the REAL core --
+               its code in RAM_EMU, the caches on, the frame loop around it --
+               which is the only environment whose cycle count describes what
+               the owner will feel. x86_opl_bench_all_on() holds all nine
+               channels sounding so this is the chip's worst case. */
+            {
+                uint32_t t0 = DWT_CYCCNT;
+                x86_opl_render_mix(abuf, audio_frames, SAMPLE_RATE, amp);
+                x86_opl_frame_cycles = DWT_CYCCNT - t0;
+            }
+#else
+            x86_opl_render_mix(abuf, audio_frames, SAMPLE_RATE, amp);
+#endif
 #endif
             /* WHAT WE ACTUALLY SUBMITTED, on every tier and every build. One
                pass over the buffer we just wrote: how many frames were handed
