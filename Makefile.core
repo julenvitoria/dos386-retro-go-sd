@@ -216,6 +216,13 @@ CORE_C_DEFS += -Df_mount=dsk_f_mount -Df_open=dsk_f_open -Df_close=dsk_f_close \
                -Df_putc=dsk_f_putc -Df_puts=dsk_f_puts -Df_printf=dsk_f_printf \
                -Df_gets=dsk_f_gets
 
+# One-off defines for a CONTROL BUILD, so grading a guard does not mean editing
+# the source it is meant to grade (and then having to remember to put it back).
+#   make -f Makefile.core clean
+#   make -f Makefile.core pack EXTRA_CFLAGS=-DGUEST_SLICE_WALL_MS=4000000u
+# A changed define does NOT rebuild on its own: clean first, every time.
+CORE_C_DEFS += $(EXTRA_CFLAGS)
+
 
 GNW_CORE_SDK ?= sdk
 BUILD_DIR ?= build/$(PROJECT_KIND)
