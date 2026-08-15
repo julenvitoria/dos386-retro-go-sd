@@ -2039,6 +2039,520 @@ static void nor_test_run(void)
  * the function while leaving the ports, which is where every real failure is,
  * completely uncovered.
  */
+
+/* =========================================================================
+ * PROTECTED MODE: the descriptor walk.
+ *
+ * Every arm below runs GUEST CODE, and that is not decoration. The walk is
+ * reached from exactly one place -- L(SET_SREG) in cpu_exec_handlers.S -- and
+ * only when a guest instruction loads a segment register with CR0.PE set. A
+ * host-side call to x86_pmode_load_seg() would test the function while leaving
+ * the path that reaches it, which is where a register-contract violation or a
+ * wrong branch target would live, completely uncovered.
+ *
+ * The guests stay in 16-bit code and switch PE on with MOV CR0. That is the
+ * real entry sequence's first half and it is enough to exercise every data
+ * segment load: between the MOV CR0 and a far jump, CS keeps its real-mode
+ * cache and 16-bit code keeps running, which both references implement
+ * deliberately (references/tiny386/i386.c:2251-2255 -- writing CR0 does not
+ * touch the segment caches). Far transfers are a later step and are not
+ * tested here because they are not built.
+ *
+ * GUEST MEMORY MAP for these arms (test_ram is identity-mapped from 0):
+ *   0x00000  code
+ *   0x01000  the LGDT/LIDT six-byte operands
+ *   0x02000  GDT, 8 entries, limit 0x3F
+ *   0x02800  LDT, 2 entries, limit 0x0F
+ *   0x03010  0x77  -- reached in REAL mode through DS=0x0300
+ *   0x30010  0x5A  -- reached through GDT selector 0x08 (base 0x30000)
+ *   0x32010  0xA5  -- reached through LDT selector 0x0C (base 0x32000)
+ * ========================================================================= */
+volatile uint32_t run_pmode_flag = 0;
+volatile uint32_t pmode_r[80];
+
+#define PM_GDT   0x2000u
+#define PM_LDT   0x2800u
+#define PM_OPND  0x1000u
+
+/* Build one 8-byte descriptor. `access` is the byte at offset 5 (P/DPL/S/type)
+   and `gran` the high nibble of the byte at offset 6 (G/D/AVL) -- both written
+   in raw descriptor terms so the table below reads like the manual, not like
+   our flags layout. */
+static void pm_desc(uint32_t at, uint32_t base, uint32_t limit,
+                    uint8_t access, uint8_t gran)
+{
+    uint8_t *d = test_ram + at;
+    d[0] = (uint8_t)(limit & 0xFF);
+    d[1] = (uint8_t)((limit >> 8) & 0xFF);
+    d[2] = (uint8_t)(base & 0xFF);
+    d[3] = (uint8_t)((base >> 8) & 0xFF);
+    d[4] = (uint8_t)((base >> 16) & 0xFF);
+    d[5] = access;
+    d[6] = (uint8_t)(((limit >> 16) & 0x0F) | (gran & 0xF0));
+    d[7] = (uint8_t)((base >> 24) & 0xFF);
+}
+
+/* Reset the CPU and run a program placed at guest 0. Returns exit_reason. */
+static uint32_t pm_run(const uint8_t *prog, uint32_t len)
+{
+    memcpy(test_ram, prog, len);
+    memset(&cpu_state_dtcm, 0, sizeof(cpu_state_dtcm));
+    for (int i = 0; i < 6; i++)
+        cpu_state_dtcm.segs[i].limit = 0xFFFFu;
+    cpu_state_dtcm.pit_reload = 0xFFFFFFFF;
+    cpu_state_dtcm.pit_counter = 0xFFFFFFFF;
+    /* The GDT is normally installed by the guest's own LGDT, and one arm below
+       proves LGDT does that. The rest start with it already in place so a
+       failure in a later arm cannot be an LGDT failure wearing a disguise. */
+    cpu_state_dtcm.gdt_base = PM_GDT;
+    cpu_state_dtcm.gdt_limit = 0x3F;
+    x86_cpu_interp_asm();
+    return cpu_state_dtcm.exit_reason;
+}
+
+/* The three instructions that turn PE on, and the three that turn it off.
+     0F 20 C0   MOV EAX,CR0
+     0C 01      OR AL,1          (24 FE = AND AL,0FEh to leave)
+     0F 22 C0   MOV CR0,EAX                                            */
+#define PM_ENTER  0x0F, 0x20, 0xC0,  0x0C, 0x01,  0x0F, 0x22, 0xC0
+#define PM_LEAVE  0x0F, 0x20, 0xC0,  0x24, 0xFE,  0x0F, 0x22, 0xC0
+
+static void pmode_test_run(void)
+{
+    for (uint32_t i = 0; i < 80; i++)
+        pmode_r[i] = 0;
+
+    /* Undo whatever the A20 and pager arms left behind: they unmap everything
+       above the HMA and hand frames around. These arms need the harness's
+       plain identity map back. */
+    for (uint32_t i = 0; i < FOLD_ENTRIES; i++)
+        guest_page_table[i] = FOLD_INVALID;
+    for (uint32_t i = 0; i < sizeof(test_ram) / 4096; i++)
+        guest_page_table[i] = FOLD_K((uint32_t)test_ram + i * 4096, i);
+
+    /* ---- the tables ---------------------------------------------------- */
+    memset(test_ram + PM_GDT, 0, 0x40);
+    memset(test_ram + PM_LDT, 0, 0x10);
+    /* 0x08  data RW, base 0x30000, limit 0xFFFF, DPL 0, present, G=0     */
+    pm_desc(PM_GDT + 0x08, 0x30000, 0xFFFF, 0x92, 0x00);
+    /* 0x10  the SAME but G=1 with a limit FIELD of 0 -- the cached limit
+       must come back 0xFFF, which is the whole granularity rule           */
+    pm_desc(PM_GDT + 0x10, 0x31000, 0x00000, 0x92, 0x80);
+    /* 0x18  data RW, DPL 0, limit 0x100 -- the plain limit, and the target
+       of the wrong-DPL arm (loaded with RPL 3)                            */
+    pm_desc(PM_GDT + 0x18, 0x00000, 0x00100, 0x92, 0x00);
+    /* 0x20  data RW but NOT PRESENT                                       */
+    pm_desc(PM_GDT + 0x20, 0x30000, 0xFFFF, 0x12, 0x00);
+    /* 0x28  an LDT descriptor: S=0, type 2, present                       */
+    pm_desc(PM_GDT + 0x28, PM_LDT, 0x000F, 0x82, 0x00);
+    /* 0x30  EXECUTE-ONLY code (type 8): unreadable, so #GP into DS        */
+    pm_desc(PM_GDT + 0x30, 0x30000, 0xFFFF, 0x98, 0x00);
+    /* 0x38  READ-ONLY data (type 0): not writable, so #GP into SS         */
+    pm_desc(PM_GDT + 0x38, 0x30000, 0xFFFF, 0x90, 0x00);
+    /* LDT entry 1 -> selector 0x0C (index 1, TI set)                      */
+    pm_desc(PM_LDT + 0x08, 0x32000, 0xFFFF, 0x92, 0x00);
+    /* 0x40  A PERFECTLY VALID DESCRIPTOR, ONE ENTRY PAST THE LIMIT.
+       This is what makes the table-bound check gradeable. With junk or zeros
+       up here, removing the bound merely moves the fault to the S-bit check
+       and the arm still "passes" -- which is exactly what the first version of
+       this test did, and the negative control caught it. */
+    pm_desc(PM_GDT + 0x40, 0x33000, 0xFFFF, 0x92, 0x00);
+
+    /* A HLT at the base of the code descriptor at selector 0x30, so a far
+       jump that installs it has somewhere to land. */
+    test_ram[0x30000] = 0xF4;
+
+    test_ram[0x03010] = 0x77;
+    test_ram[0x30010] = 0x5A;
+    test_ram[0x32010] = 0xA5;
+
+    x86_pmode_loads = 0;
+    x86_pmode_faults = 0;
+
+    /* ==================================================================
+     * A. LGDT and LIDT actually PARSE their operand.
+     *
+     * LGDT parsed nothing at all before this work -- it checked CPL and
+     * branched to the fetch loop -- so the GDT stayed at base 0 limit 0
+     * however many times a guest loaded it. Nothing could see that until
+     * something walked the table.
+     * ================================================================== */
+    {
+        /* limit 0x0027, base 0x00002000 at 0x1000; and 0x1006 for the IDT */
+        uint8_t *o = test_ram + PM_OPND;
+        o[0] = 0x27; o[1] = 0x00;
+        o[2] = 0x00; o[3] = 0x20; o[4] = 0x00; o[5] = 0x00;
+        o[6] = 0xFF; o[7] = 0x01;
+        o[8] = 0x00; o[9] = 0x40; o[10] = 0x00; o[11] = 0x00;
+        static const uint8_t prog[] = {
+            0x0F, 0x01, 0x16, 0x00, 0x10,   /* LGDT [0x1000] */
+            0x0F, 0x01, 0x1E, 0x06, 0x10,   /* LIDT [0x1006] */
+            0xF4,
+        };
+        pmode_r[0] = pm_run(prog, sizeof(prog));            /* 6 = HLT */
+        pmode_r[1] = cpu_state_dtcm.gdt_base;               /* 0x2000  */
+        pmode_r[2] = cpu_state_dtcm.gdt_limit;              /* 0x27    */
+        pmode_r[3] = cpu_state_dtcm.idtr_base;              /* 0x4000  */
+        pmode_r[4] = cpu_state_dtcm.idtr_limit;             /* 0x1FF   */
+        /* Real mode ran an LGDT and did NOT walk a descriptor. */
+        pmode_r[5] = x86_pmode_loads;                       /* 0       */
+    }
+
+    /* ==================================================================
+     * B. The BASE takes effect. A load through selector 0x08 must read
+     *    linear 0x30010, not 0x00010 and not 0x00080.
+     * ================================================================== */
+    {
+        static const uint8_t prog[] = {
+            PM_ENTER,
+            0xB8, 0x08, 0x00,               /* MOV AX,0x08      */
+            0x8E, 0xD8,                     /* MOV DS,AX        */
+            0x8A, 0x06, 0x10, 0x00,         /* MOV AL,[0x0010]  */
+            0xF4,
+        };
+        pmode_r[6] = pm_run(prog, sizeof(prog));            /* 6 = HLT  */
+        pmode_r[7] = cpu_state_dtcm.regs[0] & 0xFF;         /* 0x5A     */
+        pmode_r[8] = cpu_state_dtcm.segs[X86_CPU_SEG_DS].base;   /* 0x30000 */
+        pmode_r[9] = cpu_state_dtcm.segs[X86_CPU_SEG_DS].limit;  /* 0xFFFF  */
+        pmode_r[10] = cpu_state_dtcm.segs[X86_CPU_SEG_DS].sel;   /* 0x08    */
+        /* The rights the descriptor carried, decoded. */
+        pmode_r[11] = X86_SEG_USABLE(&cpu_state_dtcm.segs[X86_CPU_SEG_DS]);
+        pmode_r[12] = X86_DESC_TYPE(cpu_state_dtcm.segs[X86_CPU_SEG_DS].flags);
+        pmode_r[13] = X86_DESC_DPL(cpu_state_dtcm.segs[X86_CPU_SEG_DS].flags);
+        pmode_r[14] = x86_pmode_loads;                      /* exactly 1 */
+        pmode_r[15] = x86_pmode_faults;                     /* 0         */
+    }
+
+    /* ==================================================================
+     * C. The LIMIT takes effect, and the G bit expands it.
+     *    Selector 0x18 has a raw limit of 0x100 and G=0 -> 0x100.
+     *    Selector 0x10 has a raw limit of 0 and G=1     -> 0xFFF.
+     *    A G that was ignored gives 0 for the second, which is exactly
+     *    the value a null selector leaves, so both are read.
+     * ================================================================== */
+    {
+        static const uint8_t prog[] = {
+            PM_ENTER,
+            0xB8, 0x18, 0x00,  0x8E, 0xD8,  /* MOV DS,0x18 */
+            0xB8, 0x10, 0x00,  0x8E, 0xC0,  /* MOV ES,0x10 */
+            0xF4,
+        };
+        pmode_r[16] = pm_run(prog, sizeof(prog));
+        pmode_r[17] = cpu_state_dtcm.segs[X86_CPU_SEG_DS].limit;  /* 0x100 */
+        pmode_r[18] = cpu_state_dtcm.segs[X86_CPU_SEG_ES].limit;  /* 0xFFF */
+        pmode_r[19] = cpu_state_dtcm.segs[X86_CPU_SEG_ES].base;   /* 0x31000 */
+    }
+
+    /* ==================================================================
+     * D. NULL SELECTORS. Three different behaviours; collapsing them is
+     *    a real bug and neither reference records the DS case cleanly.
+     * ================================================================== */
+    {
+        static const uint8_t prog_ds[] = {
+            PM_ENTER,
+            0x31, 0xC0,                     /* XOR AX,AX  */
+            0x8E, 0xD8,                     /* MOV DS,AX  */
+            0xF4,
+        };
+        pmode_r[20] = pm_run(prog_ds, sizeof(prog_ds));     /* 6 = HLT: legal */
+        pmode_r[21] = X86_SEG_USABLE(&cpu_state_dtcm.segs[X86_CPU_SEG_DS]);
+        pmode_r[22] = cpu_state_dtcm.segs[X86_CPU_SEG_DS].limit;  /* 0 */
+
+        static const uint8_t prog_ss[] = {
+            PM_ENTER,
+            0x31, 0xC0,
+            0x8E, 0xD0,                     /* MOV SS,AX  */
+            0xF4,
+        };
+        pmode_r[23] = pm_run(prog_ss, sizeof(prog_ss));     /* 13 = GPF exit */
+        pmode_r[24] = cpu_state_dtcm.pmode_excp;            /* 13 = #GP  */
+        pmode_r[25] = cpu_state_dtcm.pmode_err;             /* 0, not the sel */
+    }
+
+    /* ==================================================================
+     * E. A selector past the DESCRIPTOR TABLE LIMIT. GDT limit is 0x3F,
+     *    so 0x38 is the last legal selector and 0x40 is one past it.
+     * ================================================================== */
+    {
+        static const uint8_t prog[] = {
+            PM_ENTER,
+            0xB8, 0x40, 0x00,  0x8E, 0xD8,  /* MOV DS,0x40 */
+            0xF4,
+        };
+        pmode_r[26] = pm_run(prog, sizeof(prog));           /* 13 */
+        pmode_r[27] = cpu_state_dtcm.pmode_excp;            /* 13 = #GP */
+        pmode_r[28] = cpu_state_dtcm.pmode_err;             /* 0x40 */
+
+        /* And the one INSIDE the table: 0x38 is legal. */
+        static const uint8_t prog_ok[] = {
+            PM_ENTER,
+            0xB8, 0x38, 0x00,  0x8E, 0xC0,  /* MOV ES,0x38 (read-only data) */
+            0xF4,
+        };
+        pmode_r[29] = pm_run(prog_ok, sizeof(prog_ok));     /* 6 = HLT */
+    }
+
+    /* ==================================================================
+     * F. WRONG DPL. Selector 0x18 has DPL 0; CPL is 0; loading it with
+     *    RPL 3 makes max(CPL,RPL) = 3 > DPL, which is #GP(0x18).
+     *    This is the check tiny386 does not have at all.
+     * ================================================================== */
+    {
+        static const uint8_t prog[] = {
+            PM_ENTER,
+            0xB8, 0x1B, 0x00,  0x8E, 0xD8,  /* MOV DS,0x1B (0x18|RPL3) */
+            0xF4,
+        };
+        pmode_r[30] = pm_run(prog, sizeof(prog));           /* 13 */
+        pmode_r[31] = cpu_state_dtcm.pmode_excp;            /* 13 */
+        pmode_r[32] = cpu_state_dtcm.pmode_err;             /* 0x18: RPL cleared */
+        /* ...and the same descriptor at RPL 0 is fine, so the arm above
+           failed for the PRIVILEGE and not for the descriptor. */
+        static const uint8_t prog_ok[] = {
+            PM_ENTER,
+            0xB8, 0x18, 0x00,  0x8E, 0xD8,
+            0xF4,
+        };
+        pmode_r[33] = pm_run(prog_ok, sizeof(prog_ok));     /* 6 = HLT */
+    }
+
+    /* ==================================================================
+     * G. NOT PRESENT -> #NP, and it is a different vector from #GP.
+     * ================================================================== */
+    {
+        static const uint8_t prog[] = {
+            PM_ENTER,
+            0xB8, 0x20, 0x00,  0x8E, 0xD8,
+            0xF4,
+        };
+        pmode_r[34] = pm_run(prog, sizeof(prog));           /* 13 = the exit */
+        pmode_r[35] = cpu_state_dtcm.pmode_excp;            /* 11 = #NP     */
+        pmode_r[36] = cpu_state_dtcm.pmode_err;             /* 0x20         */
+    }
+
+    /* ==================================================================
+     * H. TYPE rules.
+     *      - a SYSTEM descriptor (S=0) into DS is #GP
+     *      - EXECUTE-ONLY code into DS is #GP (unreadable)
+     *      - READ-ONLY data into SS is #GP (unwritable)
+     * ================================================================== */
+    {
+        static const uint8_t sysd[] = {
+            PM_ENTER, 0xB8, 0x28, 0x00, 0x8E, 0xD8, 0xF4,
+        };
+        pmode_r[37] = pm_run(sysd, sizeof(sysd));
+        pmode_r[38] = cpu_state_dtcm.pmode_excp;            /* 13 */
+        pmode_r[39] = cpu_state_dtcm.pmode_err;             /* 0x28 */
+
+        static const uint8_t xonly[] = {
+            PM_ENTER, 0xB8, 0x30, 0x00, 0x8E, 0xD8, 0xF4,
+        };
+        pmode_r[40] = pm_run(xonly, sizeof(xonly));
+        pmode_r[41] = cpu_state_dtcm.pmode_excp;            /* 13 */
+        pmode_r[42] = cpu_state_dtcm.pmode_err;             /* 0x30 */
+
+        static const uint8_t rossp[] = {
+            PM_ENTER, 0xB8, 0x38, 0x00, 0x8E, 0xD0, 0xF4,   /* MOV SS,0x38 */
+        };
+        pmode_r[43] = pm_run(rossp, sizeof(rossp));
+        pmode_r[44] = cpu_state_dtcm.pmode_excp;            /* 13 */
+        pmode_r[45] = cpu_state_dtcm.pmode_err;             /* 0x38 */
+
+        /* SS with a WRITABLE data selector at the right privilege works, so
+           the three above failed for their types and not for being SS. */
+        static const uint8_t ssok[] = {
+            PM_ENTER, 0xB8, 0x08, 0x00, 0x8E, 0xD0, 0xF4,
+        };
+        pmode_r[46] = pm_run(ssok, sizeof(ssok));           /* 6 = HLT */
+        pmode_r[47] = cpu_state_dtcm.segs[X86_CPU_SEG_SS].base;  /* 0x30000 */
+    }
+
+    /* ==================================================================
+     * I. LLDT, and a selector resolved through the LDT.
+     *    Reaching 0xA5 at linear 0x32010 means the LDT descriptor was
+     *    read out of the GDT, its base cached, and selector 0x0C's TI bit
+     *    routed the second walk through it.
+     * ================================================================== */
+    {
+        static const uint8_t prog[] = {
+            PM_ENTER,
+            0xB8, 0x28, 0x00,               /* MOV AX,0x28       */
+            0x0F, 0x00, 0xD0,               /* LLDT AX           */
+            0xB8, 0x0C, 0x00,               /* MOV AX,0x0C (TI)  */
+            0x8E, 0xD8,                     /* MOV DS,AX         */
+            0x8A, 0x06, 0x10, 0x00,         /* MOV AL,[0x0010]   */
+            0xF4,
+        };
+        pmode_r[48] = pm_run(prog, sizeof(prog));           /* 6 = HLT */
+        pmode_r[49] = cpu_state_dtcm.ldt_base;              /* 0x2800  */
+        pmode_r[50] = cpu_state_dtcm.ldt_limit;             /* 0x0F    */
+        pmode_r[51] = cpu_state_dtcm.regs[0] & 0xFF;        /* 0xA5    */
+        pmode_r[52] = cpu_state_dtcm.segs[X86_CPU_SEG_DS].base;  /* 0x32000 */
+
+        /* LLDT with a NON-LDT descriptor is #GP. 0x08 is a data segment. */
+        static const uint8_t bad[] = {
+            PM_ENTER,
+            0xB8, 0x08, 0x00,  0x0F, 0x00, 0xD0,
+            0xF4,
+        };
+        pmode_r[53] = pm_run(bad, sizeof(bad));             /* 13 */
+        pmode_r[54] = cpu_state_dtcm.pmode_err;             /* 0x08 */
+    }
+
+    /* ==================================================================
+     * J. LEAVING protected mode.
+     *
+     *    Load DS in protected mode, clear PE, load DS again in real mode
+     *    and read through it. Two things must hold and both were broken
+     *    before this work: the real-mode base must be sel<<4 again, and
+     *    the cached FLAGS must be cleared -- the real-mode store was an
+     *    STRH that wrote only the selector, so a stale D bit from the
+     *    protected-mode descriptor survived and would have left the
+     *    interpreter decoding 32-bit operands against 16-bit code.
+     * ================================================================== */
+    {
+        static const uint8_t prog[] = {
+            PM_ENTER,
+            0xB8, 0x08, 0x00,  0x8E, 0xD8,  /* MOV DS,0x08 (base 0x30000) */
+            PM_LEAVE,
+            0xB8, 0x00, 0x03,  0x8E, 0xD8,  /* MOV DS,0x0300 -> 0x3000    */
+            0x8A, 0x06, 0x10, 0x00,         /* MOV AL,[0x0010] -> 0x3010  */
+            0xF4,
+        };
+        pmode_r[55] = pm_run(prog, sizeof(prog));           /* 6 = HLT */
+        pmode_r[56] = cpu_state_dtcm.regs[0] & 0xFF;        /* 0x77    */
+        pmode_r[57] = cpu_state_dtcm.segs[X86_CPU_SEG_DS].base;  /* 0x3000 */
+        pmode_r[58] = cpu_state_dtcm.segs[X86_CPU_SEG_DS].flags; /* 0      */
+        pmode_r[59] = cpu_state_dtcm.cr0 & 1u;              /* 0       */
+    }
+
+    /* ==================================================================
+     * K. The segment-limit predicate. Host-side, because it is NOT on the
+     *    access path yet -- see x86_pmode.c. Settling the semantics now
+     *    is the point; the plumbing that calls it is a later step.
+     * ================================================================== */
+    {
+        X86CPUSeg s;
+        /* expand-up, limit 0x100: the last legal byte is at 0x100 */
+        s.flags = X86_DESC_P_FLAG | X86_DESC_S_FLAG | (2u << 8);
+        s.base = 0; s.limit = 0x100; s.sel = 8;
+        pmode_r[60] = (uint32_t)(x86_pmode_limit_ok(&s, 0x100, 1) == 1 &&
+                                 x86_pmode_limit_ok(&s, 0x101, 1) == 0 &&
+                                 /* a 4-byte access ENDING past the limit */
+                                 x86_pmode_limit_ok(&s, 0x0FE, 4) == 0 &&
+                                 x86_pmode_limit_ok(&s, 0x0FD, 4) == 1);
+        /* the wrap: an offset near 2^32 must not pass by overflowing */
+        s.limit = 0xFFFFFFFFu;
+        pmode_r[61] = (uint32_t)(x86_pmode_limit_ok(&s, 0xFFFFFFFEu, 4) == 0);
+        /* expand-down, B=0: valid is (limit, 0xFFFF] */
+        s.flags = X86_DESC_P_FLAG | X86_DESC_S_FLAG | (6u << 8);
+        s.limit = 0x1000;
+        pmode_r[62] = (uint32_t)(x86_pmode_limit_ok(&s, 0x1000, 1) == 0 &&
+                                 x86_pmode_limit_ok(&s, 0x1001, 1) == 1 &&
+                                 x86_pmode_limit_ok(&s, 0xFFFF, 1) == 1 &&
+                                 x86_pmode_limit_ok(&s, 0xFFFF, 2) == 0);
+        /* ...and B=1 raises the ceiling, which DOSBox-X's version ignores */
+        s.flags |= X86_DESC_D_FLAG;
+        pmode_r[63] = (uint32_t)(x86_pmode_limit_ok(&s, 0x10000, 1) == 1);
+    }
+
+    /* ==================================================================
+     * L. The SS PRIVILEGE rule, on its own.
+     *
+     * Selector 0x08 is writable data and present, so it passes every OTHER
+     * rule SS has; the only thing wrong with 0x0B is its RPL. Arm H's
+     * read-only and code selectors cannot grade this -- they fail on TYPE
+     * first, so removing the privilege rule leaves them still failing.
+     * The negative control caught precisely that.
+     * ================================================================== */
+    {
+        static const uint8_t prog[] = {
+            PM_ENTER,
+            0xB8, 0x0B, 0x00,  0x8E, 0xD0,  /* MOV SS,0x0B (0x08|RPL3) */
+            0xF4,
+        };
+        pmode_r[64] = pm_run(prog, sizeof(prog));           /* 13 */
+        pmode_r[65] = cpu_state_dtcm.pmode_excp;            /* 13 = #GP */
+        pmode_r[66] = cpu_state_dtcm.pmode_err;             /* 0x08 */
+    }
+
+    /* ==================================================================
+     * M. THE TABLE BOUND, graded against a VALID descriptor past the end.
+     *    Selector 0x40 names a well-formed present data segment at
+     *    GDT + 0x40, which the limit of 0x3F puts outside the table.
+     * ================================================================== */
+    {
+        static const uint8_t prog[] = {
+            PM_ENTER,
+            0xB8, 0x40, 0x00,  0x8E, 0xD8,
+            0xF4,
+        };
+        pmode_r[67] = pm_run(prog, sizeof(prog));           /* 13 */
+        pmode_r[68] = cpu_state_dtcm.pmode_excp;            /* 13 */
+        pmode_r[69] = cpu_state_dtcm.pmode_err;             /* 0x40 */
+        /* The base it WOULD have loaded, so a survivor is unambiguous. */
+        pmode_r[70] = cpu_state_dtcm.segs[X86_CPU_SEG_DS].base;  /* NOT 0x33000 */
+        /* Raise the limit and the very same selector loads: the arm above
+           failed for the BOUND and not for the descriptor. */
+        {
+            static const uint8_t prog2[] = {
+                PM_ENTER,
+                0xB8, 0x40, 0x00,  0x8E, 0xD8,
+                0xF4,
+            };
+            memcpy(test_ram, prog2, sizeof(prog2));
+            memset(&cpu_state_dtcm, 0, sizeof(cpu_state_dtcm));
+            for (int i = 0; i < 6; i++)
+                cpu_state_dtcm.segs[i].limit = 0xFFFFu;
+            cpu_state_dtcm.pit_reload = 0xFFFFFFFF;
+            cpu_state_dtcm.pit_counter = 0xFFFFFFFF;
+            cpu_state_dtcm.gdt_base = PM_GDT;
+            cpu_state_dtcm.gdt_limit = 0x47;       /* one entry further */
+            x86_cpu_interp_asm();
+            pmode_r[71] = cpu_state_dtcm.exit_reason;            /* 6 */
+            pmode_r[72] = cpu_state_dtcm.segs[X86_CPU_SEG_DS].base;  /* 0x33000 */
+        }
+    }
+
+    /* ==================================================================
+     * N. THE FAR JUMP -- the transfer that installs CS and flushes the
+     *    pipeline, which is the last step of every real entry sequence.
+     *
+     *    Positive: JMP 0x30:0x0000 with 0x30 a code descriptor based at
+     *    0x30000, where a HLT is waiting. Reaching it means CS was
+     *    installed from the descriptor and the linear EIP rebuilt from
+     *    the new base.
+     *
+     *    Negative: the same jump to selector 0x08, which is DATA. Without
+     *    the CS type check that loads and executes the data segment --
+     *    and since 0x08 is based at 0x30000 too, it would find the same
+     *    HLT and look like a success. That is why the two selectors share
+     *    a base: it makes the control unambiguous rather than accidental.
+     *
+     *    NOTE what is NOT tested here, because it is NOT BUILT: call
+     *    gates, privilege changes, stack switches and IRET across rings.
+     *    A far jump between same-privilege segments is the whole scope.
+     * ================================================================== */
+    {
+        static const uint8_t prog[] = {
+            PM_ENTER,
+            0xEA, 0x00, 0x00, 0x30, 0x00,   /* JMP FAR 0x0030:0x0000 */
+        };
+        pmode_r[73] = pm_run(prog, sizeof(prog));           /* 6 = HLT */
+        pmode_r[74] = cpu_state_dtcm.segs[X86_CPU_SEG_CS].base;  /* 0x30000 */
+        pmode_r[75] = cpu_state_dtcm.segs[X86_CPU_SEG_CS].sel;   /* 0x30    */
+        pmode_r[76] = cpu_state_dtcm.eip;                   /* 0 -- the HLT */
+        pmode_r[77] = cpu_state_dtcm.cpl;                   /* 0 = CS.RPL   */
+
+        static const uint8_t bad[] = {
+            PM_ENTER,
+            0xEA, 0x00, 0x00, 0x08, 0x00,   /* JMP FAR 0x0008:0x0000 -- DATA */
+        };
+        pmode_r[78] = pm_run(bad, sizeof(bad));             /* 13 */
+        pmode_r[79] = cpu_state_dtcm.pmode_err;             /* 0x08 */
+    }
+}
+
 static void a20_test_run(void)
 {
     for (uint32_t i = 0; i < 24; i++)
@@ -3914,6 +4428,11 @@ void Reset_Handler(void) {
         if (run_a20_flag == 1) {
             a20_test_run();
             run_a20_flag = 0;
+        }
+
+        if (run_pmode_flag == 1) {
+            pmode_test_run();
+            run_pmode_flag = 0;
         }
 
         if (run_arena_flag == 1) {

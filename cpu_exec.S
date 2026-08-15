@@ -554,6 +554,10 @@ x86_cpu_interp_asm:
     LDR R9, [R9]
 
 
+    /* The stack pointer every exit path unwinds to. See .save_state_and_exit. */
+    MOV R12, SP
+    STR R12, [R8, #CPU_HOST_SP]
+
     // Load cached x86 state
     LDR R10, [R8, #EIP_OFFSET]
     LDR R11, [R8, #EFLAGS_OFFSET]
@@ -1140,6 +1144,27 @@ x86_cpu_interp_asm:
     STR R0, [R8, #CPU_EXIT_REASON]
 
 .save_state_and_exit:
+    /* RESTORE THE HOST STACK POINTER FIRST.
+     *
+     * An exit can be taken from INSIDE a handler's subroutine call, with that
+     * handler's own pushes still on the stack: every caller of L(SET_SREG)
+     * does `PUSH {LR} / BL / POP {LR}`, and a protected-mode segmentation
+     * fault leaves through here without ever reaching the POP. The final
+     * `POP {R4-R11, PC}` then reads one word too high and branches to
+     * whatever the handler had saved -- a wild jump that presents as the
+     * interpreter never returning.
+     *
+     * This was already latent before protected mode existed: the old
+     * `TST CR0,#1 / BNE .exit_loop` at the top of L(SET_SREG) had the same
+     * imbalance and simply never fired, because no guest in the tree ever set
+     * PE. Restoring SP from the value the prologue recorded makes every exit
+     * path stack-safe regardless of how deep the handler was, which is the
+     * only version of this that stays correct as more exits are added.
+     *
+     * Cost: one store per interpreter CALL and one load per EXIT -- per
+     * slice, not per instruction. */
+    LDR SP, [R8, #CPU_HOST_SP]
+
     /* THE SECOND FLUSH POINT. Every exit hands control to host code that reads
      * and writes guest memory -- an HLE service filling a DTA, the renderer,
      * a savestate -- and a straddling store made by the LAST instruction is

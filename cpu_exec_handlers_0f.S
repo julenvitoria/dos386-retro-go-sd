@@ -16,11 +16,86 @@ OP .op_0f_0F
 L(opcode_0f_dispatch_target):
 
 
+/* 0F 00 -- group 6. SLDT (/0) and LLDT (/2) only.
+ *
+ * STR (/1) and LTR (/3) are NOT here and are not an oversight: PLAN.md records
+ * that the TSS work is not needed because INT 21h is HLE'd, so there is no
+ * task state to point a task register at. VERR (/4) and VERW (/5) wait for a
+ * guest that asks for them. All four keep the .exit_loop they have today,
+ * which names the opcode rather than inventing an answer.
+ *
+ * The operand is a 16-bit selector however the operand size is set. */
+OP .op_0f_00
+    CODE_PTR R1
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    UBFX R3, R1, #3, #3
+    CMP R3, #0
+    BEQ.W L(OP_SLDT)
+    CMP R3, #2
+    BNE.W .exit_loop
+    /* ---- LLDT ---- */
+    BL L(LXXX_CPL_CHECK)
+    CMP R1, #192                   @ mod==3: the selector is in a register
+    BLO.W L(OP_LLDT_MEM)
+    AND.W R5, R1, #7
+    ADD.W R5, R8, R5, LSL #2
+    LDRH.W R5, [R5, #8]
+    B.W L(OP_LLDT_GO)
+L(OP_LLDT_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN]
+    BLX R12
+    SEAM_CHECK R3, R7
+    UBFX R3, R7, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R7
+    MEM_TRAP_R R3
+    LDRH R5, [R3, #0]
+L(OP_LLDT_GO):
+    PUSH {R0-R3, R12, LR}
+    MOV R0, R8
+    UXTH R1, R5
+    BL x86_pmode_lldt
+    CBNZ R0, 1f
+    POP {R0-R3, R12, LR}
+    B.W .fetch_decode_loop
+1:  POP {R0-R3, R12, LR}
+    MOV.W R0, #X86_EXIT_GPF
+    STR.W R0, [R8, #CPU_EXIT_REASON]
+    LDR.W R0, [R8, #CPU_PMODE_ERR]
+    STR.W R0, [R8, #CPU_EXIT_INFO]
+    B.W .save_state_and_exit
+
+/* SLDT: store the LDT selector. Unprivileged in both references. */
+L(OP_SLDT):
+    LDR.W R5, [R8, #CPU_LDT_SEL]
+    CMP R1, #192
+    BLO.W L(OP_SLDT_MEM)
+    AND.W R3, R1, #7
+    ADD.W R3, R8, R3, LSL #2
+    STRH.W R5, [R3, #8]
+    B.W .fetch_decode_loop
+L(OP_SLDT_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN]
+    BLX R12
+    LDR.W R5, [R8, #CPU_LDT_SEL]
+    MEM_GET_PTR R3, R7
+    VGA_ST_H R5, R3, R12
+    B.W .fetch_decode_loop
+
 OP .op_0f_01
     CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
-    BL L(DECODE_MODRM_32)
+    /* The ADDRESS-SIZE decoder from the mode record, not a hardwired 32-bit
+       one. `BL L(DECODE_MODRM_32)` was unconditional here, so in a 16-bit
+       guest -- which is every guest in this tree -- `LIDT [disp16]` (ModRM
+       0x16) decoded as the 32-bit grammar's [ESI] and loaded the IDT from
+       whatever ESI pointed at. It never showed because nothing walked the IDT
+       afterwards. Same defect the docs describe for the five handlers that
+       ignore 0x67; this is a sixth. */
+    LDR.W R12, [R2, #REC_MODRM_FN]
+    BLX R12
     UBFX R3, R1, #3, #3
     CMP R3, #2
     BEQ.N L(OP_LGDT)
@@ -28,39 +103,67 @@ OP .op_0f_01
     BEQ.N L(OP_LIDT)
     B.W .exit_loop
 
+/* LGDT and LIDT read the SAME six-byte operand -- a 16-bit limit then a 32-bit
+ * base -- and differ only in where they put it. They shared no code, and LGDT
+ * PARSED NOTHING AT ALL: it checked CPL and branched to the fetch loop, so
+ * every LGDT a guest issued was silently discarded and the GDT stayed at
+ * base 0 limit 0. That is invisible until something walks the table, which is
+ * exactly what this work adds, so it is fixed here rather than left.
+ *
+ * Operand shape and the 0x66 rule: references/tiny386/i386.c:3239-3256. The
+ * 32-bit dword is ALWAYS loaded from memory; the 16-bit form differs only by
+ * masking the base to 24 bits (i386.c:3246, `if (opsz16) base &= 0xffffff`).
+ * The limit is 16 bits in both. DOSBox-X masks in the same place
+ * (src/cpu/core_full/op.h:437,441).
+ *
+ * CPL 0 is required and the fault is #GP(0) -- tiny386 i386.c:3240,
+ * DOSBox-X requires it of LLDT/LTR at src/cpu/cpu.cpp:2432,2456. */
 L(OP_LGDT):
-    LDR.W R2, [R8, #CPU_CR0]
-    TST.W R2, #1
-    BEQ.W .fetch_decode_loop
-    LDRH.W R2, [R8, #SEG_CS_SEL]
-    AND.W R2, R2, #3
-    CMP R2, #0
-    BNE.W .raise_gp_fault
+    BL L(LXXX_CPL_CHECK)
+    BL L(LXXX_OPERAND)             @ R3 = limit, R4 = base
+    STR.W R3, [R8, #CPU_GDT_LIMIT]
+    STR.W R4, [R8, #CPU_GDT_BASE]
     B.W .fetch_decode_loop
 
 L(OP_LIDT):
-    LDR.W R2, [R8, #CPU_CR0]
-    TST.W R2, #1
-    BEQ.N L(OP_LIDT_OK)
-    LDRH.W R2, [R8, #SEG_CS_SEL]
-    AND.W R2, R2, #3
-    CMP R2, #0
-    BNE.W .raise_gp_fault
-L(OP_LIDT_OK):
+    BL L(LXXX_CPL_CHECK)
+    BL L(LXXX_OPERAND)
+    STRH.W R3, [R8, #CPU_IDTR_LIMIT]
+    STR.W R4, [R8, #CPU_IDTR_BASE]
+    B.W .fetch_decode_loop
+
+/* CPL 0, but only once protected mode is on: in real mode there is no CPL and
+   these are unprivileged. Returns, or branches away to the fault.
+   R12 ONLY. This is called from LLDT *before* its ModRM is decoded, so R2 is
+   still the live MODE RECORD and R1 the ModRM byte -- the register contract in
+   CLAUDE.md makes clobbering R2 there a real bug, not a style point. */
+L(LXXX_CPL_CHECK):
+    LDR.W R12, [R8, #CPU_CR0]
+    TST.W R12, #1
+    IT EQ
+    BXEQ LR                        @ real mode: no privilege to check
+    LDR.W R12, [R8, #CPU_CPL]
+    CMP R12, #0
+    IT EQ
+    BXEQ LR
+    B.W .raise_gp_fault
+
+/* The shared six-byte read. R7 = effective address from DECODE_MODRM.
+   Returns limit in R3 and base in R4. Clobbers R2, R5. */
+L(LXXX_OPERAND):
     SEAM_CHECK R2, R7
     UBFX R2, R7, #12, #12
     LDR.W R2, [R9, R2, LSL #2]
     ADDS R2, R2, R7
     MEM_TRAP_R R2
-    LDRH R3, [R2, #0]
-    STRH.W R3, [R8, #44]
-    ADD.W R2, R2, #2
-    LDRH R4, [R2, #0]
-    ADD.W R2, R2, #2
-    LDRH R5, [R2, #0]
-    BFI R4, R5, #16, #16
-    STR.W R4, [R8, #40]
-    B.W .fetch_decode_loop
+    LDRH R3, [R2, #0]              @ limit, 16 bits in both forms
+    LDRH R4, [R2, #2]
+    LDRH R5, [R2, #4]
+    BFI R4, R5, #16, #16           @ base, 32 bits read in both forms
+#if OPSZ == 2
+    BIC.W R4, R4, #0xFF000000      @ ...but masked to 24 for the 16-bit form
+#endif
+    BX LR
 
 OP .op_int3_CC
     MOV.W R4, #3
@@ -279,8 +382,32 @@ L(OP_0F_CR):
     B.W .fetch_decode_loop
 1:  LDR.W R5, [R8, R2]
     CMP R3, #0
-    IT EQ
-    STREQ.W R5, [R8, #CPU_CR0]
+    BNE.W .fetch_decode_loop       @ CR2/CR3/CR4: still not modelled
+    /* ---- THE CR0.PE TRANSITION ----------------------------------------
+     * Writing CR0 does NOT reload or invalidate the segment caches, and that
+     * is not an omission -- it is what makes the standard entry sequence work.
+     * Between the `MOV CR0` that sets PE and the far jump that follows it, CS
+     * still holds its real-mode cache (base = sel<<4, D=0) and the guest is
+     * executing 16-bit code at a real-mode base; the far JUMP is what installs
+     * a real descriptor and FLUSHES THE PIPELINE. tiny386 does exactly this
+     * and nothing more (references/tiny386/i386.c:2251-2255): flush the TLB if
+     * PG/WP/PE moved, then store. The same holds leaving protected mode.
+     *
+     * What DOES have to happen on the transition is re-deriving the dispatch
+     * table. The interpreter picks its mode record once, at entry, from CS.D
+     * (cpu_exec.S), so a guest that leaves protected mode from a 32-bit code
+     * segment would keep running the 32-bit tables against 16-bit real-mode
+     * code. Done here, on the PE change only, because this instruction is cold
+     * and every alternative site is not. */
+    LDR.W R4, [R8, #CPU_CR0]
+    STR.W R5, [R8, #CPU_CR0]
+    EOR.W R4, R4, R5
+    TST.W R4, #1                   @ did PE actually move?
+    BEQ.W .fetch_decode_loop
+    PUSH {R0-R3, R12, LR}
+    MOV R0, R8
+    BL x86_pmode_sync_mode
+    POP {R0-R3, R12, LR}
     B.W .fetch_decode_loop
 
 OP .op_0f_movzx_gv_eb
@@ -400,6 +527,7 @@ L(OP_0F_MOVSX_GV_EW_WRITE):
 
 .align 2
 .set .op_0f_0F, .op_0f_0F_32
+.set .op_0f_00, .op_0f_00_32
 .set .op_0f_01, .op_0f_01_32
 .set .op_int3_CC, .op_int3_CC_32
 .set .op_into_CE, .op_into_CE_32
@@ -490,6 +618,7 @@ opcode_table_0f_32:
 
 .align 2
 .set .op_0f_0F, .op_0f_0F_16
+.set .op_0f_00, .op_0f_00_16
 .set .op_0f_01, .op_0f_01_16
 .set .op_int3_CC, .op_int3_CC_16
 .set .op_into_CE, .op_into_CE_16

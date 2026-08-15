@@ -1,5 +1,5 @@
     .align 2
-    .word .exit_loop + 1 // 0x0
+    .word .op_0f_00 + 1 // 0x0
     .word .op_0f_01 + 1 // 0x1
     .word .exit_loop + 1 // 0x2
     .word .exit_loop + 1 // 0x3

@@ -10,7 +10,7 @@ where numbers go stale.
 
 | Tier | State |
 |---|---|
-| 1. gwemu bare-metal | `test_opcodes` **273/273**; `test_video` **25/25 arms** at the shipping `EXTRA_PAGES=1`, Mode Y and EGA 0Dh **64000/64000**; `test_seam`, `test_pit`, `test_dos`, `test_paging`, `test_nor`, `test_sysinfo`, `test_xms` **47/47**, `test_ems` **40/40**, `test_text`, `test_keyboard`, `test_osk`, `test_disk_cache` |
+| 1. gwemu bare-metal | `test_opcodes` **273/273**; `test_video` **25/25 arms** at the shipping `EXTRA_PAGES=1`, Mode Y and EGA 0Dh **64000/64000**; `test_seam`, `test_pit`, `test_dos`, `test_paging`, `test_nor`, `test_sysinfo`, `test_xms` **47/47**, `test_ems` **40/40**, `test_text`, `test_keyboard`, `test_osk`, `test_disk_cache`, **`test_pmode` 80/80** (protected mode; 10/10 negative controls caught by `scripts/run_pmode_controls.py`) |
 | 2. gwemu + retro-go | `core_dtcm_ok=1`, bonus pool 153,600 B, 1,000,001 insns — matches tier 1. **XMS is live and a shipped title uses it**: WOLF3D detects it, allocates and moves 430,636 B in 278 moves, `xms_opens=1`, 0 errors, at a 4% frame cost ([`docs/12`](docs/12_memory_tiers.md) §6) |
 | 3. Hardware | ~**2.8 M insn/s** stock, ~**3.8 M** overclocked, 59 fps. ABI VERIFIED on silicon. **Disk reads are NOT a live cost — they freeze at t+36 s and never move again; SylverB's CMD18/DMA work is already in the flashed firmware.** The live cost is the pagefile WRITE |
 
@@ -20,6 +20,8 @@ known-bad.
 
 **Known-failing, pre-existing, not news:**
 
+- `test_nor.py` — the arm never runs. PRE-EXISTING: reproduced on stock master
+  with no local changes, so it is not news and not a protected-mode regression.
 - `test_screen.py` — text-mode CLUT assertion, entries 17-19.
 - `test_core_retrogo.py` — blitter/CLUT assertions whenever a real `.dsk` is on the
   card: they expect `demo_guest`'s pattern, which only runs with no disk.
@@ -63,9 +65,9 @@ mid-`REP`, so the decision is resolvable once), aperture reads (~4.5%), the
 
 | | value | note |
 |---|---|---|
-| ITCM | ~**14 KB** free of 65,536 | `__CORE_ITCM_CODE_END__` = 0xC978 (51,576 B used) |
+| ITCM | ~**12.7 KB** free of 65,536 | `__CORE_ITCM_CODE_END__` = 0xCD08 (52,488 B used). The protected-mode walk cost **+912 B**, all of it cold: the out-of-line `SET_SREG_PMODE`, group 6/7 (`LLDT`/`SLDT`/`LGDT`/`LIDT`) and the `MOV CRn` transition |
 | DTCM | **63,268 B** free above a bump at `0x2000A8DC` | the pool ends at `__dtc_padding_end__` = `0x2001A000`, NOT `0x20020000` — the 24 KB above it is the main stack. `core_dtcm_headroom_max` over-reported by exactly that for the whole project until now ([`docs/12`](docs/12_memory_tiers.md) §8) |
-| RAM_EMU | `arm-none-eabi-nm build/core/dos_core.elf \| grep __CORE_BSS_END__` | **exhaustion is SILENT**: `guest_ram` returns NULL, `core_ready` stays 0, no message. Core TEXT is in this region too |
+| RAM_EMU | `arm-none-eabi-nm build/core/dos_core.elf \| grep __CORE_BSS_END__` = **0x2405E960** (+704 B for `x86_pmode.c`) | **exhaustion is SILENT**: `guest_ram` returns NULL, `core_ready` stays 0, no message. Core TEXT is in this region too |
 | arena | 143,360 B | check `x86_arena_largest`, not just `_free` — claims fragment |
 
 ## What is broken right now
@@ -79,13 +81,33 @@ mid-`REP`, so the decision is resolvable once), aperture reads (~4.5%), the
 | **ONE 4 KB PAGEFILE WRITEBACK COSTS UP TO 433 ms ON SILICON** (`x86_pg_wb_us_worst`) vs 23 ms for a sector read, and GROWS over a session. The per-page `fopen`/`fclose` is fixed; `pgf_us_seek` vs `_us_write` says what the rest is, `FF_USE_FASTSEEK 0` the suspect. Gates Keen and anything EMS/XMS-backed | `src/main.c` |
 | **KEEN4 gives 60 of 160 pager frames to the arena** once 0Dh is up, so runs on 100; EMS pins 16 more — tighter than the 144 the EMS work assumed | [`docs/12`](docs/12_memory_tiers.md) |
 | Retro-go's Pause overlay is unreadable over 256-colour modes | [`docs/08`](docs/08_vga_mode13h.md) §1 |
-| Protected-mode segment loads trap out (`CR0.PE`) | no descriptor walk; sized in [`docs/13`](docs/13_title_status.md) |
 | **Interpreter gaps**: seg override before `REP` survives one element; `moffs` uses operand not ADDRESS size; `MOV SS,x` does not inhibit interrupts; 5 handlers ignore `0x67`; 13 slots exit (x87, `BOUND`/`ARPL`, `XLAT`, `WAIT`, `INT1`) | [`docs/07`](docs/07_opcode_coverage.md) |
+
+## Protected mode — the descriptor walk is IN, and real mode pays NOTHING
+
+`CR0.PE` no longer traps out. `LGDT`/`LIDT`/`LLDT`, the GDT/LDT fetch, the
+type/DPL/present rules with the right vector and error code, the cached
+per-segment descriptor, `CR0.PE` both ways, a same-privilege far JMP.
+`tests/test_pmode.py` **80 checks**; `scripts/run_pmode_controls.py` shows
+**10/10 checks FAILING when compiled out**.
+
+Zero real-mode cost is proven by DISASSEMBLY DIFF, not argued: `.fetch_decode_loop`
+and every `.op_*` handler **byte-identical**; `L(SET_SREG)`'s real-mode arm one
+`STRH`->`STR` (same cost, fixes a stale-flags bug); `x86_cpu_interp_asm` +2
+instructions per interp CALL, `.save_state_and_exit` +1 per EXIT.
+**`test_benchmark` cannot decide this** — under gwemu it spans 10.30-11.88 M
+cycles *on the baseline alone*. NOT built: gates, `IRET` across privilege,
+stack switches, paging, per-access limit enforcement.
+[`docs/14`](docs/14_protected_mode.md).
 
 ## Retractions worth keeping
 
 One line each; their value is stopping a wrong answer being re-derived.
 
+- **`references/tiny386` HAS NO PROTECTED-MODE PERMISSION CHECKS.** `set_seg()`
+  (i386.c:1076) carries `// TODO: various permission checks` and does no
+  DPL/RPL/CPL validation. Right SHAPE, wrong RULES; DOSBox-X's
+  `CPU_SetSegGeneral` (src/cpu/cpu.cpp:2976) is the authority on the rules.
 - **ALLEYCAT's golden 0.874% is NOT a palette bug.** Owner-confirmed: the cat moves and the capture never lands twice on one frame; its mask is too narrow for that travel.
 - **Keen 4's levels are NOT impossible.** The verdict quoted the prior port's budget as if it were this hardware's. [`docs/13`](docs/13_title_status.md).
 - **Do not derive the frame period from `guest_fps_achieved`.** It is a runaway: overrun lowers fps, raising the period, raising the budget. [`docs/09`](docs/09_frame_pacing_and_clocks.md) §2.
@@ -100,4 +122,4 @@ One line each; their value is stopping a wrong answer being re-derived.
 
 ## Where the design lives
 
-[`docs/01`](docs/01_memory_architecture.md) fold table, address translation; [`docs/02`](docs/02_cpu_pipeline_optimization.md) Thumb-2 interpreter, dual-issue; [`docs/03`](docs/03_devices_and_hle.md) device model, DOS HLE; [`docs/04`](docs/04_retro_go_and_gwemu.md) firmware ABI, gwemu's limits; [`docs/06`](docs/06_gwemu_determinism.md) determinism; [`docs/07`](docs/07_opcode_coverage.md) opcode coverage; [`docs/08`](docs/08_vga_mode13h.md) mode 13h, Mode Y, EGA 0Dh, presentation; [`docs/09`](docs/09_frame_pacing_and_clocks.md) frame pacing and the three clocks; [`docs/10`](docs/10_granule_seam.md) the granule seam; [`docs/11`](docs/11_pit_and_interrupt_controller.md) PIT, 8259, and what reads them; [`docs/12`](docs/12_memory_tiers.md) pager tiers, arena, frame donation; [`docs/13`](docs/13_title_status.md) per-title state and settled verdicts
+[`docs/01`](docs/01_memory_architecture.md) fold table, address translation; [`docs/02`](docs/02_cpu_pipeline_optimization.md) Thumb-2 interpreter, dual-issue; [`docs/03`](docs/03_devices_and_hle.md) device model, DOS HLE; [`docs/04`](docs/04_retro_go_and_gwemu.md) firmware ABI, gwemu's limits; [`docs/06`](docs/06_gwemu_determinism.md) determinism; [`docs/07`](docs/07_opcode_coverage.md) opcode coverage; [`docs/08`](docs/08_vga_mode13h.md) mode 13h, Mode Y, EGA 0Dh, presentation; [`docs/09`](docs/09_frame_pacing_and_clocks.md) frame pacing and the three clocks; [`docs/10`](docs/10_granule_seam.md) the granule seam; [`docs/11`](docs/11_pit_and_interrupt_controller.md) PIT, 8259, and what reads them; [`docs/12`](docs/12_memory_tiers.md) pager tiers, arena, frame donation; [`docs/13`](docs/13_title_status.md) per-title state and settled verdicts; [`docs/14`](docs/14_protected_mode.md) protected mode, the descriptor walk
