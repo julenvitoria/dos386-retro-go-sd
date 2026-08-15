@@ -78,15 +78,29 @@ endif
 # See x86_dos.c and tests/test_seam.py.
 X86_DOS_PSP_SHIFT ?= 0
 
-# INT 21h AH=4Bh (EXEC). Built and tested at tier 1 on every run; OFF in the
-# SHIPPING core because honouring it kills Wolfenstein 3-D -- it calls AH=4Bh
-# AL=00 with a loadable image, and copying a child into ~30 untouched guest
-# pages mid-run leaves the pager nowhere to put them (guest_exit_reason=5,
-# MEM_FAULT, golden gate: no picture). Bisected at tier 2, one behaviour per
-# run; the measurement is in dos_exec_child(). Turn it on with
-#   make -f Makefile.core clean && make -f Makefile.core X86_DOS_EXEC=1 pack
-# -- a changed -D is NOT a dependency in this tree, so the clean is required.
-X86_DOS_EXEC ?= 0
+# INT 21h AH=4Bh (EXEC). AL=00h (load and execute) and AL=03h (load overlay).
+# ON in the shipping core.
+#
+# It was off for several passes because honouring AL=00h was recorded as
+# killing Wolfenstein 3-D (guest_exit_reason=5 MEM_FAULT, guest_insns_total=0,
+# golden gate: no picture), attributed to the pager having nowhere to put a
+# child image's ~30 untouched pages. THAT NO LONGER REPRODUCES, and the
+# re-measurement says the attribution was wrong twice over:
+#
+#   * WOLF3D never calls AH=4Bh in the graded window at all. Measured over
+#     340 M instructions at tier 2: x86_dos_execs=0, x86_dos_overlays=0,
+#     x86_dos_load_bytes=109,927 (its OWN image, loaded by the launch path at
+#     x86_dos.c:1070, which is dos_load_mz() and not the EXEC switch). A title
+#     that never reaches the code cannot be killed by it.
+#   * The flag costs NO pager frames. x86_pg_frames_total is 159 with it on
+#     and 159 with it off; __CORE_BSS_END__ moves 0x2405EBF8 -> 0x2405F120
+#     (+1,320 B) and that fits the slack the pool already had. The recorded
+#     "insns_total=0 with every other counter healthy" is the exact signature
+#     of the RAM_EMU starvation trap in STATUS.md's Budgets row, which bit
+#     three instrumented builds in the same session.
+#
+# Graded on the flip: WOLF3D golden 0.000%, ALLEYCAT 0.874% (pre-existing).
+X86_DOS_EXEC ?= 1
 
 X86_SEAM_FIX ?= 1
 X86_CODE_THREAD_UNSAFE ?= 0

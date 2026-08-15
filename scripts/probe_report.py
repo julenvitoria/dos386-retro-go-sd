@@ -114,9 +114,15 @@ TITLES = {
         "timeline": "timelines/start-preselected-game.tl",
         "settle": 22.0, "cmdtail": 1,
         "what": "Epic Pinball. PINBALL.EXE is a LAUNCHER: it shrinks its own "
-                "block and EXECs the chosen table's EPn.EXE, so it stops dead "
-                "on INT 21h AH=4Bh with 'Please run SETUP!'. Nothing past that "
-                "call has ever been measured for this title.",
+                "block (16 x AH=4Ah) and EXECs the chosen table's EPn.EXE. It "
+                "used to stop dead on INT 21h AH=4Bh with 'Please run SETUP!'; "
+                "since X86_DOS_EXEC became the default the EXEC is ANSWERED "
+                "(CF=0) and the child lands whole -- 83,912 B, "
+                "x86_dos_load_short=0, x86_pg_exhausted=0, evictions=0. It now "
+                "reaches mode 13h and dies past it on "
+                "X86_EXIT_UNIMPLEMENTED with exit_info=0x0F, after 620,904 "
+                "instructions and 64,000 reads of the Sound Blaster port "
+                "0x22A. Those two are the open questions for this title.",
     },
     "alleycat": {
         "rom": f"{ROM_DIR}/ALLEYCAT.dsk",
@@ -161,9 +167,12 @@ def build_core(rom, probe, quiet=False, core_flags=()):
     core_flags are extra `NAME=VALUE` arguments passed straight to
     Makefile.core. The reason this exists is that the interesting question is
     often "what does the title ask for once we ANSWER something we currently
-    refuse" -- Dark Forces' whole diagnosis needs X86_DOS_EXEC=1, which is 0 in
-    the shipping core -- and that cannot be measured by a runner that can only
-    ever build the default configuration. Every flag is echoed and recorded in
+    refuse" -- Dark Forces' diagnosis needed X86_DOS_EXEC=1 back when that was
+    0 in the shipping core (it is 1 now) -- and that cannot be measured by a
+    runner that can only ever build the default configuration. It is also how
+    the OPPOSITE question gets asked: --core-flag X86_DOS_EXEC=0 is what
+    measured EPIC_PINBALL's before-and-after across the flip. Every flag is
+    echoed and recorded in
     the report, because a probe of a non-default core that does not say so is
     a number nobody can place.
     """

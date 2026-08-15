@@ -297,7 +297,33 @@ Why DPMI/VCPI/XMS stays unbuilt:
 
 **Do not half-build DPMI.**
 
-## Epic Pinball — BLOCKED on one call: `INT 21h AH=4Bh` EXEC
+## Epic Pinball — PAST the EXEC wall; next stop is an unimplemented opcode
+
+**UPDATE 2026-08-15, after `X86_DOS_EXEC` became the shipping default.** The
+`AH=4Bh` blocker described below is CLEARED. Measured at tier 2 on the shipping
+core, `EPIC_PINBALL.dsk`, `timelines/start-preselected-game.tl`:
+
+| | flag OFF (the old default) | flag ON (shipping now) |
+|---|---|---|
+| `AH=4Bh AL=00h` | refused, `x86_hle_unhandled_func=0x4B` | **answered, CF=0**, `x86_dos_execs=1` |
+| `x86_dos_load_bytes` | 36,437 (`PINBALL.EXE` itself) | **83,912** (the CHILD) |
+| `x86_dos_load_short` / `_shorts` | — | **0 / 0** — the child landed WHOLE |
+| video mode reached | 3 (text: "Please run SETUP!") | **0x13**, `x86_vga_dac_writes=1,536` |
+| `guest_exit_reason` / `exit_info` | 4 / **0xFF** (executing unwritten memory after the refusal) | 4 / **0x0F** |
+| `guest_insns_total` at the stop | 7,794,871 | 620,904 |
+| `guest_ram_pages` / `x86_pg_frames_total` | 159 / 159 | **159 / 159 — the flag costs NO frames** |
+| `x86_pg_exhausted` / `_evictions` | 0 / 0 | **0 / 0** |
+
+So the load this title needed is not a memory problem at any point: nothing was
+evicted, nothing was exhausted, and nothing came up short. **The two open
+questions are now (1) `IN 0x22A` ×64,000 — a Sound Blaster detect spinning on
+an unmodelled port, and (2) the `X86_EXIT_UNIMPLEMENTED` with `exit_info=0x0F`
+that ends the run.** The screen at the stop is mode 13h and black: it dies
+before painting. Neither question is the pager's and neither is the loader's.
+
+Everything from here down is the ORIGINAL measurement, kept because it is the
+before-picture and because its DOS-call trace is still the right description of
+what the launcher does.
 
 Measured 2026-08-15, gwemu tier 2, `EPIC_PINBALL.dsk` (11.7 MB), stock master,
 `X86_PROBE=0` (rings only — the accumulator's RAM_EMU cost is not needed to
@@ -373,6 +399,8 @@ measurement to take is a table's working set, not the launcher's.
 
 **Next blocker, one line: `INT 21h AH=4Bh`.** Nothing beyond it has been
 measured, so no further claim about this title is supported.
+*(Superseded — see the UPDATE at the top of this section. The prediction in the
+row above was right: SB probing is exactly what showed up once EXEC landed.)*
 
 ## Protected mode — SIZED, not started
 

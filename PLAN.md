@@ -101,18 +101,19 @@ Also live here, measured and sized, unblocked whenever a slot frees:
    four 16 KB windows at `E000:0000` must be folded and pinned on map / released
    on unmap. Logical pages are pager pages at linear 4 MB. Advertises 1024 KB,
    **0 with no pagefile**. `tests/test_ems.py`, `x86_ems.h`.
-3. ~~**INT 21h AH=4Bh EXEC**~~ — BUILT (AL=00; AL=01/03 refused loudly), and
-   **OFF in the shipping core** (`X86_DOS_EXEC`, `Makefile.core`). Shares
-   `dos_load_mz()` with the first program; the parent resumes through its OWN
-   stacked INT 21h frame, so the stub's IRET is the only transfer. Real parent
-   and child in `tests/test_dos.py`, three negative controls seen to fail.
-   **WHY IT IS OFF: WOLF3D CALLS AH=4Bh AL=00 WITH A LOADABLE IMAGE** and
-   honouring it kills it — `guest_insns_total`=0, `guest_exit_reason`=**5
-   (MEM_FAULT)**, golden gate: no picture. Bisected at tier 2: refusing first
-   PASSES, doing the LOAD then undoing it FAILS, and the old AX=0001 on a
-   failed load still FAILS — so the load SUCCEEDS and it is the load that
-   kills. **EXEC's blocker is MEMORY, not DOS semantics**: ~30 untouched guest
-   pages, mid-run, with the pool already full. Queue A, and it gates the flag.
+3. ~~**INT 21h AH=4Bh EXEC**~~ — BUILT **and now ON in the shipping core**
+   (`X86_DOS_EXEC` defaults to 1). AL=00h and AL=03h; AL=01h refused loudly.
+   Shares `dos_load_mz()` with the first program; the parent resumes through
+   its OWN stacked INT 21h frame, so the stub's IRET is the only transfer.
+   Real parent and child in `tests/test_dos.py`, 9 negative controls seen to
+   fail. **The "WOLF3D calls AL=00h and honouring it kills the title" finding
+   is RETRACTED** — `x86_dos_execs=0` over 340 M instructions says WOLF3D never
+   reaches the call, the golden is 0.000% with the flag on, and the flag costs
+   no pager frames (159 either way). See STATUS.md's Retractions.
+   **EPIC PINBALL is past "Please run SETUP!" on it** and now stops on an
+   unimplemented opcode (`exit_info=0x0F`) with a Sound Blaster detect spinning
+   on `IN 0x22A`; neither is a memory problem (`x86_pg_exhausted=0`,
+   `evictions=0`, `x86_dos_load_short=0`). `docs/13`.
 
 4. **DPMI** (INT 2Fh AX=1687h, INT 31h) — needs 1 and the descriptor walk from
    5. This is what DOS/4GW actually asks for; VCPI is the fallback it tries

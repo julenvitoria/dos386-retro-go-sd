@@ -1365,27 +1365,34 @@ static int dos_exec_child(void)
 
 #if !X86_DOS_EXEC
     /*
-     * MEASURED, AND THE REASON THIS IS A FLAG.
+     * THE REFUSAL ARM. X86_DOS_EXEC now defaults to 1 (Makefile.core), so this
+     * is reached only by a build that deliberately compiles EXEC out -- which
+     * is what tests/test_dos.py's negative controls do.
      *
-     * WOLFENSTEIN 3-D CALLS AH=4Bh AL=00 WITH A LOADABLE IMAGE, and honouring
-     * it kills the title outright: `guest_insns_total` 0, `guest_halted` 1,
-     * `guest_exit_reason` 5 (MEM_FAULT), golden gate 0.000% -> no picture at
-     * all. Bisected at tier 2 against the WOLF3D golden, one behaviour per
-     * run: refusing AH=4Bh before doing anything PASSES; performing the LOAD
-     * and then freeing it and refusing FAILS. So it is the load, not the
-     * control transfer and not the error code (returning the old AX=0001 for
-     * a failed load still fails, which also proves the load SUCCEEDS).
+     * IT WAS THE DEFAULT for several passes, on a measurement that DID NOT
+     * SURVIVE RE-TESTING. The record said WOLFENSTEIN 3-D calls AH=4Bh AL=00h
+     * with a loadable image and that honouring it killed the title
+     * (guest_insns_total 0, guest_exit_reason 5 MEM_FAULT, no picture), the
+     * mechanism being a child image copied into ~30 untouched guest pages with
+     * the pager's pool already full. Re-measured at tier 2 on this tree:
      *
-     * The mechanism is memory, not DOS semantics: a child image is copied into
-     * ~30 guest pages that have never been touched, mid-run, with the pager's
-     * pool already full of the parent's working set. A machine with 160 frames
-     * and no pagefile has nowhere to put them, so the next guest access faults
-     * unresolvably. That is Queue A territory, not Queue C's.
+     *   WOLF3D DOES NOT CALL AH=4Bh AT ALL in the graded window.
+     *   x86_dos_execs=0 and x86_dos_overlays=0 over 340 M instructions;
+     *   x86_dos_load_bytes=109,927 is WOLF3D.EXE itself, loaded by the LAUNCH
+     *   path (dos_load_mz() at the x86_dos_start() call site), which is not
+     *   this switch. x86_pg_exhausted=0, evictions=0, load_shorts=0,
+     *   x86_pg_frames_total=159 -- the same 159 the flag-off build gets, so
+     *   the flag costs no frames either.
      *
-     * Everything above this point is real, tested (tests/test_dos.py, three
-     * negative controls) and unchanged by the flag; only the SWITCH is gated,
-     * and gated off it returns exactly what the default arm returned before
-     * this work -- CF=1, AX=0001 -- so the shipping core behaves as it did.
+     * The reported signature -- zero instructions with every other counter
+     * healthy -- is the RAM_EMU starvation trap documented in STATUS.md's
+     * Budgets row, which took out three instrumented builds in one session.
+     * Attributing it to the loader cost this flag several passes; the number
+     * that would have caught it is x86_dos_execs, which nobody read.
+     *
+     * Everything above this point is real and tested (tests/test_dos.py, its
+     * negative controls); only the SWITCH is gated, and gated off it returns
+     * CF=1, AX=0001 exactly as the default arm did before any of this work.
      */
     x86_hle_unhandled_vector = 0x21;
     x86_hle_unhandled_func = 0x4B;

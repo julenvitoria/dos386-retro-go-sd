@@ -425,14 +425,17 @@ python3 scripts/probe_report.py --title wolf3d --settle 30
 python3 scripts/probe_report.py --rom .../GAME.dsk --name mygame
 python3 scripts/probe_report.py --title keen4 --skip-build --skip-cost   # fast
 python3 scripts/probe_report.py --compare before.json after.json
-python3 scripts/probe_report.py --title darkforces \
-    --core-flag X86_DOS_EXEC=1 --skip-cost      # measure a NON-DEFAULT core
+python3 scripts/probe_report.py --title epicpinball \
+    --core-flag X86_DOS_EXEC=0 --skip-cost      # measure a NON-DEFAULT core
 ```
 
 `--core-flag NAME=VALUE` (repeatable) is passed straight to `Makefile.core`. It
 exists because the useful question is often "what does the title ask for once we
-ANSWER something the shipping core refuses" — Dark Forces cannot be diagnosed at
-all without `X86_DOS_EXEC=1`, which is 0 by default. The flags are recorded in
+ANSWER something the shipping core refuses" — Dark Forces could not be diagnosed
+at all until `X86_DOS_EXEC=1`, which was 0 by default at the time. It works the
+other way round too, and that is how the flip to `X86_DOS_EXEC=1` was graded:
+`--core-flag X86_DOS_EXEC=0` rebuilds the OLD behaviour so a title's before and
+after come from the same runner. The flags are recorded in
 the report's `meta.core_flags`, so **a report on a non-default core says so on
 its face**; without that a number gets quoted later as if it described the
 shipping build.
@@ -1444,11 +1447,9 @@ python3 tests/test_dos.py --negative     # 9 controls: rollback, largest,
                                          # and BP are deliberately unlike the
                                          # parent's, or a core that restores
                                          # nothing still lands on a plausible
-                                         # frame. Needs X86_DOS_EXEC=1, the
-                                         # default everywhere EXCEPT the
-                                         # shipping core (Makefile.core sets 0;
-                                         # honouring AH=4Bh kills WOLF3D --
-                                         # see the flag's comment there).
+                                         # frame. Needs X86_DOS_EXEC=1, which
+                                         # is now the default EVERYWHERE, the
+                                         # shipping core included.
                                          # ALSO the OVERLAY arm (AH=4Bh AL=03h):
                                          # a real HOST.EXE overlay-loads a real
                                          # OVL.EXE into a segment IT chose and

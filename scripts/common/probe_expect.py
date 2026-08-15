@@ -246,24 +246,20 @@ INT = {
     (0x21, 0x3B): _e("unanswered", "chdir"),
     (0x21, 0x45): _e("unanswered", "dup handle"),
     (0x21, 0x46): _e("unanswered", "dup2 / force duplicate handle"),
-    # AH=4Bh is GATED. x86_dos.c implements AL=00h and AL=03h, but
-    # Makefile.core ships X86_DOS_EXEC=0, so in the SHIPPING core every
-    # subfunction is refused -- which is what the bare (0x21, 0x4B) entry
-    # describes and why it stays "unanswered". The subfunction entries below
-    # describe the X86_DOS_EXEC=1 build, the only one in which they are
-    # reachable; a report built that way must pass --core-flag X86_DOS_EXEC=1
-    # and says so in its meta.
+    # AH=4Bh: AL=00h and AL=03h are implemented and X86_DOS_EXEC now ships as
+    # 1, so both are live in the SHIPPING core. AL=01h (load, do not execute)
+    # is still refused, which is what the bare (0x21, 0x4B) entry describes.
     (0x21, 0x4B): _e("unanswered", "EXEC: load and run a child program",
                      "a title that shells out to a setup program needs this"),
     (0x21, 0x4B, 0x00): _e("implemented",
-                           "EXEC AL=00h load-and-go, with X86_DOS_EXEC=1 ONLY "
-                           "-- the shipping core refuses it, because honouring "
-                           "it kills WOLF3D on memory (see the flag comment in "
-                           "x86_dos.c)",
+                           "EXEC AL=00h load-and-go. Live in the shipping "
+                           "core: EPIC_PINBALL's launcher gets past 'Please "
+                           "run SETUP!' on it, loading an 83,912 B child with "
+                           "x86_dos_load_short=0",
                            "load a child, build its PSP and transfer to it"),
     (0x21, 0x4B, 0x03): _e("implemented",
-                           "EXEC AL=03h LOAD OVERLAY, with X86_DOS_EXEC=1 ONLY "
-                           "-- the image is placed at the caller's segment and "
+                           "EXEC AL=03h LOAD OVERLAY -- "
+                           "the image is placed at the caller's segment and "
                            "relocated by the caller's factor; returns CF=0 "
                            "AX=DX=0 and transfers nothing",
                            "load an image into a caller-supplied segment; no "
