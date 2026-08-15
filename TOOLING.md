@@ -426,7 +426,25 @@ python3 scripts/probe_report.py --compare before.json after.json
 Boots a named title, lets it run **from its first instruction** (no settle-then-
 reset — the startup probes *are* the subject), and writes one report to
 `build/artifacts/probe_<title>_<target>.md` plus the same content as JSON.
-Presets: `keen4`, `wolf3d`, `topbench`, `alleycat`.
+Presets: `keen4`, `wolf3d`, `topbench`, `alleycat`, `darkforces`.
+
+##### `X86_PROBE=1` CAN TAKE THE PAGER TO ZERO FRAMES — check the run ran
+
+The accumulator costs ~3.5 KB of RAM_EMU and **`guest_ram` is the last claim out
+of that pool**, so the instrumented build can push it over the edge:
+`ram_malloc()` returns NULL, `x86_pg_frames_total` reads **0**, every guest
+access is `X86_EXIT_MEM_FAULT` and the guest halts before its first instruction.
+`core_dtcm_ok`, `pgf_result` and `x86_xms_total_kb` are all still healthy —
+that is the trap. Measured on `darkforces` and reproduced on `wolf3d` as a
+control, both dead with `core_ready=0`; the same core with `X86_PROBE=0` runs
+WOLF3D at 160 frames and 190 M instructions.
+
+The report used to print "Nothing. Every service and port this title touched was
+answered" on exactly that run, which is true and completely misleading. It now
+leads with **THIS REPORT IS VOID — THE GUEST NEVER RAN** whenever `core_ready`
+or `guest_insns_total` is 0. When you see it, re-measure with the rings against
+a build without the accumulator: `probe.py --dos-log --io-log --watch …` answers
+the same question and costs no RAM_EMU.
 
 **The report leads with what we did NOT answer**, then with the hardware we
 answered *absent*, and only then lists everything that worked. The column that

@@ -101,6 +101,14 @@ TITLES = {
         "what": "TOPBENCH's menu: CGA text mode 3, a database read, an INT 16h "
                 "poll loop. It probes the machine deliberately and by design.",
     },
+    "darkforces": {
+        "rom": f"{ROM_DIR}/STAR_WARS_DARKFORCES.dsk",
+        "timeline": "timelines/start-preselected-game.tl",
+        "settle": 28.0, "cmdtail": 1,
+        "what": "Star Wars: Dark Forces. A DOS/4GW title -- the question is "
+                "which memory manager it asks for (XMS, EMS, VCPI, DPMI) "
+                "before it refuses to start.",
+    },
     "alleycat": {
         "rom": f"{ROM_DIR}/ALLEYCAT.dsk",
         "timeline": "timelines/profile-alleycat.tl",
@@ -268,6 +276,7 @@ def render(doc):
     m = doc["meta"]
     rows = doc["rows"]
     blk = doc["block_meta"]
+    ctx = doc.get("context", {})
 
     a(f"# Probe report: {m['title']} on {m['target']}")
     a("")
@@ -278,6 +287,35 @@ def render(doc):
     a("")
     a(TRUST_HW if m["target"] == "hardware" else TRUST)
     a("")
+
+    # ---- THE CORE HAS TO HAVE RUN, and X86_PROBE=1 is why it might not -----
+    #
+    # X86_PROBE=1 costs ~3.5 KB of RAM_EMU, and RAM_EMU's last claim is
+    # guest_ram -- the pool the demand pager lives in. When that claim fails,
+    # ram_malloc() returns NULL, x86_pg_frames_total is 0, EVERY guest access
+    # is X86_EXIT_MEM_FAULT and the guest halts before its first instruction.
+    # The core still sets core_dtcm_ok, still opens the pagefile and still
+    # advertises XMS, so a reader skimming the context table sees a healthy
+    # machine. This report then printed "Nothing. Every service and port this
+    # title touched was answered", which is TRUE and completely misleading.
+    # Measured on Dark Forces and reproduced on WOLF3D as a control.
+    if not ctx.get("core_ready") or not ctx.get("guest_insns_total"):
+        a("> # THIS REPORT IS VOID -- THE GUEST NEVER RAN.")
+        a(">")
+        a(f"> `core_ready`={ctx.get('core_ready')}, "
+          f"`guest_insns_total`={ctx.get('guest_insns_total')}, "
+          f"`guest_exit_reason`={ctx.get('guest_exit_reason')}. Nothing below "
+          "is evidence about this title -- an empty 'what we did NOT answer' "
+          "section here means nobody asked anything, not that we answered "
+          "everything.")
+        a(">")
+        a("> **First suspect: `X86_PROBE=1` itself.** It costs ~3.5 KB of "
+          "RAM_EMU and `guest_ram` is the last claim out of that pool, so the "
+          "instrumented build can take the pager's frames to zero. Check "
+          "`x86_pg_frames_total` with `scripts/probe.py` -- a 0 there is this "
+          "failure -- and re-measure with the rings (`--dos-log`, `--io-log`, "
+          "`--watch`) against a build WITHOUT the accumulator.")
+        a("")
 
     if blk.get("never_ran"):
         a("> **THE ACCUMULATOR WAS NEVER TOUCHED.** The build has "
