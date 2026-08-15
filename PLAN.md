@@ -35,167 +35,84 @@ tier that sees the pipeline, peripheral init or real memory ordering.
 
 ### Queue A — make the shipped titles good
 
-**Owner's definition (this supersedes the old A/B split).** Everything that is
-not Dark Forces lives here.
+Everything that is not Dark Forces. **Done this session:**
 
-1. **Per-game `.cfg`** — bring the prior port's implementation over; the owner
-   wants to KEEP that design. It is already a clean two-layer split and both
-   halves are in-tree:
-   - `references/8086tiny/dos_settings.{c,h}` owns the FORMAT and the policy —
-     defaults, ranges, what a corrupt file means, what is written and omitted —
-     and deliberately does NO I/O, which is what let it be tested without a
-     machine (`test286/runsettings.sh`).
-   - `references/dos_port_prior/dos_settings_rg.{c,h}` is the retro-go binding:
-     work out the path, read the bytes, hand them over; write them back on a
-     menu change. Cold path only.
-   Scope is **every Options entry AND launch parameters** per title, not just
-   the CPU profile. We already have `odroid_dialog_choice_t` options
-   (`src/main.c:2138`, the CPU profile callback) to feed it.
-   **The trap is recorded in that header and must be honoured: `MAX_OPEN_FILES`
-   is 8 across the WHOLE firmware, the DOS core already holds three for its
-   entire run plus one for the pagefile, and exhaustion is SILENT — every other
-   `fopen()` starts returning NULL and the UI degrades with nothing logged. The
-   launcher once rendered as diamonds because of it.** Open, read, close; never
-   hold a handle. Load BEFORE `dos_cpu_init()`'s equivalent here, because a
-   setting read on the segment-load path applied late looks intermittent.
-2. ~~**Guest RAM -> NOR backup path**~~ — DIAGNOSED and FIXED IN CODE, **not yet
-   confirmed on silicon**. It is a watchdog, and the flash is innocent: the
-   firmware's transport kicks throughout (`OSPI_Program()` per 256-byte page,
-   and its comment names the **~472 ms WWDG window**; `OSPI_Erase()` per
-   command; the SD driver in its busy-waits). The two un-kicked stretches are
-   ours: (a) the snapshot is a **menu callback**, so the frame loop's
-   once-per-frame refresh is absent for all 1,595–1,614 ms of it, and
-   `x86_nor_attach()`'s 640 KB XIP readback touches neither driver; (b) **the
-   first slice after the attach** runs the AXI-tuned `max_slice` at NOR prices,
-   with every access and every instruction fetch now trapping to OCTOSPI — and
-   the slice regulator corrects by 1/8 per frame, so it cannot save a frame it
-   does not survive. (b) is what matches "seems to work, then bluescreens".
-   Fixed by kicking across all three of ours and resetting the regulator to
-   `MAX_SLICE_FLOOR` (debt cleared) at attach.
-   **What is left is one tier-3 run**: read `nor_snap_wdog_gap_ms` (worst gap
-   between kicks) against 472 ms, and `guest_exec_ms` on the frames after the
-   attach. The device was held by another agent all session.
-   Also settled: `test_nor` fails because its opening store to `0x90000000`
-   **bus-faults** — the harness never sets OCTOSPI up, so the arm's premise is
-   false. Separate fix, in `tests/main.c`. `tests/test_nor_wdog.py` covers the
-   heartbeat without that window (12 checks; negative control 5/12 seen to fail).
-3. **Sound Blaster** — not implemented at all. Ports 0x220/0x388 are unanswered.
-   Size it against what real titles actually probe rather than against the
-   spec; Epic Pinball and Mortal Kombat diagnoses are being measured now and
-   will say what is really asked for.
-4. **Epic Pinball** — if it is not running by the time 1-3 are done, making it
-   run is the LAST task in Queue A.
+1. ~~**Per-game `.cfg`**~~ — dosbox.conf syntax, prior port's two-layer split kept
+   (`x86_settings.{c,h}` owns format+policy with NO I/O, so it is gradeable at
+   tier 1; `x86_cfg.{c,h}` parses; `src/main.c` binds). All Options plus
+   `[autoexec]` launch parameters, per title. **Trap honoured**: `MAX_OPEN_FILES`
+   is 8 firmware-wide and exhaustion is SILENT — open, read, close, never hold.
+2. ~~**Guest RAM -> NOR watchdog**~~ — the flash was innocent (the firmware kicks
+   the dog in `OSPI_Program`/`Erase` and the SD busy-waits). Both un-kicked
+   stretches were ours: the snapshot is a menu callback outside the frame loop,
+   and the slice regulator moves by 1/8 per frame while an attach changes the
+   price of an instruction in ONE step. `nor_snap_wdog_gap_ms` is the witness.
+   **Currently unreachable anyway**: RAM_EMU is short of a 160-frame pool, so
+   `guest_ram_pages != 160` refuses the snapshot (`nor_snap_result=2`).
+3. ~~**Sound**~~ — SB16 (8237 DMA, IRQ 5 via the 8259, DSP 4.05, CT1745 mixer,
+   `BLASTER`) **and** OPL2 FM via **emu8950**, vendored from the owner's gnw-doom
+   with its tuned `-D` set and its 16.16 linear resample (zero-order hold buzzes
+   at ~1.7 kHz — measured there, not re-derived). **Prince of Persia plays
+   digitised sound; Wolf3D plays BOTH** (digitised once enabled in the title's
+   own setup; music `keyons=48`, `audio_peak_max` 337). Cost: **6 pager frames**
+   and ~5.9% of wall for Wolf3D's actual music, 10.4-13.8% worst case.
+   `X86_OPL_FM=0` returns every byte.
+4. **Epic Pinball** — past its EXEC wall, reaches mode 13h, programs the mixer
+   and 22,050 Hz. Now stops on `0F A0` PUSH FS, still real mode. **The closing
+   task of Queue A.**
 
-Also live here, measured and sized, unblocked whenever a slot frees:
+**Open, measured, sized:**
 
-- **The 433 ms pagefile writeback** — `x86_pg_wb_us_worst` on silicon, against
-  23 ms for an ordinary sector read, and it GROWS over a session. The per-page
-  `fopen`/`fclose` is already fixed; `pgf_us_seek` vs `pgf_us_write` says what
-  the rest is and `FF_USE_FASTSEEK 0` is the suspect (`f_lseek` walks the
-  cluster chain from byte zero every call). Gates Keen and everything
-  EMS/XMS-backed.
-- **`REP STOSW`'s per-element planar hook** — ~3% of wall. The page cannot
-  change mid-`REP`, so the decision is resolvable ONCE instead of ~38 times.
-- **Keen 4's watchdog wedge** — 34.7 M instructions over 944 frames, then it
-  stops; `boot_magic=0xbad00005`. Being measured now.
-- **Wolf3D** is visually done (owner's verdict). What remains is FRAME RATE and
-  sound. Remaining measured levers: the `REP STOSW` hook, aperture reads
-  (~4.5%), and the 1,242-cycle `OUT` (`ega_shadow_rebuild()` on GC writes).
+- **Keen 4 has no music, and it is NOT the synthesiser.** `opl_writes`=264 (the
+  detect plus id's 245-register zero pass), `keyons`=**0** — its driver never
+  writes a note. Config is right (`CONFIG.CK4`: `SoundMode=2`, `MusicMode=1`),
+  detection works (`opl_timer_expiry=1`), and Wolf3D drives the identical path
+  and sounds. **Lead: `INT 08h` reaches our stub ~16/s — the 18.2 Hz chained
+  BIOS rate, not the 140 Hz music tick Keen should program.** Grade the ISR
+  rate, not FM.
+- **Keen's intro is clipped** — the card is the arena's best CONTIGUOUS run, and
+  a claim cannot span regions, so growing it means growing the arena, not
+  borrowing frames. 200 rows at `crtc_start=15360`/pitch 64 needs 28,160
+  offsets; the pan drives the start higher still (`x86_vga_planar_lost`).
+- **Wolf3D's weapon sprite** is corrupt — deterministic, byte-identical across
+  captures, so gradeable.
+- **The game port**: Wolf3D issues **2.35 M `IN 0x201`** reads, unmodelled and
+  larger than everything sound-related combined.
+- `REP STOSW`'s per-element planar hook (~3% of wall); aperture reads (~4.5%).
 - Retro-go's Pause overlay is unreadable over 256-colour modes.
 
 ### Queue B — Dark Forces. NOT DONE UNTIL DARK FORCES RUNS.
 
-**Nothing here starts before the step above it is measured.**
+**Nothing here starts before the step above it is measured.** Every blocker so
+far has been a missing DOS service or a memory gap — never the thing that was
+predicted.
 
-1. ~~**XMS**~~ — built. A BLOCK-COPY interface, so its memory is never folded
-   and costs the interpreter nothing; it lives in `x86page.swp` above every
-   pager slot. Advertises 4 MB, **0 with no pagefile**. WOLF3D uses it
-   unprompted at a 4% frame cost. [`docs/12`](docs/12_memory_tiers.md) §6.
-2. ~~**EMS**~~ — built (LIM 3.2). The OPPOSITE shape: a MAPPED interface, so the
-   four 16 KB windows at `E000:0000` must be folded and pinned on map / released
-   on unmap. Logical pages are pager pages at linear 4 MB. Advertises 1024 KB,
-   **0 with no pagefile**. `tests/test_ems.py`, `x86_ems.h`.
-3. ~~**INT 21h AH=4Bh EXEC**~~ — BUILT **and now ON in the shipping core**
-   (`X86_DOS_EXEC` defaults to 1). AL=00h and AL=03h; AL=01h refused loudly.
-   Shares `dos_load_mz()` with the first program; the parent resumes through
-   its OWN stacked INT 21h frame, so the stub's IRET is the only transfer.
-   Real parent and child in `tests/test_dos.py`, 9 negative controls seen to
-   fail. **The "WOLF3D calls AL=00h and honouring it kills the title" finding
-   is RETRACTED** — `x86_dos_execs=0` over 340 M instructions says WOLF3D never
-   reaches the call, the golden is 0.000% with the flag on, and the flag costs
-   no pager frames (159 either way). See STATUS.md's Retractions.
-   **EPIC PINBALL is past "Please run SETUP!" on it** and now stops on an
-   unimplemented opcode (`exit_info=0x0F`) with a Sound Blaster detect spinning
-   on `IN 0x22A`; neither is a memory problem (`x86_pg_exhausted=0`,
-   `evictions=0`, `x86_dos_load_short=0`). `docs/13`.
-
-3b. ~~**LMSW**~~ — BUILT (`0F 01 /6`), and it is what actually blocked Dark
-   Forces AND Mortal Kombat. Both were reported as dying on "unimplemented
-   opcode `0x0F`" at one address shared with Epic Pinball; **that convergence
-   was our own exit reporting** (`.exit_loop` named the 0F ESCAPE, and the
-   reported `CS` was never read from the CPU), and the three titles were on
-   three different opcodes. Epic Pinball's was `0F AF` IMUL, also built.
-   **`CR0=1` on both now — the descriptor walk of 5 is exercised by a real
-   title for the first time and it HELD** (`CS=0x0070`, a GDT selector).
-   [`docs/13`](docs/13_title_status.md).
-
-4. **DPMI** (INT 2Fh AX=1687h, INT 31h) — needs 1 and the descriptor walk from
-   5. This is what DOS/4GW actually asks for; VCPI is the fallback it tries
-   first. **INT 2Fh answers only AX=43xx today**, so 1687h and DE00h both
-   return with the guest's registers untouched.
-5. **Protected mode** — **the DESCRIPTOR WALK is BUILT and PROVEN**
-   (`x86_pmode.c`, `tests/test_pmode.py` 80 checks,
-   `scripts/run_pmode_controls.py` 10/10 negative controls SEEN TO FAIL).
-   `LGDT`/`LIDT`/`LLDT`, the GDT/LDT fetch and its bound, the type/DPL/present
-   rules with the right vector and error code, the cached per-segment
-   descriptor, `CR0.PE` both ways, a same-privilege far JMP.
-   **It costs real mode NOTHING, proven by disassembly diff**: `L(SET_SREG)`
-   was already the single funnel for every segment load and already tested
-   `CR0.PE`, so only the branch target changed; the fetch loop and every opcode
-   handler are byte-identical. +912 B ITCM, +704 B RAM_EMU.
-   **NO LONGER UNEXERCISED, AND THE NEXT STEP IS NOW MEASURED DEMAND.** With
-   LMSW built (3b), Dark Forces and Mortal Kombat both reach `CR0=1` and both
-   stop on the SAME thing: `exit_info=0xCD`, an `INT imm8` with PE set, which
-   `L(HANDLE_INTERRUPT)` refuses because the gate path needs descriptor
-   validation and a possible stack switch. **Protected-mode IDT gate dispatch
-   is therefore the next item here, and two titles are waiting on it** -- it is
-   no longer sized against nothing.
-   REMAINING, each its own step, none started: call gates, `IRET` across
-   privilege, stack switches, paging, and per-access SEGMENT LIMIT enforcement
-   (the predicate is written and tested; putting it on the access path for free
-   needs a protected-mode MODE-RECORD axis — the same trick `66`/`67` already
-   use — which doubles the record block and needs a second `DECODE_MODRM` in
-   ITCM).
-   **V86 is not needed** — INT 21h is HLE'd. The "not sized against Dark
-   Forces / never executed one protected-mode instruction" note that stood here
-   is RETRACTED: it executes them now.
-   *Two references, for two different things:* `references/tiny386`
-   (i386.c:1076) for the compact SHAPE, `references/dosbox-x`
-   (src/cpu/cpu.cpp:2976) for the RULES — tiny386 has NO permission checks, its
-   own `// TODO` says so, so copying it wholesale produces checks that can never
-   fire. [`docs/14`](docs/14_protected_mode.md).
-6. **Dark Forces** — RE-MEASURED 2026-08-15, tier 2, XMS and EMS live with a
-   pagefile (`x86_pg_frames_total`=160, `x86_xms_total_kb`=4096,
-   `x86_ems_total_pages`=64). **The pre-XMS verdict is wrong and must stop being
-   quoted.** The screen does read `Not enough memory on exec` / `Bad format on
-   exec`, but those are DOS/4GW STUB strings and the cause is not memory:
-   `x86_hle_unhandled_vector`=0x21, `x86_hle_unhandled_func`=**0x4B**. DARK.EXE
-   opens `DF/dos4gw.exe` and EXECs it, we answer "invalid function", the stub
-   prints its error and the guest derails into the IVT (`guest_exit_reason`=4,
-   EIP 0x5E, opcode 0x63). **It never asks for extended memory at all**:
-   `x86_xms_detects`=0, `x86_ems_device_opens`=0, and no INT 2Fh 1687h/DE00h.
-   Its only memory refusal is `AH=4Ah` grow-past-a-neighbour returning error 8,
-   which is real DOS semantics (A1).
-
-**The Dark Forces re-measure after EXEC is NOT DONE, and the reason is
-tooling**: `probe_report.py` reports `core_ready`=0 / `guest_insns_total`=0 for
-`darkforces` AND `wolf3d` — the `X86_PROBE=1` RAM_EMU trap in `CLAUDE.md`,
-VERIFIED ON MASTER with this branch stashed. There is no working "what did it
-ask for" instrument until that is fixed.
-
-**Measure at each step, not at the end.** Twice now this chain has been judged
-on an artefact: first a 640 KB denominator that existed only because no
-pagefile was wired, then a message that named the wrong subsystem.
+1. ~~**XMS**~~ — a COPY interface, never folded, costs the interpreter nothing.
+2. ~~**EMS**~~ — the opposite shape: MAPPED, so pinned on map and released on
+   unmap. Both advertise **0 with no pagefile**, by design.
+3. ~~**`INT 21h AH=4Bh` EXEC**~~ — `AL=00h` and `AL=03h` (overlay). Default ON;
+   the "honouring it kills Wolf3D" finding did not survive re-testing (Wolf3D
+   never calls it — that was the RAM_EMU starvation trap wearing a disguise).
+4. ~~**`AH=52h` list-of-lists / `AH=29h` parse filename**~~ — unpopulated chains
+   are `0xFFFF:0xFFFF`, DOS's own end-of-chain marker, so a guest that WALKS one
+   stops and one that INDEXES one faults visibly, rather than computing from
+   plausible garbage.
+5. ~~**The HMA**~~ — backed with real frames when A20 is open, alias when masked,
+   and the pager may not write those entries even to unmap. This unblocked
+   **two** titles.
+6. ~~**Protected mode: the descriptor walk**~~ — and it is now EXERCISED. Dark
+   Forces and Mortal Kombat both reach `CR0=1` with `CS=0x0070`, a real GDT
+   selector (base `0xA900`, not `sel<<4`). **They get there by `LMSW`, not
+   `MOV CR0`** — an extender must also run on a 286, so `0F 22` is never issued,
+   which is why this took so long to exercise. Real mode pays NOTHING, proven by
+   disassembly diff.
+7. **NEXT: protected-mode IDT gate dispatch.** Both titles now stop on
+   `INT imm8` with `CR0.PE` set — `L(HANDLE_INTERRUPT)` exits. **Measured demand
+   from two titles**, which is the first time this item has had any.
+8. Then: far transfers and call gates, `IRET` across privilege, stack switches,
+   paging, and per-access segment limit enforcement (the predicate is written
+   and tested; making it free needs a protected-mode mode-record axis — the same
+   trick `66`/`67` already uses).
 
 ### Queued — SylverB's FatFs DMA + SPI perf work
 
