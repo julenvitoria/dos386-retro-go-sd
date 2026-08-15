@@ -364,7 +364,10 @@ loop and say nothing. Read `x86_frame_phase` instead.
 | `guest_slice_overruns` | sub-slice loops abandoned by the `GUEST_SLICE_WALL_MS` (120 ms) wall-clock escape. Nonzero = a guest budget ran long in TIME; the escape makes that a dropped frame instead of a reset |
 | `guest_asm_ms_worst` / `guest_asm_overruns` | the longest SINGLE `x86_cpu_interp_asm()` call, and how many passed `GUEST_ASM_MS_MAX` (60 ms). One call is uninterruptible, so this is the real exposure; an overrun halves the next budget. Healthy KEEN4 reads **14 ms** |
 | `guest_kips` | emulated CPU speed in thousands of insns/s. **0 = unthrottled, and the default.** `KIPS_*` in `src/main.c` has the profile rungs; the PAUSE/SET menu's "CPU Speed" entry sets it too |
-| `cpu_profile_persisted` / `cpu_profile_events` | what the settings store kept when the menu entry was changed, and how many dialog callbacks reached us. The menu path has no other witness — a malformed options array never calls us at all |
+| `cpu_profile_persisted` / `cpu_profile_events` | what the settings store kept when the menu entry was changed, and how many dialog callbacks reached us. The menu path has no other witness — a malformed options array never calls us at all. NOTE the app-scoped store this reads is per-APP, not per-ROM; the per-TITLE value now lives in `<TITLE>.dosset` and this is the fallback under it |
+| `settings_cfg_status` / `settings_cfg_bytes` / `settings_cfg_applied` | PER-TITLE `.cfg`: the `x86_cfg_status_t` (0 = OK, 1 = ABSENT, 2 = TOOBIG, 3 = BINARY), bytes read, and keys applied. **`bytes` non-zero with `applied` 0 is the normal reading for every title shipped so far** — their `.cfg` files came from the prior port and are entirely comments. `bytes` 0 means no file was found, which is where a wrong path shows up |
+| `settings_dset_status` / `settings_dset_bytes` | PER-TITLE `.dosset` (the user's menu overrides): `x86_settings_status_t`, 1 = ABSENT and is normal until somebody changes a row. Anything ≥ 2 is a corrupt or truncated file and the title ran on defaults |
+| `settings_saves` / `settings_save_errors` | `.dosset` files written, and writes that failed. **A non-zero error count is the `MAX_OPEN_FILES = 8` budget** as often as it is a full card |
 | `frame_10us_avg` | mean iteration period, 8x oversampled, in 10 us units. What the firmware's `common_emu_frame_loop()` observer is fed |
 | `upper_filler_ok` | is 0xA0000-0xFFFFF backed? It comes from the bonus pool now, but a 0 here explains an option-ROM scan faulting |
 | `guest_insn_deficit` | instructions the emulated CPU owed and never ran. The answer to "I asked for a 386 — am I getting one?". Meaningful only in paced mode |
@@ -1561,6 +1564,34 @@ python3 tests/test_audio.py              # PC-speaker wave generator, NATIVE --
                                          # by side, because a wrong pitch is
                                          # invisible in a screenshot and
                                          # unjudgeable under gwemu
+python3 tests/test_settings.py           # PER-TITLE SETTINGS, NATIVE -- no
+                                         # target at all. Compiles
+                                         # tests/host_settings.c against
+                                         # x86_settings.c + x86_cfg.c with the
+                                         # host cc: defaults, ranges, the round
+                                         # trip, a corrupt file (every
+                                         # CRC-protected byte flipped in turn),
+                                         # a truncated one, an unknown version,
+                                         # an unknown pair id CARRIED across a
+                                         # downgrade, the DOSBox .cfg syntax
+                                         # ([cpu]/[dos]/[autoexec]) and the
+                                         # three layers. 266 checks, ~1 s.
+                                         # Those two modules do NO I/O by
+                                         # design, which is the whole reason
+                                         # this is gradeable without a machine;
+                                         # the path/open/read/close half lives
+                                         # in src/main.c and is tier 2
+python3 tests/test_settings.py --negative
+                                         # SIX negative controls, each a build
+                                         # with one guard compiled out
+                                         # (X86_SETTINGS_CTL_NOCRC / _NORANGE /
+                                         # _NOVERSION / _TRUNCSTR,
+                                         # X86_CFG_CTL_NOBINARY / _NOTOOBIG).
+                                         # Every one MUST make the harness fail
+                                         # and the script reports a control that
+                                         # PASSES as its own failure -- a guard
+                                         # that cannot be made to fail was not
+                                         # being tested. 6/6 seen to fail
 python3 tests/test_osk.py                # the on-screen keyboard, driven by
                                          # button MASK exactly as src/main.c
                                          # drives it: the grid press, the

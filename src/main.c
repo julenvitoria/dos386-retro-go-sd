@@ -45,6 +45,8 @@
 #include "x86_pager.h"
 #include "x86_xms.h"
 #include "x86_ems.h"
+#include "x86_settings.h" /* per-title settings: the format and the policy   */
+#include "x86_cfg.h"      /* per-title settings: the DOSBox-syntax .cfg      */
 
 /* Chrom-ART offload for the chained 13h blit. DEFAULT OFF and UNVERIFIED --
    the whole rationale, the price and what tier 2 can and cannot prove are on
@@ -104,6 +106,10 @@ static void dma2d_selftest(void);
 extern void x86_cpu_interp_asm(void);
 static void emulator_loop(const gw_firmware_abi_t *abi);
 static int mount_guest_disk(void);
+/* Per-title settings. Defined beside the CPU-profile menu row, because that row
+   is the only thing that WRITES them; app_main() only has to load them, and it
+   has to do it before emulator_loop() (see the call site). */
+static void settings_load(void);
 
 /* The interpreter dereferences these; it never references the symbols
  * directly, which is what lets one assembly source serve both builds. */
@@ -1336,6 +1342,14 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
      * readable; the host triggers the run deliberately via run_benchmark_flag. */
 
     mount_guest_disk();
+    /* BEFORE emulator_loop(), which calls cpu_profile_init() and then
+       guest_reset() -- and guest_reset() is where the XMS and EMS backing is
+       chosen and the first slice is sized. A setting applied after the machine
+       is up takes effect at some later, unpredictable moment; see the comment
+       on settings_load(). It needs dsk_path, so it cannot move above
+       mount_guest_disk(), and it must not move below emulator_loop(), which
+       never returns. */
+    settings_load();
     emulator_loop(abi);
 }
 
@@ -1954,8 +1968,17 @@ static void guest_reset(void)
            X86_XMS_DEFAULT_KB is what AH=08h will advertise; it is bounded by
            the card and by transfer time, NOT by the AXI pool -- no XMS byte is
            ever in a frame. See x86_xms.h. */
+        /* PER TITLE, when the .cfg says so. `[dos] xms = false` or
+           `xms_kb = N`. "Unspecified" is base_is_set() answering 0, NOT the
+           value 0 -- which is exactly what lets `xms = false` mean "advertise
+           none" and still be distinguishable from saying nothing at all. So a
+           title with no .cfg gets X86_XMS_DEFAULT_KB, unchanged, as it does
+           today. The pagefile still has the final veto: no file, no XMS,
+           whatever a .cfg asked for (the else branch below). */
         x86_xms_set_backing(xms_open, xms_close, xms_read, xms_write,
-                            X86_XMS_DEFAULT_KB);
+                            x86_settings_base_is_set(X86_SET_XMS_KB)
+                                ? (uint32_t)x86_settings_get(X86_SET_XMS_KB)
+                                : X86_XMS_DEFAULT_KB);
     } else {
         x86_pager_set_backing(NULL, NULL);
         /* No file, no extended memory, and INT 2Fh AX=4300h then answers
@@ -2021,7 +2044,22 @@ static void guest_reset(void)
      * open and the INT 67h vector is left on the bare IRET -- absent, rather
      * than present and about to lose the guest's memory.
      */
-    x86_ems_set_backing(pgf_ready ? X86_EMS_PAGES : 0u);
+    /* PER TITLE, same rule and same reason as XMS above: `[dos] ems = false`
+       or `ems_kb = N`, in 16 KB logical pages. The .cfg parser has already
+       refused anything that is not a whole number of pages -- a reservation
+       that cannot hold one leaves a physical frame page pointing at scratch,
+       which is the silent-discard failure x86_ems.c is written around. Capped
+       at X86_EMS_PAGES because that is the aux window the pager was actually
+       given at reset; asking for more could only be honoured by giving less. */
+    {
+        uint32_t pages = X86_EMS_PAGES;
+        if (x86_settings_base_is_set(X86_SET_EMS_KB)) {
+            pages = (uint32_t)x86_settings_get(X86_SET_EMS_KB) / 16u;
+            if (pages > X86_EMS_PAGES)
+                pages = X86_EMS_PAGES;
+        }
+        x86_ems_set_backing(pgf_ready ? pages : 0u);
+    }
 
     /* Everything above 1 MB wraps to the bottom, as it does with A20 masked. */
     x86_mem_wrap_1mb();
@@ -2035,9 +2073,45 @@ static void guest_reset(void)
     char cmdtail[64];
     dsk_startup_ok = 0;
     dsk_exec_rc = 0xFFFFFFFF;
-    if (dsk_mounted && find_startup_program(startup, sizeof(startup),
+
+    /*
+     * ---- THE .cfg's LAUNCH PARAMETERS ---------------------------------------
+     *
+     * `[autoexec]` (or `entry`/`args`/`cwd` written out) OVERRIDES what the
+     * guest's own AUTOEXEC.BAT names. Applied here, between the mount and the
+     * exec, because that is the only point where both the disk is readable and
+     * nothing has been launched yet.
+     *
+     * `use_cmdtail` is the pre-existing knob and keeps its pre-existing meaning
+     * -- it decides whether the GUEST's tail is passed on. It is deliberately
+     * NOT consulted for a tail this file named: an `args` line is somebody
+     * stating the whole launch, and making it conditional on a second setting
+     * would mean a .cfg that reads as complete and silently is not.
+     */
+    if (dsk_mounted && x86_settings_str_is_set(X86_STR_ENTRY)) {
+        const char *e = x86_settings_str(X86_STR_ENTRY);
+        const char *a = x86_settings_str(X86_STR_ARGS);
+        const char *d = x86_settings_str(X86_STR_CWD);
+
+        /* find_startup_program() would otherwise set the CWD itself, so the
+           .cfg's has to be installed instead of it, not before it. */
+        x86_dos_set_cwd(d);
+        snprintf(startup, sizeof(startup), "%s", e);
+        snprintf(cmdtail, sizeof(cmdtail), "%s", a);
+        dsk_startup_ok = 1;
+        /* A tail this file named is passed WHATEVER use_cmdtail says -- see
+           above -- so force the flag the exec below reads rather than adding a
+           second branch to the call. */
+        guest_use_cmdtail = 1;
+        printf("DOS: cfg launch '%s' '%s' in '%s'\n", startup, cmdtail, d);
+    } else if (dsk_mounted && find_startup_program(startup, sizeof(startup),
                                             cmdtail, sizeof(cmdtail)) == 0) {
         dsk_startup_ok = 1;
+        /* PER TITLE now, as well as host-overridable: `use_cmdtail` in the
+           .cfg reaches the same flag the debug backend writes. A .cfg that
+           says nothing leaves it exactly where it was. */
+        if (x86_settings_base_is_set(X86_SET_USE_CMDTAIL))
+            guest_use_cmdtail = (uint32_t)x86_settings_get(X86_SET_USE_CMDTAIL);
         /* Host-overridable command tail. AUTOEXEC.BAT decides by default --
            TOPBENCH.dsk asks for "-l", its continuous scoring loop. Clear
            guest_use_cmdtail (over the debug backend, or here) to launch the
@@ -2190,6 +2264,241 @@ _Static_assert(sizeof(cpu_profile_name) / sizeof(cpu_profile_name[0])
                == (size_t)CPU_PROFILE_COUNT,
                "cpu_profile_name and cpu_profile_kips must stay the same length");
 
+/*
+ * ===========================================================================
+ * PER-TITLE SETTINGS -- the retro-go binding. The other half is x86_settings.c
+ * (the format and the policy) and x86_cfg.c (the DOSBox-syntax text parser),
+ * neither of which does any I/O at all.
+ * ===========================================================================
+ *
+ * Brought over from the prior DOS port, whose split this keeps: THAT is what
+ * lets tests/test_settings.py grade the whole format natively, with no target,
+ * while this file stays small enough to read in one sitting. All of it is COLD
+ * PATH -- once at launch, once per menu change.
+ *
+ * ---- FILE HANDLES. OPEN, READ, CLOSE. NEVER HELD. -------------------------
+ *
+ * MAX_OPEN_FILES is 8 across the WHOLE firmware. This core already holds the
+ * pagefile's handle for its entire run (pgf_fp, and the comment above it says
+ * what re-opening it cost), the launcher holds its own, and EXHAUSTION IS
+ * SILENT: every other fopen() starts returning NULL and the UI degrades with
+ * nothing logged. The prior port records its whole launcher rendering as
+ * DIAMONDS because of exactly this. Each of the three functions below takes at
+ * most ONE handle and gives it back before it returns, and none of them runs
+ * while the pagefile is open -- the two loads happen before guest_reset().
+ *
+ * ---- WHICH FILE IS WHICH ---------------------------------------------------
+ *
+ *   <TITLE>.cfg      HUMAN-AUTHORED, never written by the device. DOSBox
+ *                    syntax. Sits beside the .dsk in /roms/dos, which is where
+ *                    scripts/common/sdcard.py's compose() already copies it.
+ *                    It sets this title's DEFAULTS.
+ *   <TITLE>.dosset   THE DEVICE'S, written when the PAUSE/SET menu changes a
+ *                    row. Binary, CRC'd, and it records ONLY what differs from
+ *                    the default above.
+ *
+ * NOT /CONFIG. That is retro-go's own global config -- it holds the preselected
+ * title and the overclock level and a compose rewrites it wholesale. Per-title
+ * settings are a different file with a different lifetime and a different
+ * owner, and putting one in the other is how a repack silently eats a user's
+ * choices.
+ */
+
+/* Read a whole small file into `buf`, and CLOSE IT. Returns the byte count, 0
+   for "no file" -- which is not an error and is the common case. */
+static size_t settings_slurp(const char *path, unsigned char *buf, size_t cap)
+{
+    const gw_firmware_abi_t *abi = gw_firmware_abi();
+    FILE *f = abi->fopen(path, "rb");
+    size_t n = 0;
+
+    if (!f)
+        return 0;
+    n = abi->fread(buf, 1, cap, f);
+    abi->fclose(f);                 /* OPEN, READ, CLOSE -- never held */
+    return n;
+}
+
+/*
+ * `<TITLE>.dsk` -> `<TITLE><suffix>`, in the same directory. The extension is
+ * REPLACED, not appended, which is the derivation the prior port used and the
+ * one the sidecars already on the card were named by: "KEEN4.dsk" -> "KEEN4.cfg".
+ * Deliberately the same, so the files a title can have have names a user can
+ * predict.
+ *
+ * KEYED ON THE PATH AND NOTHING ELSE -- no size, no CRC. The .dosmeta sidecar
+ * next door is keyed on the image's bytes so that regenerating a .dsk
+ * INVALIDATES it, which is correct for a MEASUREMENT and catastrophic for a
+ * PREFERENCE: rebuilding the disk image must not throw away what the user
+ * chose. The prior port lost a day to that failure in the other direction.
+ *
+ * The cost of the choice, stated honestly: rename a .dsk and the settings do
+ * not follow it. That is what its savestates and its cover art already do.
+ */
+static int settings_path(char *out, size_t cap, const char *suffix)
+{
+    size_t n = 0, cut;
+
+    if (!dsk_path[0])
+        return -1;
+    while (dsk_path[n])
+        n++;
+    cut = n;
+    for (size_t i = n; i > 0; i--) {
+        if (dsk_path[i - 1] == '/')
+            break;
+        if (dsk_path[i - 1] == '.') { cut = i - 1; break; }
+    }
+    {
+        size_t sl = 0;
+        while (suffix[sl])
+            sl++;
+        if (cut + sl + 1 > cap)
+            return -1;
+        memcpy(out, dsk_path, cut);
+        memcpy(out + cut, suffix, sl + 1);
+    }
+    return 0;
+}
+
+/* Instrumentation. The whole point of a settings layer is that it is invisible
+   when it works, which is exactly what makes a broken one indistinguishable
+   from a working one -- so what it did is readable over the probe. */
+volatile uint32_t settings_cfg_status  = 0xFF; /* x86_cfg_status_t             */
+volatile uint32_t settings_cfg_bytes   = 0;    /* .cfg bytes read              */
+volatile uint32_t settings_cfg_applied = 0;    /* keys it applied              */
+volatile uint32_t settings_dset_status = 0xFF; /* x86_settings_status_t        */
+volatile uint32_t settings_dset_bytes  = 0;    /* .dosset bytes read           */
+volatile uint32_t settings_saves       = 0;    /* files written                */
+volatile uint32_t settings_save_errors = 0;    /* writes that failed           */
+
+/*
+ * Read this title's two files and bring them into force, in THIS order.
+ *
+ * The .cfg FIRST because it sets the DEFAULTS, and the .dosset second because
+ * x86_settings_load() resets onto those defaults and then overlays only what
+ * the user changed. The other order would make a file on the card overrule the
+ * user's own menu choices, which is backwards.
+ *
+ * MUST RUN BEFORE guest_reset(). xms/ems backing is chosen inside it, and the
+ * CPU profile feeds guest_kips before the first slice -- a setting applied
+ * after the machine is up takes effect at some later, unpredictable moment,
+ * which is the kind of half-applied state that makes a feature look
+ * intermittent rather than broken. That is the prior port's warning, and it
+ * cost it a session.
+ *
+ * CANNOT FAIL IN A WAY THAT MATTERS, so there is no return value: a missing
+ * file, an unreadable card, a corrupt header and a truncated write all mean
+ * "defaults", and none of them is a reason not to start the title.
+ */
+static void settings_load(void)
+{
+    /* Both buffers are on THIS frame and nowhere else: .overlay/RAM_EMU
+       headroom is the tightest budget in this core (STATUS.md's Budgets), and
+       2 KB that lives for the length of one cold call has no business being
+       static. */
+    char path[sizeof(dsk_path) + 8];
+    x86_cfg_result_t res;
+    x86_cfg_status_t st = X86_CFG_EABSENT;
+
+    {
+        /* ON THE STACK, NOT STATIC, and that is worth 2,049 bytes of RAM_EMU --
+           which is HALF A PAGER FRAME (stride 4,104), i.e. the difference
+           between this feature costing the guest a page of memory and not.
+           RAM_EMU is the tightest budget in this core and the core's own code
+           and bss come out of the same pool the guest's pages do.
+
+           Safe because this runs exactly once, from app_main(), at the shallow
+           end of a 24 KB stack, and the parse copies out everything it keeps
+           (five ints and three short strings in x86_settings.c) before
+           returning. */
+        unsigned char cfgbuf[X86_CFG_MAX_BYTES + 1];
+        size_t n = 0;
+
+        /* Unconditionally, before anything below can go wrong: no .cfg is in
+           force. x86_cfg_parse(NULL, 0, ...) is the documented way to say that
+           and it clears the base itself, so there is no path out of here that
+           leaves a previous title's .cfg behind. */
+        x86_cfg_parse(NULL, 0, &res);
+
+        if (settings_path(path, sizeof(path), ".cfg") == 0) {
+            /* ONE BYTE MORE than the cap, so a file exactly one byte too long
+               is reported TOOBIG rather than silently read as the largest legal
+               file. Truncating is the failure x86_cfg.h refuses. */
+            n = settings_slurp(path, cfgbuf, sizeof(cfgbuf));
+            settings_cfg_bytes = (uint32_t)n;
+            st = x86_cfg_parse(cfgbuf, (unsigned long)n, &res);
+        }
+        settings_cfg_status = (uint32_t)st;
+        settings_cfg_applied = res.applied;
+        {
+            /* The BASE NAME only. The log ring is small and wraps, so the full
+               path is not affordable and is not what a user needs read back. */
+            const char *base = path, *p;
+            for (p = path; *p; p++)
+                if (*p == '/') base = p + 1;
+            x86_cfg_report(base, st, &res);
+        }
+    }
+
+    {
+        unsigned char dbuf[X86_SETTINGS_MAX_BYTES];
+        size_t n = 0;
+
+        if (settings_path(path, sizeof(path), ".dosset") == 0)
+            n = settings_slurp(path, dbuf, sizeof(dbuf));
+        settings_dset_bytes = (uint32_t)n;
+        /* n == 0 covers both "no file" and "empty file", and load() treats that
+           as ABSENT and prints nothing -- a title nobody has configured is the
+           common case, not an event worth a line in a wrapping log ring. */
+        settings_dset_status = (uint32_t)x86_settings_load(dbuf, (unsigned long)n);
+    }
+}
+
+/*
+ * Write the .dosset, but ONLY if something actually differs from what was
+ * loaded.
+ *
+ * THE `dirty` GUARD IS NOT AN OPTIMISATION. Without it every title anyone ever
+ * launched would grow a .dosset recording nothing, and -- worse -- a title that
+ * had merely been LAUNCHED would be pinned to today's defaults for ever, since
+ * a written default is indistinguishable from a chosen one. Changing a default
+ * in firmware has to keep moving every title that never overrode it.
+ */
+static void settings_save(void)
+{
+    const gw_firmware_abi_t *abi = gw_firmware_abi();
+    char path[sizeof(dsk_path) + 8];
+    unsigned char buf[X86_SETTINGS_MAX_BYTES];
+    unsigned long n;
+    FILE *f;
+
+    if (!x86_settings_dirty())
+        return;
+    n = x86_settings_save(buf, sizeof(buf));
+    if (!n || settings_path(path, sizeof(path), ".dosset") != 0)
+        return;
+
+    f = abi->fopen(path, "wb");
+    if (!f) {
+        /* LOUD. This is the one failure a user can actually observe -- they
+           changed a setting and it did not stick -- so it must not be silent,
+           and the likely cause is worth naming at the point of failure rather
+           than in a document nobody is reading at the time. */
+        settings_save_errors++;
+        printf("DOS: settings -- cannot write %s"
+               " (card full, or out of file handles?)\n", path);
+        return;
+    }
+    if (abi->fwrite(buf, 1, n, f) != n) {
+        settings_save_errors++;
+        printf("DOS: settings -- short write to %s\n", path);
+    } else {
+        settings_saves++;
+    }
+    abi->fclose(f);                 /* one handle, and it goes back here */
+}
+
 volatile uint32_t cpu_profile_persisted = 0xFF;  /* what the settings store kept */
 volatile uint32_t cpu_profile_events = 0;        /* dialog callbacks seen      */
 volatile uint32_t cpu_profile_last_event = 0xFF; /* last odroid_dialog_event_t */
@@ -2236,10 +2545,31 @@ static bool cpu_profile_cb(odroid_dialog_choice_t *option,
     if (event == ODROID_DIALOG_PREV || event == ODROID_DIALOG_NEXT) {
         const gw_firmware_abi_t *abi = gw_firmware_abi();
         cpu_profile_apply(idx);
+
+        /*
+         * PER TITLE, and this is the change the whole feature exists for. The
+         * app-scoped store below keys on "%.12s.%d" % (key, app->id) -- the
+         * APP, not the ROM -- so it held ONE CPU speed shared by every DOS
+         * title on the card. Setting Wolf3D to 486DX2 set it for Alley Cat
+         * too. The .dosset is keyed on the title's path and does not.
+         *
+         * PERSIST IMMEDIATELY, in the callback, rather than at exit. There is
+         * no core-exit hook this core reliably reaches -- the launcher can tear
+         * a core down through a savestate, a sleep or a reset -- and a setting
+         * that survives one of those three exits is WORSE than one that
+         * survives none, because it is intermittent. One fopen/fwrite/fclose
+         * per keypress on a menu row is affordable on a cold path.
+         */
+        x86_settings_set(X86_SET_CPU_PROFILE, idx);
+        settings_save();
+
+        /* The app-scoped store is still written, and NOT because it is needed:
+           cpu_profile_persisted is the existing witness that a menu press
+           reached a store at all (TOOLING.md's counter table names it), and a
+           settings key the firmware does not know is ignored in SILENCE, so
+           dropping the round trip would remove the only evidence that the menu
+           path runs. It is now a fallback, one layer under the .dosset. */
         abi->odroid_settings_app_int32_set(CPU_PROFILE_KEY, idx);
-        /* Read it straight back. A settings key the firmware does not know is
-           ignored in silence, and "it did not persist" is only visible a
-           reboot later -- this makes the round trip measurable now. */
         cpu_profile_persisted =
             (uint32_t)abi->odroid_settings_app_int32_get(CPU_PROFILE_KEY, 0xFF);
     }
@@ -2247,9 +2577,78 @@ static bool cpu_profile_cb(odroid_dialog_choice_t *option,
     return event == ODROID_DIALOG_ENTER;
 }
 
+/*
+ * `cycles` -> the nearest rung, and WHY THE RESOLUTION LIVES HERE.
+ *
+ * x86_settings.c is forbidden to carry a copy of cpu_profile_kips[] -- a second
+ * copy of another file's table is a second thing to keep in step, and a table
+ * that gains or reorders a row turns a stored INDEX into a different answer
+ * with no way for the user to tell. So the .cfg stores a self-describing RATE
+ * and this file, which owns the table, picks the rung. That is the one place
+ * this design departs from the prior port's, and its header flagged the
+ * question and left it open.
+ *
+ * The units line up with DOSBox by luck and it is worth using: DOSBox counts
+ * `cycles` as guest instructions per MILLISECOND and guest_kips is thousands
+ * per SECOND, which is the same number. So a figure copied out of somebody's
+ * dosbox.conf means what its author meant.
+ *
+ * KIPS_MAX is 0 = unthrottled, so index 0 is excluded from the search: it would
+ * otherwise be "nearest" to everything by being infinitely far in the wrong
+ * direction. `cycles = max` does not come through here at all -- x86_cfg.c
+ * writes it to the PROFILE as rung 0, because "as fast as it goes" is a rung.
+ */
+static int cpu_profile_from_kips(int kips)
+{
+    int best = 1;
+    uint32_t best_d = 0xFFFFFFFFu;
+
+    for (int i = 1; i < CPU_PROFILE_COUNT; i++) {
+        int k = (int)cpu_profile_kips[i];
+        uint32_t d = (uint32_t)(k > kips ? k - kips : kips - k);
+        if (d < best_d) { best_d = d; best = i; }
+    }
+    return best;
+}
+
 static void cpu_profile_init(const gw_firmware_abi_t *abi)
 {
-    cpu_profile_apply(abi->odroid_settings_app_int32_get(CPU_PROFILE_KEY, 0));
+    /*
+     * THE FOUR LAYERS, lowest first, and each only speaks when the one above it
+     * did not:
+     *
+     *   1. the app-scoped store -- what this core did before per-title existed,
+     *      kept as the fallback so an existing user's choice is not silently
+     *      dropped by the upgrade;
+     *   2. `[cpu] cycles` in the .cfg, resolved to a rung here;
+     *   3. `[cpu] cpu_profile` in the .cfg, which names a rung outright and so
+     *      beats a rate that had to be approximated;
+     *   4. the .dosset -- what the user actually chose on the device.
+     *
+     * Layers 2-4 all arrive through x86_settings_get(), because the .cfg is
+     * expressed as a DEFAULT rather than as a value; that is the whole design
+     * and it is why there is no precedence code here for 3 over 4.
+     */
+    int idx = abi->odroid_settings_app_int32_get(CPU_PROFILE_KEY, 0);
+
+    if (x86_settings_base_is_set(X86_SET_CPU_CYCLES)
+        && !x86_settings_base_is_set(X86_SET_CPU_PROFILE))
+        idx = cpu_profile_from_kips(x86_settings_get(X86_SET_CPU_CYCLES));
+    if (x86_settings_base_is_set(X86_SET_CPU_PROFILE)
+        || x86_settings_get(X86_SET_CPU_PROFILE)
+           != x86_settings_builtin(X86_SET_CPU_PROFILE))
+        idx = x86_settings_get(X86_SET_CPU_PROFILE);
+
+    /* VALIDATED AGAINST THIS TABLE, not against the settings range -- which is
+       deliberately looser (0..15) so that x86_settings.c need not know how many
+       rungs there are. cpu_profile_apply() clamps a bad index to 0 rather than
+       indexing off the end of two arrays. */
+    cpu_profile_apply(idx);
+
+    /* Seed the live table with what actually took, so the menu row starts where
+       the machine is and `dirty` does not fire on a value nobody chose. */
+    if (idx >= 0 && idx <= 15)
+        x86_settings_set(X86_SET_CPU_PROFILE, idx);
 }
 
 /* ====================================================================== *
