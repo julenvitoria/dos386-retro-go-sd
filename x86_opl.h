@@ -1,11 +1,12 @@
 /*
  * x86_opl.h -- YM3812 (OPL2) FM TONE GENERATION.
  *
- * The register file, the timers and the detection answer live in x86_io.c and
- * are NOT duplicated here: this file is the SYNTHESISER only. x86_io.c's
- * opl_write() forwards every accepted (index, value) pair to x86_opl_write();
- * everything else about the port -- the status byte, the sticky timer flags,
- * the ISA bus charge -- stays where it was.
+ * The synthesis is emu8950 (lib/emu8950/, vendored unmodified from the owner's
+ * G&W Doom port); x86_opl.c is the ADAPTER and carries the reasoning and the
+ * measurements. The register file, the TIMERS and the detection answer stay in
+ * x86_io.c and are not duplicated: its opl_write() forwards every accepted
+ * (index, value) pair to x86_opl_write() and keeps the status byte, the sticky
+ * timer flags and the ISA bus charge exactly where they were.
  *
  * WHAT IT IS, AND WHAT IT IS NOT. Nine channels, two operators each, four
  * waveforms, the ADSR envelope generator, key scaling of both level and rate,
@@ -45,14 +46,15 @@ int x86_opl_active(void);
  * which already holds the speaker and (after this) the Sound Blaster. Returns
  * the number of samples contributed.
  *
- * `amplitude` is a 1.15 gain applied as (raw * amplitude) >> 13 -- i.e. four
- * times the gain the Sound Blaster path takes from the same number. That is
- * deliberate and is the whole scaling story: one operator at full level peaks
- * at about +-4084 out of the +-32767 the digitised path already spans, so
- * matching gains would put a full nine-voice chord four times quieter than a
- * single sound effect. Clipping IS possible -- nine channels at simultaneous
- * peak is about 36,700 -- and the mix is clamped rather than allowed to wrap,
- * because a wrap is a loud click and a clamp is not.
+ * `amplitude` is a 1.15 gain applied as (sample * amplitude) >> 14 -- the
+ * "music * 2" balance the owner's own G&W port settled on (opl_gnw.c) against
+ * a real mix of music and digitised sound, taken rather than re-derived. One
+ * operator at total level 0 lands near 1,012 of full scale and a nine-voice
+ * chord near 8,000, against the ~4,080 a full-scale Sound Blaster sample
+ * reaches at maximum volume -- so music sits under a sound effect but is not
+ * buried by it. Clipping IS possible and the mix is CLAMPED rather than
+ * allowed to wrap, because a wrap is a loud click and a clamp is not;
+ * x86_opl_clips counts it.
  */
 unsigned x86_opl_render_mix(int16_t *dst, unsigned frames,
                             unsigned sample_rate, int16_t amplitude);

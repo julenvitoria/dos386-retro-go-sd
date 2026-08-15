@@ -2069,6 +2069,23 @@ static void sbdma_test_run(void)
 #define FM_FNUM      0x200u
 #define FM_BLOCK     7u
 
+/* emu8950 (lib/emu8950/, vendored BYTE-IDENTICAL -- see its README) names
+   free(), puts() and __assert_func() from three paths this build never takes:
+   OPL_delete(), its OPL_DEBUG slot dump, and its assert()s. They are satisfied
+   HERE rather than edited out of the vendored file, because newlib's free()
+   drags in _sbrk and a heap and TEST.ld deliberately provides neither -- the
+   bare-metal harness having no heap is a property worth keeping, and patching
+   a vendored file is how it stops being the file that was tested on the
+   owner's hardware. The CORE build needs none of this: it links against
+   retro-go's libc. */
+void free(void *p) { (void)p; }
+int puts(const char *s) { (void)s; return 0; }
+void __assert_func(const char *file, int line, const char *fn, const char *e)
+{
+    (void)file; (void)line; (void)fn; (void)e;
+    for (;;) { }
+}
+
 volatile uint32_t run_fm_flag = 0;
 volatile uint32_t fm_r[12];
 /* Cycles and operator updates for the ONE captured render call; see below. */

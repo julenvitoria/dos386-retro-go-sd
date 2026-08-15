@@ -400,10 +400,10 @@ def fm(args, runner):
     # ---- THE ENVELOPE, both ends of it. --------------------------------
     if not active_on:
         fail("x86_opl_active() is 0 while the note is held")
-    if not (1500 <= peak_on <= 2600):
+    if not (800 <= peak_on <= 1300):
         fail(f"the held note peaks at {peak_on}. One operator at total level 0 "
-             f"through this gain is 2,024 +- the resampler's hold, so a peak "
-             f"far under that is an envelope that decayed when EG-TYPE said "
+             f"through the music gain (x86_opl.h) is ~1,012, so a peak far "
+             f"under that is an envelope that decayed when EG-TYPE said "
              f"sustain, and one far over is a level or a gain that is wrong")
     if peak_off > 16:
         fail(f"twenty frames after KEY OFF the note still peaks at {peak_off}. "
@@ -600,19 +600,32 @@ MUTATE_F2_NOW_TO = "            (void)0;\n        break;\n    }\n"
 # THE FM CONTROLS. Both live in x86_opl.c, and each breaks ONE of the two
 # things the arm above measures independently.
 
-# THE ENVELOPE'S RELEASE. Without it a keyed-off operator never leaves whatever
-# stage it was in, so the note sustains for ever: the PITCH assertions still
-# pass, x86_opl_keyons still counts, and only the key-off peak says so.
-MUTATE_FM_ENV = """    if (!s->key)
-        s->eg_gen = EG_RELEASE;
-"""
+# THE ENVELOPE'S RELEASE, in the synthesiser itself. Without the state change
+# a keyed-off operator never leaves the stage it was in, so the note sustains
+# for ever: the PITCH assertions still pass, x86_opl_keyons still counts, and
+# only the key-off peak and the idle-channel skip say so.
+#
+# BOTH FM CONTROLS MUTATE THE VENDORED lib/emu8950/emu8950.c. That is the point
+# -- they grade the code that actually makes the sound, not our adapter around
+# it -- and the file is restored in the same `finally` every other control uses.
+MUTATE_FM_ENV = """static INLINE void slotOff(OPL *opl, int i) {
+    OPL_SLOT *slot = &opl->slot[i];
+    slot->eg_state = RELEASE;
+    request_update(slot, UPDATE_EG);
+}"""
+MUTATE_FM_ENV_TO = """static INLINE void slotOff(OPL *opl, int i) {
+    OPL_SLOT *slot = &opl->slot[i];
+    request_update(slot, UPDATE_EG);
+}"""
 
-# THE FREQUENCY. Dropping the >> 1 from the phase increment puts every note an
-# octave up. Every counter stays green, the envelope is untouched, and the
-# tune is simply in the wrong key -- which is exactly the class of defect a
-# counter-only test cannot see.
-MUTATE_FM_FREQ = "    uint32_t base = ((uint32_t)c->f_num << c->block) >> 1;\n"
-MUTATE_FM_FREQ_TO = "    uint32_t base = ((uint32_t)c->f_num << c->block);\n"
+# THE FREQUENCY. ml_table is the frequency-multiple the phase increment is
+# scaled by; doubling it puts every note an octave up. Every counter stays
+# green, the envelope is untouched, and the tune is simply in the wrong key --
+# exactly the class of defect a counter-only test cannot see.
+MUTATE_FM_FREQ = ("static uint32_t ml_table[16] = {1, 1 * 2, 2 * 2, 3 * 2, "
+                  "4 * 2, 5 * 2, 6 * 2, 7 * 2,\n")
+MUTATE_FM_FREQ_TO = ("static uint32_t ml_table[16] = {2, 1 * 4, 2 * 4, 3 * 4, "
+                     "4 * 4, 5 * 4, 6 * 4, 7 * 4,\n")
 
 
 def _mutate_and_require_failure(args, target, what, replacement="",
@@ -694,9 +707,9 @@ if __name__ == "__main__":
     if args.negative_fm_env:
         sys.exit(0 if _mutate_and_require_failure(
             args, MUTATE_FM_ENV, "the FM envelope's RELEASE",
-            path="x86_opl.c") else 1)
+            MUTATE_FM_ENV_TO, path="lib/emu8950/emu8950.c") else 1)
     if args.negative_fm_freq:
         sys.exit(0 if _mutate_and_require_failure(
-            args, MUTATE_FM_FREQ, "the FM PHASE INCREMENT", MUTATE_FM_FREQ_TO,
-            path="x86_opl.c") else 1)
+            args, MUTATE_FM_FREQ, "the FM FREQUENCY MULTIPLE", MUTATE_FM_FREQ_TO,
+            path="lib/emu8950/emu8950.c") else 1)
     sys.exit(0 if main(args) else 1)

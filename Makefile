@@ -24,6 +24,17 @@ SDK_INC = $(SDK)/include
 # submodule) and our own headers, which is what keeps it a clean, isolated
 # measurement tier.
 CFLAGS += -DIS_LITTLE_ENDIAN -Ilib/FatFs
+
+# emu8950 (lib/emu8950/) -- the FM synthesiser behind x86_opl.c. The flag set
+# is the owner's, transcribed from gnw-doom/Makefile and explained in
+# lib/emu8950/README-tinyemu.md; Makefile.core carries the same list and the
+# two MUST stay in step, because a mismatch changes struct layouts rather than
+# just behaviour. -fms-extensions is not optional: OPL_SLOT embeds
+# `struct SLOT_RENDER` anonymously, which is a hard error in plain C11.
+CFLAGS += -Ilib/emu8950 -fms-extensions \
+  -DUSE_EMU8950_OPL=1 -DDOOMX=1 -DEMU8950_LINEAR=1 -DEMU8950_LINEAR_SKIP=1 \
+  -DEMU8950_NO_RATECONV=1 -DEMU8950_NO_TLL=1 -DEMU8950_NO_TIMER=1 \
+  -DEMU8950_NO_TEST_FLAG=1 -DEMU8950_NO_PERCUSSION_MODE=1
 # The pagefile slot ring, small. This harness's .bss is 176 bytes from
 # overflowing RAM_EMU, and the ring's logic is size-independent -- a 32-slot
 # ring wraps in tests/main.c's pgfile arm sooner, which is if anything better
@@ -118,7 +129,7 @@ LDFLAGS = -mcpu=cortex-m7 -mthumb -T STM32H7B0VBTx_SDCARD.ld -Wl,--gc-sections -
 
 PROGS = test_core.elf
 
-TEST_OBJS = x86_cpu.o x86_nor.o x86_profile.o x86_probe.o x86_io.o x86_opl.o x86_mem.o x86_arena.o x86_pager.o x86_pgfile.o x86_seam.o x86_pmode.o x86_video.o x86_video_planar.o x86_osk.o x86_hle.o x86_bios.o x86_dos.o x86_ems.o cga_blit.o cpu_exec.o tests/main.o hw_accel.o x86_disk.o lib/FatFs/ff.o lib/FatFs/ffunicode.o
+TEST_OBJS = x86_cpu.o x86_nor.o x86_profile.o x86_probe.o x86_io.o x86_opl.o emu8950.o x86_mem.o x86_arena.o x86_pager.o x86_pgfile.o x86_seam.o x86_pmode.o x86_video.o x86_video_planar.o x86_osk.o x86_hle.o x86_bios.o x86_dos.o x86_ems.o cga_blit.o cpu_exec.o tests/main.o hw_accel.o x86_disk.o lib/FatFs/ff.o lib/FatFs/ffunicode.o
 
 all: $(PROGS)
 
@@ -140,6 +151,9 @@ cpu_exec.o: x86_offsets.inc cpu_exec_handlers.S cpu_exec_handlers_0f.S \
 # included it stale and the harness measures the PREVIOUS build -- which is how
 # a rewritten font8x8.h produced a "fixed" renderer that still drew the old
 # glyphs. sdk/Makefile has done this all along; this build had not.
+emu8950.o: lib/emu8950/emu8950.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
 %.o: %.c
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
