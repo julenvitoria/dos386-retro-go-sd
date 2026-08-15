@@ -24,6 +24,41 @@ known-bad.
 - `test_core_retrogo.py` — blitter/CLUT assertions whenever a real `.dsk` is on the
   card: they expect `demo_guest`'s pattern, which only runs with no disk.
 
+## WHERE THE CYCLES GO — read this before optimising anything
+
+Wolf3D, Mode Y, **hardware**, gated gameplay window, **% of WALL** throughout.
+Method and menu control: [`docs/09`](docs/09_frame_pacing_and_clocks.md) §8.
+
+| block | % wall |
+|---|---|
+| idle waiting for the panel (vsync-quantised, not freely convertible) | 27.0 |
+| **planar store hook** | **25.0** |
+| **interpreter excluding the hook** — of which: | **47.1** |
+| — ordinary opcodes, the guest's own work, **~57 cyc/insn** ← LARGEST BLOCK | 29.4 |
+| — `88` aperture byte store 10.3, `AB` REP STOSW 3.3, `89` word store 2.3 | 15.9 |
+| — VGA `OUT`/`IN`, **1,242 cyc each** (`ega_shadow_rebuild()`) | 1.5 |
+| Mode Y blit + paint | 0.84 |
+| residual (root-zone self-time, measured not derived) | 0.05 |
+
+An aperture byte store costs **171 cyc**; the same store to ordinary memory
+costs **55**. ~1.67 M insn/s, ~16 presents/s.
+
+**Open and sized:** `REP STOSW`'s per-element hook (~3%; the page cannot change
+mid-`REP`, so the decision is resolvable once), aperture reads (~4.5%), the
+1,242-cyc `OUT`.
+
+### Measured and REJECTED — do not re-propose
+
+| lever | measured |
+|---|---|
+| DMA2D for the blit | blit is 0.84% — the whole ceiling |
+| `planar_store` in assembly | AAPCS is ~25 of 171 cyc, ≤2% of wall |
+| Planes in DTCM vs AXI | 121.8 vs 120.8 cyc — identical; ITCM likewise nothing |
+| `x86_code_reloc` | 0.79% (rate 14.8 k/s, not the 88 k/s first claimed) |
+| `SEAM_CHECK` | 0.04% |
+| `IDIV`/`IMUL` ("division-heavy raycaster") | `F7` is 4.2% at 55.2 cyc — below average |
+| Disk reads / CMD18 / SD DMA | reads freeze at t+36 s; already in shipped firmware |
+
 ## Budgets — measure these before and after any core change
 
 | | value | note |
@@ -39,61 +74,30 @@ known-bad.
 |---|---|
 | Wolf3D's cached pictures render as noise (off-screen VRAM cache too small) | [`docs/13`](docs/13_title_status.md) |
 | Wolf3D paints mid-draw frames in gameplay (`x86_modey_mid_draw`) | [`docs/08`](docs/08_vga_mode13h.md) §4 |
-| Retro-go's `/CONFIG` magic is cleared by a probe reset (`Expected 0xcafef00d, got 0`) | cosmetic; settings return on the next clean boot |
-| `REP STOSW` calls the planar store hook once per element (~38x), though the page cannot change mid-`REP` — worth ~3% of wall | [`docs/09`](docs/09_frame_pacing_and_clocks.md) §8 |
-| **Wolf3D's WEAPON SPRITE is corrupt** — a stable band of wrong pixels across the pistol at the level-1 spawn. DETERMINISTIC (byte-identical in successive captures), so it is gradeable, unlike the "rare" stage-select corruption it may share a cause with | Queue B1 |
-| **KEEN4 hangs, then the WATCHDOG resets the device** — HARDWARE: `guest_insns_total` reaches 34,707,122 over 944 frames then stops; `boot_magic=0xbad00005 Watchdog` | [`docs/13`](docs/13_title_status.md) |
-| **ONE 4 KB PAGEFILE WRITEBACK COSTS UP TO 433 ms ON SILICON** (`x86_pg_wb_us_worst`, 3 min of WOLF3D play) against 23 ms for an ordinary sector read, and it GROWS over a session. WOLF3D thrashes on it: 368 evictions against 334 refills in 126 frames, `_exhausted=0`, and every fps collapse lines up with an eviction burst. The per-page `fopen`/`fclose` is fixed; `pgf_us_seek` vs `_us_write` says what the rest is, and `FF_USE_FASTSEEK 0` is the suspect | `src/main.c`, [`PLAN.md`](PLAN.md) |
-| **KEEN4 gives 60 of 160 pager frames to the arena** (`x86_pg_frames_total` 160 → 100 once 0Dh is up), so it runs on 100. EMS pins 16 more when used — a much tighter budget than the 144 the EMS work assumed | [`docs/12`](docs/12_memory_tiers.md) |
+| **Wolf3D's WEAPON SPRITE is corrupt** — a stable band of wrong pixels across the pistol at the spawn. DETERMINISTIC, so gradeable; may share a cause with the "rare" stage-select corruption | Queue B1 |
+| **KEEN4 hangs, then the WATCHDOG resets** — HARDWARE: 34.7 M insns over 944 frames, then stops; `boot_magic=0xbad00005` | [`docs/13`](docs/13_title_status.md) |
+| **ONE 4 KB PAGEFILE WRITEBACK COSTS UP TO 433 ms ON SILICON** (`x86_pg_wb_us_worst`) vs 23 ms for a sector read, and GROWS over a session. The per-page `fopen`/`fclose` is fixed; `pgf_us_seek` vs `_us_write` says what the rest is, `FF_USE_FASTSEEK 0` the suspect. Gates Keen and anything EMS/XMS-backed | `src/main.c` |
+| **KEEN4 gives 60 of 160 pager frames to the arena** once 0Dh is up, so runs on 100; EMS pins 16 more — tighter than the 144 the EMS work assumed | [`docs/12`](docs/12_memory_tiers.md) |
 | Retro-go's Pause overlay is unreadable over 256-colour modes | [`docs/08`](docs/08_vga_mode13h.md) §1 |
-| A segment override before `REP` survives only the first element | `rep_resume` records the repeat prefix, not the START of the prefix run |
-| `moffs` (`A0`-`A3`) takes its offset at the operand size, not the ADDRESS size | |
-| `MOV SS,x` does not inhibit interrupts | can land on a half-switched stack |
 | Protected-mode segment loads trap out (`CR0.PE`) | no descriptor walk; sized in [`docs/13`](docs/13_title_status.md) |
-| Five handlers call `DECODE_MODRM` by symbol, ignoring a `0x67` prefix | |
-| 13 opcode slots reach `.exit_loop`: x87 (`D8`-`DF`), `BOUND`/`ARPL`, `XLAT`, `WAIT`, `INT1` | |
+| **Interpreter gaps**: seg override before `REP` survives one element; `moffs` uses operand not ADDRESS size; `MOV SS,x` does not inhibit interrupts; 5 handlers ignore `0x67`; 13 slots exit (x87, `BOUND`/`ARPL`, `XLAT`, `WAIT`, `INT1`) | [`docs/07`](docs/07_opcode_coverage.md) |
 
 ## Retractions worth keeping
 
-One line each, because their value is stopping a wrong answer being re-derived.
+One line each; their value is stopping a wrong answer being re-derived.
 
-- **ALLEYCAT's golden 0.874% is NOT a palette bug.** Owner-confirmed: the cat moves and
-  the capture never lands twice on one frame; its mask is too narrow for that travel.
-- **Keen 4's levels are NOT impossible.** The verdict quoted the prior port's budget as
-  if it were this hardware's. [`docs/13`](docs/13_title_status.md).
-- **Do not derive the frame period from `guest_fps_achieved`.** It is a runaway: overrun
-  lowers fps, raising the period, raising the budget. [`docs/09`](docs/09_frame_pacing_and_clocks.md) §2.
-- **Wolf3D's split/mirrored gameplay was NOT a video bug.** `INC`/`DEC r16` never
-  normalised their operand, corrupting `finetangent[]`. `test_alu_fuzz.py` grades it.
+- **ALLEYCAT's golden 0.874% is NOT a palette bug.** Owner-confirmed: the cat moves and the capture never lands twice on one frame; its mask is too narrow for that travel.
+- **Keen 4's levels are NOT impossible.** The verdict quoted the prior port's budget as if it were this hardware's. [`docs/13`](docs/13_title_status.md).
+- **Do not derive the frame period from `guest_fps_achieved`.** It is a runaway: overrun lowers fps, raising the period, raising the budget. [`docs/09`](docs/09_frame_pacing_and_clocks.md) §2.
+- **Wolf3D's split/mirrored gameplay was NOT a video bug.** `INC`/`DEC r16` never normalised their operand, corrupting `finetangent[]`. `test_alu_fuzz.py` grades it.
 - **A pager counter read while no core is loaded is NOISE.** Check `core_ready`.
-- **`MPU_TEX_LEVEL1` on the framebuffer measured no gain.** Patch at
-  `build/artifacts/mpu_level1.patch`.
-- **Mode Y's cost is NOT plane-storage placement.** The plane RMW cost the SAME in DTCM
-  as in AXI (121.8 vs 120.8 cyc, hardware) — because the cost was the READ, now gone.
-- **The Mode Y BLIT and PRESENTATION are 0.84% of wall** -- DMA2D's ceiling on this
-  path is 0.84%. The blit was never the cost.
-- **FIXED: the planar store read 4 bytes to write 1.** Nothing was computed from the
-  cell's old contents. Store 286.9 -> **171.1 cyc**, WOLF3D **13.5 -> 16.3 fps (+21%)**.
-- **Wolf3D's interpreter is NOT slower in gameplay, it runs a different MIX** (90% of
-  66 -> 125 cyc/insn): aperture STORES, not `IDIV`; `x86_code_reloc` **0.79%** of wall,
-  `SEAM_CHECK` **0.04%**. Both §8-9 of [`docs/09`](docs/09_frame_pacing_and_clocks.md).
-
-> **An inherited number from another project is not a property of this hardware** —
+- **`MPU_TEX_LEVEL1` on the framebuffer measured no gain.** Patch at `build/artifacts/mpu_level1.patch`.
+- **Mode Y's cost is NOT plane-storage placement.** The plane RMW cost the SAME in DTCM as in AXI (121.8 vs 120.8 cyc, hardware) — because the cost was the READ, now gone.
+- **The Mode Y BLIT and PRESENTATION are 0.84% of wall** -- DMA2D's ceiling on this path is 0.84%. The blit was never the cost.
+- **FIXED: the planar store read 4 bytes to write 1.** Nothing was computed from the cell's old contents. Store 286.9 -> **171.1 cyc**, WOLF3D **13.5 -> 16.3 fps (+21%)**.
+- **Wolf3D's interpreter is NOT slower in gameplay, it runs a different MIX** (90% of 66 -> 125 cyc/insn): aperture STORES, not `IDIV`; `x86_code_reloc` **0.79%** of wall, `SEAM_CHECK` **0.04%**. Both §8-9 of [`docs/09`](docs/09_frame_pacing_and_clocks.md). > **An inherited number from another project is not a property of this hardware** —
 > and neither is a bound that was never checked against the map.
 
 ## Where the design lives
 
-| | |
-|---|---|
-| [`docs/01`](docs/01_memory_architecture.md) | fold table, address translation |
-| [`docs/02`](docs/02_cpu_pipeline_optimization.md) | Thumb-2 interpreter, dual-issue |
-| [`docs/03`](docs/03_devices_and_hle.md) | device model, DOS HLE |
-| [`docs/04`](docs/04_retro_go_and_gwemu.md) | firmware ABI, gwemu's limits |
-| [`docs/06`](docs/06_gwemu_determinism.md) | determinism |
-| [`docs/07`](docs/07_opcode_coverage.md) | opcode coverage |
-| [`docs/08`](docs/08_vga_mode13h.md) | mode 13h, Mode Y, EGA 0Dh, presentation |
-| [`docs/09`](docs/09_frame_pacing_and_clocks.md) | **frame pacing and the three clocks** |
-| [`docs/10`](docs/10_granule_seam.md) | **the granule seam** |
-| [`docs/11`](docs/11_pit_and_interrupt_controller.md) | **PIT, 8259, and what reads them** |
-| [`docs/12`](docs/12_memory_tiers.md) | **pager tiers, arena, frame donation** |
-| [`docs/13`](docs/13_title_status.md) | **per-title state and settled verdicts** |
+[`docs/01`](docs/01_memory_architecture.md) fold table, address translation; [`docs/02`](docs/02_cpu_pipeline_optimization.md) Thumb-2 interpreter, dual-issue; [`docs/03`](docs/03_devices_and_hle.md) device model, DOS HLE; [`docs/04`](docs/04_retro_go_and_gwemu.md) firmware ABI, gwemu's limits; [`docs/06`](docs/06_gwemu_determinism.md) determinism; [`docs/07`](docs/07_opcode_coverage.md) opcode coverage; [`docs/08`](docs/08_vga_mode13h.md) mode 13h, Mode Y, EGA 0Dh, presentation; [`docs/09`](docs/09_frame_pacing_and_clocks.md) frame pacing and the three clocks; [`docs/10`](docs/10_granule_seam.md) the granule seam; [`docs/11`](docs/11_pit_and_interrupt_controller.md) PIT, 8259, and what reads them; [`docs/12`](docs/12_memory_tiers.md) pager tiers, arena, frame donation; [`docs/13`](docs/13_title_status.md) per-title state and settled verdicts

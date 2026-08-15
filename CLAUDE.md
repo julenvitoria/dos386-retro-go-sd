@@ -13,6 +13,27 @@ This project relies on strict documentation organization to manage extreme archi
 
 *Note: `CLAUDE.md`, `STATUS.md`, and `PLAN.md` must strictly remain under 100 lines so they are never skipped over.*
 
+## Where the cycles actually go — READ BEFORE OPTIMISING ANYTHING
+
+Measured on HARDWARE, Wolf3D in Mode Y, as % of wall. Full table and method:
+[`STATUS.md`](STATUS.md) and [`docs/09`](docs/09_frame_pacing_and_clocks.md) §8.
+
+- **29.4%** ordinary opcodes — the guest's own work, **~57 cyc/insn**. The
+  largest single block, and the one nobody has attacked.
+- **25.0%** the planar store hook. An aperture byte store is **171 cyc**
+  against **55** for the same store to ordinary memory.
+- **27.0%** idle waiting for the panel — vsync-quantised, not freely convertible.
+- **0.84%** the blit. **0.05%** residual.
+
+**Already measured and REJECTED — do not re-propose:** DMA2D for the blit
+(0.84% ceiling); `planar_store` in assembly (AAPCS ≤2%); planes in DTCM vs AXI
+(121.8 vs 120.8 cyc, identical); `x86_code_reloc` (0.79%); `SEAM_CHECK`
+(0.04%); `IDIV`/`IMUL` (below average cost); disk reads (freeze at t+36 s).
+Each was plausible and each measured to nothing.
+
+**A number without a tier is not a measurement.** gwemu does not model timing;
+cycle claims are tier 3 only.
+
 ## Core Conceptual Constraints (Read Carefully)
 Working on this project requires a fundamental mindset shift:
 - **Silicon**: We must play to the STM32H7B0VB's strengths and utilize its capabilities as efficiently as possible.
