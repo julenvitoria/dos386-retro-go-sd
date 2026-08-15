@@ -58,13 +58,27 @@ not Dark Forces lives here.
    launcher once rendered as diamonds because of it.** Open, read, close; never
    hold a handle. Load BEFORE `dos_cpu_init()`'s equivalent here, because a
    setting read on the segment-load path applied late looks intermittent.
-2. **Guest RAM -> NOR backup path** — it appears to work and then BSODs on a
-   watchdog. Diagnose the watchdog, not the snapshot: `nor_snap_cb_bytes`
-   (anything other than 655,360 means the snapshot is not the guest's memory),
-   `x86_nor_attached` / `x86_nor_attach_err` (7 = the flash readback did not
-   match guest RAM, i.e. the fold table was never touched and the guest is
-   still on AXI — the invariant the design turns on). Note `test_nor` currently
-   FAILS on stock master (pre-existing, verified by stash-and-rebuild).
+2. ~~**Guest RAM -> NOR backup path**~~ — DIAGNOSED and FIXED IN CODE, **not yet
+   confirmed on silicon**. It is a watchdog, and the flash is innocent: the
+   firmware's transport kicks throughout (`OSPI_Program()` per 256-byte page,
+   and its comment names the **~472 ms WWDG window**; `OSPI_Erase()` per
+   command; the SD driver in its busy-waits). The two un-kicked stretches are
+   ours: (a) the snapshot is a **menu callback**, so the frame loop's
+   once-per-frame refresh is absent for all 1,595–1,614 ms of it, and
+   `x86_nor_attach()`'s 640 KB XIP readback touches neither driver; (b) **the
+   first slice after the attach** runs the AXI-tuned `max_slice` at NOR prices,
+   with every access and every instruction fetch now trapping to OCTOSPI — and
+   the slice regulator corrects by 1/8 per frame, so it cannot save a frame it
+   does not survive. (b) is what matches "seems to work, then bluescreens".
+   Fixed by kicking across all three of ours and resetting the regulator to
+   `MAX_SLICE_FLOOR` (debt cleared) at attach.
+   **What is left is one tier-3 run**: read `nor_snap_wdog_gap_ms` (worst gap
+   between kicks) against 472 ms, and `guest_exec_ms` on the frames after the
+   attach. The device was held by another agent all session.
+   Also settled: `test_nor` fails because its opening store to `0x90000000`
+   **bus-faults** — the harness never sets OCTOSPI up, so the arm's premise is
+   false. Separate fix, in `tests/main.c`. `tests/test_nor_wdog.py` covers the
+   heartbeat without that window (12 checks; negative control 5/12 seen to fail).
 3. **Sound Blaster** — not implemented at all. Ports 0x220/0x388 are unanswered.
    Size it against what real titles actually probe rather than against the
    spec; Epic Pinball and Mortal Kombat diagnoses are being measured now and

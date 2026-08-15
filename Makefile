@@ -95,6 +95,10 @@ CFLAGS += -DX86_CS_LOG=$(X86_CS_LOG)
 # Driven by scripts/run_pmode_controls.py; see the table in x86_pmode.c.
 X86_PMODE_NEGCTL ?= 0
 CFLAGS += -DX86_PMODE_NEGCTL=$(X86_PMODE_NEGCTL)
+# Negative control for tests/test_nor_wdog.py: compiles the watchdog heartbeat
+# out of x86_nor_attach()'s readback loop, which is the defect the fix removes.
+X86_NOR_WDOG_NEGCTL ?= 0
+CFLAGS += -DX86_NOR_WDOG_NEGCTL=$(X86_NOR_WDOG_NEGCTL)
 
 LDFLAGS = -mcpu=cortex-m7 -mthumb -T STM32H7B0VBTx_SDCARD.ld -Wl,--gc-sections --specs=nosys.specs
 

@@ -170,6 +170,9 @@ volatile uint32_t dosovl_r[16];
 volatile uint32_t run_nor_flag = 0;
 volatile uint32_t nor_r[40];
 
+volatile uint32_t run_norwd_flag = 0;
+volatile uint32_t norwd_r[12];
+
 volatile uint32_t run_a20_flag = 0;
 volatile uint32_t a20_r[24];
 
@@ -1878,6 +1881,100 @@ static uint8_t nor_test_ram[NOR_TEST_BYTES]
 static uint8_t nor_pattern_byte(uint32_t off)
 {
     return (uint8_t)(off * 7u + (off >> 8) * 31u + 1u);   /* never 0, never uniform */
+}
+
+/* ---------------------------------------------------------------------- *
+ * The WATCHDOG HEARTBEAT across x86_nor_attach()'s readback.
+ *
+ * Separate arm, separate flag, separate buffer, and deliberately NOT built on
+ * NOR_FAKE_BASE. nor_test_run() below cannot run in this firmware at all: it
+ * opens by storing to 0x90000000, nothing here configures OCTOSPI
+ * memory-mapped mode, and the store takes a precise bus fault (BFAR
+ * 0x90000000) into the spin in Fault_Handler_C -- which is why test_nor.py
+ * reports "target never ran" rather than a failure. That is a pre-existing
+ * defect in the harness's premise, and hanging a NEW check off it would make
+ * the new check untestable for an unrelated reason.
+ *
+ * What this arm needs is not the TRAP behaviour but the READBACK LOOP, and
+ * that runs against any pointer. So "NOR" here is an ordinary aligned .bss
+ * buffer: bit 31 is clear, nothing traps, and the loop that has to kick the
+ * watchdog once per page is exercised exactly as it is on silicon.
+ *
+ * The property under test: on silicon this loop is 160 memcmps of 4 KB each
+ * out of memory-mapped OCTOSPI, it is the one stretch of the snapshot that
+ * neither the flash driver nor the SD driver kicks the watchdog inside of
+ * (gw_flash.c's OSPI_Program kicks per 256-byte page and says why: the ~472 ms
+ * WWDG window), and the frame loop is not running because the snapshot is a
+ * menu callback. A hook that is silently never called is the failure that
+ * matters, so the COUNT is what is asserted.
+ * ---------------------------------------------------------------------- */
+/* NO NEW .bss. RAM_EMU in this harness has under 4 KB of headroom -- a pair of
+   fresh 32 KB buffers overflows the region by 61,616 bytes and the link fails.
+   nor_test_ram is already allocated, already 4096-aligned, and is 8 pages; it
+   is split down the middle to play both sides here. 16384 is a multiple of
+   4096, so the "NOR" half is aligned too, which x86_nor_attach() checks. */
+#define NORWD_PAGES  4u
+#define NORWD_BYTES  (NORWD_PAGES * 4096u)
+#define NORWD_FIRST  220u              /* guest page, clear of the other arms */
+
+#define norwd_ram  (nor_test_ram)
+#define norwd_nor  (nor_test_ram + NORWD_BYTES)
+
+static uint32_t norwd_hook_calls;
+static void norwd_hook(void) { norwd_hook_calls++; }
+
+static void norwd_test_run(void)
+{
+    for (uint32_t i = 0; i < 12; i++)
+        norwd_r[i] = 0;
+
+    for (uint32_t i = 0; i < NORWD_BYTES; i++)
+        norwd_ram[i] = nor_pattern_byte(i);
+    memcpy(norwd_nor, norwd_ram, NORWD_BYTES);
+
+    for (uint32_t i = 0; i < NORWD_PAGES; i++) {
+        guest_page_table[NORWD_FIRST + i] =
+            FOLD_K((uint32_t)norwd_ram + i * 4096u, NORWD_FIRST + i);
+    }
+
+    /* 1. A REFUSED attach must still have kicked for every page it read.
+     * The refusal path is the SLOW one -- it walks the whole readback before
+     * it can know the bytes disagree -- so a heartbeat that only ran on
+     * success would leave the longest stretch uncovered. Corrupt the LAST
+     * page so the mismatch is found as late as possible. */
+    norwd_hook_calls = 0;
+    x86_nor_heartbeat = norwd_hook;
+    norwd_nor[NORWD_BYTES - 1] ^= 0xFFu;
+    norwd_r[0] = (uint32_t)x86_nor_attach(norwd_nor, NORWD_BYTES,
+                                          norwd_ram, NORWD_BYTES, NORWD_FIRST);
+    norwd_r[1] = x86_nor_attach_err;        /* 7 = readback disagreed */
+    norwd_r[2] = x86_nor_heartbeats;        /* must be NORWD_PAGES */
+    norwd_r[3] = norwd_hook_calls;          /* the hook really ran */
+    norwd_r[4] = x86_nor_attached;          /* 0: nothing moved */
+
+    /* 2. And on the ACCEPTED path, once per page, with the hook installed. */
+    norwd_nor[NORWD_BYTES - 1] ^= 0xFFu;    /* put it back */
+    norwd_hook_calls = 0;
+    norwd_r[5] = (uint32_t)x86_nor_attach(norwd_nor, NORWD_BYTES,
+                                          norwd_ram, NORWD_BYTES, NORWD_FIRST);
+    norwd_r[6] = x86_nor_heartbeats;
+    norwd_r[7] = norwd_hook_calls;
+    norwd_r[8] = x86_nor_attached;
+
+    /* 3. A NULL hook is the tier-1 default and must be a no-op, not a branch
+     * to zero -- the exact shape that has cost this project days elsewhere
+     * (retro-go's unguarded repaint callback, CLAUDE.md). The counter still
+     * advances, which is what lets coverage be asserted with no hook at all. */
+    x86_nor_heartbeat = NULL;
+    x86_nor_attached = 0;                   /* allow one more attach */
+    norwd_hook_calls = 0;
+    norwd_r[9]  = (uint32_t)x86_nor_attach(norwd_nor, NORWD_BYTES,
+                                           norwd_ram, NORWD_BYTES, NORWD_FIRST);
+    norwd_r[10] = x86_nor_heartbeats;       /* still counted */
+    norwd_r[11] = norwd_hook_calls;         /* 0: no hook installed */
+
+    /* Leave nothing attached: later arms share the fold table. */
+    x86_nor_attached = 0;
 }
 
 static void nor_test_run(void)
@@ -4673,6 +4770,11 @@ void Reset_Handler(void) {
         if (run_nor_flag == 1) {
             nor_test_run();
             run_nor_flag = 0;
+        }
+
+        if (run_norwd_flag == 1) {
+            norwd_test_run();
+            run_norwd_flag = 0;
         }
 
         if (run_a20_flag == 1) {

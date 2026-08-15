@@ -479,6 +479,13 @@ extern volatile uint32_t x86_nor_axi_free, x86_nor_reads, x86_nor_writes;
 extern volatile uint32_t x86_nor_cow_pulls, x86_nor_cow_failures;
 extern volatile uint32_t x86_nor_slow_cycles, x86_nor_unmapped, x86_nor_attach_err;
 extern volatile uint32_t x86_nor_host_cow;
+/* Watchdog heartbeat for x86_nor_attach()'s 640 KB XIP readback -- the one
+   stretch of the snapshot with no incidental kick from the flash or SD
+   drivers. A hook rather than a direct wdog_refresh() so this file keeps
+   knowing nothing about the firmware ABI; NULL (the tier-1 case) is a no-op.
+   x86_nor_heartbeats counts the ticks whether or not a hook is installed. */
+extern void (*x86_nor_heartbeat)(void);
+extern volatile uint32_t x86_nor_heartbeats;
 void x86_unmap_all(void);
 /*
  * The real-mode address wrap, scoped to what it is actually FOR.
