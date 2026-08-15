@@ -527,6 +527,10 @@ static void video_render_body(uint8_t *dst, uint32_t stride)
        and bottom; leaving them alone means they keep whatever the firmware or
        the other buffer had, reinterpreted through the CGA palette -- which is
        what turns an otherwise black screen into colour flashes. */
+    /* The donation policy runs HERE and nowhere else: once per frame, before
+       anything has read the card, and before a mode set can adopt a new one.
+       See x86_video_policy_tick(). */
+    x86_video_policy_tick();
     /* Follow the guest BEFORE anything reads the mode: the renderer, the
        palette and the letterbox clear must all be for the same frame. */
     mode_sync_from_bda();
@@ -1275,6 +1279,48 @@ static uint32_t modey_fit_offsets(void)
     return 0;
 }
 
+/*
+ * Borrow what the policy allows, fit the card to it, claim it, publish it.
+ *
+ * Split out of the 0Dh arm of planar_storage_follow() because it is now called
+ * from TWO places: mode adoption, and the once-per-frame policy tick that
+ * re-fits the card when the pager's measured working set has moved. Every
+ * caller must have RELEASED the EGA claim first -- x86_arena_largest cannot
+ * know that a re-claim would free the card it is being asked to replace.
+ *
+ * BORROW FROM GUEST RAM. The arena is 143,360 B and 100% used in 0Dh while the
+ * guest's frame pool has idle frames; PLAN.md Phase 3 always meant the extra
+ * plane storage to come from there. The floor is one page past the best run
+ * the arena already has -- donating to build a card no bigger than the one
+ * that already fits would shrink the guest for nothing. How MANY frames may go
+ * is x86_pager_policy_reserve()'s answer and it changes as the guest runs; see
+ * x86_pager.h.
+ */
+static void ega_card_place(int may_borrow)
+{
+    void *blk = NULL;
+    uint32_t floor = x86_arena_largest + X86_ARENA_PAGE;
+
+    if (floor < 4u * X86_EGA_PLANE_OFFSETS)
+        floor = 4u * X86_EGA_PLANE_OFFSETS;
+    if (may_borrow && floor <= 4u * X86_EGA_PLANE_MAX)
+        x86_pager_donate_upto(4u * X86_EGA_PLANE_MAX, floor);
+
+    uint32_t offs = ega_fit_offsets();
+    if (offs && x86_arena_claim(X86_ARENA_ID_EGA, 1, 4u * offs, &blk) == 0) {
+        x86_vga_ega_set_planes(blk, offs);
+        x86_vga_ega_card_offsets = offs;
+        x86_video_log_event(8, offs >> 8, 0);
+    } else {
+        /* Loud: the mode is about to be refused, and the counter plus the
+           arena deficit are what say why. */
+        x86_vga_ega_set_planes(NULL, 0);
+        x86_vga_ega_card_offsets = 0;
+        x86_vga_ega_refused++;
+        x86_video_log_event(7, 0, 1);
+    }
+}
+
 static void planar_storage_follow(uint8_t kind)
 {
     void *blk = NULL;
@@ -1290,33 +1336,7 @@ static void planar_storage_follow(uint8_t kind)
         x86_vga_ega_set_planes(NULL, 0);
         cga_storage_lend();
         aperture_compact();
-        /* BORROW FROM GUEST RAM. The arena is 143,360 B and 100% used in 0Dh
-           while the guest's frame pool has idle frames; PLAN.md Phase 3 always
-           meant the extra plane storage to come from there. The floor is one
-           page past the best run the arena already has -- donating to build a
-           card no bigger than the one that already fits would shrink the guest
-           for nothing. See x86_pager.h for what a donation may and may not
-           take (with no pagefile wired, only FREE frames). */
-        {
-            uint32_t floor = x86_arena_largest + X86_ARENA_PAGE;
-            if (floor < 4u * X86_EGA_PLANE_OFFSETS)
-                floor = 4u * X86_EGA_PLANE_OFFSETS;
-            if (floor <= 4u * X86_EGA_PLANE_MAX)
-                x86_pager_donate_upto(4u * X86_EGA_PLANE_MAX, floor);
-        }
-        uint32_t offs = ega_fit_offsets();
-        if (offs && x86_arena_claim(X86_ARENA_ID_EGA, 1, 4u * offs, &blk) == 0) {
-            x86_vga_ega_set_planes(blk, offs);
-            x86_vga_ega_card_offsets = offs;
-            x86_video_log_event(8, offs >> 8, 0);
-        } else {
-            /* Loud: the mode is about to be refused, and the counter plus the
-               arena deficit are what say why. */
-            x86_vga_ega_set_planes(NULL, 0);
-            x86_vga_ega_card_offsets = 0;
-            x86_vga_ega_refused++;
-            x86_video_log_event(7, 0, 1);
-        }
+        ega_card_place(1);
         return;
     }
 
@@ -1472,6 +1492,101 @@ static void planar_storage_follow(uint8_t kind)
            wanted and x86_vga_modey_pages stays 1. */
         x86_vga_modey_set_pages(NULL, NULL);
     x86_video_log_event(9, x86_vga_modey_pages, 0);
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * THE DYNAMIC SIDE OF THE CARD: re-fit it as the guest's working set moves.
+ *
+ * Sizing the card ONCE, at mode adoption, is what made "EGA or frames" look
+ * like a choice. It is not one: KEEN4's intro is idle in RAM and wants every
+ * plane offset it can get, its gameplay wants its frames back, and both facts
+ * are true of the same title ten seconds apart. So the fit is re-evaluated,
+ * once per frame, against a reserve the pager MEASURES (x86_pager.h).
+ *
+ * WHERE THIS IS ALLOWED TO RUN, and it is the whole safety argument:
+ *
+ *  - Once per FRAME, from the top of the render, BEFORE anything has read the
+ *    card this frame and before mode_sync_from_bda() can adopt a new mode.
+ *    Never mid-frame, never per access -- the cycle budget in CLAUDE.md is not
+ *    negotiable and a placement walk is not a per-store cost.
+ *  - A shrink RELEASES THE EGA CLAIM FIRST and only then reclaims. A reclaim
+ *    while the arena still holds a page inside the donated extent is refused
+ *    (x86_pg_reclaim_busy) and the frames stay lent for the session; the Mode Y
+ *    arm below gives the real pages back for exactly the same reason.
+ *  - The card's CONTENTS DO NOT SURVIVE a re-fit -- the claim moves, and
+ *    x86_vga_planar_arm() zeroes planes and aperture on the way back in. That
+ *    is a frame of blank card until the guest redraws, and it is the price of
+ *    handing frames back at all. It is paid only when the policy actually
+ *    fires, which on a title that never comes under pressure is never.
+ *
+ * The GROW arm is deliberately more timid than the shrink arm: a shrink is
+ * correctness (the alternative is 433 ms pagefile writes inside the frame
+ * loop), a grow is picture quality, so it needs a whole second of quiet AND a
+ * gain of at least one arena page before it will spend a card's contents on it.
+ */
+void x86_video_policy_tick(void)
+{
+    int act = x86_pager_policy_tick();
+
+    if (act == X86_PG_POLICY_HOLD || !cur_desc)
+        return;
+
+    if (cur_desc->kind == VM_VGA8) {
+        /*
+         * MODE Y. The card here is the real display pages, and they are not
+         * re-fittable mid-mode: vga_cell() folds a display start onto page
+         * storage that the raycaster is drawing into, so growing one in would
+         * hand the guest a page full of somebody else's bytes. Only the shrink
+         * arm exists, and it is the one that matters -- it is the path back
+         * out of a level-load stall. At the shipping rung the arena places the
+         * extra page with no frames donated at all, so this never fires.
+         */
+        if (act != X86_PG_POLICY_SHRINK || !x86_pg_donated)
+            return;
+        x86_arena_release(X86_ARENA_ID_MODEYP);
+        x86_vga_modey_set_pages(NULL, NULL);
+        x86_pager_reclaim_from_arena();
+        x86_video_log_event(9, x86_vga_modey_pages, 2);
+        return;
+    }
+
+    if (cur_desc->kind != VM_EGA4)
+        return;
+
+    if (act == X86_PG_POLICY_SHRINK) {
+        if (!x86_pg_donated)
+            return;                     /* nothing lent: nothing to give back */
+    } else {
+        /* GROW is permission, not an instruction: only spend the card's
+           contents when a bigger one demonstrably fits. x86_arena_largest is
+           already counted by ega_fit_offsets(); what is new is the headroom. */
+        uint32_t head = x86_pager_policy_headroom();
+        uint32_t have = 4u * x86_vga_ega_card_offsets;
+        if (have >= 4u * X86_EGA_PLANE_MAX)
+            return;                     /* the mode cannot address more */
+        if (head < have + X86_ARENA_PAGE)
+            return;                     /* no gain worth a blank frame for */
+    }
+
+    /* Disarm, release, hand the frames back, re-fit from scratch. Both
+       directions go through the same sequence: after the reclaim the state is
+       exactly what a fresh mode set would find, and the reserve in force is
+       what decides how much of it goes back out again. */
+    x86_vga_planar_arm(0);
+    x86_arena_release(X86_ARENA_ID_EGA);
+    x86_vga_ega_set_planes(NULL, 0);
+    x86_pager_reclaim_from_arena();
+    aperture_compact();
+    /* A SHRINK BORROWS NOTHING. Re-donating inside the same refit is what a
+       first draft did, and MEASURED on KEEN4 it cost 9 evictions instead of 2:
+       the reserve had risen, so the smaller donation was taken and then had to
+       be recalled again one tick later, and every hop paid its own writebacks.
+       A shrink goes straight to the arena-only card; the grow arm is the only
+       thing that lends, and it needs a second of quiet first. */
+    ega_card_place(act == X86_PG_POLICY_GROW);
+    if (!x86_vga_planar_arm(1))
+        x86_video_log_event(7, 0, 2);   /* no card at all: loud, not silent */
 }
 
 static int mode_select(uint8_t mode)

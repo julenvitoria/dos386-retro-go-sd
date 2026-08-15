@@ -1823,7 +1823,7 @@ python3 tests/test_paging.py             # the guest memory ARCHITECTURE, as
                                          # deficit. Two arms (0x110000 and
                                          # 0x200000 not aliased) fail on the
                                          # pre-fix whole-space wrap.
-                                         # 165 checks, of which 32 are THE HMA:
+                                         # 181 checks: 32 the HMA, 16 the
                                          # a guest that opens A20, writes the
                                          # HMA, reads it back, MASKS A20 and
                                          # must then see the ALIAS (getting

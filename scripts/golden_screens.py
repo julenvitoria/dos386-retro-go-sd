@@ -84,6 +84,17 @@ WITNESS = ("x86_video_mode_byte", "frames_rendered", "guest_insns_total",
            "x86_vga_modey_cache_offs", "x86_vga_modey_lost_hi",
            "x86_vga_modey_lost_lo",
            "x86_vga_ega_card_offsets", "x86_arena_largest",
+           # The DONATION POLICY. A card size on its own does not say whether
+           # the frames behind it were idle or taken off a working set, and
+           # that is the whole question the policy decides -- so every golden
+           # run now reports the reserve it ran under and what pressure it saw.
+           "x86_pg_donated", "x86_pg_frames_total", "x86_pg_resident_peak",
+           "x86_pg_reserve_eff", "x86_pg_evictions", "x86_pg_wb_file",
+           "x86_pg_shrink_signals", "x86_pg_grow_signals",
+           # The RAM_EMU alarm (STATUS.md's Budgets row). A pool one frame
+           # short changes every pager number under it, so a golden run that
+           # did not report it could not be compared with one that did.
+           "guest_ram_pages", "guest_ram_pages_short",
            # The DMA2D offload's witnesses. Absent from a control build, which
            # _read_u32 answers with None rather than a missing key -- that is
            # the difference between "the engine did nothing" and "this build

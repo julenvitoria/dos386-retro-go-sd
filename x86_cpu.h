@@ -454,6 +454,9 @@ void x86_hle_set_zf(int set);
 int x86_video_map(void);
 uint8_t *x86_video_vram(void);
 void x86_video_render(uint8_t *dst, uint32_t stride);
+/* Once per frame, from the top of the render: re-fit the display card against
+   the pager's MEASURED working set. x86_video.c has the safety argument. */
+void x86_video_policy_tick(void);
 /* Optional 2-D engine offload for the CHAINED mode 13h blit only; NULL (the
    default, and what the host tests build) keeps the CPU row loop. Contract and
    the reason it is a hook rather than a call: x86_video.c. */

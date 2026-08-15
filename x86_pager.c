@@ -47,6 +47,12 @@ volatile uint32_t x86_pg_donated      = 0;
 volatile uint32_t x86_pg_donate_bytes = 0;
 volatile uint32_t x86_pg_donate_refused = 0;
 volatile uint32_t x86_pg_reclaim_busy = 0;
+/* ---- the donation POLICY's own state, all host-readable ------------------ */
+volatile uint32_t x86_pg_resident_peak  = 0;
+volatile uint32_t x86_pg_reserve_eff    = 0;
+volatile uint32_t x86_pg_shrink_signals = 0;
+volatile uint32_t x86_pg_grow_signals   = 0;
+volatile uint32_t x86_pg_policy_ratchet = 0;
 
 /* ---- per-page state ------------------------------------------------------
  *
@@ -155,6 +161,7 @@ void x86_pager_reset(void)
     donated_frames = donated_lo = 0;
     x86_pg_frames_total = x86_pg_frames_free = x86_pg_resident = 0;
     x86_pg_donated = x86_pg_donate_bytes = 0;
+    x86_pager_policy_reset();
 }
 
 int x86_pager_add_frames(void *base, uint32_t bytes)
@@ -699,7 +706,10 @@ uint32_t x86_pager_donate_to_arena(uint32_t bytes)
         uint32_t n = (bytes + 2u * X86_PG_SIZE - 2u + X86_PG_STRIDE - 1u)
                      / X86_PG_STRIDE;
         uint32_t live = frame_count - donated_frames;
-        if (!n || live < donate_reserve || n > live - donate_reserve)
+        /* The reserve is the POLICY's, which with the policy off is the static
+           constant this used to read directly. One call, at a mode set. */
+        uint32_t reserve = x86_pager_policy_reserve();
+        if (!n || live < reserve || n > live - reserve)
             goto refuse;
 
         for (uint32_t e = 0; e < extent_count; e++) {
@@ -844,6 +854,170 @@ int x86_pager_reclaim_from_arena(void)
     return 0;
 }
 
+/* ---- the donation POLICY -------------------------------------------------
+ *
+ * Everything above this line is MECHANISM: donate a run, take it back. What
+ * was missing is the decision, and until now that decision was a build-time
+ * constant (X86_PG_DONATE_RESERVE) evaluated ONCE, at mode adoption. A
+ * constant cannot serve a title whose working set varies -- KEEN4's intro
+ * wants a big card and few frames, its gameplay the opposite -- so the pick
+ * between "EGA" and "frames" was an artefact of when the question was asked,
+ * not a property of the memory.
+ *
+ * The rule here, in one line: THE RESERVE IS THE MEASURED WORKING SET PLUS A
+ * RUNWAY, and it only ever goes up within a session.
+ *
+ *   reserve = max(FLOOR, resident_peak + MARGIN, ratchet)
+ *
+ * x86_pg_resident_peak is measured on the fill path (free -- a compare after
+ * a 4 KB copy). The ratchet records what pressure has already taught us, so a
+ * working set that dips does not invite the card to grow back into it and
+ * re-learn the same lesson at 433 ms a page.
+ *
+ * WHY A WATERMARK AND NOT "SHRINK AT THE FIRST EVICTION". An eviction is the
+ * cost, not the warning: by the time x86_pg_evictions moves, the guest has
+ * already paid one 4 KB pagefile write, and on silicon that is up to 433 ms
+ * (x86_pg_wb_us_worst) -- a dropped frame at best. So the primary signal is
+ * FREE FRAMES falling below the same MARGIN the reserve carries, which fires
+ * while the pool still has runway and hands the frames back BEFORE the first
+ * write. The eviction counter is kept as a BACKSTOP for the case the
+ * watermark cannot see (a burst inside one tick), not as the trigger.
+ *
+ * WHY NOT A HYSTERESIS LOOP ON THE EVICTION RATE. It has to thrash to sample:
+ * every probe upward costs real writebacks, and the loop converges by paying
+ * the exact cost it exists to avoid. The peak is free to measure and is
+ * strictly better information.
+ *
+ * NOTHING HERE IS ON A HOT PATH. x86_pager_policy_tick() is called once per
+ * FRAME by the video path, and acts only at a moment the renderer tolerates.
+ */
+#ifndef X86_PG_POLICY
+#define X86_PG_POLICY 1
+#endif
+/* The two negative controls, built as arms rather than argued: with the shrink
+   compiled out the evictions must appear, and with the grow compiled out the
+   card must stay at the arena's size. run_paging_controls.py builds both. */
+#ifndef X86_PG_POLICY_NO_SHRINK
+#define X86_PG_POLICY_NO_SHRINK 0
+#endif
+#ifndef X86_PG_POLICY_NO_GROW
+#define X86_PG_POLICY_NO_GROW 0
+#endif
+
+static uint8_t  policy_on = X86_PG_POLICY;
+static uint32_t pol_ev_seen;
+static uint32_t pol_quiet;
+/* The three numbers, runtime rather than #define, for the same reason
+   x86_pager_set_donate_reserve() exists: the tier-1 harness runs an 8-frame
+   pool and must state its own arithmetic instead of the shipping part's. */
+static uint32_t pol_floor  = X86_PG_RESERVE_FLOOR;
+static uint32_t pol_margin = X86_PG_RESERVE_MARGIN;
+static uint32_t pol_quiet_n = X86_PG_POLICY_QUIET;
+
+void x86_pager_policy_config(uint32_t floor, uint32_t margin, uint32_t quiet)
+{
+    pol_floor = floor;
+    pol_margin = margin ? margin : 1u;
+    pol_quiet_n = quiet;
+}
+
+void x86_pager_policy_enable(int on)
+{
+    policy_on = (uint8_t)(on && X86_PG_POLICY);
+}
+
+void x86_pager_policy_reset(void)
+{
+    pol_ev_seen = x86_pg_evictions;
+    pol_quiet = 0;
+    x86_pg_policy_ratchet = 0;
+    x86_pg_resident_peak = x86_pg_resident;
+    x86_pg_shrink_signals = x86_pg_grow_signals = 0;
+}
+
+uint32_t x86_pager_policy_reserve(void)
+{
+    uint32_t r;
+
+    if (!policy_on)
+        return donate_reserve;
+    r = x86_pg_resident_peak + pol_margin;
+    if (r < pol_floor)
+        r = pol_floor;
+    if (r < x86_pg_policy_ratchet)
+        r = x86_pg_policy_ratchet;
+    if (r > frame_count)
+        r = frame_count;
+    x86_pg_reserve_eff = r;
+    return r;
+}
+
+/*
+ * What a donation could take RIGHT NOW without breaking the reserve, in bytes.
+ *
+ * Two pages are held back because x86_arena_add_region() rounds BOTH ends of
+ * the run inward and the caller is about to compare this against a card size:
+ * an over-estimate here turns into a refit that releases a good card and
+ * cannot rebuild it, which is a visible defect rather than a missed
+ * optimisation.
+ */
+uint32_t x86_pager_policy_headroom(void)
+{
+    uint32_t reserve = x86_pager_policy_reserve();
+    uint32_t live = frame_count - donated_frames;
+
+    if (live <= reserve + 2u)
+        return 0;
+    return (live - reserve - 2u) * X86_PG_STRIDE;
+}
+
+int x86_pager_policy_tick(void)
+{
+    uint32_t ev, live, want;
+    int pressure;
+
+    if (!policy_on)
+        return X86_PG_POLICY_HOLD;
+
+    ev = x86_pg_evictions;
+    live = frame_count - donated_frames;
+    /* The watermark first (it fires BEFORE a write), the eviction counter
+       second (it fires after one, and only catches what the watermark could
+       not see inside a single tick). */
+    pressure = (x86_pg_frames_free < pol_margin)
+               || (ev != pol_ev_seen);
+    pol_ev_seen = ev;
+
+    if (pressure) {
+        pol_quiet = 0;
+        /* Learn. The set is at least this big, so never lend into it again. */
+        want = x86_pg_resident_peak + pol_margin;
+        if (want > x86_pg_policy_ratchet)
+            x86_pg_policy_ratchet = want;
+        (void)x86_pager_policy_reserve();
+        if (X86_PG_POLICY_NO_SHRINK || !donated_frames)
+            return X86_PG_POLICY_HOLD;
+        x86_pg_shrink_signals++;
+        return X86_PG_POLICY_SHRINK;
+    }
+
+    (void)x86_pager_policy_reserve();
+    if (X86_PG_POLICY_NO_GROW)
+        return X86_PG_POLICY_HOLD;
+    /* Quiet for a whole second of frames before lending anything: a title
+       loading a level is idle between bursts, and growing into the gap is how
+       a policy manages to be wrong in both directions at once. */
+    if (++pol_quiet < pol_quiet_n)
+        return X86_PG_POLICY_HOLD;
+    if (live <= x86_pg_reserve_eff)
+        return X86_PG_POLICY_HOLD;
+    /* PERMISSION, not an instruction. The caller still has to find that a
+       bigger card actually fits -- a refit costs the card's contents, so it
+       may not be done speculatively. */
+    x86_pg_grow_signals++;
+    return X86_PG_POLICY_GROW;
+}
+
 uint8_t *x86_pager_slack(uint32_t page)
 {
 #if X86_HMA_NEGCTL == 2
@@ -930,6 +1104,11 @@ uint32_t x86_pager_fault(uint32_t lin, int write)
     pg_frame[page] = (uint16_t)f;
     pg_flags[page] |= PG_RESIDENT;
     x86_pg_resident++;
+    /* The high-water mark IS the working set, measured rather than assumed,
+       and it is the input the donation policy runs on. One compare on a path
+       that has just done a 4 KB fill. */
+    if (x86_pg_resident > x86_pg_resident_peak)
+        x86_pg_resident_peak = x86_pg_resident;
     fold_install(page, host);
 
     return (uint32_t)(uintptr_t)host + (lin & (X86_PG_SIZE - 1u));

@@ -183,6 +183,79 @@ by `tests/test_video.py`'s Mode Y real-page arm — with the alias, a write to
 page 1 overwrites page 0, and that negative control is seen to fail in the same
 run.
 
+## 5b. The donation POLICY -- the reserve is measured, not compiled in
+
+`X86_PG_DONATE_RESERVE` is evaluated ONCE, at mode adoption, and that single
+fact is the whole of the "EGA card OR guest frames" dichotomy. It is not a
+property of the memory: KEEN4's intro is idle in RAM and wants every plane
+offset it can get, its gameplay wants its frames back, and both are true of the
+same title ten seconds apart. So the decision is re-evaluated, once per frame,
+against a working set the pager MEASURES:
+
+    reserve = max(FLOOR 64, x86_pg_resident_peak + MARGIN 8, ratchet)
+
+`x86_pg_resident_peak` is a compare on the fill path (after a 4 KB copy, so
+free). The ratchet records what pressure has already taught the policy, so a
+working set that dips does not invite the card to grow back into it.
+
+**The shrink trigger is FREE FRAMES below MARGIN, not `x86_pg_evictions`.** An
+eviction is the cost, not the warning -- by the time the counter moves the guest
+has already paid a 4 KB pagefile write, up to 433 ms on silicon (§1a). Two
+alternatives were rejected: *shrink at the first eviction* (fires one whole
+writeback too late) and *a hysteresis loop on the eviction rate* (it has to
+thrash to sample, so it converges by paying exactly the cost it exists to
+avoid). The eviction counter is kept as a backstop for a burst inside one tick.
+
+`x86_pager_policy_tick()` returns HOLD / GROW / SHRINK and is called from ONE
+place: the top of `video_render_body()`, before anything has read the card and
+before `mode_sync_from_bda()` can adopt a new mode. Never mid-frame, never per
+access. A SHRINK releases the EGA claim and only then reclaims -- a reclaim with
+a claim still inside the donated extent is refused (`x86_pg_reclaim_busy`) and
+the frames stay lent for the session. **GROW is permission, not an
+instruction**: a re-fit costs the card's contents (`x86_vga_planar_arm()` zeroes
+planes and aperture), so the video side only spends that when the headroom
+demonstrably funds a card at least one arena page bigger.
+
+**A SHRINK BORROWS NOTHING.** The first draft re-donated inside the same refit
+under the new, higher reserve; measured on KEEN4 that cost **9 evictions**
+instead of 0, because each smaller donation was recalled again a tick later and
+every hop paid its own writebacks. A shrink now goes straight to the arena-only
+card.
+
+### Measured, KEEN4, gwemu tier 2 AND hardware (same shape both tiers)
+
+| t | card offsets | donated | frames_total | resident | reserve | evictions |
+|---|---:|---:|---:|---:|---:|---:|
+| before 0Dh | 0 | 0 | 158 | 68 | 76 | 0 |
+| 0Dh adopted | **65,536** | 66 | 92 | 68 | 76 | 0 |
+| the set grows | 65,536 | 66 | 92 | 78 | 86 | 0 |
+| watermark fires | 35,840 | **0** | **158** | 86 | 94 | **0** |
+| steady state | 35,840 | 0 | 158 | 134 | 142 | **0** |
+
+So Keen gets the **65,536 offsets/plane the Galaxy engine wants** for its intro
+-- a size no build-time reserve on this part can fund -- and its gameplay runs
+on the whole 158-frame pool with `x86_pg_wb_us_worst` = **0**. At the static
+reserve of 134 the card was 35,840 for the whole session; at 100 it was bigger
+and cost 84 evictions and 82 writes. The dichotomy was the schedule, not the
+memory.
+
+**WOLF3D is untouched, on hardware**: `donated`=0, `frames_total`=158,
+`evictions`=0, `wb_file`=0, `shrink_signals`=0, `modey_pages`=2. At
+`X86_MODEY_EXTRA_PAGES=1` the arena places the extra page with no donation, so
+the policy never fires and the golden stays at **0.000%**.
+
+**What the knobs mean now.** `X86_PG_RESERVE_FLOOR` / `_MARGIN` /
+`X86_PG_POLICY_QUIET` (x86_pager.h) are the owner's dials; `X86_PG_POLICY=0`
+restores the old fixed-reserve behaviour byte for byte, and
+`X86_PG_DONATE_RESERVE` is what governs in that build. The intro-rows-versus-
+frames trade is not silently picked: it is resolved IN TIME, and both ends of
+it are visible in `x86_vga_ega_card_offsets` and `x86_pg_frames_total`.
+
+**Negative controls, seen to fail**: `scripts/run_paging_controls.py` builds
+`X86_PG_POLICY_NO_SHRINK=1` (17 evictions appear, pagefile written) and
+`X86_PG_POLICY_NO_GROW=1` (nothing is ever borrowed). `tests/test_paging.py`
+grades the loop at tier 1, 149 checks.
+
 ## 6. XMS — a tier with NO fast path at all
 
 `x86_xms.h` / the XMS block at the end of `x86_dos.c`. It is listed here because

@@ -160,7 +160,7 @@ def main(args):
         ]
 
         # ---- demand paging, driven by guest instructions -------------------
-        p = run_arm(b, syms, "run_pager_flag", "pager_r", 80)
+        p = run_arm(b, syms, "run_pager_flag", "pager_r", 96)
         if p is None:
             print("FAIL: target never ran the pager test")
             return False
@@ -282,6 +282,37 @@ def main(args):
             # The check that was absent: the SHIPPING constant against the
             # peak recorded in the same header. It was 100 against 134.
             ("shipping reserve covers KEEN4's peak", p[76], 1),
+
+            # ---- THE POLICY: the same memory, decided again every frame ----
+            # Everything above grades the MECHANISM against a fixed reserve.
+            # These grade the DECISION -- borrow while the frames are idle,
+            # hand them back before the guest evicts -- on an 8-frame pool with
+            # the floor and margin scaled to it (tests/main.c).
+            ("idle pool: the policy offers to lend", p[77], 1),
+            ("  ... and says how much",              p[78], 1),
+            ("frames borrowed",                      p[79], 1),
+            ("  ... for NOTHING: no eviction",       p[80], 0),
+            ("  ... guest RAM shrank",               p[81], 1),
+
+            # The half that did not exist: the working set grows into what was
+            # lent, and the watermark fires while the pool still has runway.
+            ("the working set grows: SHRINK",        p[82], 1),
+            ("  ... BEFORE the first eviction",      p[83], 0),
+            ("  ... counted",                        p[84], 1),
+            ("released, then reclaimed",             p[85], 1),
+            ("  ... the pool is whole again",        p[86], 8),
+            ("  ... and it LEARNED the working set", p[87], 1),
+            ("re-evaluated: it now lends less",      p[88], 1),
+
+            # NEGATIVE CONTROL for the shrink, run rather than argued: the same
+            # walk with the SHRINK thrown away. The evictions the arm above
+            # proves absent must appear here, or that arm measures nothing.
+            ("shrink ignored: it evicts",            p[89], 1),
+            ("  ... and writes to the pagefile",     p[90], 1),
+            # NEGATIVE CONTROL for the grow: policy off, static reserve at the
+            # pool size -- the tree's behaviour before this work.
+            ("grow disabled: nothing is lent",       p[91], 0),
+            ("  ... the pool is untouched",          p[92], 8),
         ]
 
         # ---- the HMA: backed when A20 is open, aliased when it is not ------

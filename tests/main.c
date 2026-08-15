@@ -199,7 +199,7 @@ volatile uint32_t run_arena_flag = 0;
 volatile uint32_t arena_r[32];
 
 volatile uint32_t run_pager_flag = 0;
-volatile uint32_t pager_r[80];
+volatile uint32_t pager_r[96];
 
 /* The pagefile, as a plain RAM buffer.
  *
@@ -3322,11 +3322,165 @@ static uint32_t pager_donate_working_set(uint32_t pool, uint32_t wset,
     return x86_pg_wb_file - wf0;
 }
 
+
+/* ===========================================================================
+ * THE DONATION POLICY -- the loop, both ways, and its negative controls.
+ *
+ * Everything above this point tests the MECHANISM against a FIXED reserve.
+ * What is graded here is the DECISION: frames borrowed while they are
+ * genuinely idle, and handed back under pressure BEFORE the guest starts
+ * evicting. The pool is 8 frames rather than 160 and the floor/margin are
+ * scaled to it, but the shape is KEEN4's -- an idle phase that wants a big
+ * card, a working set that then grows into the frames it lent.
+ *
+ * The two negative controls are RUN, not argued: the same walk with the shrink
+ * IGNORED must produce evictions (and does), and the same walk with the policy
+ * off must produce no donation at all.
+ */
+#define POL_FLOOR   2u
+#define POL_MARGIN  2u
+#define POL_QUIET   3u
+
+/* The eviction counter is CUMULATIVE across every arm in this file, so the
+   policy arms read deltas from here. An absolute read passes or fails on what
+   an unrelated arm did earlier, which is not a test of anything. */
+static uint32_t pol_ev0, pol_wb0;
+
+static void pol_setup(uint32_t pool)
+{
+    x86_arena_reset();
+    x86_pager_reset();
+    x86_livemap_clear();
+    x86_pager_policy_enable(1);
+    x86_pager_policy_config(POL_FLOOR, POL_MARGIN, POL_QUIET);
+    x86_pager_set_backing(pgf_read, pgf_write);
+    pgf_first_slot = PGT_FIRST;
+    x86_pager_own(PGT_FIRST, PGT_PAGES);
+    x86_pager_add_frames(test_ram + PGT_MEM_OFF, X86_PG_POOL_BYTES(pool));
+    for (uint32_t i = 0; i < PGT_PAGES; i++)
+        guest_page_table[PGT_FIRST + i] = FOLD_INVALID;
+    x86_pager_policy_reset();
+    pol_ev0 = x86_pg_evictions;
+    pol_wb0 = x86_pg_wb_file;
+}
+
+/* Dirty pages [0,n) of the window, the way a guest would. */
+static void pol_touch(uint32_t n)
+{
+    for (uint32_t p = 0; p < n; p++) {
+        uint32_t h = x86_pager_fault(0xC0000u + (p << 12), 1);
+        x86_livemap_clear();
+        if (h)
+            *(uint8_t *)(uintptr_t)(h + 4095u) = (uint8_t)(p + 1u);
+    }
+}
+
+/* Quiet ticks until the policy offers to lend, bounded so a policy that never
+   grows fails the arm rather than hanging the harness. */
+static int pol_tick_until_grow(void)
+{
+    for (uint32_t i = 0; i < POL_QUIET + 4u; i++) {
+        if (x86_pager_policy_tick() == X86_PG_POLICY_GROW)
+            return 1;
+    }
+    return 0;
+}
+
+static void pager_policy_arms(void)
+{
+    uint32_t donated_first, ev_at_shrink;
+
+    /* ---- 1. GROW WHILE IDLE ------------------------------------------- */
+    pol_setup(8u);
+    pol_touch(2u);                      /* a small working set: peak = 2 */
+    pager_r[77] = pol_tick_until_grow();                        /* 1 */
+    pager_r[78] = (x86_pager_policy_headroom() > 0u);           /* 1 */
+    /* Borrow ONLY on the policy's permission, exactly as the video path does.
+       Donating unconditionally here would leave the grow's negative control
+       with nothing to catch -- the card would still get built. */
+    if (pager_r[77])
+        x86_pager_donate_upto(4u * 4096u, 4096u);
+    donated_first = x86_pg_donated;
+    pager_r[79] = (donated_first > 0u);                         /* 1 */
+    pager_r[80] = x86_pg_evictions - pol_ev0;  /* idle frames cost NOTHING */
+    pager_r[81] = (x86_pg_frames_total < 8u);                   /* 1 */
+
+    /* ---- 2. HAND THEM BACK BEFORE THE GUEST THRASHES ------------------ */
+    /* Grow the working set into what was lent. The watermark must fire while
+       the pool still has runway -- the eviction counter at that moment is the
+       whole point of the arm, because an eviction is a 4 KB pagefile write and
+       on silicon that is up to 433 ms INSIDE the frame loop. */
+    {
+        int shrank = 0;
+        for (uint32_t p = 2u; p < PGT_PAGES && !shrank; p++) {
+            pol_touch(p + 1u);
+            if (x86_pager_policy_tick() == X86_PG_POLICY_SHRINK)
+                shrank = 1;
+        }
+        pager_r[82] = shrank;                                   /* 1 */
+    }
+    ev_at_shrink = x86_pg_evictions - pol_ev0;
+    pager_r[83] = ev_at_shrink;         /* 0: BEFORE the first writeback */
+    pager_r[84] = x86_pg_shrink_signals;                        /* 1 */
+    /* What the video path does with a SHRINK: release, then reclaim. */
+    x86_arena_release(X86_ARENA_ID_EGA);
+    pager_r[85] = (x86_pager_reclaim_from_arena() == 0);        /* 1 */
+    pager_r[86] = x86_pg_frames_total;                          /* 8: whole */
+    pager_r[87] = (x86_pg_policy_ratchet
+                   >= x86_pg_resident_peak + POL_MARGIN);       /* 1 */
+    /* THE RE-EVALUATION ITSELF: the second time round, the same call lends
+       FEWER frames, because the reserve now carries a working set that has
+       been measured rather than guessed. A policy that re-lent the same amount
+       would pass every arm above this one. */
+    x86_pager_donate_upto(4u * 4096u, 4096u);
+    pager_r[88] = (x86_pg_donated < donated_first);             /* 1 */
+    x86_arena_release(X86_ARENA_ID_EGA);
+    x86_pager_reclaim_from_arena();
+
+    /* ---- 3. NEGATIVE CONTROL: the shrink IGNORED ----------------------- */
+    /* Identical walk, and the SHRINK is thrown away instead of acted on. The
+       evictions the arm above proves absent must now appear, or that arm is
+       measuring nothing. */
+    pol_setup(8u);
+    pol_touch(2u);
+    (void)pol_tick_until_grow();
+    x86_pager_donate_upto(4u * 4096u, 4096u);
+    for (uint32_t pass = 0; pass < 2u; pass++)
+        pol_touch(PGT_PAGES);
+    pager_r[89] = (x86_pg_evictions - pol_ev0 > 0u);                      /* 1 */
+    pager_r[90] = (x86_pg_wb_file > pol_wb0);                        /* 1 */
+
+    /* ---- 4. NEGATIVE CONTROL: the grow DISABLED ------------------------ */
+    /* The policy off, with the static reserve at the pool size -- which is
+       what the tree did before this work whenever the constant was set for
+       the working set. Nothing is lent and the card stays the arena's. */
+    pol_setup(8u);
+    x86_pager_policy_enable(0);
+    x86_pager_set_donate_reserve(8u);
+    pol_touch(2u);
+    (void)pol_tick_until_grow();
+    x86_pager_donate_upto(4u * 4096u, 4096u);
+    pager_r[91] = x86_pg_donated;                               /* 0 */
+    pager_r[92] = x86_pg_frames_total;                          /* 8 */
+
+    x86_pager_policy_enable(1);
+    x86_pager_policy_config(X86_PG_RESERVE_FLOOR, X86_PG_RESERVE_MARGIN,
+                            X86_PG_POLICY_QUIET);
+    x86_arena_reset();
+    x86_pager_reset();
+}
+
 static void pager_test_run(void)
 {
-    for (uint32_t i = 0; i < 80; i++)
+    for (uint32_t i = 0; i < 96; i++)
         pager_r[i] = 0;
 
+    /* THE STATIC ARMS RUN WITH THE POLICY OFF, and that is the header's own
+       rule: with it on, the reserve is the pager's MEASURED working set and
+       every arm below that states the arithmetic of a fixed reserve would be
+       asserting the policy's answer instead of its own. The policy has its own
+       arm at the end of this function, and it turns it back on itself. */
+    x86_pager_policy_enable(0);
     x86_pager_reset();
     pgf_first_slot = PGT_FIRST;
     pgf_writes = pgf_reads = pgf_fail = 0;
@@ -3686,6 +3840,8 @@ static void pager_test_run(void)
      * recorded three paragraphs away from it in x86_pager.h.
      */
     pager_r[76] = (X86_PG_DONATE_RESERVE >= KEEN4_PEAK_FRAMES);    /* 1 */
+
+    pager_policy_arms();
 
     x86_pager_set_backing(NULL, NULL);
     x86_pager_set_donate_reserve(X86_PG_DONATE_RESERVE);
