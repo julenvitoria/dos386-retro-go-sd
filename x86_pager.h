@@ -218,11 +218,50 @@ void x86_pager_set_nor(const void *base, uint32_t bytes, uint32_t first_page);
  * 196,608 B and silently got 106,496 gets the noise the arena's
  * never-partially-satisfy rule exists to prevent.
  */
-#define X86_PG_DONATE_RESERVE 100u   /* frames guest RAM keeps, come what may */
+/*
+ * THE RESERVE IS KEEN4'S MEASURED PEAK, NOT A CARD SIZE. It was 100, chosen to
+ * fund a 63 KB/plane card, while the paragraph above already recorded that
+ * KEEN4 peaks at 134 frames -- so the shipping constant knowingly left the one
+ * title that reaches this path 34 frames short of its own working set.
+ *
+ * Under gwemu that costs nothing and reads as a healthy run: KEEN4 reaches the
+ * MAIN MENU, x86_pg_exhausted stays 0, and the only symptom is a counter. On
+ * SILICON a dirty eviction is a 4 KB pagefile write costing up to 433,509 us
+ * (x86_pg_wb_us_worst, measured), and at reserve 100 KEEN4 paid 84 evictions
+ * and 82 of those writes in the first 15 seconds. At 134 it pays ZERO --
+ * measured at tier 2 and again on HARDWARE: donated=0, frames_total=160,
+ * evictions=0, wb_file=0, wb_us_worst=0.
+ *
+ * MAX_SLICE_CEIL bounds a slice in INSTRUCTIONS and cannot bound that cost:
+ * the time is spent in f_write, not in the interpreter. The reserve is the
+ * only thing that decides whether those writes happen at all.
+ *
+ * THIS IS NOT THE KEEN4 WEDGE, AND THAT WAS CHECKED, NOT ASSUMED. The obvious
+ * story -- 0Dh donates, the guest thrashes, the writeback storm stalls the
+ * frame loop past the watchdog -- is wrong. With this reserve the donation is
+ * refused outright and the pagefile is never touched, and KEEN4 STILL wedges
+ * on silicon: guest_insns_total and frames_rendered both freeze (measured at
+ * 14.9 M/347, 19.9 M/352, 31.4 M/640 frames on three runs) and WWDG resets it
+ * with boot_magic=0xbad00005. The wedge is a genuine hang elsewhere; do not
+ * re-derive it from these counters.
+ *
+ * AND THE DONATION CANNOT HELP KEEN4 AT ALL, structurally. An arena claim may
+ * not span regions, so the card is the BEST SINGLE RUN -- either the arena's
+ * 143,360 B (35,840 plane offsets) or the donated run, never their sum. Beating
+ * the arena therefore takes ~35 frames, and Keen's 160-134 leaves 26. So above
+ * a reserve that respects the working set the feature is inert for this title,
+ * and the card is the arena. Shrinking the reserve to make it fire again buys
+ * 61,440 offsets by running the guest 34 frames short of its own peak.
+ *
+ * So the floor is the working set and the card is what is left over, never the
+ * other way round. A smaller card is a RENDERING defect (KEEN4's golden is
+ * already known-bad for one); a card funded out of the working set is SD I/O
+ * the frame loop pays for. Raise this only against a re-measured peak.
+ */
+#define X86_PG_DONATE_RESERVE 134u   /* frames guest RAM keeps, come what may */
 /* Change the floor. The default is sized for THIS part (160 frames, KEEN4's
-   134-frame peak, a 63 KB/plane card); the tier-1 harness sets its own so the
-   arms below are arithmetic the test can state rather than the shipping
-   constant. */
+   134-frame peak); the tier-1 harness sets its own so the arms below are
+   arithmetic the test can state rather than the shipping constant. */
 void x86_pager_set_donate_reserve(uint32_t frames);
 uint32_t x86_pager_donate_to_arena(uint32_t bytes);
 /* The ladder: the largest run between the two, or 0. One refusal, not one per

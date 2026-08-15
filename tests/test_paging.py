@@ -155,7 +155,7 @@ def main(args):
         ]
 
         # ---- demand paging, driven by guest instructions -------------------
-        p = run_arm(b, syms, "run_pager_flag", "pager_r", 72)
+        p = run_arm(b, syms, "run_pager_flag", "pager_r", 80)
         if p is None:
             print("FAIL: target never ran the pager test")
             return False
@@ -262,6 +262,21 @@ def main(args):
             ("donate/reclaim round 3",              p[69], 1),
             ("  ... reclaimed",                     p[70], 1),
             ("  ... the pool did not fragment",     p[71], 5),
+
+            # ---- the reserve is the WORKING SET, not a card size -----------
+            # KEEN4's wedge, scaled to test_ram. A reserve at or above the
+            # working set means the donation costs no pagefile I/O at all;
+            # a reserve below it means every pass round the set writes 4 KB to
+            # the SD card, which is free here and up to 433 ms on silicon.
+            ("reserve >= working set: no SD writes", p[72], 0),
+            ("  ... and the pool is whole",          p[73], 8),
+            # The negative control for that arm, in the test rather than in a
+            # reviewer's head.
+            ("reserve < working set: it thrashes",   p[74], 1),
+            ("  ... because the pool shrank",        p[75], 1),
+            # The check that was absent: the SHIPPING constant against the
+            # peak recorded in the same header. It was 100 against 134.
+            ("shipping reserve covers KEEN4's peak", p[76], 1),
         ]
 
         bad = 0
