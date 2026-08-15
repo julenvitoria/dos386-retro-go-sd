@@ -33,48 +33,63 @@ tier that sees the pipeline, peripheral init or real memory ordering.
 
 ## Backlog
 
-### Queue A — memory tier: the groundwork is DONE
+### Queue A — make the shipped titles good
 
-1. ~~MCB arena~~, 2. ~~pager eviction~~, 3. ~~pagefile~~, 4. ~~frame donation~~.
-   Two live knobs came out of it:
-   - **The pagefile WRITE path is pathological, not merely slow** — 433,509 us
-     for one 4 KB write on silicon, growing over the session, against 23,531 us
-     for a sector read. One cause fixed (a per-page `fopen`/`fclose`); the
-     remaining suspect is `FF_USE_FASTSEEK 0`, which makes `f_lseek` walk the
-     chain from byte zero. Split by `pgf_us_open/_seek/_write`. A write-behind
-     queue hides latency without reducing churn, so it comes after this.
-   - **`X86_MODEY_EXTRA_PAGES` trades a rendering defect for a paging one** and
-     the WOLF3D golden cannot grade it — it passes on all arms.
-     2 → 126 frames, 0 alias hits · 1 → 142, 13,119,029 · 0 → 160 and no paging
-     at all, 27,011,108. **Default stays at 2**; only tier 3 and the owner's eye
-     can decide. `x86_vga_modey_alias_hits` is the gate.
-5. **Keen 4's levels** — fundable by the same mechanism. Blocked on B3.
+**Owner's definition (this supersedes the old A/B split).** Everything that is
+not Dark Forces lives here.
 
-### Queue B — rendering
+1. **Per-game `.cfg`** — bring the prior port's implementation over; the owner
+   wants to KEEP that design. It is already a clean two-layer split and both
+   halves are in-tree:
+   - `references/8086tiny/dos_settings.{c,h}` owns the FORMAT and the policy —
+     defaults, ranges, what a corrupt file means, what is written and omitted —
+     and deliberately does NO I/O, which is what let it be tested without a
+     machine (`test286/runsettings.sh`).
+   - `references/dos_port_prior/dos_settings_rg.{c,h}` is the retro-go binding:
+     work out the path, read the bytes, hand them over; write them back on a
+     menu change. Cold path only.
+   Scope is **every Options entry AND launch parameters** per title, not just
+   the CPU profile. We already have `odroid_dialog_choice_t` options
+   (`src/main.c:2138`, the CPU profile callback) to feed it.
+   **The trap is recorded in that header and must be honoured: `MAX_OPEN_FILES`
+   is 8 across the WHOLE firmware, the DOS core already holds three for its
+   entire run plus one for the pagefile, and exhaustion is SILENT — every other
+   `fopen()` starts returning NULL and the UI degrades with nothing logged. The
+   launcher once rendered as diamonds because of it.** Open, read, close; never
+   hold a handle. Load BEFORE `dos_cpu_init()`'s equivalent here, because a
+   setting read on the segment-load path applied late looks intermittent.
+2. **Guest RAM -> NOR backup path** — it appears to work and then BSODs on a
+   watchdog. Diagnose the watchdog, not the snapshot: `nor_snap_cb_bytes`
+   (anything other than 655,360 means the snapshot is not the guest's memory),
+   `x86_nor_attached` / `x86_nor_attach_err` (7 = the flash readback did not
+   match guest RAM, i.e. the fold table was never touched and the guest is
+   still on AXI — the invariant the design turns on). Note `test_nor` currently
+   FAILS on stock master (pre-existing, verified by stash-and-rebuild).
+3. **Sound Blaster** — not implemented at all. Ports 0x220/0x388 are unanswered.
+   Size it against what real titles actually probe rather than against the
+   spec; Epic Pinball and Mortal Kombat diagnoses are being measured now and
+   will say what is really asked for.
+4. **Epic Pinball** — if it is not running by the time 1-3 are done, making it
+   run is the LAST task in Queue A.
 
-0. ~~Planar store path~~ — write class decided at `OUT` time, **+55-73%**.
-   2. ~~Mode Y off-screen cache~~ (15,616 offsets, `lost_cache` → 0).
-   7. ~~Mode Y real pages~~ (3 pages, `alias_hits=0`; awaiting the owner on the
-   doubled-walls artefact).
-1. ~~Golden-screenshot gate~~ — `scripts/golden_screens.py`. **ALLEYCAT's
-   golden was captured while the title was stuck on its first frame.** An
-   attestation records what a golden SHOWS, not that the emulator was healthy.
-   Re-bless against an owner-verified run.
-3. **Fold-trap the VGA aperture check** — in progress. Removes 4-5 instructions
-   from every memory access and may free the 65,536-byte 0Dh read shadow.
-3b. **The aperture in DTCM — MEASURED, DOES NOT FIT.** `dtc_malloc()` refuses
-   it: 63,268 free against 65,568 wanted, short by 2,300. The one route left is
-   evicting the 8,192-byte pager page table — fits with 5,892 to spare, costs
-   two pager frames or an unknowable bite of the AHB heap. **Owner's call**, and
-   it forecloses B5. [`docs/12`](docs/12_memory_tiers.md) §8.
-4. **Keen's half-height intro** — `crtc_start=15360`, pitch 64, 19,456 offsets
-   fitted, needs 28,160. Blocked on 3.
-5. **DMA2D A/B** — in progress; chained 13h only, unprovable below tier 3.
-   **Mutually exclusive with B3b** — Chrom-ART cannot address DTCM.
-6. **Overlay legibility over 256-colour modes** — in progress.
-8. Alley Cat's other cats flicker in and out. New, unmeasured.
+Also live here, measured and sized, unblocked whenever a slot frees:
 
-### Queue C — Dark Forces, in dependency order
+- **The 433 ms pagefile writeback** — `x86_pg_wb_us_worst` on silicon, against
+  23 ms for an ordinary sector read, and it GROWS over a session. The per-page
+  `fopen`/`fclose` is already fixed; `pgf_us_seek` vs `pgf_us_write` says what
+  the rest is and `FF_USE_FASTSEEK 0` is the suspect (`f_lseek` walks the
+  cluster chain from byte zero every call). Gates Keen and everything
+  EMS/XMS-backed.
+- **`REP STOSW`'s per-element planar hook** — ~3% of wall. The page cannot
+  change mid-`REP`, so the decision is resolvable ONCE instead of ~38 times.
+- **Keen 4's watchdog wedge** — 34.7 M instructions over 944 frames, then it
+  stops; `boot_magic=0xbad00005`. Being measured now.
+- **Wolf3D** is visually done (owner's verdict). What remains is FRAME RATE and
+  sound. Remaining measured levers: the `REP STOSW` hook, aperture reads
+  (~4.5%), and the 1,242-cycle `OUT` (`ega_shadow_rebuild()` on GC writes).
+- Retro-go's Pause overlay is unreadable over 256-colour modes.
+
+### Queue B — Dark Forces. NOT DONE UNTIL DARK FORCES RUNS.
 
 **Nothing here starts before the step above it is measured.**
 
