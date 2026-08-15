@@ -161,10 +161,35 @@ void x86_pager_own(uint32_t first_page, uint32_t count);
  * A second window rather than one widened one, deliberately. Widening
  * x86_pager_own() to cover [0, 5 MB) would make every page between 640 KB and
  * 4 MB ownable, and a stray guest access up there would quietly be handed a
- * frame instead of the clean X86_EXIT_MEM_FAULT it has earned. The two windows
- * are checked separately and nothing between them is ours.
+ * frame instead of the clean X86_EXIT_MEM_FAULT it has earned. The windows are
+ * checked separately and nothing between them is ours.
+ *
+ * THERE IS MORE THAN ONE OF THEM, and the second user is the HMA. EMS lives at
+ * linear 4 MB; the sixteen pages at 1 MB are the other storage that is neither
+ * inside the 640 KB window nor a fixed mapping, and they come and go with the
+ * A20 gate (x86_mem_wrap_1mb()). So this is an ADD, not a store:
+ *
+ *   count != 0   register (or replace, matching on first_page) a window.
+ *   count == 0   drop the window that starts at first_page.
+ *   (0, 0)       drop them all -- the "no aux windows" reset the harness uses.
+ *
+ * A window is not a claim on frames: pages inside it are ordinary pageable
+ * guest pages, filled on fault and evictable like any other.
  */
 void x86_pager_own_aux(uint32_t first_page, uint32_t count);
+
+/*
+ * Re-install one page's fold entry from the pager's own record: the frame's
+ * host address if it is resident, FOLD_INVALID if it is not.
+ *
+ * This exists for the A20 gate. While the gate is MASKED the sixteen HMA fold
+ * entries belong to the WRAP -- they alias low memory -- and the pager must
+ * not write them even for a page it still holds a frame for. When the gate
+ * OPENS those entries become the HMA's own again, and every page that was
+ * resident from an earlier open window has to be pointed back at its frame
+ * rather than left FOLD_INVALID to fault in a second, unrelated copy.
+ */
+void x86_pager_refold(uint32_t page);
 
 /*
  * Service a fold miss. `lin` is the faulting guest linear address; `write` is

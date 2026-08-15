@@ -244,6 +244,150 @@ Two errors produced the wrong verdict, and both are the same shape:
 > hardware.** Re-measure before concluding anything is impossible. This cost a
 > wrong "impossible" once and a wrong "38% idle" the same day.
 
+## THE HMA IS BACKED WHEN A20 IS OPEN — MEASURED 2026-08-15, and it moved BOTH blocked titles
+
+`x86_mem_wrap_1mb()` used to write `FOLD_INVALID` across the sixteen pages at
+1 MB whenever the gate was OPEN. That was honest about the implementation and
+wrong about the machine: a 286+ with A20 open HAS memory there, and it was the
+single blocker under both entries below. The pages are now ordinary demand-paged
+guest pages, through the pager's SECOND WINDOW — the same `x86_pager_own_aux()`
+mechanism EMS uses at linear 4 MB, generalised from one window to two rather
+than a third mechanism being invented.
+
+**The ownership rule, because getting it wrong is silent corruption, not a fault:**
+
+| gate | who owns the sixteen fold entries | the frames |
+|---|---|---|
+| OPEN | the pager, via the aux window. Filled from the ZERO tier on first touch | the HMA's own |
+| MASKED | the WRAP. The alias onto low memory is the guest-visible truth, and the pager may not write those entries **even to unmap a page it is evicting** (`fold_is_wrapped()`, `x86_pager.c`) | kept, untouched, behind the alias |
+| REOPENED | the pager again; `x86_pager_refold()` points every still-resident page back at its own frame | unchanged, data intact |
+
+**They are EVICTABLE and NOT PINNED.** They are ordinary guest pages: untouched
+they cost nothing, and a touched one is a normal victim with a normal writeback.
+`x86_pinned_pages` is unchanged — nothing here pins. The only special-casing is
+the fold entry above, which is about who may WRITE the table, not about frames.
+
+**The 1 MB seam is real, refused and COUNTED, exactly as `docs/10` requires.**
+Sixteen pages handed out in FAULT order are sixteen unrelated frames, so a
+16-bit access straddling a boundary INSIDE the window is docs/10's defect — it
+is served by the ordinary slack mechanism and `tests/test_paging.py` grades both
+halves of the value landing in the right frames. The 1 MB LINE ITSELF is
+different: page 255 is a fixed mapping with no slack of its own, so a straddle
+across `0x100000` cannot be served, is refused, and shows up in
+`x86_seam_overflow`. Both titles below read **`x86_seam_overflow=1`** — one
+refused straddle each, the honest degradation and not a silent wrong byte.
+
+**`INT 15h AH=88h` now answers 64 KB** (`EXT_MEM_KB`, `x86_bios.c`) because that
+is exactly what is backed — sixteen pages and nothing above `0x110000`. `AH=87h`
+(move block to extended memory) and `AH=89h` (switch to protected mode) are
+still refused with CF=1/AH=86h, which is not an inconsistency: the memory exists
+and those two services do not. `AH=C0h`/`AH=BFh` stay unanswered and counted —
+answering them means synthesising a system configuration table, which is a
+different piece of work and would be a lie about the machine, not about memory.
+**XMS still reports no HMA** (`BL=90h`): XMS `AH=01h` grants EXCLUSIVE ownership
+to one client and requires the driver to drive A20 on its behalf, none of which
+is built. The memory being backed and a driver managing it are two claims, and
+only the first is true. `test_xms` stays 47/47.
+
+### The gates
+
+`tests/test_paging.py` is **165 checks** (was 133): 32 new ones covering the
+write/read-back, the mask-and-see-the-ALIAS round trip, the reopen, the straddle
+inside the window, the refused straddle across the line, and the window coming
+and going with the gate. `scripts/run_hma_controls.py` is the negative-control
+runner and **both arms were SEEN TO FAIL**: `X86_HMA_NEGCTL=1` leaves the window
+registered across a mask (the guest then reads its HMA data where the alias
+belongs) and `=2` refuses the HMA's slack (the straddle is no longer served).
+Both caught, baseline green.
+
+### What it cost, measured and not estimated
+
+`__CORE_ITCM_CODE_END__` = **0xD2D8**, byte-for-byte unchanged — none of this is
+on the fast path. `__CORE_BSS_END__` **0x2405FC30 -> 0x2405FD38** (+264 B), and
+that 264 B **crosses a 4 KB alignment boundary in the RAM_EMU claim**:
+`guest_ram_free_at_claim` **655,360 -> 651,264**, so `guest_ram_pages` is
+**158** with `guest_ram_pages_short=2`, one frame below stock master's 159/1.
+One 4 KB guest frame is the price of sixteen, on demand. It is recoverable by
+trimming any 264 bytes of RAM_EMU footprint, and it is quoted here so nobody
+re-derives it as a starvation bug — `core_ready=1`, `x86_pg_frames_total=158`,
+`x86_pg_exhausted=0`, `x86_pg_evictions=0`, and the WOLF3D golden is **0.000%**
+on this exact core.
+
+## Mortal Kombat — MEASURED 2026-08-15: THE A20 WRAP TEST PASSES, and it now runs 42,188 instructions
+
+Same command as the entry below it (`start-preselected-game.tl`, gwemu tier 2),
+plus `probe_report.py --title mortalkombat`, which is now a PRESET rather than a
+hand-rolled run.
+
+**The wrap test is answered, and answered the way a 286+ answers it.** The guest
+opens A20 at port 0x92, compares `FFFF:0030` against `0000:0020` with
+`REPE CMPSW`, and the two locations now DIFFER because the HMA is its own
+memory. `x86_a20_changes=3` — open, mask, open — which is the shape of a program
+that tests the gate in both directions and then leaves it where it wants it.
+`x86_a20_state=1`, `x86_pg_unmapped=0` (it was 1, and that 1 WAS the wrap test).
+
+**It went from 0 instructions to 42,188** and from wall 4 of its C runtime into
+a whole extender phase it had never reached. It now asks for exactly what Dark
+Forces asks for, in the same order: `INT 2Fh AX=1687h` (DPMI), `INT 67h AH=DEh`
+(VCPI) ×2, `INT 67h AH=43h`/`45h`, `INT 15h AH=BFh` ×2, `AH=C0h`, and
+`INT 21h AH=38h`. It also opens files now (`x86_dos_file_calls=7`, three
+`AH=3Dh`, two `AH=3Fh`) and writes the CMOS index/data ports (`OUT 0x70,0x0F`,
+`OUT 0x71,0x09` — unmodelled, dropped).
+
+**Where it stops now:** `guest_exit_reason=4` (`X86_EXIT_UNIMPLEMENTED`) with
+`exit_info=0x0F` at `CS:EIP = 0081:032F`, i.e. inside the image loaded at
+segment 0x81. **That is the same exit, the same info byte and the same CS:EIP as
+Dark Forces**, which is a fact worth carrying forward: the two titles are now
+blocked on ONE thing, in shared extender code, not on two.
+
+**Read this caveat before chasing it.** A `--guest` hexdump at that linear
+address (`0x810 + 0x32F = 0xB3F`) shows an 8-byte-stride DATA table, not an
+instruction stream with an `0F` in it. So either `cpu_state.eip` is not the
+faulting address on this exit path, or the guest has transferred into data.
+Settle THAT before naming an opcode — an opcode named from a stale EIP is how a
+day gets spent implementing something nothing asked for.
+
+Everything else stayed healthy: `x86_pg_exhausted=0`, `_evictions=0`,
+`x86_map_failures=0`, `core_ready=1`, `x86_xms_detects=0` (still never asked).
+
+## Star Wars: Dark Forces — MEASURED 2026-08-15 (FOURTH PASS): past the memory hunt, into file loading
+
+`probe_report.py --title darkforces --skip-cost`, gwemu, 30 s, same preset as
+the third pass below.
+
+**`guest_exit_reason` moved from 5 to 4.** The `X86_EXIT_MEM_FAULT` at the HMA
+is gone: the extender opens A20 (`x86_a20_changes=3`, `x86_a20_state=1`), reads
+over the 1 MB line through `ES=0xFFFF`, and **gets memory**. `x86_pg_unmapped=0`
+where the third pass measured the fault.
+
+**And it went to work.** 102,517 instructions and **28 distinct probes against
+30 file calls**, where the third pass died in the hunt: ten `AH=3Fh` reads, eight
+`AH=42h` seeks, three opens, three closes, sixteen `AH=4Ah` resizes and three
+`AH=48h` allocations. It is loading its data files.
+
+**`CR0=0`. STILL REAL MODE, AND THE CLAIM WAS TESTED AGAIN, NOT ASSUMED.** The
+descriptor walk of `docs/14` remains unexercised by this title — backing the HMA
+did not push it into protected mode, and nothing in this pass exercises the
+walk. `x86_xms_detects=0`: XMS is still never asked.
+
+**`INT 15h AH=88h` did not decide this.** Dark Forces does not call it in this
+run at all — it asks `AH=BFh` and `AH=C0h`, both still unanswered. The honest 64
+is there for the titles that do ask; it is not what moved this one.
+
+**Where it stops now:** identical to Mortal Kombat above —
+`X86_EXIT_UNIMPLEMENTED`, `exit_info=0x0F`, `CS:EIP = 0081:032F`, with the same
+caveat about that EIP. `x86_seam_overflow=1`, `x86_pg_exhausted=0`,
+`_evictions=0`, `x86_map_failures=0`.
+
+**THREE titles now end on `exit_info=0x0F`** — these two and Epic Pinball. That
+is either one missing two-byte opcode shared by the runtimes they are built
+with, or a shape the exit path reports for something else entirely. It is now
+the single highest-value question on this page, and the first step is deciding
+which of those two it is rather than implementing an opcode from an EIP nobody
+has corroborated.
+
+### The third pass, which named the HMA (superseded by the above)
+
 ## Star Wars: Dark Forces — MEASURED 2026-08-15 (THIRD PASS): AH=52h/29h are IN, and the extender now runs its MEMORY HUNT
 
 `INT 21h AH=52h` (list of lists) and `AH=29h` (parse filename into FCB) are now
@@ -567,7 +711,7 @@ reflects none of the graphics work. Its six sub-timings read `65535` until port
 `0x20` answered — see
 [`11_pit_and_interrupt_controller.md`](11_pit_and_interrupt_controller.md) §3.
 
-## Mortal Kombat — BLOCKED on the HMA, after four walls in the first 200 instructions
+## Mortal Kombat — BLOCKED on the HMA, after four walls in the first 200 instructions (SUPERSEDED: the HMA is backed, see the entry above)
 
 First measured 2026-08-15, gwemu tier 2, `timelines/start-preselected-game.tl`.
 The `.dsk` mounts, the program LOADS (`dsk_startup_ok=1`, `dsk_exec_rc=0`), the

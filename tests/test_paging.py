@@ -76,7 +76,12 @@ def main(args):
             # ---- the gate, opened by the guest through port 0x92
             ("guest OUT 92h opened the gate",           r[8], 1),
             ("exactly one transition",                  r[9], 1),
-            ("HMA access now faults cleanly",           r[10], MEM_FAULT),
+            # With NO POOL behind it, an HMA access is still a clean fault --
+            # that is the pager having nothing to give, not the wrap. The HMA
+            # arms below run the same access WITH a pool and require it to
+            # succeed; the two together say the memory comes from the pager and
+            # from nowhere else.
+            ("HMA access faults with no pool",          r[10], MEM_FAULT),
             ("  ... because the HMA is unmapped",       r[11], 1),
             ("port 0x92 reads back open",               r[12], 0x02),
 
@@ -277,6 +282,65 @@ def main(args):
             # The check that was absent: the SHIPPING constant against the
             # peak recorded in the same header. It was 100 against 134.
             ("shipping reserve covers KEEN4's peak", p[76], 1),
+        ]
+
+        # ---- the HMA: backed when A20 is open, aliased when it is not ------
+        h = run_arm(b, syms, "run_hma_flag", "hma_r", 32)
+        if h is None:
+            print("FAIL: target never ran the HMA test")
+            return False
+
+        checks += [
+            # Gate OPEN: the sixteen pages at 1 MB are real memory. This is
+            # what DOS4GW's memory hunt and Mortal Kombat's wrap test hit.
+            ("A20 open: the guest ran to HLT",      h[0], HALT),
+            ("  ... the HMA byte read back",        h[1], 0x22),
+            # THE CORRUPTION ARM: an HMA still aliased with the gate open
+            # would have overwritten the low-memory marker with 0x22.
+            ("  ... low memory is NOT the same byte", h[2], 0x11),
+            ("  ... exactly one write fault",       h[3], 1),
+            ("  ... filled from the ZERO tier",     h[4], 1),
+            ("  ... one page resident",             h[5], 1),
+            ("  ... and on the fast path",          h[6], 1),
+            ("  ... the mirror says open",          h[7], 1),
+
+            # Gate MASKED: the ALIAS is what the guest sees, and a write
+            # through it lands in LOW memory, not in the HMA frame behind it.
+            ("masked: the guest ran to HLT",        h[8], HALT),
+            ("  ... it reads the ALIAS, not the HMA", h[9], 0x11),
+            ("  ... and writes through it to low RAM", h[10], 0x33),
+            ("  ... nothing faulted: no frame handed out", h[11], 0),
+            ("  ... the HMA frame is still held",   h[12], 1),
+
+            # Reopened: the page goes back to ITS OWN frame, unrefilled.
+            ("reopened: the guest ran to HLT",      h[13], HALT),
+            ("  ... the HMA data survived the toggle", h[14], 0x22),
+            ("  ... and was never refilled",        h[15], 0),
+            ("  ... low RAM kept what the alias wrote", h[16], 0x33),
+
+            # The seam INSIDE the HMA: 16 pages in fault order are 16
+            # unrelated frames, so 0x100FFF straddles two of them.
+            ("straddle inside the HMA: ran to HLT", h[17], HALT),
+            ("  ... the 16-bit value is whole",     h[18], 0x1234),
+            ("  ... the high byte is in the NEXT page", h[19], 0x12),
+            ("  ... the seam SERVED it",            h[20], 1),
+            ("  ... and refused nothing",           h[21], 0),
+            ("  ... two pages resident",            h[22], 2),
+
+            # The 1 MB line itself. Page 255 is a fixed mapping with no slack,
+            # so a straddle there is refused -- and COUNTED, which is the whole
+            # point of x86_seam_overflow existing.
+            ("straddle across 1 MB: ran to HLT",    h[23], HALT),
+            ("  ... refused, and COUNTED",          h[24], 1),
+            ("  ... the low byte is still right",   h[25], 0xA5),
+
+            # The window comes and goes with the gate.
+            ("open: the HMA is the pager's",        h[26], 1),
+            ("masked: it is not ours",              h[27], 1),
+            ("  ... counted as unmapped",           h[28], 1),
+            ("  ... and the alias is intact",       h[29], 1),
+            ("left masked for the next test",       h[30], 0),
+            ("host-readable mirror agrees",         h[31], 0),
         ]
 
         bad = 0

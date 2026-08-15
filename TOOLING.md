@@ -487,7 +487,7 @@ Boots a named title, lets it run **from its first instruction** (no settle-then-
 reset — the startup probes *are* the subject), and writes one report to
 `build/artifacts/probe_<title>_<target>.md` plus the same content as JSON.
 Presets: `keen4`, `wolf3d`, `topbench`, `alleycat`, `darkforces`,
-`epicpinball`.
+`epicpinball`, `mortalkombat`.
 
 ##### `X86_PROBE=1` USED TO TAKE THE PAGER TO ZERO FRAMES — FIXED, BOTH ENDS
 
@@ -1822,7 +1822,29 @@ python3 tests/test_paging.py             # the guest memory ARCHITECTURE, as
                                          # NOTHING and reports its exact
                                          # deficit. Two arms (0x110000 and
                                          # 0x200000 not aliased) fail on the
-                                         # pre-fix whole-space wrap
+                                         # pre-fix whole-space wrap.
+                                         # 165 checks, of which 32 are THE HMA:
+                                         # a guest that opens A20, writes the
+                                         # HMA, reads it back, MASKS A20 and
+                                         # must then see the ALIAS (getting
+                                         # that backwards is silent
+                                         # corruption, not a fault), reopens
+                                         # and finds its data intact; plus a
+                                         # 16-bit straddle INSIDE the window,
+                                         # which is served, and one ACROSS the
+                                         # 1 MB line, which is refused and
+                                         # counted in x86_seam_overflow
+python3 scripts/run_hma_controls.py      # grades those arms. TWO negative
+                                         # controls (X86_HMA_NEGCTL=1,2), both
+                                         # required to make test_paging FAIL,
+                                         # plus a baseline that must pass
+                                         # first. 1 leaves the HMA window
+                                         # registered across a mask, so the
+                                         # guest reads its HMA data where the
+                                         # alias belongs; 2 refuses the HMA's
+                                         # seam slack, so a straddle inside the
+                                         # window is no longer served. Both
+                                         # caught on the first run
 python3 tests/test_xms.py                # XMS, driven by GUEST code doing the
                                          # real sequence: INT 2Fh AX=4300h ->
                                          # AX=4310h -> CALL FAR the returned
