@@ -1503,6 +1503,130 @@ static void pit_test_run(void)
     ztimer_r[6] = x86_pit_ticks();
 }
 
+/* ---------------------------------------------------------------------------
+ * SOUND CARD DETECTION -- the Sound Blaster DSP reset handshake and the AdLib
+ * timer test, run as GUEST INSTRUCTIONS because that is how a title asks.
+ *
+ * These are the two sequences measured on this tree's own titles: Prince of
+ * Persia writes 0x226 and then polls 0x22E for the 0xAA at 0x22A (32 polls, 33
+ * reads, in the run where nothing answered), and Wolfenstein 3D and Keen 4 read
+ * 0x388 348 times around six writes to 0x388/0x389 -- an AdLib timer test.
+ *
+ * Results at SND_RES, one word each, read back out of GUEST memory:
+ *   0  data-available status polled at 0x22E (bit 7 must come up)
+ *   2  polls left in CX (0 means it timed out)
+ *   4  the byte at 0x22A               MUST BE 0xAA
+ *   6  the write-buffer status at 0x22C (bit 7 must be CLEAR = ready)
+ *   8  DSP version major               2
+ *  10  DSP version minor               1
+ *  12  OPL status after both timers masked and the flags reset  &0xE0 == 0
+ *  14  OPL status after timer 1 has expired                     &0xE0 == 0xC0
+ *  16  OPL status after the flags are reset again               &0xE0 == 0
+ */
+#define SND_CODE        0x2C00u
+#define SND_RES         0x2D00u
+
+volatile uint32_t run_sound_flag = 0;
+volatile uint32_t snd_r[16];
+
+static const uint8_t sound_code[] = {
+    /* -- the DSP reset handshake: write 1, write 0, expect 0xAA ---------- */
+    0xBA, 0x26, 0x02,             /* MOV DX,0226h  DSP reset               */
+    0xB0, 0x01,                   /* MOV AL,1                              */
+    0xEE,                         /* OUT DX,AL                             */
+    0xB0, 0x00,                   /* MOV AL,0                              */
+    0xEE,                         /* OUT DX,AL                             */
+    0xBA, 0x2E, 0x02,             /* MOV DX,022Eh  read-buffer status      */
+    0xB9, 0x64, 0x00,             /* MOV CX,100    a BOUNDED poll          */
+    0xEC,                         /* IN  AL,DX   <-+                       */
+    0xA8, 0x80,                   /* TEST AL,80h   |                       */
+    0x75, 0x02,                   /* JNZ  +2 ------|--> ready              */
+    0xE2, 0xF9,                   /* LOOP ---------+                       */
+    0xA2, 0x00, 0x2D,             /* MOV [2D00h],AL   the status byte      */
+    0x89, 0x0E, 0x02, 0x2D,       /* MOV [2D02h],CX   polls left           */
+    0xBA, 0x2A, 0x02,             /* MOV DX,022Ah  DSP read data           */
+    0xEC,                         /* IN  AL,DX                             */
+    0xA2, 0x04, 0x2D,             /* MOV [2D04h],AL   MUST BE 0xAA         */
+    /* -- E1h: the DSP version, the next thing every driver asks ---------- */
+    0xBA, 0x2C, 0x02,             /* MOV DX,022Ch  write-buffer status     */
+    0xEC,                         /* IN  AL,DX                             */
+    0xA2, 0x06, 0x2D,             /* MOV [2D06h],AL   bit 7 clear = ready  */
+    0xB0, 0xE1,                   /* MOV AL,E1h                            */
+    0xEE,                         /* OUT DX,AL                             */
+    0xBA, 0x2A, 0x02,             /* MOV DX,022Ah                          */
+    0xEC,                         /* IN  AL,DX                             */
+    0xA2, 0x08, 0x2D,             /* MOV [2D08h],AL   major                */
+    0xEC,                         /* IN  AL,DX                             */
+    0xA2, 0x0A, 0x2D,             /* MOV [2D0Ah],AL   minor                */
+    /* -- the AdLib timer test: mask both timers, reset the flags --------- */
+    0xBA, 0x88, 0x03,             /* MOV DX,0388h                          */
+    0xB0, 0x04, 0xEE,             /* MOV AL,4  / OUT DX,AL   index 4       */
+    0xBA, 0x89, 0x03,             /* MOV DX,0389h                          */
+    0xB0, 0x60, 0xEE,             /* MOV AL,60h / OUT DX,AL  mask T1+T2    */
+    0xBA, 0x88, 0x03,             /* MOV DX,0388h                          */
+    0xB0, 0x04, 0xEE,             /* MOV AL,4  / OUT DX,AL                 */
+    0xBA, 0x89, 0x03,             /* MOV DX,0389h                          */
+    0xB0, 0x80, 0xEE,             /* MOV AL,80h / OUT DX,AL  IRQ reset     */
+    0xBA, 0x88, 0x03,             /* MOV DX,0388h                          */
+    0xEC,                         /* IN  AL,DX                             */
+    0xA2, 0x0C, 0x2D,             /* MOV [2D0Ch],AL   status 1: &E0h == 0  */
+    /* -- preset timer 1 to FFh (one 80 us step) and start it ------------- */
+    0xB0, 0x02, 0xEE,             /* MOV AL,2  / OUT DX,AL   index 2       */
+    0xBA, 0x89, 0x03,             /* MOV DX,0389h                          */
+    0xB0, 0xFF, 0xEE,             /* MOV AL,FFh / OUT DX,AL                */
+    0xBA, 0x88, 0x03,             /* MOV DX,0388h                          */
+    0xB0, 0x04, 0xEE,             /* MOV AL,4  / OUT DX,AL                 */
+    0xBA, 0x89, 0x03,             /* MOV DX,0389h                          */
+    0xB0, 0x21, 0xEE,             /* MOV AL,21h / OUT DX,AL  start T1      */
+    /* -- spin on the status port, which is what the real driver does ----- */
+    0xBA, 0x88, 0x03,             /* MOV DX,0388h                          */
+    0xB9, 0x00, 0x08,             /* MOV CX,2048                           */
+    0xEC,                         /* IN  AL,DX   <-+                       */
+    0xE2, 0xFD,                   /* LOOP ---------+                       */
+    0xA2, 0x0E, 0x2D,             /* MOV [2D0Eh],AL   status 2: &E0h == C0 */
+    /* -- and the flags must CLEAR again, or they are not flags ----------- */
+    0xB0, 0x04, 0xEE,             /* MOV AL,4  / OUT DX,AL                 */
+    0xBA, 0x89, 0x03,             /* MOV DX,0389h                          */
+    0xB0, 0x60, 0xEE,             /* MOV AL,60h / OUT DX,AL  mask both     */
+    0xBA, 0x88, 0x03,             /* MOV DX,0388h                          */
+    0xB0, 0x04, 0xEE,             /* MOV AL,4  / OUT DX,AL                 */
+    0xBA, 0x89, 0x03,             /* MOV DX,0389h                          */
+    0xB0, 0x80, 0xEE,             /* MOV AL,80h / OUT DX,AL  IRQ reset     */
+    0xBA, 0x88, 0x03,             /* MOV DX,0388h                          */
+    0xEC,                         /* IN  AL,DX                             */
+    0xA2, 0x10, 0x2D,             /* MOV [2D10h],AL   status 3: &E0h == 0  */
+    0xF4,                         /* HLT                                   */
+};
+
+static uint32_t snd_r8(uint32_t off)
+{
+    return (uint32_t)test_ram[SND_RES + off];
+}
+
+static void sound_test_run(void)
+{
+    static const uint8_t hle_vectors[] = { 0x08, 0x09, 0x10, 0x16, 0x1A, 0x20, 0x21 };
+
+    x86_video_init(cga_test_vram, cga_test_palette);
+    x86_video_set_aperture(vga_test_aperture, vga_test_pal);
+    x86_bios_init();
+    x86_hle_install(hle_vectors, sizeof(hle_vectors));
+
+    memset(&test_ram[SND_RES], 0, 32);
+    memcpy(&test_ram[SND_CODE], sound_code, sizeof(sound_code));
+    kbd_test_reset_cpu(SND_CODE);
+    snd_r[15] = kbd_test_run_to_halt();
+
+    for (unsigned i = 0; i < 9; i++)
+        snd_r[i] = snd_r8(i * 2);
+    snd_r[9]  = x86_sb_resets;
+    snd_r[10] = x86_sb_cmds;
+    snd_r[11] = x86_sb_dma_refused;
+    snd_r[12] = x86_opl_writes;
+    snd_r[13] = x86_opl_status_reads;
+    snd_r[14] = x86_opl_timer_expiry;
+}
+
 static void kbd_test_run(void)
 {
     static const uint8_t hle_vectors[] = {
@@ -4854,6 +4978,11 @@ void Reset_Handler(void) {
         if (run_pit_flag == 1) {
             pit_test_run();
             run_pit_flag = 0;
+        }
+
+        if (run_sound_flag == 1) {
+            sound_test_run();
+            run_sound_flag = 0;
         }
 
         if (run_sysinfo_flag == 1) {

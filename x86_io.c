@@ -792,6 +792,261 @@ static uint8_t kbd_read_data(void)
     return x86_io.kbd_last;
 }
 
+/* ---------------------------------------------------------------------------
+ * SOUND: the OPL2 (AdLib) timer registers, and the Sound Blaster DSP's RESET
+ * HANDSHAKE. THIS IS A DETECTION MODEL AND NOTHING ELSE -- IT PRODUCES NO
+ * SAMPLES, and every arm below is written so a guest can tell that.
+ *
+ * WHAT THE TITLES ACTUALLY PROBE (measured, X86_PROBE=1 + probe_report.py,
+ * gwemu, this tree -- not inferred from a spec):
+ *
+ *   WOLF3D   IN 0x388 x348, OUT 0x388/0x389 x6 each.  NOTHING on 0x22x.
+ *   KEEN4    IN 0x388 x348, OUT 0x388/0x389 x6 each.  NOTHING on 0x22x.
+ *   POP      the full SB BASE SCAN: OUT 0x226 x3 (DSP reset), IN 0x22E x32
+ *            (data-available poll), IN 0x22A x33 (the 0xAA), IN 0x228 x94 and
+ *            OUT 0x220/0x221/0x228/0x229 (the FM aliases), then 0x240, 0x280
+ *            and 0x2C0 in turn when 0x220 does not answer.
+ *   ALLEYCAT, SIMCITY, TOPBENCH, JAZZ, TYRIAN, MORTAL_KOMBAT, EPIC_PINBALL
+ *            NOTHING -- the last four die before they get anywhere near it.
+ *
+ * So the shape is: 348 status reads is an AdLib TIMER test spinning on a port
+ * that floated 0xFF, and 32 polls plus 33 data reads is a DSP reset handshake
+ * that never saw its 0xAA. Both are answered here.
+ *
+ * THE FM REGISTER FILE IS DELIBERATELY NOT STORED. On a real YM3812 those
+ * registers are WRITE-ONLY -- there is no readback -- so dropping them loses
+ * nothing a guest can observe, and storing them would only invite someone to
+ * believe a synthesiser is implied. The two TIMERS are different: their expiry
+ * is readable at 0x388 bit 6/5 and IS the detection test.
+ *
+ * ONE CARD, AT ONE BASE. 0x240/0x280/0x2C0 stay absent so a scanning title
+ * finds exactly one, at 0x220, the address every DOS title defaults to.
+ *
+ * WHAT IS NOT HERE, AND WHY IT IS ABSENT RATHER THAN FAKED: the mixer chip
+ * (0x224/0x225), DMA, and the IRQ. We cannot deliver a DMA-completion IRQ 5,
+ * so a transfer would be started and never finish. The DSP therefore ACCEPTS
+ * a transfer command's bytes -- refusing them mid-command desynchronises the
+ * command stream, which is worse -- and counts them in x86_sb_dma_refused.
+ * That counter is the honest statement "a title asked for digitised audio and
+ * got silence"; read it before believing any title is audio-clean.
+ *
+ * AND `BLASTER` IS DELIBERATELY NOT IN THE ENVIRONMENT (x86_dos.c builds
+ * "PATH=\0COMSPEC=..." and nothing else). Wolfenstein 3D reads BLASTER to find
+ * the card and does not probe 0x22x without it -- which is exactly what the
+ * measurement above shows. Setting it would make WOLF3D start a DMA transfer
+ * and wait for an IRQ that cannot arrive. Adding BLASTER is the LAST step of
+ * sound support, not the first.
+ */
+#define SB_BASE       0x220u
+#define OPL_T1_STEP   96u    /* 80 us at 1.193182 MHz -- 95.45, rounded  */
+#define OPL_T2_STEP   382u   /* 320 us                                   */
+
+/* Published for the tests and for probe.py --watch. */
+volatile uint32_t x86_opl_writes;        /* register writes accepted        */
+volatile uint32_t x86_opl_status_reads;  /* status-port reads answered      */
+volatile uint32_t x86_opl_timer_expiry;  /* times a timer flag came up set  */
+volatile uint32_t x86_sb_resets;         /* completed 1-then-0 handshakes   */
+volatile uint32_t x86_sb_cmds;           /* DSP command bytes accepted      */
+volatile uint32_t x86_sb_cmds_unknown;   /* accepted, no reply, no effect   */
+volatile uint32_t x86_sb_dma_refused;    /* transfers asked for, none run   */
+volatile uint32_t x86_sb_reads_empty;    /* data reads with nothing queued  */
+
+static struct {
+    uint8_t  idx;             /* the register index latch                 */
+    uint8_t  t1_preset, t2_preset;
+    uint8_t  ctrl;            /* register 4 as last written (minus 0x80)  */
+    uint8_t  t1_run, t2_run;
+    uint32_t t1_start, t2_start;   /* x86_pit_ticks() when started        */
+    uint8_t  status_sticky;   /* flags latched until an IRQ-reset write   */
+} opl;
+
+static struct {
+    uint8_t  reset_armed;     /* a write with bit 0 set is pending a 0    */
+    uint8_t  out[8], out_head, out_tail;
+    uint8_t  cmd, args_left, arg0;
+    uint8_t  test_reg, speaker_on;
+} dsp;
+
+static void opl_push_status(void)
+{
+    uint32_t now = x86_pit_ticks();
+    uint8_t  f   = 0;
+
+    /* A timer's flag comes up when its period has elapsed AND it is unmasked:
+       control bit 6 masks timer 1, bit 5 masks timer 2. The flags are STICKY
+       -- only a write of 0x80 to register 4 clears them -- because the whole
+       detection sequence is "start it, spin, read it back". */
+    if (opl.t1_run && !(opl.ctrl & 0x40u) &&
+        (uint32_t)(now - opl.t1_start) >=
+            (uint32_t)(256u - opl.t1_preset) * OPL_T1_STEP)
+        f |= 0x40u;
+    if (opl.t2_run && !(opl.ctrl & 0x20u) &&
+        (uint32_t)(now - opl.t2_start) >=
+            (uint32_t)(256u - opl.t2_preset) * OPL_T2_STEP)
+        f |= 0x20u;
+    if (f && !(opl.status_sticky & f))
+        x86_opl_timer_expiry++;
+    opl.status_sticky |= f;
+}
+
+static uint32_t opl_read_status(void)
+{
+    x86_opl_status_reads++;
+    opl_push_status();
+    /* Bit 7 mirrors "some timer fired". The low bits read 0x06 on a YM3812 and
+       0x00 on a YMF262 -- that pair IS the OPL2/OPL3 test, and we are an OPL2,
+       so 0x06 is the answer that matches what the rest of this claims. */
+    return (opl.status_sticky ? (0x80u | opl.status_sticky) : 0u) | 0x06u;
+}
+
+static void opl_write(uint32_t port, uint8_t v)
+{
+    if (!(port & 1u)) {              /* 0x388 / 0x220 / 0x228: index latch */
+        opl.idx = v;
+        return;
+    }
+    x86_opl_writes++;
+    switch (opl.idx) {
+    case 0x02: opl.t1_preset = v; break;
+    case 0x03: opl.t2_preset = v; break;
+    case 0x04:
+        if (v & 0x80u) {             /* IRQ RESET: clears the flags, only  */
+            opl.status_sticky = 0;
+            return;
+        }
+        opl.ctrl = v;
+        if ((v & 0x01u) && !opl.t1_run) opl.t1_start = x86_pit_ticks();
+        if ((v & 0x02u) && !opl.t2_run) opl.t2_start = x86_pit_ticks();
+        opl.t1_run = (uint8_t)(v & 0x01u);
+        opl.t2_run = (uint8_t)((v >> 1) & 0x01u);
+        break;
+    default:
+        /* Write-only on the real part; see the header. Counted, not stored. */
+        break;
+    }
+}
+
+static void dsp_push(uint8_t v)
+{
+    uint8_t next = (uint8_t)((dsp.out_tail + 1u) & 7u);
+    if (next == dsp.out_head)
+        return;
+    dsp.out[dsp.out_tail] = v;
+    dsp.out_tail = next;
+}
+
+static uint32_t dsp_read_data(void)
+{
+    if (dsp.out_head == dsp.out_tail) {
+        x86_sb_reads_empty++;
+        return 0xFFu;                /* an empty DSP buffer floats high    */
+    }
+    uint8_t v = dsp.out[dsp.out_head];
+    dsp.out_head = (uint8_t)((dsp.out_head + 1u) & 7u);
+    return v;
+}
+
+/*
+ * How many ARGUMENT bytes follow a command. Getting this wrong is the one way
+ * this block can wedge a guest: an argument mistaken for a command makes every
+ * later byte a command, and a command mistaken for an argument swallows the
+ * next one. Only the commands a DSP 2.01 answers are listed; anything else
+ * takes no arguments, which is true of every remaining 2.x command.
+ */
+static uint8_t dsp_cmd_args(uint8_t c)
+{
+    switch (c) {
+    case 0x10:                        /* direct DAC output                 */
+    case 0x40:                        /* time constant                     */
+    case 0xE0:                        /* DSP identify                      */
+    case 0xE4:                        /* write test register               */
+        return 1;
+    case 0x14: case 0x15:             /* 8-bit single-cycle DMA output     */
+    case 0x16: case 0x17:             /* 2-bit ADPCM                       */
+    case 0x24:                        /* 8-bit DMA input                   */
+    case 0x48:                        /* set DMA block size                */
+        return 2;
+    default:
+        return 0;
+    }
+}
+
+static void dsp_exec(uint8_t c, uint8_t a0)
+{
+    (void)a0;
+    switch (c) {
+    case 0xE1:                        /* DSP version. 2.01: a plain SB 2.0 */
+        dsp_push(2); dsp_push(1);
+        break;
+    case 0xE0:                        /* identify: the argument, inverted  */
+        dsp_push((uint8_t)~dsp.arg0);
+        break;
+    case 0xE4: dsp.test_reg = dsp.arg0; break;
+    case 0xE8: dsp_push(dsp.test_reg); break;
+    case 0xE3:
+        /* The copyright string. A DSP 2.01 does not answer this at all, but a
+           reader loops until it sees a NUL and silence there is a HANG, so we
+           answer with the terminator and no string. Nothing can be computed
+           from an empty string; something can be computed from an invented
+           one, which is why there is not one here. */
+        dsp_push(0);
+        break;
+    case 0xD1: dsp.speaker_on = 1; break;
+    case 0xD3: dsp.speaker_on = 0; break;
+    case 0xD8: dsp_push(dsp.speaker_on ? 0xFFu : 0x00u); break;
+    case 0x10: case 0x14: case 0x15: case 0x16: case 0x17: case 0x24:
+        x86_sb_dma_refused++;         /* accepted, consumed, NOT PLAYED    */
+        break;
+    case 0x40: case 0x48:             /* rate/block size: no audio, no-op  */
+    case 0xD0: case 0xD4:             /* pause/continue a transfer         */
+        break;
+    default:
+        x86_sb_cmds_unknown++;
+        break;
+    }
+}
+
+static void dsp_write_cmd(uint8_t v)
+{
+    if (dsp.args_left) {
+        if (dsp.args_left == dsp_cmd_args(dsp.cmd))
+            dsp.arg0 = v;
+        if (--dsp.args_left == 0)
+            dsp_exec(dsp.cmd, dsp.arg0);
+        return;
+    }
+    x86_sb_cmds++;
+    dsp.cmd = v;
+    dsp.args_left = dsp_cmd_args(v);
+    if (!dsp.args_left)
+        dsp_exec(v, 0);
+}
+
+static void dsp_write_reset(uint8_t v)
+{
+    if (v & 1u) {
+        dsp.reset_armed = 1;
+        return;
+    }
+    if (!dsp.reset_armed)
+        return;                       /* a lone 0 is not a reset           */
+    dsp.reset_armed = 0;
+    dsp.out_head = dsp.out_tail = 0;
+    dsp.args_left = 0;
+    dsp.speaker_on = 0;
+    dsp_push(0xAAu);                  /* THE handshake: "a card is here"   */
+    x86_sb_resets++;
+}
+
+/* 0x388/0x389 is the AdLib pair; 0x2x0/0x2x1 and 0x2x8/0x2x9 are its aliases
+   at the SB base, which is why POP probes 0x220, 0x221, 0x228 and 0x229. */
+static int opl_port(uint32_t p)
+{
+    return p == 0x388u || p == 0x389u ||
+           p == SB_BASE || p == SB_BASE + 1u ||
+           p == SB_BASE + 8u || p == SB_BASE + 9u;
+}
+
 /* --------------------------------------------------------------------------- */
 
 static uint32_t port_read_inner(uint32_t port);
@@ -919,6 +1174,18 @@ static uint32_t port_read_inner(uint32_t port)
      * Bit 3 is vertical retrace; bit 0 is "display disabled", true during
      * either.
      */
+    /* ---- sound: see the block above. Detection only, no audio. -------- */
+    case 0x388: case 0x220: case 0x228:
+        return opl_read_status();
+    case 0x389: case 0x221: case 0x229:
+        return 0xFFu;                /* FM data is WRITE-ONLY on a YM3812 */
+    case SB_BASE + 0xA:              /* DSP read data                     */
+        return dsp_read_data();
+    case SB_BASE + 0xC:              /* write-buffer status: b7=0 = ready */
+        return 0x7Fu;
+    case SB_BASE + 0xE:              /* read-buffer status: b7=1 = data   */
+        return (dsp.out_head != dsp.out_tail) ? 0xFFu : 0x7Fu;
+
     case 0x3BA:
         if (!vga_mono_decoded()) return 0xFFu;
         /* fall through */
@@ -1105,6 +1372,18 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
            it. It is stored so a read-back sees what was written. */
         x86_io.port92 = (uint8_t)value;
         x86_a20_set((value & 0x02u) != 0u);
+        break;
+
+    /* ---- sound: see the block above. Detection only, no audio. -------- */
+    case 0x388: case 0x389:
+    case 0x220: case 0x221: case 0x228: case 0x229:
+        opl_write(port, (uint8_t)value);
+        break;
+    case SB_BASE + 6:                /* DSP reset: 1 then 0 -> 0xAA       */
+        dsp_write_reset((uint8_t)value);
+        break;
+    case SB_BASE + 0xC:              /* DSP command / data                */
+        dsp_write_cmd((uint8_t)value);
         break;
 
     case 0x3B4:
