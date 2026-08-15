@@ -1843,6 +1843,160 @@ static const uint8_t dosfile_guest_code[] = {
 
 static FATFS dosfile_fs;
 
+/* --------------------------------------------------------------------------
+ * AH=52h (list of lists) and AH=29h (parse filename into FCB), from GUEST code.
+ *
+ * Both are pointer-producing calls, and that is why the guest has to drive
+ * them. AH=52h's answer is a FAR POINTER in ES:BX and the only thing that
+ * proves it is a real one is dereferencing it -- so the guest reads the first
+ * MCB segment out of ES:BX-2 and then WALKS THE CHAIN from it, with DS pointed
+ * at each header in turn. The host walks the same chain independently and the
+ * two must agree; a host-side call to x86_dos_int21() would never touch ES at
+ * all. AH=29h's answer is half in AL and half in an ADVANCED SI, and a caller
+ * that parses argument after argument off one line depends entirely on the
+ * second half, so every case records both.
+ */
+#define DOSS_CODE   0x3000u
+#define DOSS_STR    0x4000u     /* the command lines, planted by the host  */
+#define DOSS_RES    0x4100u     /* 7 words from AH=52h, then 9 parse pairs */
+#define DOSS_PRES   0x4110u     /* per-case (AL word, SI word)             */
+#define DOSS_FCB    0x4200u     /* eight 16-byte FCBs                      */
+#define DOSS_SPLIT  0x4FF8u     /* a ninth, STRADDLING the 4 KB granule    */
+#define DOSS_SYS    0x4400u     /* the whole SysVars block, copied by guest */
+#define DOSS_SYS_BYTES 0x70u
+#define DOSS_CASES  9u
+
+/* One AH=29h case: DS:SI = string, ES:DI = FCB, AL = parse control. */
+#define DOSS_PARSE(str, fcb, al, res)                                     \
+    0xBE, (uint8_t)(str), (uint8_t)((str) >> 8),        /* mov si,str  */ \
+    0xBF, (uint8_t)(fcb), (uint8_t)((fcb) >> 8),        /* mov di,fcb  */ \
+    0xB8, (al), 0x29,                                   /* mov ax,29xx */ \
+    0xCD, 0x21,                                         /* int 21h     */ \
+    0xA2, (uint8_t)(res), (uint8_t)((res) >> 8),        /* mov [res],al */ \
+    0x89, 0x36, (uint8_t)((res) + 2), (uint8_t)(((res) + 2) >> 8)
+
+static const uint8_t dossys_guest_code[] = {
+    /* ---- AH=52h. Record BX, ES and the returned FLAGS. ---- */
+    0xB8, 0x00, 0x52,                       /* mov ax,5200h            */
+    0xCD, 0x21,                             /* int 21h                 */
+    0x9C, 0x58, 0xA3, 0x04, 0x41,           /* pushf/pop ax/mov [4104],ax */
+    0x89, 0x1E, 0x00, 0x41,                 /* mov [4100h],bx          */
+    0x8C, 0xC0,  0xA3, 0x02, 0x41,          /* mov ax,es/mov [4102],ax */
+
+    /*
+     * Copy the whole block, ES:BX-0x22 for 0x70 bytes, down to DS:4400 so the
+     * HOST can check every field against the reference layout. MOVSB's
+     * destination is ES:DI and cannot be overridden, so DS and ES are swapped
+     * for the copy rather than an override being used on the source.
+     */
+    0x8C, 0xC0,                             /* mov ax,es  (SysVars seg) */
+    0x31, 0xD2,                             /* xor dx,dx               */
+    0x8E, 0xC2,                             /* mov es,dx  (ES = 0)     */
+    0x8E, 0xD8,                             /* mov ds,ax  (DS = SysVars) */
+    0x89, 0xDE,                             /* mov si,bx               */
+    0x81, 0xEE, 0x22, 0x00,                 /* sub si,22h              */
+    0xBF, 0x00, 0x44,                       /* mov di,4400h            */
+    0xB9, 0x70, 0x00,                       /* mov cx,70h              */
+    0xFC,  0xF3, 0xA4,                      /* cld / rep movsb         */
+    0x31, 0xC0,  0x8E, 0xD8,                /* xor ax,ax / mov ds,ax   */
+
+    /* ---- Walk the MCB chain from the copied firstMCB word (block +0x20). */
+    0xA1, 0x20, 0x44,                       /* mov ax,[4420h]          */
+    0xA3, 0x06, 0x41,                       /* mov [4106h],ax          */
+    0x89, 0xC5,                             /* mov bp,ax   (cursor)    */
+    0x31, 0xC9,                             /* xor cx,cx   (count)     */
+    0x31, 0xFF,                             /* xor di,di   (last type) */
+    /* .walk: */
+    0x8E, 0xDD,                             /* mov ds,bp               */
+    0x31, 0xF6,                             /* xor si,si               */
+    0x8A, 0x04,                             /* mov al,[si]   type      */
+    0x8B, 0x54, 0x03,                       /* mov dx,[si+3] size      */
+    0x41,                                   /* inc cx                  */
+    0xB4, 0x00,  0x89, 0xC7,                /* mov ah,0 / mov di,ax    */
+    0x3C, 0x5A,  0x74, 0x0C,                /* cmp al,'Z' / je .done   */
+    0x3C, 0x4D,  0x75, 0x08,                /* cmp al,'M' / jne .done  */
+    0x01, 0xD5,  0x45,                      /* add bp,dx / inc bp      */
+    0x83, 0xF9, 0x40,  0x72, 0xE2,          /* cmp cx,64 / jb .walk    */
+    /* .done: */
+    0x31, 0xC0,  0x8E, 0xD8,                /* xor ax,ax / mov ds,ax   */
+    0x89, 0x0E, 0x08, 0x41,                 /* mov [4108h],cx  blocks  */
+    0x89, 0x2E, 0x0A, 0x41,                 /* mov [410Ah],bp  last seg */
+    0x89, 0x3E, 0x0C, 0x41,                 /* mov [410Ch],di  last type */
+
+    /* ---- AH=29h. Nine cases; the strings are at DOSS_STR, planted by the
+     *      host, and every expected answer is computed there too.
+     *
+     *  0  "TEST.INI"          plain
+     *  1  "*.TXT"             star expansion, AL=1
+     *  2  "B:FOO.BAR baz"     drive letter, and a space terminates
+     *  3  " ;X.Y"   AL=01     bit 0 scans ONE leading separator off
+     *  4  " ;X.Y"   AL=00     ... and without it the ';' stops the parse dead
+     *  5  "1:FOO.TXT"         a non-alphabetic drive: AL=0FFh
+     *  6  "VERYLONGNAME.EXT"  the deliberate over-long-name behaviour
+     *  7  ";"       AL=0Eh    every "leave the field" bit, over a filled FCB
+     *  8  "TEST.INI"          the same as case 0 with the FCB STRADDLING 4 KB
+     */
+    DOSS_PARSE(0x4000, 0x4200, 0x00, 0x4110),
+    DOSS_PARSE(0x4010, 0x4210, 0x00, 0x4114),
+    DOSS_PARSE(0x4020, 0x4220, 0x00, 0x4118),
+    DOSS_PARSE(0x4030, 0x4230, 0x01, 0x411C),
+    DOSS_PARSE(0x4030, 0x4240, 0x00, 0x4120),
+    DOSS_PARSE(0x4040, 0x4250, 0x00, 0x4124),
+    DOSS_PARSE(0x4050, 0x4260, 0x00, 0x4128),
+    DOSS_PARSE(0x4070, 0x4270, 0x0E, 0x412C),
+    DOSS_PARSE(0x4000, 0x4FF8, 0x00, 0x4130),
+
+    0xF4,                                                       /* HLT */
+};
+
+volatile uint32_t run_dossys_flag = 0;
+volatile uint32_t dossys_r[8];
+
+static void dossys_test_run(void)
+{
+    static const uint8_t hle_vectors[] = { 0x20, 0x21 };
+
+    for (int i = 0; i < 8; i++)
+        dossys_r[i] = 0;
+    memset(&test_ram[DOSS_STR], 0, 0x100);
+    memset(&test_ram[DOSS_RES], 0, 0x100);
+    memset(&test_ram[DOSS_FCB], 0, 0x100);
+    memset(&test_ram[DOSS_SYS], 0, DOSS_SYS_BYTES);
+    memset(&test_ram[DOSS_SPLIT], 0, 16);
+
+    x86_hle_install(hle_vectors, sizeof(hle_vectors));
+    x86_dos_arena_init();
+
+    /* Two allocations, so the chain the guest walks has more than one link and
+       "walked to the end" is a real claim rather than a single 'Z' header. */
+    uint16_t largest = 0;
+    dossys_r[2] = dos_test_alloc(0x100, &largest);
+    dossys_r[3] = dos_test_alloc(0x200, &largest);
+
+    memcpy(&test_ram[DOSS_STR + 0x00], "TEST.INI", 9);
+    memcpy(&test_ram[DOSS_STR + 0x10], "*.TXT", 6);
+    memcpy(&test_ram[DOSS_STR + 0x20], "B:FOO.BAR baz", 14);
+    memcpy(&test_ram[DOSS_STR + 0x30], " ;X.Y", 6);
+    memcpy(&test_ram[DOSS_STR + 0x40], "1:FOO.TXT", 10);
+    memcpy(&test_ram[DOSS_STR + 0x50], "VERYLONGNAME.EXT", 17);
+    memcpy(&test_ram[DOSS_STR + 0x70], ";", 2);
+
+    /* Case 7's FCB is pre-filled: with AL=0Eh nothing in the first twelve
+       bytes may change, and the two words after them must be zeroed anyway. */
+    memset(&test_ram[DOSS_FCB + 7 * 16], 0x5A, 16);
+
+    memcpy(&test_ram[DOSS_CODE], dossys_guest_code, sizeof(dossys_guest_code));
+
+    uint32_t sv0 = x86_dos_sysvars_calls, p0 = x86_dos_parse_calls;
+    kbd_test_reset_cpu(DOSS_CODE);
+    dossys_r[0] = kbd_test_run_to_halt();
+    dossys_r[1] = X86_DOS_ARENA_SEG;        /* what -2 has to come back as */
+    dossys_r[4] = x86_dos_sysvars_calls - sv0;
+    dossys_r[5] = x86_dos_parse_calls - p0;
+    dossys_r[6] = x86_xms_total_kb;
+    dossys_r[7] = (uint32_t)sizeof(dossys_guest_code);
+}
+
 /* ---------------------------------------------------------------------- *
  * NOR cold-page backing, driven by GUEST code.
  *
@@ -4869,6 +5023,11 @@ void Reset_Handler(void) {
         if (run_dosfile_flag == 1) {
             dosfile_test_run();
             run_dosfile_flag = 0;
+        }
+
+        if (run_dossys_flag == 1) {
+            dossys_test_run();
+            run_dossys_flag = 0;
         }
 
         if (run_dosexec_flag == 1) {

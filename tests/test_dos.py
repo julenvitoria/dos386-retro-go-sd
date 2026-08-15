@@ -384,6 +384,200 @@ def file_test(b, syms):
 
 
 # ---------------------------------------------------------------------------
+# AH=52h (list of lists) and AH=29h (parse filename into FCB).
+#
+# WHY IT EXISTS. Dark Forces' DOS/4GW stub loads whole and then far-jumps into
+# unwritten memory. The two calls refused immediately before that jump are one
+# AH=52h and two AH=29h. AH=52h is how an extender finds the DOS data segment
+# and the head of the MCB chain, so a refusal there is not a no-op: the guest
+# computes an address from whatever ES:BX held and jumps to it.
+#
+# WHAT IS ASSERTED. The FIELDS are checked against the layout in
+# references/MS-DOS/v4.0/src/DOS/MSCONST.ASM:66-105 (cross-checked against
+# references/dosbox-x/include/dos_inc.h:616-668), but the field a program
+# actually acts on is the first-MCB word at offset -2, and a word that merely
+# LOOKS right is the whole failure mode being fixed. So the guest DEREFERENCES
+# it: it walks the MCB chain from that segment with its own DS, and the host
+# walks the same chain independently. Agreement between the two is the claim.
+#
+# AH=29h is asserted on both halves of its contract -- the AL return code AND
+# the advanced SI -- because a caller peeling arguments off one command line
+# depends entirely on the second, and a parser that returns the right FCB with
+# SI unmoved loops forever. Expected values are derived from MakeFcb,
+# references/MS-DOS/v4.0/src/DOS/FCB.ASM:53-230.
+# ---------------------------------------------------------------------------
+DOSS_STR = 0x4000
+DOSS_RES = 0x4100
+DOSS_PRES = 0x4110
+DOSS_FCB = 0x4200
+DOSS_SYS = 0x4400
+DOSS_SPLIT = 0x4FF8
+
+# (label, string offset, FCB address, expected AL, expected SI,
+#  expected 16 FCB bytes or None to skip)
+def _fcb(drive, name, ext):
+    return bytes([drive]) + name.encode() + ext.encode() + bytes(4)
+
+
+PARSE_CASES = [
+    ("TEST.INI", 0x4200, 0x00, 0x4008, _fcb(0, "TEST    ", "INI")),
+    ("*.TXT", 0x4210, 0x01, 0x4015, _fcb(0, "????????", "TXT")),
+    ("B:FOO.BAR baz", 0x4220, 0x00, 0x4029, _fcb(2, "FOO     ", "BAR")),
+    (" ;X.Y  (AL=01, one separator scanned)", 0x4230, 0x00, 0x4035,
+     _fcb(0, "X       ", "Y  ")),
+    (" ;X.Y  (AL=00, the ';' stops it)", 0x4240, 0x00, 0x4031,
+     _fcb(0, "        ", "   ")),
+    ("1:FOO.TXT  (bad drive)", 0x4250, 0xFF, 0x4049,
+     _fcb(0xF1, "FOO     ", "TXT")),
+    # The over-long name is consumed and DISCARDED past the eighth character
+    # (FCB.ASM:168), so SI ends up past ".EXT" at 0x4050+16 and the extension
+    # is still parsed -- the whole point of MS-DOS's deliberate "horrible bug".
+    ("VERYLONGNAME.EXT", 0x4260, 0x00, 0x4060, _fcb(0, "VERYLONG", "EXT")),
+    (";  (AL=0Eh, leave every field)", 0x4270, 0x00, 0x4070,
+     bytes([0x5A] * 12) + bytes(4)),
+    ("TEST.INI  (FCB straddles 4 KB)", DOSS_SPLIT, 0x00, 0x4008,
+     _fcb(0, "TEST    ", "INI")),
+]
+
+# Offset -> (label, expected value, width in bytes). Relative to the returned
+# BX, i.e. index 0x22 in the copied block. Only the fields this core populates
+# from something real, plus the end-of-chain markers it deliberately writes.
+SYSVAR_FIELDS = [
+    (-2, "first MCB segment", ARENA_FIRST_MCB, 2),
+    (0x00, "DPB chain (absent)", 0xFFFFFFFF, 4),
+    (0x04, "SFT chain (absent)", 0xFFFFFFFF, 4),
+    (0x08, "CLOCK$ header (absent)", 0xFFFFFFFF, 4),
+    (0x0C, "CON header (absent)", 0xFFFFFFFF, 4),
+    (0x10, "max sector size", 512, 2),
+    (0x16, "CDS array (absent)", 0xFFFFFFFF, 4),
+    (0x20, "block devices", 1, 1),
+    (0x21, "LASTDRIVE", 1, 1),
+    (0x22, "NUL next driver (chain ends)", 0xFFFFFFFF, 4),
+    (0x26, "NUL attributes", 0x8004, 2),
+    (0x43, "boot drive", 1, 1),
+    (0x44, "386 dword move", 1, 1),
+]
+
+
+def sysvars_test(b, syms):
+    """AH=52h and AH=29h, both driven from guest code."""
+    for n in ("run_dossys_flag", "dossys_r", "test_ram"):
+        if n not in syms:
+            print(f"missing symbol {n} -- rebuild tests/main.c")
+            return False
+    ram = syms["test_ram"]
+
+    b.write_uint32(syms["run_dossys_flag"], 1)
+    for _ in range(400):
+        if b.read_uint32(syms["run_dossys_flag"]) == 0:
+            break
+        time.sleep(0.05)
+    else:
+        print("FAIL: the SysVars arm never completed")
+        return False
+
+    d = [b.read_uint32(syms["dossys_r"] + 4 * i) for i in range(8)]
+    exit_reason, arena_seg, allocA, allocB = d[0], d[1], d[2], d[3]
+    sv_calls, parse_calls, xms_kb = d[4], d[5], d[6]
+
+    w = lambda a: int.from_bytes(bytes(b.read_memory(ram + a, 2)), "little")
+    bx, es, flags = w(DOSS_RES + 0), w(DOSS_RES + 2), w(DOSS_RES + 4)
+    firstmcb, blocks = w(DOSS_RES + 6), w(DOSS_RES + 8)
+    last_seg, last_type = w(DOSS_RES + 10), w(DOSS_RES + 12)
+    blk = bytes(b.read_memory(ram + DOSS_SYS, 0x70))
+
+    print(f"\nAH=52h (list of lists):")
+    print(f"  guest exit reason  {exit_reason} (6 = HLT)")
+    print(f"  ES:BX              {es:04x}:{bx:04x}  FLAGS {flags:04x} "
+          f"(CF {flags & CF})")
+    print(f"  calls seen by core {sv_calls}   AH=29h calls {parse_calls}")
+    print(f"  first MCB at -2    0x{firstmcb:04x} (arena is 0x{arena_seg:04x})")
+    print(f"  guest walked       {blocks} blocks, last 0x{last_seg:04x} "
+          f"type 0x{last_type:02x}")
+    print(f"  host allocations   0x{allocA:04x} 0x{allocB:04x}")
+
+    ok = True
+
+    def fail(msg):
+        nonlocal ok
+        print("FAIL: " + msg)
+        ok = False
+
+    if exit_reason != 6:
+        fail(f"the guest exited with {exit_reason}, not 6 (HLT) -- it did not "
+             f"reach the end of the program")
+        return False
+    if sv_calls != 1:
+        fail(f"the core recorded {sv_calls} AH=52h calls, expected 1")
+    if parse_calls != len(PARSE_CASES):
+        fail(f"the core recorded {parse_calls} AH=29h calls, expected "
+             f"{len(PARSE_CASES)}")
+    if flags & CF:
+        fail("AH=52h returned with CF set. A refused list of lists is the "
+             "defect: the guest computes an address from ES:BX regardless")
+    if es == 0 and bx == 0:
+        fail("AH=52h left ES:BX at 0000:0000 -- that is the segment of the "
+             "interrupt vector table, and it is what the guest will jump into")
+
+    # The fields, against the MS-DOS 4.0 layout.
+    for off, label, want, width in SYSVAR_FIELDS:
+        i = 0x22 + off
+        got = int.from_bytes(blk[i:i + width], "little")
+        if got != want:
+            fail(f"SysVars +0x{off & 0xFFFF:02x} ({label}) is "
+                 f"0x{got:0{width * 2}x}, expected 0x{want:0{width * 2}x}")
+    if blk[0x22 + 0x2C:0x22 + 0x34] != b"NUL     ":
+        fail(f"the NUL device header is named "
+             f"{blk[0x22 + 0x2C:0x22 + 0x34]!r}, expected b'NUL     '")
+    ext_kb = int.from_bytes(blk[0x22 + 0x45:0x22 + 0x47], "little")
+    if ext_kb != (xms_kb & 0xFFFF):
+        fail(f"SysVars +0x45 (extended memory) says {ext_kb} KB but XMS "
+             f"reports {xms_kb} KB; the field has to be the real number or "
+             f"it is filler")
+
+    # THE CLAIM: the pointer is real, because the chain walks from it.
+    if firstmcb != arena_seg:
+        fail(f"the word at ES:BX-2 is 0x{firstmcb:04x}, but the arena we built "
+             f"starts at 0x{arena_seg:04x}. An extender reads exactly this "
+             f"word to find the MCB chain")
+    host_chain = walk(b, ram)
+    print("  host chain:        " +
+          " ".join(f"{s:04x}{'MZ'[t == MCB_LAST]}" for s, t, _, _ in host_chain))
+    if blocks != len(host_chain):
+        fail(f"the guest walked {blocks} blocks from the returned pointer; the "
+             f"host walks {len(host_chain)} from the arena. The pointer does "
+             f"not lead to the chain we actually built")
+    elif len(host_chain) < 3:
+        fail(f"only {len(host_chain)} blocks in the chain -- the two test "
+             f"allocations did not happen, so 'walked to the end' proves "
+             f"nothing")
+    if last_type != MCB_LAST:
+        fail(f"the guest's walk ended on a 0x{last_type:02x} header, not a "
+             f"'Z' (0x5A); it ran off the chain rather than to its end")
+    elif host_chain and last_seg != host_chain[-1][0]:
+        fail(f"the guest's walk ended at 0x{last_seg:04x}, the host's at "
+             f"0x{host_chain[-1][0]:04x}")
+
+    print("\nAH=29h (parse filename into FCB):")
+    for i, (label, addr, want_al, want_si, want_fcb) in enumerate(PARSE_CASES):
+        al = w(DOSS_PRES + i * 4) & 0xFF
+        si = w(DOSS_PRES + i * 4 + 2)
+        fcb = bytes(b.read_memory(ram + addr, 16))
+        print(f"  {label:<40} AL={al:02x} SI={si:04x} "
+              f"drv={fcb[0]:02x} {fcb[1:9]!r} {fcb[9:12]!r}")
+        if al != want_al:
+            fail(f"case {i} ({label}): AL={al:02x}, expected {want_al:02x}")
+        if si != want_si:
+            fail(f"case {i} ({label}): SI={si:04x}, expected {want_si:04x}. "
+                 f"A caller peeling arguments off one line needs SI to move")
+        if want_fcb is not None and fcb != want_fcb:
+            fail(f"case {i} ({label}): FCB is {fcb.hex()}, expected "
+                 f"{want_fcb.hex()}")
+
+    return ok
+
+
+# ---------------------------------------------------------------------------
 # The MZ LOAD test.
 #
 # WHY IT EXISTS. A DOS-layer change was merged, and reverted, that loaded
@@ -1250,6 +1444,9 @@ def main(args):
         if not file_test(b, syms):
             ok = False
 
+        if not sysvars_test(b, syms):
+            ok = False
+
         if not exec_test(b, syms):
             ok = False
 
@@ -1343,6 +1540,42 @@ MUTATIONS = {
     "resume": ("the parent's registers and SS:SP are not restored", [
         ("        for (int i = 0; i < 8; i++)\n"
          "            cpu_state_ptr->regs[i] = fr->regs[i];\n", ""),
+    ]),
+    # AH=52h. The first-MCB word is the ONE field an extender acts on, and the
+    # natural wrong answer is the segment the block itself lives in -- a value
+    # that is real, in range, and points at memory that is not a chain. This is
+    # the defect the guest-side walk exists to catch; a test that only compared
+    # the word to a constant would pass on any plausible number.
+    "firstmcb": ("the SysVars -2 word is not the first MCB", [
+        ("    sv_w16(p, b - 2, ARENA_FIRST_MCB);",
+         "    sv_w16(p, b - 2, SYSVARS_SEG);"),
+    ]),
+    # AH=52h. Return the START of the block instead of the documented +0x22
+    # entry point. Every positive offset then reads 0x22 bytes early and the
+    # first-MCB word comes out of memory before the block entirely.
+    "sysvarsbx": ("AH=52h returns the block start, not SYSINITVAR", [
+        ("    x86_set_bx(SYSVARS_OFF);", "    x86_set_bx(0);"),
+    ]),
+    # AH=29h. Return the right FCB and leave SI where the caller put it. This
+    # is the half of the contract a test that only looks at the FCB cannot see,
+    # and the half that makes a caller's argument loop immortal.
+    "parsesi": ("AH=29h does not advance SI", [
+        ("    r[6] = (r[6] & 0xFFFF0000u) | si;               "
+         "/* SI, as PARSE.ASM:57-59 */", "    (void)si;"),
+    ]),
+    # AH=29h. Treat '*' as an ordinary character instead of expanding it over
+    # the rest of the field. "*.TXT" then parses to a file literally named
+    # "*", the wildcard flag never sets, and every findfirst built from the
+    # resulting FCB matches nothing.
+    "parsestar": ("'*' is not expanded to '?' across the field", [
+        ("        if (c == '*') {\n"
+         "            /* REP STOSB over the whole remainder, and keep consuming: the star\n"
+         "               eats the rest of the field and everything after it. */\n"
+         "            while (i < n)\n"
+         "                dst[i++] = '?';\n"
+         "            *flag |= 1u;\n"
+         "            continue;\n"
+         "        }\n", ""),
     ]),
     "owner": ("owner 0 is recorded as-is: live memory on the free list", [
         ("    if (owner == MCB_FREE)\n"

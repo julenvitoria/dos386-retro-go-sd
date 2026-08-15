@@ -421,6 +421,11 @@ void x86_video_set_cursor(uint8_t col, uint8_t row);
    program writes over whatever it finds above it. Shared so the HLE layer can
    check its stub placement against it at compile time. */
 #define X86_DOS_ARENA_SEG 0x0070u
+/* Where x86_hle.c plants the vector stubs (0x600..0x6FF). Shared because
+   x86_dos.c builds the AH=52h SysVars block in the 256 bytes BELOW it and has
+   to prove at compile time that the two do not overlap -- an interrupt whose
+   stub had been overwritten by SysVars would execute it as code. */
+#define X86_DOS_STUB_SEG  0x0060u
 
 uint16_t x86_video_get_cursor(void);
 uint16_t x86_video_read_cell(void);
@@ -557,6 +562,12 @@ extern volatile uint32_t x86_dos_load_shorts;
 extern volatile uint32_t x86_dos_overlays;
 extern volatile uint32_t x86_dos_overlay_seg;
 extern volatile uint32_t x86_dos_overlay_reloc;
+/* AH=52h (list of lists) and AH=29h (parse filename into FCB). Call counts
+   only: the SysVars block is ordinary guest memory reached through the fold
+   table, so WHICH offsets a title reads cannot be seen without faulting the
+   granule, which the pager has no read-side mechanism for. See dos_sysvars(). */
+extern volatile uint32_t x86_dos_sysvars_calls;
+extern volatile uint32_t x86_dos_parse_calls;
 void x86_dos_arena_init(void);
 void x86_disk_set_memory(const void *base, uint32_t bytes);
 void x86_disk_set_reader(int (*rd)(void *, void *, uint32_t, uint32_t),

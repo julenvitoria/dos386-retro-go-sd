@@ -85,8 +85,10 @@ void x86_hle_set_cf(int set)
  * Three bytes of code per vector plus the IRET; laid out contiguously so one
  * page covers every service we take over.
  */
-#define STUB_SEG      0x0060u        /* linear 0x600: above the IVT and the
-                                        BIOS data area, below the DOS arena */
+/* linear 0x600: above the IVT, the BIOS data area and the AH=52h SysVars block,
+   below the DOS arena. Shared through x86_cpu.h because x86_dos.c asserts the
+   SysVars block ends before it -- one definition, or the two drift apart. */
+#define STUB_SEG      X86_DOS_STUB_SEG
 #define STUB_BYTES    4u
 /* The stub block must fit between STUB_SEG and the first MCB of the DOS arena
    at segment 0x0070 -- 0x600..0x6FF, 256 bytes. It used to be sized to the
