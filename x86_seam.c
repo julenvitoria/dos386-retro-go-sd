@@ -61,6 +61,7 @@
 #include "x86_cpu.h"
 #include "x86_pager.h"
 #include "x86_arena.h"
+#include "x86_vprof.h"
 
 #define X86_SEAM_SLOTS 4
 
@@ -99,7 +100,26 @@ static uint8_t seam_pool_full;
    can test it at the loop head with one DTCM load off R8 instead of
    materialising a literal address on every guest instruction. */
 
+/* The vprof bracket is a WRAPPER, not an edit of the body, and it disappears
+   completely when X86_VPROF is 0 -- x86_seam_sync then compiles to exactly the
+   code it compiled to before this instrument existed. A split into a wrapper
+   plus a body that GCC re-inlines does NOT give that: it reorders registers and
+   the shipping dos.bin stops being byte-identical, which is the one thing a
+   profiling flag is required not to do. */
+#if X86_VPROF
+static void seam_sync_body(uint32_t lin);
+
 void x86_seam_sync(uint32_t lin)
+{
+    X86_VPROF_BEGIN(sm);
+    seam_sync_body(lin);
+    X86_VPROF_END(sm, seam);
+}
+
+static void seam_sync_body(uint32_t lin)
+#else
+void x86_seam_sync(uint32_t lin)
+#endif
 {
     uint32_t page = lin >> FOLD_SHIFT;
 
@@ -262,6 +282,7 @@ volatile uint32_t x86_code_reloc_faults = 0;
 void *x86_code_reloc(uint32_t lin)
 {
     uint8_t *buf = cpu_state_ptr->code_buf;
+    X86_VPROF_BEGIN(rl);
 
     x86_code_relocs++;
     for (uint32_t i = 0; i < sizeof(cpu_state_ptr->code_buf); i++) {
@@ -284,6 +305,7 @@ void *x86_code_reloc(uint32_t lin)
     }
 
     cpu_state_ptr->code_k = (uint32_t)(uintptr_t)buf - lin;
+    X86_VPROF_END(rl, reloc);
     return buf;
 }
 

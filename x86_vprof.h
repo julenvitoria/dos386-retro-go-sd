@@ -106,6 +106,31 @@ X86_VPROF_DECL(render);
 X86_VPROF_DECL(osk);
 X86_VPROF_DECL(cell);
 
+/* NOT video, and here anyway because this is the instrument that already has
+   64-bit accumulators, a calibrated bracket and a host-side window control.
+   Both are per-GUEST-INSTRUCTION costs that no other instrument can see: the
+   opcode profiler charges them to whichever opcode happened to pay, and the
+   zone profiler is per-frame.
+
+   RELOC  x86_code_reloc() -- staging an instruction that straddles a granule
+          into DTCM. ~5% of instructions in Mode Y gameplay were staged and
+          the COST of one had never been measured, only the rate.
+   SEAM   x86_seam_sync() -- the multi-byte-access straddle prologue. Fires on
+          every SEAM_CHECK that trips, which is a false positive most of the
+          time (offset 0xFFC with a 4-byte operand does not really straddle),
+          so its mean is dominated by the call that finds nothing to do. */
+/* Guarded, unlike the five above. Those are unconditional so a host tool can
+   read a truthful zero off any build; these two would ADD BSS to the shipping
+   core, and adding BSS shifts the link, which shifts address literals, which
+   makes the shipping dos.bin differ from master by 303 scattered bytes. A
+   profiling flag must not change the shipping binary at all, so on a clean
+   build these symbols simply do not exist and probe.py fails to resolve them
+   -- which is the honest signal that the instrument is not compiled in. */
+#if X86_VPROF
+X86_VPROF_DECL(reloc);
+X86_VPROF_DECL(seam);
+#endif
+
 /* Paints reached from the guest's own page flip vs from the frame loop's
    fallback. x86_modey_presents counts only the first, which is why "10 frames
    per second" has never been the whole paint count. */

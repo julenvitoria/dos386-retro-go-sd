@@ -18,6 +18,10 @@ X86_VPROF_DEF(paint);
 X86_VPROF_DEF(render);
 X86_VPROF_DEF(osk);
 X86_VPROF_DEF(cell);
+#if X86_VPROF
+X86_VPROF_DEF(reloc);
+X86_VPROF_DEF(seam);
+#endif
 
 volatile uint32_t x86_vprof_paint_flip;
 volatile uint32_t x86_vprof_paint_loop;
@@ -42,6 +46,10 @@ void x86_vprof_clear(void)
     X86_VPROF_ZERO(render);
     X86_VPROF_ZERO(osk);
     X86_VPROF_ZERO(cell);
+#if X86_VPROF
+    X86_VPROF_ZERO(reloc);
+    X86_VPROF_ZERO(seam);
+#endif
     x86_vprof_paint_flip = 0;
     x86_vprof_paint_loop = 0;
 }

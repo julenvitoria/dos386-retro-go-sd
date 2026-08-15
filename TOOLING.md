@@ -774,6 +774,54 @@ from the interpreter is uncounted (one per interp call). Profiling also slows
 the emulator, so anything timing-dependent in the guest is perturbed; that is
 noted, not corrected.
 
+##### `--gate` — the check that says WHICH WORKLOAD was profiled
+
+```bash
+python3 scripts/profile_opcodes.py --retrogo --target hardware --no-flash \
+    --hard-reset --timeline timelines/wolf3d-hw.tl --settle 33 --window 20 \
+    --gate x86_modey_presents --gate guest_insns_total \
+    --json build/artifacts/profile_wolf3d_play.json
+
+# the CONTROL, same core and clock, no raycaster
+python3 scripts/profile_opcodes.py --retrogo --target hardware --no-flash \
+    --hard-reset --timeline timelines/wolf3d-menu-hw.tl --settle 12 --window 20 \
+    --gate x86_modey_presents=const --gate guest_insns_total \
+    --json build/artifacts/profile_wolf3d_menu.json
+```
+
+`--gate SYM[=climb|const]` reads named counters at the two ends of the
+measurement window, prints before/after/delta, and **exits non-zero if any one
+moved the wrong way**. Repeatable and comma-separated; `climb` is the default.
+
+**A profile looks equally confident whether the guest was raycasting or sitting
+on a menu**, and two full 57-second hardware runs of Wolf3D data turned out to
+be menus before anything in the tooling ever looked. `x86_modey_presents` is
+the Mode Y gameplay gate — it must CLIMB — and the same symbol with `=const` is
+what makes the menu control a control rather than an assumption. The gate
+result is written into the JSON (`meta.gates`, `meta.gates_ok`), so a saved
+profile carries its own provenance and cannot be quoted later as the wrong
+workload.
+
+##### `--compare A.json B.json` — a changed MIX or a real slowdown?
+
+```bash
+python3 scripts/profile_opcodes.py --compare menu.json play.json --top 18
+```
+
+Needs no target. Decomposes the change in **cycles per instruction** between two
+saved profiles into the part explained by a changed opcode MIX (same per-opcode
+cost, different shares) and the part that is a genuine per-opcode COST increase,
+and prints both columns per opcode.
+
+**The two look identical in an average and are completely different problems.**
+"Gameplay runs at 95 cycles per instruction against 64 in menus" is consistent
+both with an interpreter that regressed on this code and with a guest that
+simply asked for more expensive instructions; only the split says which. For
+WOLF3D the answer was **90% mix, 10% cost** — see [`docs/09`](docs/09_frame_pacing_and_clocks.md) §8.
+
+Requires both profiles to come from the same core and the same clock. Comparing
+across builds compares the builds.
+
 ### `profile_all.py` — ONE command, one workload, one full report
 
 ```bash
@@ -881,6 +929,20 @@ DTCM — the pool is the scarcest thing in the project):
 | `x86_vprof_render` | `x86_video_render()` alone: in Mode Y this IS the de-interleave blit |
 | `x86_vprof_osk` | `x86_osk_draw()` alone |
 | `x86_vprof_cell` | inside the PL_PLANE loop: the 4-byte read-modify-write of one plane cell and nothing else. **DIFFERENTIAL USE ONLY — see the warning below** |
+| `x86_vprof_reloc` | `x86_code_reloc()` — staging a granule-straddling instruction into DTCM. Not video; it is here because this is the instrument that already has 64-bit accumulators and a window control, and because the RATE was counted for a long time while the COST never was |
+| `x86_vprof_seam` | `x86_seam_sync()` — the multi-byte-access straddle prologue, the other long-standing "explicitly unmeasured" suspect |
+
+**`reloc` and `seam` exist only when `X86_VPROF=1`**, unlike the five above,
+which are declared on every build so a host tool reads a truthful zero rather
+than failing to resolve a symbol. These two could not follow that rule: two more
+BSS accumulators shift the link, shifting address literals, and the shipping
+`dos.bin` stopped being byte-identical to master by 303 scattered bytes. A
+profiling flag must not change the shipping binary at all, so on a clean build
+`probe.py --watch` simply fails to resolve them — which is the honest signal
+that the instrument is not compiled in. The same constraint is why
+`x86_seam_sync`'s bracket is an `#if X86_VPROF` WRAPPER around the untouched
+original function and not a split into wrapper + body: GCC re-inlines the split
+body, but it reallocates registers doing it, and that alone broke byte-identity.
 
 Each is `{lo, hi, n, worst}` — 64-bit because CYCCNT wraps every ~15 s at
 280 MHz and a 32-bit accumulator would wrap inside a measurement window.
@@ -912,6 +974,14 @@ RAM_EMU, `guest_ram` comes back NULL, `core_ready` stays 0 and the emulator
 simply never starts — `guest_insns_total` reads 0 and every zone and bracket
 reads a plausible zero. Take the two as SEPARATE PASSES, exactly as
 `profile_all.py` already does for zones and opcodes.
+
+**`x86_vga_planar_cls_plane1`** counts the `PL_PLANE` stores that took the
+no-load path — a single aligned `STR` when the Map Mask enables all four planes,
+otherwise one `STRB` per enabled plane. Against `x86_vga_planar_cls_plane` it
+says what fraction of the frame avoids a read; it is 100% of `PL_PLANE` on
+WOLF3D because the read was removed for every mask ([`docs/09`](docs/09_frame_pacing_and_clocks.md) §9). The
+intermediate arm that took the fast path only for a single-plane mask read 35%,
+which is why "single plane" was the wrong condition to key it on.
 
 **THE `cell` BRACKET IS NOT A VALID ABSOLUTE NUMBER.** DWT->CYCCNT lives on the
 private peripheral bus, which is strongly ordered: a read of it inside a
