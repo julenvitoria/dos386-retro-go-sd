@@ -109,6 +109,15 @@ TITLES = {
                 "which memory manager it asks for (XMS, EMS, VCPI, DPMI) "
                 "before it refuses to start.",
     },
+    "epicpinball": {
+        "rom": f"{ROM_DIR}/EPIC_PINBALL.dsk",
+        "timeline": "timelines/start-preselected-game.tl",
+        "settle": 22.0, "cmdtail": 1,
+        "what": "Epic Pinball. PINBALL.EXE is a LAUNCHER: it shrinks its own "
+                "block and EXECs the chosen table's EPn.EXE, so it stops dead "
+                "on INT 21h AH=4Bh with 'Please run SETUP!'. Nothing past that "
+                "call has ever been measured for this title.",
+    },
     "alleycat": {
         "rom": f"{ROM_DIR}/ALLEYCAT.dsk",
         "timeline": "timelines/profile-alleycat.tl",
