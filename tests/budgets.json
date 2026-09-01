@@ -1,0 +1,7 @@
+{
+ "_comment": "Recorded budgets for a STOCK build of build/core/dos_core.elf. Checked by scripts/budget_gate.py; write with --update. RAISING A NUMBER HERE IS THE REVIEW -- the commit that raises it must say what grew and why. See scripts/common/budgets.py for what each one means and what the frame count is and is not.",
+ "_measured": "2026-09-02 on agent/guards, branched from master 8040927, stock flags, forced re-link.",
+ "itcm_code_end_max": 59696,
+ "core_bss_end_max": 604395336,
+ "frames_implied_min": 154
+}
