@@ -252,6 +252,256 @@ def playback(args, runner):
 
 
 # ---------------------------------------------------------------------------
+# CREATIVE ADPCM. Three formats, two reference spellings, graded on the SAMPLES.
+#
+# THE RULE, and its source: Creative ADPCM is a TABLE WALK, not IMA/DVI ADPCM
+# and not a filter. Each code is ADDED to a running step index, the sum is
+# clamped to the table, the step table entry is added to a running unsigned
+# 8-bit reference (clamped to 0..255) and IS the sample, and the adjust table
+# entry is added to the step index modulo 256. The "+reference" commands
+# (0x17 / 0x75 / 0x77 and the auto-init forms) spend the FIRST byte of the
+# transfer on an absolute sample and reset the step. Checked against
+# DOSBox-X's decode_ADPCM_{2,3,4}_sample() in
+# references/dosbox-x/src/hardware/sblaster.cpp; the PACKING is stated below in
+# our own terms because a bit index copied out of a reference whose byte order
+# differs is exactly how this goes silently wrong.
+#
+# This decoder is written HERE from that rule. It is not a copy of x86_io.c's
+# control flow -- a test carrying a second copy of the implementation would
+# agree with it however wrong both were.
+
+APC_SCALE4 = [
+    0, 1, 2, 3, 4, 5, 6, 7, 0, -1, -2, -3, -4, -5, -6, -7,
+    1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15,
+    2, 6, 10, 14, 18, 22, 26, 30, -2, -6, -10, -14, -18, -22, -26, -30,
+    4, 12, 20, 28, 36, 44, 52, 60, -4, -12, -20, -28, -36, -44, -52, -60,
+]
+APC_ADJ4 = [
+    0, 0, 0, 0, 0, 16, 16, 16,
+    0, 0, 0, 0, 0, 16, 16, 16,
+    240, 0, 0, 0, 0, 16, 16, 16,
+    240, 0, 0, 0, 0, 16, 16, 16,
+    240, 0, 0, 0, 0, 16, 16, 16,
+    240, 0, 0, 0, 0, 16, 16, 16,
+    240, 0, 0, 0, 0, 0, 0, 0,
+    240, 0, 0, 0, 0, 0, 0, 0,
+]
+APC_SCALE3 = [
+    0, 1, 2, 3, 0, -1, -2, -3,
+    1, 3, 5, 7, -1, -3, -5, -7,
+    2, 6, 10, 14, -2, -6, -10, -14,
+    4, 12, 20, 28, -4, -12, -20, -28,
+    5, 15, 25, 35, -5, -15, -25, -35,
+]
+APC_ADJ3 = [
+    0, 0, 0, 8, 0, 0, 0, 8,
+    248, 0, 0, 8, 248, 0, 0, 8,
+    248, 0, 0, 8, 248, 0, 0, 8,
+    248, 0, 0, 8, 248, 0, 0, 8,
+    248, 0, 0, 0, 248, 0, 0, 0,
+]
+APC_SCALE2 = [
+    0, 1, 0, -1, 1, 3, -1, -3,
+    2, 6, -2, -6, 4, 12, -4, -12,
+    8, 24, -8, -24, 16, 48, -16, -48,
+]
+APC_ADJ2 = [
+    0, 4, 0, 4,
+    252, 4, 252, 4, 252, 4, 252, 4,
+    252, 4, 252, 4, 252, 4, 252, 4,
+    252, 0, 252, 0,
+]
+
+# command -> (label, codes-per-byte format, has a reference byte)
+APC_CMDS = {
+    0x75: ("4-bit  +ref", 4, True),
+    0x74: ("4-bit  no ref", 4, False),
+    0x77: ("2.6-bit +ref", 3, True),
+    0x17: ("2-bit  +ref", 2, True),
+}
+
+APC_BYTES = 20                  # must match APC_BYTES in tests/main.c
+APC_SRC_RATE = 24000
+APC_OUT_RATE = 48000
+APC_HOLD = APC_OUT_RATE // APC_SRC_RATE     # 2
+
+
+def _apc_src_bytes():
+    """The block tests/main.c generates. Same closed formula, derived here."""
+    return [(i * 37 + 11) & 0xFF for i in range(APC_BYTES)]
+
+
+def _apc_codes(byte, fmt):
+    """OUR packing, stated explicitly.
+
+    4-bit:   high nibble first, then the low nibble.
+    2.6-bit: THREE codes -- bits 7:5, bits 4:2, and the low TWO bits SHIFTED UP
+             one so a 2-bit field indexes a 3-bit table. Reading that last
+             field as three bits, or without the shift, is the classic error.
+    2-bit:   four codes, 7:6 down to 1:0.
+    """
+    if fmt == 4:
+        return [byte >> 4, byte & 0x0F]
+    if fmt == 3:
+        return [(byte >> 5) & 7, (byte >> 2) & 7, (byte & 3) << 1]
+    return [(byte >> 6) & 3, (byte >> 4) & 3, (byte >> 2) & 3, byte & 3]
+
+
+def _apc_decode(data, fmt, have_ref):
+    scale, adj, top = {
+        4: (APC_SCALE4, APC_ADJ4, 63),
+        3: (APC_SCALE3, APC_ADJ3, 39),
+        2: (APC_SCALE2, APC_ADJ2, 23),
+    }[fmt]
+    i = 0
+    ref, step = 128, 0
+    if have_ref:
+        ref, step = data[0], 0
+        i = 1
+    out = []
+    for b in data[i:]:
+        for code in _apc_codes(b, fmt):
+            idx = min(max(code + step, 0), top)
+            ref = min(max(ref + scale[idx], 0), 255)
+            step = (step + adj[idx]) & 0xFF
+            out.append(ref)
+    return out
+
+
+def _apc_expect(cmd):
+    _, fmt, have_ref = APC_CMDS[cmd]
+    dec = _apc_decode(_apc_src_bytes(), fmt, have_ref)
+    pcm = []
+    for d in dec:
+        v = ((d - 128) << 8)
+        v = (v * SBD_AMP) >> 15
+        for _ in range(APC_HOLD):
+            pcm.append(v)
+    return dec, pcm[:64]
+
+
+def adpcm(args, runner):
+    """Creative ADPCM: the transport AND the decoded waveform, per format."""
+    b = runner.backend
+    syms = get_symbols("test_core.elf")
+    for n in ("run_sbadpcm_flag", "apc_in", "apc_r", "apc_pcm"):
+        if n not in syms:
+            print(f"missing symbol {n} -- rebuild tests/main.c")
+            return False
+
+    print()
+    print("=== CREATIVE ADPCM ===")
+    ok = True
+
+    def fail(msg):
+        nonlocal ok
+        print("FAIL: " + msg)
+        ok = False
+
+    for cmd in (0x75, 0x74, 0x77, 0x17):
+        name, fmt, have_ref = APC_CMDS[cmd]
+        b.write_uint32(syms["apc_in"], cmd)
+        b.write_uint32(syms["run_sbadpcm_flag"], 1)
+        for _ in range(600):
+            if b.read_uint32(syms["run_sbadpcm_flag"]) == 0:
+                break
+            time.sleep(0.05)
+        else:
+            fail(f"DSP {cmd:#04x} ({name}): the arm never completed")
+            return False
+
+        r = [b.read_uint32(syms["apc_r"] + 4 * i) for i in range(12)]
+        (aa, isr, polls_left, dma_status, starts, blocks, dma_bytes,
+         samples, underruns, silenced, captured, reason) = r
+        pcm = []
+        for i in range(32):
+            w = b.read_uint32(syms["apc_pcm"] + 4 * i)
+            pcm.append(_s16(w & 0xFFFF))
+            pcm.append(_s16((w >> 16) & 0xFFFF))
+
+        dec, want = _apc_expect(cmd)
+        print(f"-- DSP {cmd:#04x}  {name} --")
+        print(f"   transfer starts {starts} blocks {blocks} "
+              f"dma_bytes {dma_bytes} ISR {isr}x polls left {polls_left} "
+              f"8237 status {dma_status:#04x}")
+        print(f"   samples {samples} underruns {underruns} "
+              f"adpcm_silenced {silenced} captured {captured} reason {reason}")
+        print("   decoded  " + " ".join(f"{v:4d}" for v in dec[:12]))
+        print("   got      " + " ".join(f"{v:6d}" for v in pcm[:10]))
+        print("   want     " + " ".join(f"{v:6d}" for v in want[:10]))
+
+        if aa != 0xAA:
+            fail(f"{name}: 0x22A returned {aa:#04x} -- the card is not found")
+        if silenced:
+            fail(f"{name}: x86_sb_adpcm_silenced is {silenced}. THIS IS THE "
+                 f"ORIGINAL STUB: the ADPCM commands took the deliberate "
+                 f"silent path instead of decoding")
+        if starts != 1:
+            fail(f"{name}: x86_sb_starts is {starts}, expected 1")
+        if dma_bytes != APC_BYTES:
+            fail(f"{name}: the DMA moved {dma_bytes} bytes, expected exactly "
+                 f"{APC_BYTES}. An ADPCM block length is in BYTES, not in "
+                 f"decoded samples -- a decoder that ticks the block per "
+                 f"OUTPUT sample interrupts several times too early and reads "
+                 f"correspondingly too few bytes")
+        if blocks != 1:
+            fail(f"{name}: {blocks} blocks completed, expected exactly 1")
+        if isr < 1:
+            fail(f"{name}: the guest's IRQ 5 handler never ran")
+        if polls_left == 0:
+            fail(f"{name}: the guest's bounded wait ran to its bound")
+        if underruns:
+            fail(f"{name}: x86_sb_underruns is {underruns}")
+        if reason != 6:
+            fail(f"{name}: the guest exited with reason {reason}, not 6 (HLT)")
+        if not captured:
+            fail(f"{name}: no audio was captured at all")
+            continue
+
+        # ---- THE WAVEFORM. Three assertions, and they fail differently. ----
+        #
+        # (1) It must not be silence.
+        # (2) It must not be a CONSTANT -- a DC offset and real silence are
+        #     different failures, and a decoder that consumed the reference
+        #     byte as data, or never consumed it, collapses toward a constant
+        #     that is NOT zero. An all-zero expectation would accept both.
+        # (3) It must be the RIGHT waveform, sample for sample, held APC_HOLD
+        #     apiece -- which no counter and no energy measure can fake.
+        if all(v == 0 for v in pcm):
+            fail(f"{name}: every one of the 64 rendered samples is ZERO -- "
+                 f"the transfer ran and emitted silence")
+            continue
+        distinct = len(set(pcm))
+        if distinct < 4:
+            fail(f"{name}: the 64 rendered samples take only {distinct} "
+                 f"distinct values -- this is a CONSTANT (or near-constant), "
+                 f"not a decoded waveform. A reference byte consumed as data, "
+                 f"or a step table that never adapts, looks exactly like this")
+        want_distinct = len(set(want))
+        if want_distinct < 4:
+            fail(f"{name}: the EXPECTATION itself has only {want_distinct} "
+                 f"distinct values, so this arm could be passed by a decoder "
+                 f"that does nothing. The source block is wrong for this "
+                 f"format and the arm proves nothing")
+        bad = [(k, pcm[k], want[k]) for k in range(64) if pcm[k] != want[k]]
+        if bad:
+            k, got, exp = bad[0]
+            fail(f"{name}: {len(bad)} of 64 rendered samples differ from the "
+                 f"reference decode. First at output sample {k}: got {got}, "
+                 f"expected {exp} (decoded sample {k // APC_HOLD} = "
+                 f"{dec[k // APC_HOLD]}). At {APC_SRC_RATE} Hz into "
+                 f"{APC_OUT_RATE} Hz each decoded sample is held exactly "
+                 f"{APC_HOLD} outputs, so this catches the step table, the "
+                 f"packing, the reference byte AND the resampler at once")
+        else:
+            print(f"   all 64 samples match the reference decode "
+                  f"({distinct} distinct values, held {APC_HOLD} apiece)")
+
+    print("\nADPCM PASS" if ok else "\nADPCM FAIL")
+    return ok
+
+
+# ---------------------------------------------------------------------------
 # THE FM ARM. The OPL2 tone generator, graded on the SAMPLES.
 #
 # Everything the expectation needs is computed HERE, from the register bytes
@@ -527,6 +777,7 @@ def main(args):
         # The playback arm runs on the SAME target: rebuilding for it would
         # double every negative control's cost for nothing.
         ok = playback(args, runner) and ok
+        ok = adpcm(args, runner) and ok
         ok = fm(args, runner) and ok
 
         print("\nPASS" if ok else "\nFAIL")
@@ -628,14 +879,60 @@ MUTATE_FM_FREQ_TO = ("static uint32_t ml_table[16] = {2, 1 * 4, 2 * 4, 3 * 4, "
                      "4 * 4, 5 * 4, 6 * 4, 7 * 4,\n")
 
 
+# ---- the ADPCM controls -------------------------------------------------
+#
+# THE STUB, restored. Before this work every ADPCM command called sb_start()
+# with silent=1: the transfer ran, the block completed, the interrupt was
+# raised, and the samples were zero. This control puts 0x75 back on that path,
+# so the arm must reject it -- both through x86_sb_adpcm_silenced and, more to
+# the point, through the samples themselves.
+MUTATE_ADPCM = "        sb_start_fmt(0, 0, 0, 0, 0, dsp_len() + 1u, 4, 1);\n"
+MUTATE_ADPCM_TO = "        sb_start(0, 0, 0, 0, 1, dsp_len() + 1u);\n"
+
+# THE REFERENCE BYTE, never consumed as a reference. The first byte of the
+# block is then decoded as ordinary codes and the predictor starts at
+# mid-scale. Every counter stays green, the output is NOT silent and NOT a
+# constant -- so only the sample-exact comparison can see it. This is the exact
+# failure mode the arm's three-layer expectation exists to separate.
+MUTATE_ADPCM_REF = "    sbp.adpcm_ref_pending = adpcm_fmt ? ref : 0u;\n"
+MUTATE_ADPCM_REF_TO = "    sbp.adpcm_ref_pending = 0u;\n"
+
+# THE 2.6-BIT PACKING. Its third code is the byte's low TWO bits shifted UP one
+# so a 2-bit field indexes a 3-bit table; dropping the shift is the classic
+# error and it changes only every third sample.
+MUTATE_ADPCM_PACK = """        sbp.adpcm_out[2] = adpcm_step_one((uint8_t)((b & 0x03u) << 1),
+"""
+MUTATE_ADPCM_PACK_TO = """        sbp.adpcm_out[2] = adpcm_step_one((uint8_t)(b & 0x03u),
+"""
+
+# THE BLOCK LENGTH UNIT. An ADPCM block is counted in DMA BYTES; ticking it per
+# OUTPUT sample instead interrupts two to four times too early and stops the
+# DMA short. The waveform's first 64 samples survive that, so this one is
+# caught by dma_bytes and the block count -- a different layer again.
+MUTATE_ADPCM_BLK = """            adpcm_expand((uint8_t)u);
+            sb_block_tick();
+        }
+"""
+MUTATE_ADPCM_BLK_TO = """            adpcm_expand((uint8_t)u);
+        }
+        sb_block_tick();
+"""
+
+
 def _mutate_and_require_failure(args, target, what, replacement="",
                                 path="x86_io.c"):
     import pathlib
     src = pathlib.Path(path)
     original = src.read_text()
-    if target not in original:
-        print(f"FAIL: the mutation target ({what}) is not in {path} -- this "
-              f"control would pass without testing anything")
+    # AN OCCURRENCE ASSERT, not a presence check. A target that matches twice
+    # patches whichever copy comes first, which is how a control ends up
+    # mutating something other than what it names -- and a control that
+    # mutates nothing passes for free.
+    n = original.count(target)
+    if n != 1:
+        print(f"FAIL: the mutation target ({what}) occurs {n} times in "
+              f"{path}, expected exactly 1 -- this control would mutate the "
+              f"wrong thing, or nothing at all")
         return False
     try:
         src.write_text(original.replace(target, replacement, 1))
@@ -643,7 +940,9 @@ def _mutate_and_require_failure(args, target, what, replacement="",
         print(f"-- negative control: rebuilt with {what} {verb} --")
         for a in ("negative", "negative_opl", "negative_tc",
                   "negative_irq", "negative_rate", "negative_f2",
-                  "negative_f2_now", "negative_fm_env", "negative_fm_freq"):
+                  "negative_f2_now", "negative_fm_env", "negative_fm_freq",
+                  "negative_adpcm", "negative_adpcm_ref",
+                  "negative_adpcm_pack", "negative_adpcm_blk"):
             setattr(args, a, False)
         failed = not main(args)
     finally:
@@ -678,6 +977,18 @@ if __name__ == "__main__":
                         "and only the guest's short window catches it")
     p.add_argument("--negative-fm-env", action="store_true",
                    help="rebuild with the FM envelope's RELEASE deleted")
+    p.add_argument("--negative-adpcm", action="store_true",
+                   help="rebuild with 4-bit ADPCM back on the SILENT stub")
+    p.add_argument("--negative-adpcm-ref", action="store_true",
+                   help="rebuild with the ADPCM REFERENCE BYTE never consumed "
+                        "as a reference -- output stays non-silent and "
+                        "non-constant, so only the sample-exact arm sees it")
+    p.add_argument("--negative-adpcm-pack", action="store_true",
+                   help="rebuild with the 2.6-bit format's third code read "
+                        "without its shift")
+    p.add_argument("--negative-adpcm-blk", action="store_true",
+                   help="rebuild with the ADPCM block ticked per OUTPUT "
+                        "sample instead of per DMA byte")
     p.add_argument("--negative-fm-freq", action="store_true",
                    help="rebuild with the FM phase increment an octave out")
     args = p.parse_args()
@@ -704,6 +1015,22 @@ if __name__ == "__main__":
         sys.exit(0 if _mutate_and_require_failure(
             args, MUTATE_F2_NOW, "F2h's IMMEDIATE DELIVERY",
             MUTATE_F2_NOW_TO) else 1)
+    if args.negative_adpcm:
+        sys.exit(0 if _mutate_and_require_failure(
+            args, MUTATE_ADPCM, "4-bit ADPCM back on the SILENT STUB",
+            MUTATE_ADPCM_TO) else 1)
+    if args.negative_adpcm_ref:
+        sys.exit(0 if _mutate_and_require_failure(
+            args, MUTATE_ADPCM_REF, "the ADPCM REFERENCE BYTE",
+            MUTATE_ADPCM_REF_TO) else 1)
+    if args.negative_adpcm_pack:
+        sys.exit(0 if _mutate_and_require_failure(
+            args, MUTATE_ADPCM_PACK, "the 2.6-bit ADPCM PACKING",
+            MUTATE_ADPCM_PACK_TO) else 1)
+    if args.negative_adpcm_blk:
+        sys.exit(0 if _mutate_and_require_failure(
+            args, MUTATE_ADPCM_BLK, "the ADPCM BLOCK LENGTH UNIT",
+            MUTATE_ADPCM_BLK_TO) else 1)
     if args.negative_fm_env:
         sys.exit(0 if _mutate_and_require_failure(
             args, MUTATE_FM_ENV, "the FM envelope's RELEASE",

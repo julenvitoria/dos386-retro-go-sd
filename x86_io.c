@@ -934,7 +934,10 @@ volatile uint32_t x86_sb_irqs_lost;      /* refused: the one-deep slot was full 
 volatile uint32_t x86_sb_irqs_acked;     /* DSP acks (a 0x22E / 0x22F read) */
 volatile uint32_t x86_sb_eois;           /* non-specific EOIs seen at 0x20  */
 volatile uint32_t x86_sb_underruns;      /* the source ran dry mid-render   */
-volatile uint32_t x86_sb_adpcm_silenced; /* ADPCM consumed, emitted silent  */
+volatile uint32_t x86_sb_adpcm_silenced; /* a transfer that ran SILENT.
+                                            ADPCM decodes now, so this is a
+                                            REGRESSION DETECTOR: only 0x2C
+                                            (A/D, no input source) raises it */
 volatile uint32_t x86_sb_rate;           /* the rate last programmed, Hz    */
 volatile uint32_t x86_sb_dma_maps;       /* granule re-resolves per render  */
 volatile uint32_t x86_dma_writes;        /* 8237 register writes accepted   */
@@ -1248,6 +1251,16 @@ static struct {
     uint32_t blk, blk_left;       /* DSP block length, in SAMPLES          */
     uint32_t frac;                /* 16.16 resampler accumulator           */
     int16_t  last;                /* the sample currently being held       */
+    /* Creative ADPCM decoder state. fmt is 0 for PCM and 2/3/4 for the
+       2-bit / 2.6-bit / 4-bit formats; it is the ONE flag that switches
+       sb_next_sample() from "one DMA unit is one sample" to "one DMA BYTE is
+       two, three or four samples". */
+    uint8_t  adpcm_fmt;
+    uint8_t  adpcm_ref_pending;   /* the next byte is the absolute reference */
+    uint8_t  adpcm_ref;           /* the running predictor, unsigned 8-bit  */
+    uint8_t  adpcm_step;          /* the adaptive step index, mod 256       */
+    uint8_t  adpcm_n, adpcm_i;    /* samples decoded from the current byte  */
+    uint8_t  adpcm_out[4];
 } sbp = { .dma8 = 1, .dma16 = 5 };
 
 static uint8_t sb_irq_line;       /* the DSP's interrupt output            */
@@ -1383,6 +1396,121 @@ static uint32_t sb_dma_unit(void)
     return v;
 }
 
+/* ---------------------------------------------------------------------------
+ * CREATIVE ADPCM -- and it is NOT IMA/DVI ADPCM. Three formats, three step
+ * tables, three packings, and each has a "with reference byte" variant where
+ * the FIRST byte of the transfer is an absolute unsigned 8-bit sample and the
+ * rest are deltas against it.
+ *
+ * THE RULE, and the reference for it: the decoder is a table walk, not a
+ * filter. An index is formed by ADDING the raw code to a running step index,
+ * clamped to the table; the step table entry is added to the running 8-bit
+ * reference (clamped to 0..255) and IS the output sample; the adjust table
+ * entry is added to the step index MODULO 256 -- which is why the "shrink"
+ * entries are 240 / 248 / 252 rather than -16 / -8 / -4. Checked against
+ * DOSBox-X's decode_ADPCM_{2,3,4}_sample() and its table triple in
+ * references/dosbox-x/src/hardware/sblaster.cpp.
+ *
+ * THE PACKING IS OURS TO STATE, not to copy blind: 4-bit is high nibble then
+ * low; 2.6-bit is THREE samples in a byte, bits 7:5, then 4:2, then the low
+ * TWO bits shifted UP one so a 2-bit code enters a 3-bit table; 2-bit is four
+ * codes, 7:6 down to 1:0. A 2.6-bit decoder that reads the last field as three
+ * bits, or reads it without the shift, is the classic way to get a stream that
+ * decodes and sounds wrong.
+ *
+ * These tables are `const` in a plain C file: they live in FLASH, not ITCM.
+ */
+static const int8_t adpcm4_scale[64] = {
+    0,  1,  2,  3,  4,  5,  6,  7,  0,  -1,  -2,  -3,  -4,  -5,  -6,  -7,
+    1,  3,  5,  7,  9, 11, 13, 15, -1,  -3,  -5,  -7,  -9, -11, -13, -15,
+    2,  6, 10, 14, 18, 22, 26, 30, -2,  -6, -10, -14, -18, -22, -26, -30,
+    4, 12, 20, 28, 36, 44, 52, 60, -4, -12, -20, -28, -36, -44, -52, -60
+};
+static const uint8_t adpcm4_adjust[64] = {
+      0, 0, 0, 0, 0, 16, 16, 16,
+      0, 0, 0, 0, 0, 16, 16, 16,
+    240, 0, 0, 0, 0, 16, 16, 16,
+    240, 0, 0, 0, 0, 16, 16, 16,
+    240, 0, 0, 0, 0, 16, 16, 16,
+    240, 0, 0, 0, 0, 16, 16, 16,
+    240, 0, 0, 0, 0,  0,  0,  0,
+    240, 0, 0, 0, 0,  0,  0,  0
+};
+static const int8_t adpcm3_scale[40] = {
+    0,  1,  2,  3,  0,  -1,  -2,  -3,
+    1,  3,  5,  7, -1,  -3,  -5,  -7,
+    2,  6, 10, 14, -2,  -6, -10, -14,
+    4, 12, 20, 28, -4, -12, -20, -28,
+    5, 15, 25, 35, -5, -15, -25, -35
+};
+static const uint8_t adpcm3_adjust[40] = {
+      0, 0, 0, 8,   0, 0, 0, 8,
+    248, 0, 0, 8, 248, 0, 0, 8,
+    248, 0, 0, 8, 248, 0, 0, 8,
+    248, 0, 0, 8, 248, 0, 0, 8,
+    248, 0, 0, 0, 248, 0, 0, 0
+};
+static const int8_t adpcm2_scale[24] = {
+    0,  1,  0,  -1,  1,  3,  -1,  -3,
+    2,  6, -2,  -6,  4, 12,  -4, -12,
+    8, 24, -8, -24, 16, 48, -16, -48
+};
+static const uint8_t adpcm2_adjust[24] = {
+      0, 4,   0, 4,
+    252, 4, 252, 4, 252, 4, 252, 4,
+    252, 4, 252, 4, 252, 4, 252, 4,
+    252, 0, 252, 0
+};
+
+static uint8_t adpcm_step_one(uint8_t code, const int8_t *scale,
+                              const uint8_t *adjust, unsigned top)
+{
+    int idx = (int)code + (int)sbp.adpcm_step;
+    if (idx < 0)
+        idx = 0;
+    else if (idx > (int)top)
+        idx = (int)top;
+    int ref = (int)sbp.adpcm_ref + (int)scale[idx];
+    sbp.adpcm_ref  = (uint8_t)(ref > 255 ? 255 : (ref < 0 ? 0 : ref));
+    sbp.adpcm_step = (uint8_t)((sbp.adpcm_step + adjust[idx]) & 0xFFu);
+    return sbp.adpcm_ref;
+}
+
+/* One DMA byte -> 2, 3 or 4 decoded unsigned-8 samples in sbp.adpcm_out. */
+static void adpcm_expand(uint8_t b)
+{
+    switch (sbp.adpcm_fmt) {
+    case 4:
+        sbp.adpcm_out[0] = adpcm_step_one((uint8_t)(b >> 4),
+                                          adpcm4_scale, adpcm4_adjust, 63);
+        sbp.adpcm_out[1] = adpcm_step_one((uint8_t)(b & 0x0Fu),
+                                          adpcm4_scale, adpcm4_adjust, 63);
+        sbp.adpcm_n = 2;
+        break;
+    case 3:
+        sbp.adpcm_out[0] = adpcm_step_one((uint8_t)((b >> 5) & 0x07u),
+                                          adpcm3_scale, adpcm3_adjust, 39);
+        sbp.adpcm_out[1] = adpcm_step_one((uint8_t)((b >> 2) & 0x07u),
+                                          adpcm3_scale, adpcm3_adjust, 39);
+        sbp.adpcm_out[2] = adpcm_step_one((uint8_t)((b & 0x03u) << 1),
+                                          adpcm3_scale, adpcm3_adjust, 39);
+        sbp.adpcm_n = 3;
+        break;
+    default:
+        sbp.adpcm_out[0] = adpcm_step_one((uint8_t)((b >> 6) & 0x03u),
+                                          adpcm2_scale, adpcm2_adjust, 23);
+        sbp.adpcm_out[1] = adpcm_step_one((uint8_t)((b >> 4) & 0x03u),
+                                          adpcm2_scale, adpcm2_adjust, 23);
+        sbp.adpcm_out[2] = adpcm_step_one((uint8_t)((b >> 2) & 0x03u),
+                                          adpcm2_scale, adpcm2_adjust, 23);
+        sbp.adpcm_out[3] = adpcm_step_one((uint8_t)(b & 0x03u),
+                                          adpcm2_scale, adpcm2_adjust, 23);
+        sbp.adpcm_n = 4;
+        break;
+    }
+    sbp.adpcm_i = 0;
+}
+
 static int32_t sb_decode(uint32_t u)
 {
     if (sbp.bits16)
@@ -1392,11 +1520,63 @@ static int32_t sb_decode(uint32_t u)
                     : ((int32_t)(uint8_t)u - 128) << 8;
 }
 
+/* One unit of the DSP's block length has been consumed: for PCM that is a
+   sample frame, for ADPCM it is a DMA BYTE -- the 2.x ADPCM commands carry
+   their length in bytes, not in decoded samples, so a decoder that ticked per
+   OUTPUT sample would interrupt two to four times too early. */
+static void sb_block_tick(void)
+{
+    if (sbp.blk_left && --sbp.blk_left == 0u) {
+        x86_sb_blocks++;
+        sb_irq_assert();
+        if (sbp.autoinit)
+            sbp.blk_left = sbp.blk;    /* the next half is already queued   */
+        else
+            sbp.active = 0;            /* single cycle: this was the block  */
+    }
+}
+
 /* Advance the source by one SAMPLE FRAME. Returns 0 when the source is dry. */
 static int sb_next_sample(void)
 {
     if (!sbp.active)
         return 0;
+
+    if (sbp.adpcm_fmt) {
+        /* ADPCM is mono 8-bit by construction -- there is no stereo or 16-bit
+           spelling of these commands -- so this path ignores sbp.stereo. */
+        if (sbp.adpcm_i >= sbp.adpcm_n) {
+            uint32_t u = sb_dma_unit();
+            if (u == SB_DMA_END) {
+                x86_sb_underruns++;
+                sbp.active = 0;
+                return 0;
+            }
+            if (sbp.adpcm_ref_pending) {
+                /* THE REFERENCE BYTE. It is an absolute sample, it is NOT a
+                   packed set of codes, and it costs one byte of the block --
+                   consuming it as data is what collapses the output toward a
+                   constant. It also resets the adaptive step to its minimum,
+                   which is 0 for all three formats. */
+                sbp.adpcm_ref_pending = 0;
+                sbp.adpcm_ref  = (uint8_t)u;
+                sbp.adpcm_step = 0;
+                sb_block_tick();
+                u = sb_dma_unit();
+                if (u == SB_DMA_END) {
+                    x86_sb_underruns++;
+                    sbp.active = 0;
+                    return 0;
+                }
+            }
+            adpcm_expand((uint8_t)u);
+            sb_block_tick();
+        }
+        sbp.last = (int16_t)((((int32_t)sbp.adpcm_out[sbp.adpcm_i++]) - 128)
+                             << 8);
+        return 1;
+    }
+
     unsigned chans = sbp.stereo ? 2u : 1u;
     int32_t sum = 0;
     for (unsigned i = 0; i < chans; i++) {
@@ -1411,14 +1591,7 @@ static int sb_next_sample(void)
     }
     sbp.last = (int16_t)(chans == 2u ? sum / 2 : sum);
 
-    if (sbp.blk_left && --sbp.blk_left == 0u) {
-        x86_sb_blocks++;
-        sb_irq_assert();
-        if (sbp.autoinit)
-            sbp.blk_left = sbp.blk;    /* the next half is already queued   */
-        else
-            sbp.active = 0;            /* single cycle: this was the block  */
-    }
+    sb_block_tick();
     return 1;
 }
 
@@ -1470,9 +1643,34 @@ done:
 
 int x86_sb_playing(void) { return sbp.active && !sbp.paused; }
 
+static void sb_start_fmt(uint8_t bits16, uint8_t autoinit, uint8_t stereo,
+                         uint8_t sign, uint8_t silent, uint32_t samples,
+                         uint8_t adpcm_fmt, uint8_t ref);
+
 static void sb_start(uint8_t bits16, uint8_t autoinit, uint8_t stereo,
                      uint8_t sign, uint8_t silent, uint32_t samples)
 {
+    sb_start_fmt(bits16, autoinit, stereo, sign, silent, samples, 0, 0);
+}
+
+/* The full form. adpcm_fmt is 0 / 2 / 3 / 4 and `ref` says the first byte of
+   the transfer is the absolute reference sample. */
+static void sb_start_fmt(uint8_t bits16, uint8_t autoinit, uint8_t stereo,
+                         uint8_t sign, uint8_t silent, uint32_t samples,
+                         uint8_t adpcm_fmt, uint8_t ref)
+{
+    sbp.adpcm_fmt         = adpcm_fmt;
+    sbp.adpcm_ref_pending = adpcm_fmt ? ref : 0u;
+    sbp.adpcm_n = sbp.adpcm_i = 0;
+    if (adpcm_fmt && !ref) {
+        /* No reference byte: the predictor and the step carry over from the
+           previous block, which is what an auto-init driver that issues 0x75
+           once and 0x74 thereafter depends on. On the FIRST such transfer
+           there is nothing to carry, and mid-scale is the only defensible
+           start -- 0 would open every such stream with a full-scale step. */
+        if (!sbp.active)
+            sbp.adpcm_ref = 128u, sbp.adpcm_step = 0u;
+    }
     sbp.bits16   = bits16;
     sbp.autoinit = autoinit;
     sbp.stereo   = stereo;
@@ -1783,24 +1981,48 @@ static void dsp_exec(uint8_t c)
         break;
 
     /*
-     * ADPCM. The transfer RUNS -- the DMA is drained, the block completes, the
-     * interrupt is raised -- and the samples come out SILENT, counted in
-     * x86_sb_adpcm_silenced. That is the deliberate choice: a driver that is
-     * refused mid-transfer waits for an interrupt for ever, which is the hang
-     * this whole task exists to remove, whereas a driver whose ADPCM block
-     * plays quiet keeps running and the counter says exactly why. Decoding
-     * Creative's 2-/2.6-/4-bit ADPCM is a separate, gradeable piece of work.
+     * ADPCM, DECODED. The ODD command of each pair is the "+reference"
+     * spelling and the auto-init forms are all reference forms; the length
+     * argument is in BYTES for these, which is why sb_block_tick() ticks per
+     * DMA byte here and per sample frame for PCM.
+     *
+     * x86_sb_adpcm_silenced is no longer reachable from this block. It is kept
+     * BECAUSE it is now a regression detector: a non-zero reading means an
+     * ADPCM transfer took the silent path again.
      */
-    case 0x16: case 0x17:             /* 2-bit ADPCM, +reference           */
-        sb_start(0, 0, 0, 0, 1, dsp_len() + 1u);
+    case 0x16:                        /* 2-bit ADPCM                       */
+        sb_start_fmt(0, 0, 0, 0, 0, dsp_len() + 1u, 2, 0);
         break;
-    case 0x74: case 0x75:             /* 4-bit ADPCM                       */
-    case 0x76: case 0x77:             /* 2.6-bit ADPCM                     */
-        sb_start(0, 0, 0, 0, 1, dsp_len() + 1u);
+    case 0x17:                        /* 2-bit ADPCM, +reference           */
+        sb_start_fmt(0, 0, 0, 0, 0, dsp_len() + 1u, 2, 1);
         break;
-    case 0x1F:                        /* 2-bit ADPCM, auto-init            */
-    case 0x2C:                        /* ...and its 0x2C spelling          */
-    case 0x7D: case 0x7F:             /* 4-bit / 2.6-bit ADPCM, auto-init  */
+    case 0x74:                        /* 4-bit ADPCM                       */
+        sb_start_fmt(0, 0, 0, 0, 0, dsp_len() + 1u, 4, 0);
+        break;
+    case 0x75:                        /* 4-bit ADPCM, +reference           */
+        sb_start_fmt(0, 0, 0, 0, 0, dsp_len() + 1u, 4, 1);
+        break;
+    case 0x76:                        /* 2.6-bit ADPCM                     */
+        sb_start_fmt(0, 0, 0, 0, 0, dsp_len() + 1u, 3, 0);
+        break;
+    case 0x77:                        /* 2.6-bit ADPCM, +reference         */
+        sb_start_fmt(0, 0, 0, 0, 0, dsp_len() + 1u, 3, 1);
+        break;
+    case 0x1F:                        /* 2-bit ADPCM, auto-init, +ref      */
+        sb_start_fmt(0, 1, 0, 0, 0, 0, 2, 1);
+        break;
+    case 0x7D:                        /* 4-bit ADPCM, auto-init, +ref      */
+        sb_start_fmt(0, 1, 0, 0, 0, 0, 4, 1);
+        break;
+    case 0x7F:                        /* 2.6-bit ADPCM, auto-init, +ref    */
+        sb_start_fmt(0, 1, 0, 0, 0, 0, 3, 1);
+        break;
+    case 0x2C:                        /* auto-init 8-bit A/D (RECORDING).
+                                         Not ADPCM on real hardware and there
+                                         is no input source here; it keeps the
+                                         old silent behaviour deliberately and
+                                         is the one thing that can still bump
+                                         x86_sb_adpcm_silenced. */
         sb_start(0, 1, 0, 0, 1, 0);
         break;
 
