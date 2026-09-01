@@ -34,6 +34,7 @@ from scripts.common.elf import get_symbols
 
 GPF = 13    # X86_EXIT_GPF
 HALT = 6    # X86_EXIT_HALT -- the guest ran to its HLT
+UNIMP = 4   # X86_EXIT_UNIMPLEMENTED
 
 EX_NP = 11
 EX_SS = 12
@@ -63,13 +64,13 @@ def main(args):
                 return False
 
         time.sleep(0.5)
-        r = run_arm(b, syms, "run_pmode_flag", "pmode_r", 128)
+        r = run_arm(b, syms, "run_pmode_flag", "pmode_r", 192)
         if r is None:
             # A stall here is the arm hard-faulting or a guest that never
             # reaches its HLT, and "never ran" alone cannot tell those apart.
             # The partial results say HOW FAR it got, which names the arm.
             print("FAIL: target never ran the protected-mode test")
-            part = [b.read_uint32(syms["pmode_r"] + 4 * i) for i in range(128)]
+            part = [b.read_uint32(syms["pmode_r"] + 4 * i) for i in range(192)]
             last = max([i for i, v in enumerate(part) if v] or [-1])
             print(f"  last slot written: {last}")
             for n in ("x86_pmode_loads", "x86_pmode_faults"):
@@ -326,6 +327,74 @@ def main(args):
             ("  ... and ESP was not left consumed", r[123], 0x7FFA),
             ("  ... the same frame with DPL == RPL returns", r[124], HALT),
             ("  ... to the offset the frame named", r[125], 0x61),
+
+            # ---- V. LAR -------------------------------------------------
+            # 58 static sites in DOS4GW.EXE. Every ZF=0 arm below sets ZF
+            # first (XOR AX,AX), or it could not fail: PM_ENTER's OR leaves
+            # ZF clear and a handler that never ran would read as a refusal.
+            ("LAR of a valid selector ran to HLT",  r[126], HALT),
+            ("  ... ZF set",                        r[127], 1),
+            # The access byte at bits 8-15, which is NOT where our flags
+            # packing keeps it (docs/14 Sec.4).
+            ("  ... AR is the access byte, shifted", r[128], 0x9200),
+            # NEGATIVE CONTROL 18: the same descriptor at RPL 3.
+            ("LAR at RPL 3 against DPL 0 clears ZF", r[129], 0),
+            ("  ... and leaves the destination alone", r[130], 0xDEAD),
+            # NEGATIVE CONTROL 19.
+            ("LAR of an INTERRUPT GATE clears ZF",  r[131], 0),
+            ("  ... but a CALL GATE is accessible", r[132], 1),
+            ("LAR of a null selector clears ZF",    r[133], 0),
+            # And in REAL mode it is not an instruction at all.
+            ("LAR in real mode is UNIMPLEMENTED",   r[134], UNIMP),
+            ("  ... and the exit names 0F 02",      r[135], 0x0F02),
+
+            # ---- W. LSL -------------------------------------------------
+            ("LSL of a valid selector set ZF",      r[136], 1),
+            ("  ... and loaded the limit",          r[137], 0xFFFF),
+            # The G bit, through LSL: control 8 grades this arm too.
+            ("  ... G=1 expands 0 to 0xFFF",        r[138], 0xFFF),
+            # NEGATIVE CONTROL 20. The call gate LAR accepted: the ONLY
+            # descriptor the two type lists disagree about.
+            ("LSL of a CALL GATE clears ZF",        r[139], 0),
+            ("  ... but a TSS has a limit",         r[140], 1),
+            ("  ... and LSL reads it",              r[141], 0x67),
+
+            # ---- X. VERR and VERW ---------------------------------------
+            ("VERR of writable data set ZF",        r[142], 1),
+            # NEGATIVE CONTROL 21.
+            ("VERR of EXECUTE-ONLY code clears ZF", r[143], 0),
+            ("VERW of writable data set ZF",        r[144], 1),
+            # NEGATIVE CONTROL 22, from both sides: removing it turns VERW
+            # into VERR and both of these move.
+            ("VERW of READ-ONLY data clears ZF",    r[145], 0),
+            ("VERW of readable CODE clears ZF",     r[146], 0),
+
+            # ---- Y. LTR and STR -----------------------------------------
+            # The task register is LOADED AND STORED and no task switch is
+            # implemented: DOS/4GW runs entirely at CPL 0 (x86_pmode.c).
+            ("LTR then STR ran to HLT",             r[147], HALT),
+            ("  ... the task register holds the selector", r[148], 0x58),
+            ("  ... with the descriptor's base",    r[149], 0x35000),
+            ("  ... and its limit",                 r[150], 0x67),
+            ("  ... STR read it back",              r[151], 0x58),
+            ("  ... and the TSS is marked BUSY in memory", r[152], 0x8B),
+            ("  ... one task register loaded",      r[153], 1),
+            # NEGATIVE CONTROL 17: a BUSY TSS is present, S=0 and a TSS.
+            ("LTR of a BUSY TSS FAULTS",            r[154], GPF),
+            ("  ... with #GP",                      r[155], EX_GP),
+            ("  ... error code is the selector",    r[156], 0x60),
+            ("LTR of a DATA selector FAULTS",       r[157], GPF),
+            ("  ... error code",                    r[158], 0x08),
+
+            # ---- Z. CLTS ------------------------------------------------
+            ("LMSW really set CR0.TS",              r[159], 8),
+            ("CLTS ran to HLT",                     r[160], HALT),
+            ("  ... and cleared TS",                r[161], 0),
+            ("  ... leaving PE alone",              r[162], 1),
+
+            # LAR/LSL/VERR/VERW NEVER FAULT. The only two refusals in the
+            # whole V-Z block are LTR's.
+            ("the inspection arms raised nothing",  r[163], 2),
         ]
 
         bad = 0

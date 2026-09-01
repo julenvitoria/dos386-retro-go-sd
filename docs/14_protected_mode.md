@@ -15,11 +15,17 @@ both directions; a same-privilege far `JMP` — the transfer that installs CS an
 flushes the pipeline — and, since the gate work below, **same-privilege
 interrupt DELIVERY through an IDT gate and the `IRET` that returns from it**.
 
+Since the inspection step below, also **`LAR`, `LSL`, `VERR`, `VERW`, `STR`,
+`LTR` and `CLTS`** — every remaining member of group 6 plus the two
+descriptor-reading opcodes and the TS clear.
+
 **Not built, and not stubbed.** Call gates, privilege-change stack switches,
-the TSS, task gates, `IRET` across privilege, paging, and per-access **segment
-limit enforcement**. Each is its own step, and each is REFUSED rather than
-approximated: an `INT` or `IRET` that would change ring comes back as `#GP` and
-exits loudly. V86 is not needed at all: INT 21h is HLE'd.
+**task switching**, task gates, `IRET` across privilege, paging, and per-access
+**segment limit enforcement**. Each is REFUSED rather than approximated: an
+`INT` or `IRET` that would change ring comes back as `#GP` and exits loudly.
+V86 is not needed at all: INT 21h is HLE'd. The TASK REGISTER now exists —
+`LTR` loads it and `STR` reads it — and **that is not the same thing as a task
+switch**; see §9.
 
 **This is now sized against a title, and that is new.** Dark Forces and Mortal
 Kombat both reach `CR0.PE=1` through `LMSW` — not `MOV CR0`, because a DOS
@@ -286,6 +292,67 @@ interrupt.** The only thing that distinguishes them is the gate-DPL check, which
 cannot fire at CPL 0. This is a known, bounded divergence and it is one line to
 fix — but fixing it before measuring whether any title ever leaves CPL 0 would
 be building for a case nobody has shown exists.
+
+## 9. The descriptor-inspection instructions, and the lane MEASUREMENT DELETED
+
+`x86_pmode_lar/lsl/verrw/ltr` in `x86_pmode.c`; group 6 and `0F 02`/`0F 03`/
+`0F 06` in `cpu_exec_handlers_0f.S`.
+
+**The demand is static and it was counted, not guessed.**
+`scripts/opcode_demand.py` over DOS4GW.EXE: **58 `LAR` sites, 28 `LSL`,
+5 `CLTS`, 5 `STR`, 2 `LTR`** — one of the `LTR`s at `+0x476e`, in the
+PE/paging re-entry path. Every one of them reached `.exit_loop`.
+
+**The same scan deleted roughly 1,225 planned lines.** The extender's IDT
+template is 256 entries and **every one is DPL 0**, and **no DPL-3 CODE
+descriptor is built anywhere in the image** — ring-3 code could not issue
+INT 21h at all. **DOS/4GW RUNS ENTIRELY AT CPL 0.** Call gates, TSS stack
+switches, task switching and `IRET`-across-privilege are therefore not deferred,
+they are **not wanted**, and building them would have been building for a case
+nobody has shown exists.
+
+**An `LTR` is NOT evidence of a ring change**, and that is the trap this step
+walks past: a TSS at DPL 0 is wanted for SS0:ESP0 and the I/O permission bitmap
+whether or not a ring ever changes. So the task register is loaded, its
+descriptor is validated as an **available** TSS (a busy one is `#GP`, which is
+what stops a task being entered twice) and marked busy in guest memory — and no
+task switch is implemented.
+
+### The two rules that are easy to get wrong
+
+**The accessible-type table is not "any present descriptor",** and it is wrong
+in *both* directions. An interrupt gate is present and well-formed and is NOT
+accessible to `LAR` (`cpu.cpp:2824`); a not-present descriptor IS accessible to
+it, because reporting P is the whole point of reading an access-rights byte.
+`LAR` and `LSL` differ over exactly one descriptor class — a **call gate**,
+which `LAR` reads and `LSL` refuses because a gate has no limit — and negative
+control 20 is that one descriptor.
+
+**`LAR`'s result is not the raw access byte and not our `flags` word.** It is
+the second descriptor dword with its low byte masked: the access byte at bits
+8-15, the granularity byte at 16-23 (`cpu.cpp:2856`). Our packing (§4) puts the
+access byte at bits 8-15 of a **16-bit** word and the granularity byte at 0-7,
+so the value is **derived from the packing** rather than lifted from `w2` —
+citing a reference for a bit index is the mistake §3 names and this is the site
+it names it for.
+
+**`LAR`/`LSL`/`VERR`/`VERW` NEVER FAULT.** An inaccessible selector is `ZF=0`
+and nothing else, so they go through a non-faulting `read_desc_raw()`; routing
+them through `read_desc()` would record a phantom vector in `cpu->pmode_excp`
+and move `x86_pmode_faults`, which is the counter the walk arms are graded on.
+And all four are **`#UD` in real mode** — the handlers test `CR0.PE` and take
+`.exit_loop`, so a real-mode title that lands on `0F 02` exits loudly with the
+opcode named instead of walking a GDT it never installed.
+
+### Cost
+
+`tests/test_pmode.py` **164 checks**; `run_pmode_controls.py` **22/22 seen to
+fail**. Real mode again pays **NOTHING**, and again by disassembly diff rather
+than by argument: `--hot` reports **0 symbols changed**, the only entries being
+the three ADDED handlers and six RELOCATED-ONLY. ITCM
+**0xD978 → 0xDE60 (+1,256 B)**, `__CORE_BSS_END__`
+**0x24065510 → 0x24065748 (+568 B)** — under one 4,104-byte pager frame, but
+read `guest_ram_pages_short` before adding more.
 
 ### What has NOT been measured, and it is the next thing to do
 

@@ -3072,7 +3072,7 @@ static void nor_test_run(void)
  *   0x32010  0xA5  -- reached through LDT selector 0x0C (base 0x32000)
  * ========================================================================= */
 volatile uint32_t run_pmode_flag = 0;
-volatile uint32_t pmode_r[128];
+volatile uint32_t pmode_r[192];
 
 #define PM_GDT   0x2000u
 #define PM_LDT   0x2800u
@@ -3161,7 +3161,7 @@ static uint32_t pm_run_int(const uint8_t *prog, uint32_t len)
 
 static void pmode_test_run(void)
 {
-    for (uint32_t i = 0; i < 128; i++)
+    for (uint32_t i = 0; i < 192; i++)
         pmode_r[i] = 0;
 
     /* Undo whatever the A20 and pager arms left behind: they unmap everything
@@ -3915,6 +3915,304 @@ static void pmode_test_run(void)
         pmode_r[124] = pm_run_int(good, sizeof(good));     /* 6 = HLT   */
         pmode_r[125] = cpu_state_dtcm.eip;                 /* 0x61      */
     }
+
+    /* ==================================================================
+     * V-Z. THE DESCRIPTOR-INSPECTION INSTRUCTIONS.
+     *
+     * LAR, LSL, VERR, VERW, STR, LTR and CLTS. Every one of them reached
+     * .exit_loop before this, and every one of them is in DOS4GW.EXE:
+     * 58 LAR sites, 28 LSL, 5 CLTS, 5 STR, 2 LTR (scripts/opcode_demand.py).
+     *
+     * EVERY "ZF=0" ARM SETS ZF FIRST, with an XOR AX,AX. Without that the
+     * arm cannot fail: PM_ENTER's `OR AL,1` already leaves ZF clear, so a
+     * handler that never ran would read exactly like one that correctly
+     * refused the selector. The ZF=1 arms need no such preparation for the
+     * same reason in reverse.
+     * ================================================================== */
+    /* 0x58  an AVAILABLE 386 TSS (access 0x89): what LTR must accept     */
+    pm_desc(PM_GDT + 0x58, 0x35000, 0x0067, 0x89, 0x00);
+    /* 0x60  a BUSY 386 TSS (0x8B). Present, S=0, and a TSS -- so a rule of
+       "any present system descriptor" would take it. Only the AVAILABLE
+       rule refuses it, which is what makes it the control's target.      */
+    pm_desc(PM_GDT + 0x60, 0x36000, 0x0067, 0x8B, 0x00);
+    /* 0x68  a 386 INTERRUPT GATE sitting in the GDT (0x8E): present and
+       well-formed, and NOT accessible to LAR                             */
+    pm_desc(PM_GDT + 0x68, 0x00000, 0x0000, 0x8E, 0x00);
+    /* 0x70  a 386 CALL GATE (0x8C). THE ONE DESCRIPTOR LAR AND LSL
+       DISAGREE ABOUT: LAR reads it, LSL refuses it because a gate has no
+       limit. Nothing else in this file can separate the two type lists.  */
+    pm_desc(PM_GDT + 0x70, 0x00000, 0x0000, 0x8C, 0x00);
+    /* 0x78  READ-ONLY data (0x90): VERR yes, VERW no                     */
+    pm_desc(PM_GDT + 0x78, 0x30000, 0xFFFF, 0x90, 0x00);
+
+    x86_pmode_faults = 0;
+
+    /* ---- V. LAR ------------------------------------------------------ */
+    {
+        static const uint8_t ok[] = {
+            PM_ENTER,
+            0xBB, 0x08, 0x00,               /* MOV BX,0x08 */
+            0x0F, 0x02, 0xC3,               /* LAR AX,BX   */
+            0xF4,
+        };
+        pmode_r[126] = pm_run_int(ok, sizeof(ok));          /* 6 = HLT   */
+        pmode_r[127] = (cpu_state_dtcm.eflags >> 6) & 1u;   /* ZF = 1    */
+        /* The ACCESS BYTE at bits 8-15 and the granularity byte at 16-23:
+           0x92 with G=0, so 0x9200. Our flags packing puts the access byte
+           somewhere else entirely (docs/14 Sec.4) and this number is what
+           says the conversion happened. */
+        pmode_r[128] = cpu_state_dtcm.regs[0] & 0xFFFFu;    /* 0x9200    */
+
+        /* NEGATIVE CONTROL 18: selector 0x08 loaded at RPL 3 against its
+           DPL 0. The descriptor is the very one that just succeeded, so
+           the ONLY thing wrong is the privilege. */
+        static const uint8_t priv[] = {
+            PM_ENTER,
+            0x31, 0xC0,                     /* XOR AX,AX -> ZF=1 */
+            0xB8, 0xAD, 0xDE,               /* MOV AX,0xDEAD     */
+            0xBB, 0x0B, 0x00,               /* MOV BX,0x0B       */
+            0x0F, 0x02, 0xC3,
+            0xF4,
+        };
+        pmode_r[129] = (pm_run_int(priv, sizeof(priv)) == 6)
+                       ? ((cpu_state_dtcm.eflags >> 6) & 1u) : 99u;
+        /* ZF=0 leaves the DESTINATION UNMODIFIED, which is architectural
+           and is a second, independent thing the arm proves. */
+        pmode_r[130] = cpu_state_dtcm.regs[0] & 0xFFFFu;    /* 0xDEAD    */
+
+        /* NEGATIVE CONTROL 19: an INTERRUPT GATE is not accessible. */
+        static const uint8_t gate[] = {
+            PM_ENTER,
+            0x31, 0xC0,
+            0xBB, 0x68, 0x00,
+            0x0F, 0x02, 0xC3,
+            0xF4,
+        };
+        pm_run_int(gate, sizeof(gate));
+        pmode_r[131] = (cpu_state_dtcm.eflags >> 6) & 1u;   /* 0         */
+
+        /* ... and a CALL GATE is. The twin of the LSL arm below. */
+        static const uint8_t call[] = {
+            PM_ENTER,
+            0x31, 0xC0,
+            0xBB, 0x70, 0x00,
+            0x0F, 0x02, 0xC3,
+            0xF4,
+        };
+        pm_run_int(call, sizeof(call));
+        pmode_r[132] = (cpu_state_dtcm.eflags >> 6) & 1u;   /* 1         */
+
+        static const uint8_t nul[] = {
+            PM_ENTER,
+            0x31, 0xC0,
+            0xBB, 0x00, 0x00,
+            0x0F, 0x02, 0xC3,
+            0xF4,
+        };
+        pm_run_int(nul, sizeof(nul));
+        pmode_r[133] = (cpu_state_dtcm.eflags >> 6) & 1u;   /* 0         */
+
+        /* AND IN REAL MODE IT IS NOT AN INSTRUCTION AT ALL. LAR/LSL/VERR/
+           VERW are invalid outside protected mode, and the guard keeps a
+           real-mode title that lands on 0F 02 exiting LOUDLY with the
+           opcode named rather than walking a GDT it never installed. */
+        static const uint8_t real[] = {
+            0xBB, 0x08, 0x00,
+            0x0F, 0x02, 0xC3,
+            0xF4,
+        };
+        pmode_r[134] = pm_run_int(real, sizeof(real));      /* 4         */
+        pmode_r[135] = cpu_state_dtcm.exit_info;            /* 0x0F02    */
+    }
+
+    /* ---- W. LSL ------------------------------------------------------ */
+    {
+        static const uint8_t ok[] = {
+            PM_ENTER,
+            0xBB, 0x08, 0x00,
+            0x0F, 0x03, 0xC3,               /* LSL AX,BX */
+            0xF4,
+        };
+        pmode_r[136] = (pm_run_int(ok, sizeof(ok)) == 6)
+                       ? ((cpu_state_dtcm.eflags >> 6) & 1u) : 99u;
+        pmode_r[137] = cpu_state_dtcm.regs[0] & 0xFFFFu;    /* 0xFFFF    */
+
+        /* The G bit again, and through LSL this time: selector 0x10 has a
+           limit FIELD of zero with G set, so 0xFFF is the granularity rule
+           and 0 is the rule ignored (negative control 8). */
+        static const uint8_t gran[] = {
+            PM_ENTER,
+            0xBB, 0x10, 0x00,
+            0x0F, 0x03, 0xC3,
+            0xF4,
+        };
+        pm_run_int(gran, sizeof(gran));
+        pmode_r[138] = cpu_state_dtcm.regs[0] & 0xFFFFu;    /* 0xFFF     */
+
+        /* NEGATIVE CONTROL 20: the call gate LAR accepted above. This is
+           the ONLY difference between the two type lists, so with LSL's
+           list replaced by LAR's, this arm and nothing else moves. */
+        static const uint8_t call[] = {
+            PM_ENTER,
+            0x31, 0xC0,
+            0xBB, 0x70, 0x00,
+            0x0F, 0x03, 0xC3,
+            0xF4,
+        };
+        pm_run_int(call, sizeof(call));
+        pmode_r[139] = (cpu_state_dtcm.eflags >> 6) & 1u;   /* 0         */
+
+        /* A TSS, on the other hand, has a limit and LSL reads it. */
+        static const uint8_t tss[] = {
+            PM_ENTER,
+            0xBB, 0x58, 0x00,
+            0x0F, 0x03, 0xC3,
+            0xF4,
+        };
+        pmode_r[140] = (pm_run_int(tss, sizeof(tss)) == 6)
+                       ? ((cpu_state_dtcm.eflags >> 6) & 1u) : 99u;
+        pmode_r[141] = cpu_state_dtcm.regs[0] & 0xFFFFu;    /* 0x67      */
+    }
+
+    /* ---- X. VERR and VERW -------------------------------------------- */
+    {
+        static const uint8_t rr[] = {
+            PM_ENTER,
+            0xBB, 0x08, 0x00,
+            0x0F, 0x00, 0xE3,               /* VERR BX */
+            0xF4,
+        };
+        pmode_r[142] = (pm_run_int(rr, sizeof(rr)) == 6)
+                       ? ((cpu_state_dtcm.eflags >> 6) & 1u) : 99u;
+
+        /* NEGATIVE CONTROL 21: execute-only code cannot be read. */
+        static const uint8_t rx[] = {
+            PM_ENTER,
+            0x31, 0xC0,
+            0xBB, 0x30, 0x00,
+            0x0F, 0x00, 0xE3,
+            0xF4,
+        };
+        pm_run_int(rx, sizeof(rx));
+        pmode_r[143] = (cpu_state_dtcm.eflags >> 6) & 1u;   /* 0         */
+
+        static const uint8_t ww[] = {
+            PM_ENTER,
+            0xBB, 0x08, 0x00,
+            0x0F, 0x00, 0xEB,               /* VERW BX */
+            0xF4,
+        };
+        pmode_r[144] = (pm_run_int(ww, sizeof(ww)) == 6)
+                       ? ((cpu_state_dtcm.eflags >> 6) & 1u) : 99u;
+
+        /* NEGATIVE CONTROL 22, twice over. Read-only DATA is readable and
+           not writable; readable CODE is readable and not writable either,
+           because no code segment is ever writable. Removing the rule
+           turns VERW into VERR and BOTH of these move. */
+        static const uint8_t wro[] = {
+            PM_ENTER,
+            0x31, 0xC0,
+            0xBB, 0x78, 0x00,
+            0x0F, 0x00, 0xEB,
+            0xF4,
+        };
+        pm_run_int(wro, sizeof(wro));
+        pmode_r[145] = (cpu_state_dtcm.eflags >> 6) & 1u;   /* 0         */
+
+        static const uint8_t wcode[] = {
+            PM_ENTER,
+            0x31, 0xC0,
+            0xBB, 0x48, 0x00,
+            0x0F, 0x00, 0xEB,
+            0xF4,
+        };
+        pm_run_int(wcode, sizeof(wcode));
+        pmode_r[146] = (cpu_state_dtcm.eflags >> 6) & 1u;   /* 0         */
+    }
+
+    /* ---- Y. LTR and STR ---------------------------------------------- */
+    {
+        /* LTR loads the register, STR reads it straight back out, and the
+           descriptor is left marked BUSY in guest memory. The XOR between
+           them is not decoration: without it AX still holds the selector
+           LTR was given and STR could write nothing at all and pass. */
+        static const uint8_t ok[] = {
+            PM_ENTER,
+            0xB8, 0x58, 0x00,               /* MOV AX,0x58 */
+            0x0F, 0x00, 0xD8,               /* LTR AX      */
+            0x31, 0xC0,                     /* XOR AX,AX   */
+            0x0F, 0x00, 0xC8,               /* STR AX      */
+            0xF4,
+        };
+        x86_pmode_ltrs = 0;
+        pmode_r[147] = pm_run_int(ok, sizeof(ok));          /* 6 = HLT   */
+        pmode_r[148] = cpu_state_dtcm.tr_sel;               /* 0x58      */
+        pmode_r[149] = cpu_state_dtcm.tr_base;              /* 0x35000   */
+        pmode_r[150] = cpu_state_dtcm.tr_limit;             /* 0x67      */
+        pmode_r[151] = cpu_state_dtcm.regs[0] & 0xFFFFu;    /* 0x58      */
+        /* 0x89 -> 0x8B: the descriptor is marked busy in GUEST MEMORY,
+           which is what a loader that reads its own GDT back would see. */
+        pmode_r[152] = test_ram[PM_GDT + 0x58 + 5];         /* 0x8B      */
+        pmode_r[153] = x86_pmode_ltrs;                      /* 1         */
+
+        /* NEGATIVE CONTROL 17: a BUSY TSS. Present, S=0 and a TSS type, so
+           every weaker rule admits it; only "available" refuses it. */
+        static const uint8_t busy[] = {
+            PM_ENTER,
+            0xB8, 0x60, 0x00,
+            0x0F, 0x00, 0xD8,
+            0xF4,
+        };
+        pmode_r[154] = pm_run_int(busy, sizeof(busy));      /* 13        */
+        pmode_r[155] = cpu_state_dtcm.pmode_excp;           /* 13 = #GP  */
+        pmode_r[156] = cpu_state_dtcm.pmode_err;            /* 0x60      */
+
+        /* ... and a plain DATA segment, which is the same rule from the
+           other side: S=1 is not a TSS however present it is. */
+        static const uint8_t data[] = {
+            PM_ENTER,
+            0xB8, 0x08, 0x00,
+            0x0F, 0x00, 0xD8,
+            0xF4,
+        };
+        pmode_r[157] = pm_run_int(data, sizeof(data));      /* 13        */
+        pmode_r[158] = cpu_state_dtcm.pmode_err;            /* 0x08      */
+    }
+
+    /* ---- Z. CLTS ------------------------------------------------------
+     * LMSW is the only instruction in the tree that can SET TS, so the
+     * twin without the CLTS is what proves the bit was ever set: an arm
+     * that reads 0 with nothing having set it grades nothing at all.
+     */
+    {
+        static const uint8_t setts[] = {
+            PM_ENTER,
+            0xB8, 0x09, 0x00,               /* MOV AX,9  (TS|PE) */
+            0x0F, 0x01, 0xF0,               /* LMSW AX           */
+            0xF4,
+        };
+        pm_run_int(setts, sizeof(setts));
+        pmode_r[159] = cpu_state_dtcm.cr0 & 8u;             /* 8         */
+
+        static const uint8_t clts[] = {
+            PM_ENTER,
+            0xB8, 0x09, 0x00,
+            0x0F, 0x01, 0xF0,
+            0x0F, 0x06,                     /* CLTS */
+            0xF4,
+        };
+        pmode_r[160] = pm_run_int(clts, sizeof(clts));      /* 6 = HLT   */
+        pmode_r[161] = cpu_state_dtcm.cr0 & 8u;             /* 0         */
+        /* CLTS clears TS and NOTHING ELSE -- PE above it must survive, or
+           the guest has just been thrown out of protected mode. */
+        pmode_r[162] = cpu_state_dtcm.cr0 & 1u;             /* 1         */
+    }
+
+    /* NOT ONE of the arms above may have raised. LAR, LSL, VERR and VERW
+       report an inaccessible selector in ZF and NEVER fault -- they go
+       through read_desc_raw for exactly that reason -- so this counter
+       reads the LTR arms' three refusals and nothing else. */
+    pmode_r[163] = x86_pmode_faults;                        /* 2         */
 }
 
 static void a20_test_run(void)
@@ -5857,6 +6155,73 @@ static void seam_test_run(void)
     slack = x86_pager_slack(SEAM_FIRST);
     seam_r[6] = slack ? slack[0] : 0xFFFFFFFFu;
     seam_r[7] = seam_contiguous;
+    /* ---- THE STACK STRADDLE -----------------------------------------------
+     *
+     * PUSH_V and POP_V (cpu_exec_handlers.S) carry NO SEAM_CHECK. There are
+     * ZERO occurrences, and they are multi-byte fold sites -- the same shape
+     * CLAUDE.md says is silently wrong at one address in 2,048.
+     *
+     * Nothing aligns SP on x86. SS.base + SP can land on 0xFFF with a 16-bit
+     * push, or 0xFFD-0xFFF with a 32-bit one, and this arm does exactly that:
+     * SS = 0xC000, SP = 0x1001, so `PUSH AX` writes the low byte at the last
+     * byte of one granule and the high byte at the first byte of the NEXT --
+     * which, with the pager handing frames out in fault order, is not the
+     * host memory after it.
+     *
+     * THE GUEST'S OWN VIEW CANNOT SEE THIS, which is why it went unnoticed:
+     * the matching POP walks off the top of the same frame in the same
+     * direction and reads back what the PUSH wrote, so AX comes home intact.
+     * What is graded instead is the NEIGHBOUR: the high byte must land at
+     * hi+0 in the other granule, and NOT in the low frame's eight bytes of
+     * slack. r[16] and r[17] are the whole of the question.
+     *
+     * The bytes are repainted first: the operand program above already wrote
+     * 0x34/0x12 at these two addresses, and reusing those values would make a
+     * pass indistinguishable from the previous arm's leftovers.
+     */
+    seam_poke(lo + 0xFFF, 0xAA);
+    seam_poke(hi + 0,     0xBB);
+    if (slack)
+        memset(slack, 0xEE, X86_PG_SLACK);
+    {
+        /*   mov ax,0C000h    B8 00 C0
+         *   mov ds,ax        8E D8
+         *   mov ss,ax        8E D0
+         *   mov sp,1001h     BC 01 10
+         *   mov ax,5678h     B8 78 56
+         *   push ax          50            <- writes 0FFFh and 1000h
+         *   mov ax,0         B8 00 00
+         *   pop ax           58            <- reads them back
+         *   mov [0010h],ax   A3 10 00
+         *   hlt              F4
+         */
+        static const uint8_t sprog[] = {
+            0xB8, 0x00, 0xC0,  0x8E, 0xD8,  0x8E, 0xD0,
+            0xBC, 0x01, 0x10,
+            0xB8, 0x78, 0x56,
+            0x50,
+            0xB8, 0x00, 0x00,
+            0x58,
+            0xA3, 0x10, 0x00,
+            0xF4,
+        };
+        memcpy(test_ram, sprog, sizeof(sprog));
+        memset(&cpu_state_dtcm, 0, sizeof(cpu_state_dtcm));
+        for (int i = 0; i < 6; i++)
+            cpu_state_dtcm.segs[i].limit = 0xFFFFFFFF;
+        cpu_state_dtcm.pit_reload = 0xFFFFFFFF;
+        cpu_state_dtcm.pit_counter = 0xFFFFFFFF;
+        x86_cpu_interp_asm();
+        seam_r[13] = cpu_state_dtcm.exit_reason;            /* 6 = HLT     */
+        /* The round trip. This passes EITHER WAY and is here to say so. */
+        seam_r[14] = seam_peek(lo + 0x10) | (seam_peek(lo + 0x11) << 8);
+        seam_r[15] = seam_peek(lo + 0xFFF);                 /* 0x78        */
+        seam_r[16] = seam_peek(hi + 0);                     /* 0x56 -- or
+                                                               0xBB, the hole */
+        slack = x86_pager_slack(SEAM_FIRST);
+        seam_r[17] = slack ? slack[0] : 0xFFFFFFFFu;        /* 0xEE        */
+        seam_r[18] = cpu_state_dtcm.regs[4] & 0xFFFFu;      /* 0x1001      */
+    }
     seam_r[8] = x86_seam_syncs - s0;
     seam_r[9] = x86_seam_writes - w0;
     seam_r[10] = x86_seam_overflow - o0;

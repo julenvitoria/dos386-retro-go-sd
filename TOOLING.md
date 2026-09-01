@@ -1968,8 +1968,12 @@ python3 scripts/run_planar_controls.py   # grades those arms: EIGHT negative
                                          # nothing tests the stride learning.
                                          # One CLEAN build per arm (flags are
                                          # not dependencies), so it is slow
-python3 tests/test_pmode.py              # PROTECTED MODE: the descriptor walk.
-                                         # 80 checks, all driven by GUEST code
+python3 tests/test_pmode.py              # PROTECTED MODE: the descriptor walk,
+                                         # IDT gate delivery and IRET, and the
+                                         # descriptor-INSPECTION instructions
+                                         # (LAR, LSL, VERR, VERW, STR, LTR,
+                                         # CLTS).
+                                         # 164 checks, all driven by GUEST code
                                          # -- the walk is reachable from exactly
                                          # one place (L(SET_SREG)), so a
                                          # host-side call would leave the path
@@ -1987,8 +1991,9 @@ python3 tests/test_pmode.py              # PROTECTED MODE: the descriptor walk.
                                          # x86_pmode_loads == 0 after a
                                          # REAL-MODE program: the check that
                                          # says real mode never enters the walk
-python3 scripts/run_pmode_controls.py    # grades those arms. TEN negative
-                                         # controls (X86_PMODE_NEGCTL=1..10),
+python3 scripts/run_pmode_controls.py    # grades those arms. TWENTY-TWO
+                                         # negative controls
+                                         # (X86_PMODE_NEGCTL=1..22),
                                          # each compiling ONE rule out and each
                                          # required to make test_pmode FAIL,
                                          # plus a BASELINE arm that must pass
@@ -2186,6 +2191,18 @@ python3 tests/test_ems.py                # EMS, the MAPPED counterpart, driven
                                          # readback go wrong, and one flipped
                                          # byte through the window is detected.
                                          # RAM store, no card, no FatFs
+python3 tests/test_seam.py --stack-seam   # GRADE the straddling PUSH/POP arm
+                                         # instead of merely reporting it. It
+                                         # FAILS on today's tree: PUSH_V/POP_V
+                                         # are multi-byte fold sites with NO
+                                         # SEAM_CHECK (zero occurrences), and
+                                         # arm 1b demonstrates it -- the pushed
+                                         # high byte lands in the LOW frame's
+                                         # slack instead of the neighbour. The
+                                         # guest's own POP reads it back, so the
+                                         # round trip passes either way; the
+                                         # neighbour's byte is what is lost.
+                                         # docs/10 Sec.7
 python3 tests/test_seam.py               # THE GRANULE SEAM. host = lin + k with
                                          # one k per 4 KB page, so two adjacent
                                          # GUEST granules are adjacent in HOST

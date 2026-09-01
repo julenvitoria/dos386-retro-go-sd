@@ -36,25 +36,40 @@ OP .op_0f_0F
 L(opcode_0f_dispatch_target):
 
 
-/* 0F 00 -- group 6. SLDT (/0) and LLDT (/2) only.
+/* 0F 00 -- group 6, now ALL SIX members: SLDT /0, STR /1, LLDT /2, LTR /3,
+ * VERR /4, VERW /5. (/6 and /7 do not exist and keep .exit_loop.)
  *
- * STR (/1) and LTR (/3) are NOT here and are not an oversight: PLAN.md records
- * that the TSS work is not needed because INT 21h is HLE'd, so there is no
- * task state to point a task register at. VERR (/4) and VERW (/5) wait for a
- * guest that asks for them. All four keep the .exit_loop they have today,
- * which names the opcode rather than inventing an answer.
+ * STR and LTR used to sit in the .exit_loop with them, on the reasoning that
+ * INT 21h is HLE'd so there is no task state to point a task register at.
+ * MEASUREMENT SUPERSEDES THAT: scripts/opcode_demand.py counts 5 STR sites and
+ * 2 LTR sites in DOS4GW.EXE, one of them at +0x476e in the PE/paging re-entry
+ * path. A TSS at DPL 0 is needed for SS0:ESP0 and the I/O permission bitmap
+ * and is NOT evidence of a ring change -- the same scan found all 256 IDT
+ * entries at DPL 0 and no DPL 3 code descriptor anywhere in the image. So the
+ * task register is loaded and stored and NO TASK SWITCH IS IMPLEMENTED.
  *
- * The operand is a 16-bit selector however the operand size is set. */
+ * The operand is a 16-bit selector however the operand size is set, for every
+ * member of the group. */
 OP .op_0f_00
     CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     UBFX R3, R1, #3, #3
     CMP R3, #0
-    BEQ.W L(OP_SLDT)
-    CMP R3, #2
-    BNE.W .exit_loop
-    /* ---- LLDT ---- */
+    BNE.N 1f
+    LDR.W R5, [R8, #CPU_LDT_SEL]
+    B.W L(OP_STORE_SEL)
+1:  CMP R3, #1
+    BNE.N 2f
+    LDR.W R5, [R8, #CPU_TR_SEL]
+    B.W L(OP_STORE_SEL)
+2:  CMP R3, #6                     @ /6 and /7 do not exist
+    BHS.W .exit_loop
+    CMP R3, #4
+    BHS.W L(OP_VERRW)              @ /4 VERR, /5 VERW
+    CMP R3, #3
+    BEQ.W L(OP_LTR)
+    /* ---- LLDT (/2) ---- */
     BL L(LXXX_CPL_CHECK)
     CMP R1, #192                   @ mod==3: the selector is in a register
     BLO.W L(OP_LLDT_MEM)
@@ -86,21 +101,219 @@ L(OP_LLDT_GO):
     STR.W R0, [R8, #CPU_EXIT_INFO]
     B.W .save_state_and_exit
 
-/* SLDT: store the LDT selector. Unprivileged in both references. */
-L(OP_SLDT):
-    LDR.W R5, [R8, #CPU_LDT_SEL]
+/* SLDT (/0) and STR (/1): store a 16-bit selector. Both are UNPRIVILEGED in
+ * both references -- CPU_STR is a bare `return cpu_tss.selector`
+ * (dosbox-x src/cpu/cpu.cpp:2441) with no CPL test at all -- and they differ
+ * only in which selector the caller put in R5, so they share this tail.
+ *
+ * The register form writes a HALFWORD and leaves the high half of a 32-bit
+ * destination alone. That matches SMSW below and is what SLDT shipped with;
+ * Intel's zero-extension for the r32 form buys nothing for a guest that is
+ * only ever going to compare the selector. */
+L(OP_STORE_SEL):
     CMP R1, #192
-    BLO.W L(OP_SLDT_MEM)
+    BLO.W L(OP_STORE_SEL_MEM)
     AND.W R3, R1, #7
     ADD.W R3, R8, R3, LSL #2
-    STRH.W R5, [R3, #8]
+    STRH.W R5, [R3, #CPU_REGS]
     B.W .fetch_decode_loop
-L(OP_SLDT_MEM):
+L(OP_STORE_SEL_MEM):
+    /* R5 is the selector and must survive DECODE_MODRM, which clobbers R2-R5
+       (CLAUDE.md). It does not, so it is re-read after the walk -- and it is
+       re-read from the same place the dispatch chose, carried in R4, because
+       R1 alone cannot say whether /0 or /1 got here. */
     LDR.W R12, [R2, #REC_MODRM_FN]
     BLX R12
-    LDR.W R5, [R8, #CPU_LDT_SEL]
+    /* R1 is the ModRM byte and survives the walk; R4 would NOT -- the decoder
+       clobbers R2-R5 -- so the /reg field is recomputed here rather than
+       carried across. */
+    TST.W R1, #0x08                @ /reg bit 0: 0 = SLDT, 1 = STR
+    ITE EQ
+    LDREQ.W R5, [R8, #CPU_LDT_SEL]
+    LDRNE.W R5, [R8, #CPU_TR_SEL]
     MEM_GET_PTR R3, R7
     VGA_ST_H R5, R3, R12
+    B.W .fetch_decode_loop
+
+/* LTR (/3). The selector is fetched exactly as LLDT's is; only the C function
+ * differs, and so does nothing else -- validation, the busy write-back and the
+ * refusal to switch tasks all live in x86_pmode_ltr(). CPL 0 in protected mode
+ * only, the same predicate LLDT uses (dosbox-x src/cpu/cpu.cpp:2456). */
+L(OP_LTR):
+    BL L(LXXX_CPL_CHECK)
+    CMP R1, #192
+    BLO.W L(OP_LTR_MEM)
+    AND.W R5, R1, #7
+    ADD.W R5, R8, R5, LSL #2
+    LDRH.W R5, [R5, #CPU_REGS]
+    B.W L(OP_LTR_GO)
+L(OP_LTR_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN]
+    BLX R12
+    SEAM_CHECK R3, R7
+    UBFX R3, R7, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R7
+    MEM_TRAP_R R3
+    LDRH R5, [R3, #0]
+L(OP_LTR_GO):
+    PUSH {R0-R3, R12, LR}
+    MOV R0, R8
+    UXTH R1, R5
+    BL x86_pmode_ltr
+    CBNZ R0, 1f
+    POP {R0-R3, R12, LR}
+    B.W .fetch_decode_loop
+1:  POP {R0-R3, R12, LR}
+    B.W L(PMODE_EXIT_GPF)
+
+/* VERR (/4) and VERW (/5). Pure predicates: they set ZF and touch nothing
+ * else, and they NEVER FAULT -- an inaccessible selector is reported as ZF=0
+ * (dosbox-x src/cpu/cpu.cpp:2904, :2937), which is why nothing here has an
+ * exit path. R3 still holds the /reg field, and bit 0 of it is exactly the
+ * VERR/VERW distinction. */
+L(OP_VERRW):
+    /* NOT AN INSTRUCTION IN REAL MODE. VERR/VERW (and LAR/LSL below) are
+       invalid outside protected mode, and without this a real-mode title
+       that lands on one would walk a GDT it never installed and come back
+       with an answer. .exit_loop names the opcode instead. */
+    LDR.W R3, [R8, #CPU_CR0]
+    TST.W R3, #1
+    BEQ.W .exit_loop
+    CMP R1, #192
+    BLO.W L(OP_VERRW_MEM)
+    AND.W R5, R1, #7
+    ADD.W R5, R8, R5, LSL #2
+    LDRH.W R5, [R5, #CPU_REGS]
+    B.W L(OP_VERRW_GO)
+L(OP_VERRW_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN]
+    BLX R12
+    SEAM_CHECK R3, R7
+    UBFX R3, R7, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R7
+    MEM_TRAP_R R3
+    LDRH R5, [R3, #0]
+L(OP_VERRW_GO):
+    /* From R1, not from R3: R3 held the /reg field on entry and DECODE_MODRM
+       clobbers R2-R5, so anything carried across the walk in it is gone. */
+    UBFX R4, R1, #3, #1            @ 0 = VERR, 1 = VERW
+    PUSH {R0-R3, R12, LR}
+    MOV R0, R8
+    UXTH R1, R5
+    MOV R2, R4
+    BL x86_pmode_verrw
+    CMP R0, #0
+    ITE EQ
+    BICEQ.W R11, R11, #0x40        @ ZF
+    ORRNE.W R11, R11, #0x40
+    POP {R0-R3, R12, LR}
+    B.W .fetch_decode_loop
+
+/* The shared protected-mode fault exit. x86_pmode_* left the vector in the
+   return value and the error code in cpu->pmode_err; the exit carries the
+   error code, matching what the walk's callers already do. */
+L(PMODE_EXIT_GPF):
+    MOV.W R0, #X86_EXIT_GPF
+    STR.W R0, [R8, #CPU_EXIT_REASON]
+    LDR.W R0, [R8, #CPU_PMODE_ERR]
+    STR.W R0, [R8, #CPU_EXIT_INFO]
+    B.W .save_state_and_exit
+
+/* 0F 02 LAR and 0F 03 LSL -- read a descriptor's ACCESS RIGHTS or its LIMIT
+ * into a register and report accessibility in ZF. 58 and 28 static sites in
+ * DOS4GW.EXE respectively, which is what put them on this lane's list; they
+ * are how an extender asks "may I touch this selector" without risking a
+ * fault, so a title that uses them uses them constantly.
+ *
+ * They are the SAME handler but for the C function, so they share everything
+ * below R0. Declared OP rather than OP_AGNOSTIC because the DESTINATION is
+ * operand-sized -- LAR r16 writes a halfword and LAR r32 a word -- and
+ * STREG_V is what makes that true in both passes rather than in neither.
+ *
+ * THE SOURCE IS ALWAYS 16 BITS whatever the operand size: it is a selector.
+ *
+ * ZF=0 leaves the destination UNMODIFIED, which is architectural and is why
+ * the store is inside the taken arm rather than after it.
+ */
+OP .op_0f_lar_02
+OP .op_0f_lsl_03
+    /* Real mode: not an instruction. See L(OP_VERRW). */
+    LDR.W R3, [R8, #CPU_CR0]
+    TST.W R3, #1
+    BEQ.W .exit_loop
+    /* R0 carries 0x0F02 or 0x0F03 from the two-byte dispatch and DECODE_MODRM
+       does not clobber it (R2-R5 only), so bit 0 of R0 IS the LAR/LSL choice
+       and nothing has to be stashed across the walk. */
+    CODE_PTR R1
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    CMP R1, #192
+    BLO.W L(OP_LAR_MEM)
+    AND.W R5, R1, #7
+    ADD.W R5, R8, R5, LSL #2
+    LDRH.W R5, [R5, #CPU_REGS]
+    B.W L(OP_LAR_GO)
+L(OP_LAR_MEM):
+    LDR.W R12, [R2, #REC_MODRM_FN]
+    BLX R12
+    /* A HALFWORD load is a multi-byte fold site and needs SEAM_CHECK: two
+       bytes can straddle a 4 KB granule whose neighbour is not the host memory
+       after it (CLAUDE.md, docs/10). */
+    SEAM_CHECK R3, R7
+    UBFX R3, R7, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    ADDS R3, R3, R7
+    MEM_TRAP_R R3
+    LDRH R5, [R3, #0]
+L(OP_LAR_GO):
+    /* R1 -- the ModRM byte -- survives DECODE_MODRM by contract, so the
+       destination register is recomputed from it AFTER the walk rather than
+       read before it. Reading it early is the bug MOV Ev,Gv shipped with. */
+    PUSH {R0-R3, R12, LR}
+    SUB SP, SP, #8                 @ the out slot; 8 keeps SP 8-byte aligned
+    MOV R0, R8
+    UXTH R1, R5
+    MOV R2, SP
+    LDR R4, [SP, #8]               @ R0 as pushed: the opcode
+    TST.W R4, #1
+    BNE.N 1f
+    BL x86_pmode_lar
+    B.N 2f
+1:  BL x86_pmode_lsl
+2:  LDR R5, [SP]                   @ the value, valid only when R0 != 0
+    ADD SP, SP, #8
+    CMP R0, #0
+    ITE EQ
+    BICEQ.W R11, R11, #0x40        @ ZF
+    ORRNE.W R11, R11, #0x40
+    MOV R4, R0
+    POP {R0-R3, R12, LR}
+    CBZ R4, 3f
+    UBFX R3, R1, #3, #3
+    ADD.W R3, R3, #(CPU_REGS / 4)
+    LSLS R3, R3, #2
+    STREG_V R5, R3
+3:  B.W .fetch_decode_loop
+
+/* 0F 06 CLTS -- clear CR0.TS. Five static sites in DOS4GW.EXE and it exited
+ * today, which is the whole reason it is here; it is the cheapest thing on
+ * this lane's list and it was still a wall.
+ *
+ * TS is bit 3 of CR0, set by a task switch to make the next x87 instruction
+ * trap so a kernel can swap the FPU state lazily. We never set it -- there is
+ * no task switch -- so clearing it is genuinely all there is to do, and that
+ * is the CORRECT emulation rather than a stub: the guest's own LMSW and MOV
+ * CR0 can set TS, and CLTS is the only instruction that clears it alone.
+ *
+ * Privileged: CPL 0 in protected mode, unprivileged in real mode, the same
+ * predicate LGDT/LIDT/LLDT/LTR/LMSW share. No ModRM byte at all. */
+OP_AGNOSTIC .op_0f_clts_06
+    BL L(LXXX_CPL_CHECK)
+    LDR.W R3, [R8, #CPU_CR0]
+    BIC.W R3, R3, #8
+    STR.W R3, [R8, #CPU_CR0]
     B.W .fetch_decode_loop
 
 OP .op_0f_01
@@ -1016,6 +1229,8 @@ OP .op_0f_lgs_B5
 .align 2
 .set .op_0f_0F, .op_0f_0F_32
 .set .op_0f_00, .op_0f_00_32
+.set .op_0f_lar_02, .op_0f_lar_02_32
+.set .op_0f_lsl_03, .op_0f_lsl_03_32
 .set .op_0f_01, .op_0f_01_32
 .set .op_0f_ba, .op_0f_ba_32
 .set .op_int3_CC, .op_int3_CC_32
@@ -1116,6 +1331,8 @@ opcode_table_0f_32:
 .align 2
 .set .op_0f_0F, .op_0f_0F_16
 .set .op_0f_00, .op_0f_00_16
+.set .op_0f_lar_02, .op_0f_lar_02_16
+.set .op_0f_lsl_03, .op_0f_lsl_03_16
 .set .op_0f_01, .op_0f_01_16
 .set .op_0f_ba, .op_0f_ba_16
 .set .op_int3_CC, .op_int3_CC_16

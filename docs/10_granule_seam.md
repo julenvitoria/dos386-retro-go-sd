@@ -131,3 +131,38 @@ table rather than a base:
    `.op_lea_8D` subtracts the segment base.
 2. **Pool exhaustion.** Their seam re-asked an exhausted pool once per straddling
    access and turned `dos_cow_lost` into 16,392. Ours is sticky.
+
+## 7. THE STACK IS A HOLE. Demonstrated, not argued.
+
+`PUSH_V` and `POP_V` (`cpu_exec_handlers.S:288`, `:302`) are multi-byte fold
+sites and carry **NO `SEAM_CHECK`** — zero occurrences in the tree. Nobody
+owned the question; the answer is that it is real.
+
+**The demonstration** is `tests/test_seam.py`'s arm 1b, on the same
+deliberately non-contiguous fold as arm 1: `SS = 0xC000`, `SP = 0x1001`, so
+`PUSH AX` writes the low byte at the last byte of one granule and the high byte
+at the first byte of the next. On today's tree the neighbour reads **0xBB**
+(untouched) and the low frame's **slack** holds the pushed **0x56** — the high
+byte went off the top of the low frame. The contiguous control passes, so it is
+the seam and not the program.
+
+**Nothing prevents it.** SP is not aligned on x86 and nothing in the
+interpreter aligns it: a 16-bit push at offset 0xFFF straddles, a 32-bit one at
+0xFFD-0xFFF straddles. One stack address in 2,048, exactly as CLAUDE.md's rule
+predicts for a fold site without the check.
+
+**Why it has never shown, and why that is the dangerous part.** The matching
+`POP` walks off the top of the *same* frame in the *same* direction and reads
+back precisely what the `PUSH` wrote, so the guest's own round trip is intact —
+the test grades that too, and it passes either way. What is lost is the byte at
+the *neighbour's* first address: a later non-straddling access to it reads stale
+data, and the slack the push corrupted is never pushed back because nothing
+called `x86_seam_sync()`. The failure is a wrong byte somewhere else, later.
+
+**It is REPORTED and not FAILED by default** (`--stack-seam` grades it). The
+fix is a `SEAM_CHECK` on every push and every pop, which is a **hot-path** cost
+on a machine where 29.4% of wall is ordinary opcodes and where `SEAM_CHECK`'s
+measured cost elsewhere was 0.04% — cheap, but per-push rather than per-fold-site
+and therefore a number somebody should take before the check lands, not a
+decision a red test makes by itself. `x86_seam_overflow` does not fire here
+either: the site never asks.

@@ -1,11 +1,11 @@
     .align 2
     .word .op_0f_00 + 1 // 0x0
     .word .op_0f_01 + 1 // 0x1
-    .word .exit_loop + 1 // 0x2
-    .word .exit_loop + 1 // 0x3
+    .word .op_0f_lar_02 + 1 // 0x2
+    .word .op_0f_lsl_03 + 1 // 0x3
     .word .exit_loop + 1 // 0x4
     .word .exit_loop + 1 // 0x5
-    .word .exit_loop + 1 // 0x6
+    .word .op_0f_clts_06 + 1 // 0x6
     .word .exit_loop + 1 // 0x7
     .word .exit_loop + 1 // 0x8
     .word .exit_loop + 1 // 0x9

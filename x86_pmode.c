@@ -123,6 +123,17 @@ volatile uint32_t x86_pmode_faults;
  *  14  a software interrupt may not reach a gate with DPL < CPL
  *  15  the frame WIDTH comes from the gate's type, not the operand size
  *  16  IRET's CS DPL/RPL rule (== for non-conforming, <= for conforming)
+ *
+ * The DESCRIPTOR-INSPECTION instructions (LAR, LSL, VERR, VERW, LTR) add six
+ * more, on the same numbering discipline.
+ *
+ *  17  LTR's type rule: an AVAILABLE TSS only, never a busy one or anything
+ *      else
+ *  18  LAR/LSL/VERR/VERW's privilege rule (DPL >= max(CPL,RPL))
+ *  19  LAR's excluded types -- an interrupt or trap gate is NOT accessible
+ *  20  LSL's excluded types -- a CALL GATE is accessible to LAR and not to LSL
+ *  21  VERR's readability rule
+ *  22  VERW's writability rule
  */
 #ifndef X86_PMODE_NEGCTL
 #define X86_PMODE_NEGCTL 0
@@ -181,7 +192,8 @@ static int fault(X86CPUState *cpu, uint32_t vec, uint32_t err)
  *
  * Returns 0 and fills w1/w2, or the vector. #GP(sel & ~3) on a bound failure.
  */
-static int read_desc(X86CPUState *cpu, uint32_t sel, uint32_t *w1, uint32_t *w2)
+static int read_desc_raw(X86CPUState *cpu, uint32_t sel,
+                         uint32_t *w1, uint32_t *w2)
 {
     uint32_t off = sel & 0xFFF8u;
     uint32_t base, limit;
@@ -194,7 +206,7 @@ static int read_desc(X86CPUState *cpu, uint32_t sel, uint32_t *w1, uint32_t *w2)
         limit = cpu->gdt_limit;
     }
     if (!NEGCTL(1) && off + 7u > limit)
-        return fault(cpu, EX_GP, SEL_ERR(sel));
+        return -1;
 
     /* The table lives in guest memory, so the read goes through the pager the
        same way any host-side guest access does. A descriptor may not straddle
@@ -203,12 +215,27 @@ static int read_desc(X86CPUState *cpu, uint32_t sel, uint32_t *w1, uint32_t *w2)
        #GP rather than a silent zero descriptor. */
     uint8_t raw[8];
     if (x86_guest_copy_out(raw, base + off, 8) != 8)
-        return fault(cpu, EX_GP, SEL_ERR(sel));
+        return -1;
 
     *w1 = (uint32_t)raw[0] | ((uint32_t)raw[1] << 8) |
           ((uint32_t)raw[2] << 16) | ((uint32_t)raw[3] << 24);
     *w2 = (uint32_t)raw[4] | ((uint32_t)raw[5] << 8) |
           ((uint32_t)raw[6] << 16) | ((uint32_t)raw[7] << 24);
+    return 0;
+}
+
+/* The faulting wrapper, which is what every LOADING path wants. LAR, LSL,
+ * VERR and VERW want the RAW form instead: an inaccessible selector clears ZF
+ * for them and raises NOTHING, so routing them through this would record a
+ * phantom fault in cpu->pmode_excp and move x86_pmode_faults -- which is the
+ * counter the walk arms are graded on. DOSBox-X gets the same split from
+ * GetDescriptor() returning a bool that CPU_LAR turns into ZF and
+ * CPU_SetSegGeneral turns into an exception (src/cpu/cpu.cpp:2809 vs :2976).
+ */
+static int read_desc(X86CPUState *cpu, uint32_t sel, uint32_t *w1, uint32_t *w2)
+{
+    if (read_desc_raw(cpu, sel, w1, w2))
+        return fault(cpu, EX_GP, SEL_ERR(sel));
     return 0;
 }
 
@@ -960,5 +987,279 @@ int x86_pmode_iret(X86CPUState *cpu, uint32_t op32)
                   & ~FLAG_VM;
 
     x86_pmode_irets++;
+    return 0;
+}
+
+/* ===========================================================================
+ * THE DESCRIPTOR-INSPECTION INSTRUCTIONS: LAR, LSL, VERR, VERW, STR, LTR.
+ * ===========================================================================
+ *
+ * WHY THESE AND NOT THE REST OF PROTECTED MODE. A static scan of DOS4GW.EXE
+ * (scripts/opcode_demand.py) counted what the extender actually contains:
+ * 58 LAR sites, 28 LSL, 5 CLTS, 5 STR and 2 LTR -- every one of which reached
+ * .exit_loop before this. The same scan settled the far larger question: the
+ * extender's IDT template is 256 entries and EVERY ONE IS DPL 0, and no DPL 3
+ * CODE descriptor is built anywhere in the image, so ring-3 code could not
+ * issue INT 21h at all. DOS/4GW RUNS ENTIRELY AT CPL 0. Call gates, TSS stack
+ * switches, task switches and IRET-across-privilege are therefore NOT BUILT
+ * and are not stubbed -- about 1,225 lines that measurement deleted rather
+ * than deferred.
+ *
+ * THE TSS IS THE PART THAT LOOKS LIKE EVIDENCE AND IS NOT. An `LTR` at
+ * +0x476e is real, and a TSS at DPL 0 is needed for SS0:ESP0 and the I/O
+ * permission bitmap whether or not a ring ever changes. So the task register
+ * is LOADED AND STORED and its descriptor is VALIDATED AS A TSS -- and no task
+ * switch is implemented, because nothing has asked for one.
+ *
+ * THE RULES ARE DOSBox-X's, cited per check: CPU_LAR (src/cpu/cpu.cpp:2809),
+ * CPU_LSL (:2861), CPU_VERR (:2904), CPU_VERW (:2937), CPU_LTR (:2452),
+ * CPU_STR (:2441). tiny386 is not the authority here for the reason it is not
+ * anywhere else in this file, and the permitted-type lists below are the
+ * concrete case: "any present descriptor" is the intuitive rule and it is
+ * wrong in both directions -- an interrupt gate is present and is NOT
+ * accessible to LAR, and a not-present descriptor IS accessible to it (LAR
+ * reads the access-rights byte, whose whole point is to report P).
+ */
+
+/* DOSBox-X's Descriptor::Type() is FIVE bits with S in bit 4 (include/cpu.h:
+ * DESC_LDT 0x02 is a system type, DESC_DATA_EU_RO_NA 0x10 the first non-system
+ * one). Our flags packing keeps S as its own bit, so the two are reconciled
+ * here, ONCE, rather than at every case below -- which is what lets the type
+ * lists be quoted from cpu.cpp as literal numbers and checked by eye. */
+static uint32_t desc_type5(uint32_t flags)
+{
+    return X86_DESC_TYPE(flags) | ((flags & X86_DESC_S_FLAG) ? 0x10u : 0u);
+}
+
+/* The SYSTEM types (5-bit type < 0x10) each instruction admits, as a bitmask
+ * over the low type nibble. Read them against cpu.cpp's case lists:
+ *
+ *   LAR (:2820-2853)  LDT 2, task gate 5, TSS 1/3/9/B, call gates 4/C.
+ *                     The four INT/TRAP gates 6/7/E/F fall to an explicit
+ *                     `SETFLAGBIT(ZF,false)` arm of their own (:2824), and
+ *                     0, 8 and D are invalid types.
+ *   LSL (:2872-2896)  LDT 2 and the four TSS types only. Every GATE is out,
+ *                     call gates included -- a gate has no limit to load, and
+ *                     this is the ONE place LAR and LSL differ.
+ */
+#define LAR_SYS_TYPES  0x1A3Eu   /* 1,2,3,4,5,9,B,C */
+#define LSL_SYS_TYPES  0x0A0Eu   /* 1,2,3,9,B       */
+
+/*
+ * The privilege test LAR, LSL, VERR and VERW all share:
+ * `desc.DPL() < cpu.cpl || desc.DPL() < rpl` clears ZF (cpu.cpp:2846, :2889,
+ * :2925, :2951). It is the same predicate as the data-segment load's
+ * DPL >= max(CPL,RPL), which is why it is written the same way here.
+ *
+ * A CONFORMING CODE SEGMENT IS EXEMPT, and that exemption is not decoration:
+ * conforming code is by definition reachable from any privilege level, so
+ * DOSBox-X gives types 0x1C-0x1F a case that breaks without testing anything
+ * (cpu.cpp:2821-2823). Omitting it would make LAR lie about the one kind of
+ * descriptor a protected-mode loader is most likely to ask about.
+ */
+static int ar_priv_ok(const X86CPUState *cpu, uint32_t dpl, uint32_t rpl)
+{
+    uint32_t cpl = cpu->cpl & 3u;
+    uint32_t need = rpl > cpl ? rpl : cpl;
+    if (NEGCTL(18))
+        return 1;
+    return dpl >= need;
+}
+
+/* Shared front half of all four: fetch the descriptor WITHOUT faulting, and
+ * apply the type list and the privilege test. Returns 0 (ZF clear) or 1 with
+ * w1/w2 filled. `sys_types` is the system-type mask, `seg_ok` a predicate on
+ * the 5-bit type for the S=1 half. */
+static int ar_common(X86CPUState *cpu, uint32_t sel, uint32_t sys_types,
+                     int (*seg_ok)(uint32_t t5), uint32_t *w1, uint32_t *w2)
+{
+    uint32_t flags, t5, dpl, rpl = sel & 3u;
+
+    /* DOSBox-X tests `selector == 0` literally (cpu.cpp:2811) and lets 1..3
+       fall through to GDT entry 0, whose all-zero type reaches the default arm
+       and clears ZF anyway. SEL_IS_NULL reaches the same answer one step
+       earlier and without a guest-memory read. */
+    if (SEL_IS_NULL(sel))
+        return 0;
+    if (read_desc_raw(cpu, sel, w1, w2))
+        return 0;
+
+    flags = desc_flags(*w2);
+    t5 = desc_type5(flags);
+    dpl = X86_DESC_DPL(flags);
+
+    if (t5 < 0x10u) {                       /* a SYSTEM descriptor */
+        if (!((sys_types >> t5) & 1u))
+            return 0;
+    } else if (!seg_ok(t5)) {
+        return 0;
+    } else if ((t5 & 0x0Cu) == 0x0Cu) {
+        /* Conforming code (0x1C-0x1F): exempt from the privilege test. */
+        return 1;
+    }
+    return ar_priv_ok(cpu, dpl, rpl);
+}
+
+/* LAR and LSL admit every code and data type; only their SYSTEM lists differ,
+   and the excluded ones are handled by the mask above. */
+static int type_any_seg(uint32_t t5) { (void)t5; return 1; }
+
+/* VERR: readable. Data is always readable; code only with its readable bit
+   (cpu.cpp:2914-2921 -- DESC_CODE_R_* and the eight data types, everything
+   else to the default arm). */
+static int type_readable(uint32_t t5)
+{
+    if (NEGCTL(21))
+        return 1;
+    if (!(t5 & X86_TYPE_CODE))
+        return 1;                            /* any data segment */
+    return (t5 & X86_TYPE_READABLE) != 0;
+}
+
+/* VERW: WRITABLE DATA ONLY -- cpu.cpp:2947-2949 lists exactly the four
+   writable data types and NO code type at all, conforming or not. Code is
+   never writable on this architecture, which is the entire distinction
+   between VERR and VERW. */
+static int type_writable(uint32_t t5)
+{
+    if (NEGCTL(22))
+        return type_readable(t5);
+    if (t5 & X86_TYPE_CODE)
+        return 0;
+    return (t5 & X86_TYPE_WRITABLE) != 0;
+}
+
+volatile uint32_t x86_pmode_ars;        /* LAR/LSL/VERR/VERW executed */
+volatile uint32_t x86_pmode_ltrs;       /* task registers loaded      */
+
+/*
+ * LAR. Returns 1 with *ar set (ZF=1), or 0 (ZF=0) leaving *ar alone --
+ * architecturally the destination is UNMODIFIED when ZF comes back clear, and
+ * DOSBox-X gets that by writing `ar` only on the success path (cpu.cpp:2856).
+ *
+ * THE VALUE. DOSBox-X returns `desc.saved.fill[1] & 0x00ffff00` -- the second
+ * descriptor dword with its low byte masked off, so the ACCESS byte sits at
+ * bits 8-15 and the granularity byte at 16-23. That is the architectural
+ * result and it is NOT our flags packing, which puts the access byte at bits
+ * 8-15 of a 16-bit word and the granularity byte at 0-7 (docs/14 Sec.4). The
+ * two are related by moving one byte, and it is DERIVED from the packing here
+ * rather than lifted from w2, so a future change to the packing cannot leave
+ * this reading a stale layout: quoting a reference for a BIT INDEX is the
+ * mistake docs/14 Sec.3 names, and this is exactly the site it names it for.
+ */
+int x86_pmode_lar(X86CPUState *cpu, uint32_t sel, uint32_t *ar)
+{
+    uint32_t w1, w2, flags;
+
+    x86_pmode_ars++;
+    sel &= 0xFFFFu;
+    if (!ar_common(cpu, sel, NEGCTL(19) ? 0xFFFEu : LAR_SYS_TYPES,
+                   type_any_seg, &w1, &w2))
+        return 0;
+    flags = desc_flags(w2);
+    *ar = ((flags & 0xFF00u)) | ((flags & 0x00FFu) << 16);
+    return 1;
+}
+
+/*
+ * LSL. The limit is the one the CACHE would hold -- G already applied
+ * (cpu.cpp:2898 `desc.GetLimit()`, and GetLimit() is where DOSBox-X applies
+ * granularity too). decode_desc is reused rather than the shift rewritten,
+ * so negative control 8 grades this arm as well as the load arms.
+ */
+int x86_pmode_lsl(X86CPUState *cpu, uint32_t sel, uint32_t *limit)
+{
+    uint32_t w1, w2;
+    X86CPUSeg tmp;
+
+    x86_pmode_ars++;
+    sel &= 0xFFFFu;
+    if (!ar_common(cpu, sel, NEGCTL(20) ? LAR_SYS_TYPES : LSL_SYS_TYPES,
+                   type_any_seg, &w1, &w2))
+        return 0;
+    decode_desc(&tmp, sel, w1, w2);
+    *limit = tmp.limit;
+    return 1;
+}
+
+/* VERR/VERW. `write` selects which. Both are pure predicates -- they touch
+   only ZF and never fault (cpu.cpp:2904, :2937). */
+int x86_pmode_verrw(X86CPUState *cpu, uint32_t sel, uint32_t write)
+{
+    uint32_t w1, w2;
+
+    x86_pmode_ars++;
+    sel &= 0xFFFFu;
+    /* Neither admits ANY system type: both switch statements list only
+       segment types and send everything else to their default arm. */
+    return ar_common(cpu, sel, 0u,
+                     write ? type_writable : type_readable, &w1, &w2);
+}
+
+/*
+ * LTR. Loads the task register; DOES NOT SWITCH TASKS.
+ *
+ * The distinction is the whole point. A TSS is needed for SS0:ESP0 and for the
+ * I/O permission bitmap, and a protected-mode extender installs one whether or
+ * not it ever changes ring -- so an LTR is NOT evidence that a task switch or
+ * a privilege change will follow, and DOS4GW's 256 DPL-0 IDT entries say it
+ * will not. The register is loaded, the descriptor is validated, and nothing
+ * else happens.
+ *
+ * The rules are CPU_LTR (src/cpu/cpu.cpp:2452-2477):
+ *   - a null selector clears the register and is NOT an exception (:2453)
+ *   - TI=1, or a descriptor that will not read, is #GP(sel) (:2457)
+ *   - the type must be an AVAILABLE TSS, 286 (1) or 386 (9). A BUSY one
+ *     (3 or 0xB) is #GP -- that is what stops a task being entered twice --
+ *     and so is everything else (:2470-2474, the else arm)
+ *   - not present is #NP(sel) (:2464)
+ *   - and on success the descriptor is marked BUSY IN GUEST MEMORY
+ *     (:2467-2468, SetBusy + SaveSelector)
+ *
+ * The busy write-back is a one-byte store into the descriptor's access byte.
+ * It is done because it is architectural and because a loader that reads its
+ * own GDT back -- which is exactly the kind of thing a protected-mode extender
+ * does -- would otherwise see a TSS it believes it installed still marked
+ * available. It cannot straddle a granule: it is one byte.
+ */
+int x86_pmode_ltr(X86CPUState *cpu, uint32_t sel)
+{
+    uint32_t w1, w2, flags, type;
+    X86CPUSeg tmp;
+    uint8_t busy;
+
+    sel &= 0xFFFFu;
+    if (SEL_IS_NULL(sel)) {
+        cpu->tr_sel = sel;
+        cpu->tr_base = 0;
+        cpu->tr_limit = 0;
+        return 0;
+    }
+    /* A TSS descriptor always lives in the GDT, exactly as an LDT one does. */
+    if (sel & 4u)
+        return fault(cpu, EX_GP, SEL_ERR(sel));
+
+    if (read_desc(cpu, sel, &w1, &w2))
+        return EX_GP;
+
+    flags = desc_flags(w2);
+    type = X86_DESC_TYPE(flags);
+    if (!NEGCTL(17) && ((flags & X86_DESC_S_FLAG) ||
+                        (type != 0x1u && type != 0x9u)))
+        return fault(cpu, EX_GP, SEL_ERR(sel));
+    if (!(flags & X86_DESC_P_FLAG))
+        return fault(cpu, EX_NP, SEL_ERR(sel));
+
+    decode_desc(&tmp, sel, w1, w2);
+    cpu->tr_sel = sel;
+    cpu->tr_base = tmp.base;
+    cpu->tr_limit = tmp.limit;
+
+    /* Mark it busy: access byte, bit 1 of the type nibble. The byte is taken
+       from w2 rather than rebuilt out of `flags`, because a rebuild would be a
+       second decoder of the packing and those are what drift. */
+    busy = (uint8_t)(((w2 >> 8) & 0xFFu) | 0x2u);
+    x86_guest_copy_in(cpu->gdt_base + (sel & 0xFFF8u) + 5u, &busy, 1);
+    x86_pmode_ltrs++;
     return 0;
 }
