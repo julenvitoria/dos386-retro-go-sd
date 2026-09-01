@@ -2191,6 +2191,18 @@ python3 tests/test_ems.py                # EMS, the MAPPED counterpart, driven
                                          # readback go wrong, and one flipped
                                          # byte through the window is detected.
                                          # RAM store, no card, no FatFs
+python3 tests/test_seam.py --stack-seam   # GRADE the straddling PUSH/POP arm
+                                         # instead of merely reporting it. It
+                                         # FAILS on today's tree: PUSH_V/POP_V
+                                         # are multi-byte fold sites with NO
+                                         # SEAM_CHECK (zero occurrences), and
+                                         # arm 1b demonstrates it -- the pushed
+                                         # high byte lands in the LOW frame's
+                                         # slack instead of the neighbour. The
+                                         # guest's own POP reads it back, so the
+                                         # round trip passes either way; the
+                                         # neighbour's byte is what is lost.
+                                         # docs/10 Sec.7
 python3 tests/test_seam.py               # THE GRANULE SEAM. host = lin + k with
                                          # one k per 4 KB page, so two adjacent
                                          # GUEST granules are adjacent in HOST

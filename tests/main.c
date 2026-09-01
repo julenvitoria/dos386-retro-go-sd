@@ -6155,6 +6155,73 @@ static void seam_test_run(void)
     slack = x86_pager_slack(SEAM_FIRST);
     seam_r[6] = slack ? slack[0] : 0xFFFFFFFFu;
     seam_r[7] = seam_contiguous;
+    /* ---- THE STACK STRADDLE -----------------------------------------------
+     *
+     * PUSH_V and POP_V (cpu_exec_handlers.S) carry NO SEAM_CHECK. There are
+     * ZERO occurrences, and they are multi-byte fold sites -- the same shape
+     * CLAUDE.md says is silently wrong at one address in 2,048.
+     *
+     * Nothing aligns SP on x86. SS.base + SP can land on 0xFFF with a 16-bit
+     * push, or 0xFFD-0xFFF with a 32-bit one, and this arm does exactly that:
+     * SS = 0xC000, SP = 0x1001, so `PUSH AX` writes the low byte at the last
+     * byte of one granule and the high byte at the first byte of the NEXT --
+     * which, with the pager handing frames out in fault order, is not the
+     * host memory after it.
+     *
+     * THE GUEST'S OWN VIEW CANNOT SEE THIS, which is why it went unnoticed:
+     * the matching POP walks off the top of the same frame in the same
+     * direction and reads back what the PUSH wrote, so AX comes home intact.
+     * What is graded instead is the NEIGHBOUR: the high byte must land at
+     * hi+0 in the other granule, and NOT in the low frame's eight bytes of
+     * slack. r[16] and r[17] are the whole of the question.
+     *
+     * The bytes are repainted first: the operand program above already wrote
+     * 0x34/0x12 at these two addresses, and reusing those values would make a
+     * pass indistinguishable from the previous arm's leftovers.
+     */
+    seam_poke(lo + 0xFFF, 0xAA);
+    seam_poke(hi + 0,     0xBB);
+    if (slack)
+        memset(slack, 0xEE, X86_PG_SLACK);
+    {
+        /*   mov ax,0C000h    B8 00 C0
+         *   mov ds,ax        8E D8
+         *   mov ss,ax        8E D0
+         *   mov sp,1001h     BC 01 10
+         *   mov ax,5678h     B8 78 56
+         *   push ax          50            <- writes 0FFFh and 1000h
+         *   mov ax,0         B8 00 00
+         *   pop ax           58            <- reads them back
+         *   mov [0010h],ax   A3 10 00
+         *   hlt              F4
+         */
+        static const uint8_t sprog[] = {
+            0xB8, 0x00, 0xC0,  0x8E, 0xD8,  0x8E, 0xD0,
+            0xBC, 0x01, 0x10,
+            0xB8, 0x78, 0x56,
+            0x50,
+            0xB8, 0x00, 0x00,
+            0x58,
+            0xA3, 0x10, 0x00,
+            0xF4,
+        };
+        memcpy(test_ram, sprog, sizeof(sprog));
+        memset(&cpu_state_dtcm, 0, sizeof(cpu_state_dtcm));
+        for (int i = 0; i < 6; i++)
+            cpu_state_dtcm.segs[i].limit = 0xFFFFFFFF;
+        cpu_state_dtcm.pit_reload = 0xFFFFFFFF;
+        cpu_state_dtcm.pit_counter = 0xFFFFFFFF;
+        x86_cpu_interp_asm();
+        seam_r[13] = cpu_state_dtcm.exit_reason;            /* 6 = HLT     */
+        /* The round trip. This passes EITHER WAY and is here to say so. */
+        seam_r[14] = seam_peek(lo + 0x10) | (seam_peek(lo + 0x11) << 8);
+        seam_r[15] = seam_peek(lo + 0xFFF);                 /* 0x78        */
+        seam_r[16] = seam_peek(hi + 0);                     /* 0x56 -- or
+                                                               0xBB, the hole */
+        slack = x86_pager_slack(SEAM_FIRST);
+        seam_r[17] = slack ? slack[0] : 0xFFFFFFFFu;        /* 0xEE        */
+        seam_r[18] = cpu_state_dtcm.regs[4] & 0xFFFFu;      /* 0x1001      */
+    }
     seam_r[8] = x86_seam_syncs - s0;
     seam_r[9] = x86_seam_writes - w0;
     seam_r[10] = x86_seam_overflow - o0;
