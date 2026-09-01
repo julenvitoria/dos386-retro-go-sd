@@ -3644,7 +3644,7 @@ static void pmode_test_run(void)
      * a passing test.
      *
      *   0x48:0x0020   HLT       the delivery arms' landing site
-     *   0x48:0x0030   HLT       the 286 gate's handler
+     *   0x48:0x0030   IRET      the round trip's handler
      *   0x48:0x0060   HLT       where the good IRET returns to
      *   0x48:0x0100   STI / INT 0x25 / HLT     the round trip itself
      *   0x48:0x0200   a hand-built IRET frame naming a WRONG-DPL selector
@@ -3653,11 +3653,7 @@ static void pmode_test_run(void)
      *   0x50:0x0010   INT 0x26 / HLT           run at CPL 3
      * ================================================================== */
     test_ram[0x30020] = 0xF4;                       /* HLT               */
-    /* A HLT, not an IRET: protected-mode IRET is the NEXT commit, and an arm
-       must not depend on code that is not there yet. The 286-gate arm below
-       grades the FRAME, which it can do perfectly well by halting inside the
-       handler. */
-    test_ram[0x30030] = 0xF4;                       /* HLT               */
+    test_ram[0x30030] = 0xCF;                       /* IRET              */
     test_ram[0x30060] = 0xF4;                       /* HLT               */
     {
         /* STI first, so "the gate cleared IF" and "the IRET put it back"
@@ -3856,6 +3852,69 @@ static void pmode_test_run(void)
         test_ram[0x31011] = 0x26;                          /* put it back */
     }
 
+    /* ---- T. THE ROUND TRIP: gate in, IRET out ------------------------
+     * Task 1 is useless without task 2 and this is the arm that says so.
+     * A far JMP puts CS in a real selector first, because after PM_ENTER
+     * alone CS.sel is still 0 -- and a frame carrying a null CS is one an
+     * IRET must refuse, correctly, for a reason that has nothing to do
+     * with the return path.
+     *
+     * The gate is the 286 one, so the frame the interrupt PUSHES and the
+     * frame the 16-bit IRET POPS are the same width. They need not be --
+     * the gate decides one and the operand size the other -- and a guest
+     * that mismatches them is wrong on silicon too.
+     */
+    {
+        static const uint8_t prog[] = {
+            0xBC, 0x00, 0x80,
+            PM_ENTER,
+            0xEA, 0x00, 0x01, 0x48, 0x00,   /* JMP FAR 0x48:0x0100 */
+        };
+        x86_pmode_gates = 0;
+        x86_pmode_irets = 0;
+        pmode_r[113] = pm_run_int(prog, sizeof(prog));     /* 6 = HLT   */
+        /* Offset 0x100 is STI, 0x101 the INT, 0x103 the HLT: the IRET
+           returned to 0x103 and the HLT retired, so EIP is 0x104. Any
+           other number means the popped IP was not the pushed one. */
+        pmode_r[114] = cpu_state_dtcm.eip;                 /* 0x104     */
+        pmode_r[115] = cpu_state_dtcm.regs[4];             /* 0x8000    */
+        pmode_r[116] = cpu_state_dtcm.segs[X86_CPU_SEG_CS].sel;  /* 0x48 */
+        pmode_r[117] = x86_pmode_gates;                    /* 1         */
+        pmode_r[118] = x86_pmode_irets;                    /* 1         */
+        /* STI set IF, the INTERRUPT gate cleared it, the IRET restored it
+           from the frame. Three separate things have to be right for this
+           to read 1. */
+        pmode_r[119] = (cpu_state_dtcm.eflags >> 9) & 1u;  /* 1         */
+    }
+
+    /* ---- U. IRET's OWN CS rule ---------------------------------------
+     * NEGATIVE CONTROL 16. A non-conforming target must have DPL == RPL,
+     * which is stricter than the "is it code, is it present" that
+     * L(SET_SREG)'s CS arm applies -- so this cannot be graded by reusing
+     * the far-jump arms and it is not.
+     */
+    {
+        static const uint8_t bad[] = {
+            0xBC, 0x00, 0x80,
+            PM_ENTER,
+            0xEA, 0x00, 0x02, 0x48, 0x00,   /* JMP FAR 0x48:0x0200 */
+        };
+        pmode_r[120] = pm_run_int(bad, sizeof(bad));       /* 13        */
+        pmode_r[121] = cpu_state_dtcm.pmode_excp;          /* 13 = #GP  */
+        pmode_r[122] = cpu_state_dtcm.pmode_err;           /* 0x50      */
+        /* And ESP is back where it started: the three pops are
+           SPECULATIVE until the CS is known good, and a fault must not
+           leave the stack half-consumed. */
+        pmode_r[123] = cpu_state_dtcm.regs[4];             /* 0x7FFA    */
+
+        static const uint8_t good[] = {
+            0xBC, 0x00, 0x80,
+            PM_ENTER,
+            0xEA, 0x20, 0x02, 0x48, 0x00,   /* JMP FAR 0x48:0x0220 */
+        };
+        pmode_r[124] = pm_run_int(good, sizeof(good));     /* 6 = HLT   */
+        pmode_r[125] = cpu_state_dtcm.eip;                 /* 0x61      */
+    }
 }
 
 static void a20_test_run(void)

@@ -448,6 +448,20 @@ L(INT_PMODE):
     B.W .save_state_and_exit
 
 OP .op_iret_CF
+    /* PROTECTED MODE goes to L(IRET_PMODE) below. These three instructions are
+       the only thing this work costs real mode anywhere, and they are here
+       rather than folded into the mode record because the record block would
+       have to double -- 8 KB to 16 KB of DTCM against 5,856 B free (STATUS.md
+       Budgets), which does not fit. IRET is per-interrupt, not per-instruction.
+
+       They cannot go below the pops either: a protected-mode IRET's CS has to
+       be validated by IRET's OWN rules (DPL == RPL for a non-conforming
+       target), which are stricter than the ones L(SET_SREG)'s CS arm applies,
+       and the 16-bit form must CARRY the high half of EFLAGS rather than let
+       POP_V zero it. Both decisions have to be made before anything commits. */
+    LDR.W R3, [R8, #CPU_CR0]
+    TST.W R3, #1
+    BNE.W L(IRET_PMODE)
     /* Pops IP, CS, FLAGS -- the exact inverse of the frame above. The old
        version popped 32-bit values, skipped a word, and never installed CS. */
     MOVW R3, #:lower16:x86_iret_log
@@ -474,6 +488,45 @@ OP .op_iret_CF
     LDR.W R3, [R8, #SEG_CS_BASE]
     ADD.W R10, R0, R3
     B.W .fetch_decode_loop
+
+/* ---------------------------------------------------------------------------
+ * IRET in PROTECTED MODE, same privilege. COLD and out of line.
+ *
+ * x86_pmode_iret() does the pops, the validation and the install, for the same
+ * reason the gate walk is in C: it is a dozen predicates that run once per
+ * return in a protected-mode guest and never in a real-mode one. It also has
+ * to do the pops ITSELF rather than take three popped values, because the
+ * three are SPECULATIVE -- a CS that fails IRET's DPL/RPL rule must leave ESP
+ * reading exactly as it did before the instruction, and that unwind is only
+ * possible where the pops happened.
+ *
+ * The OPERAND SIZE is the frame width and it is a per-pass constant, so it is
+ * an immediate here and this handler is declared OP, not OP_AGNOSTIC.
+ *
+ * EIP is NOT advanced past the IRET: it is replaced wholesale by the popped
+ * value, so R10 is rebuilt from cpu->eip and the new CS.base. R11 likewise
+ * comes back from cpu->eflags, which the C side has masked by CPL.
+ */
+L(IRET_PMODE):
+    STR.W R11, [R8, #EFLAGS_OFFSET]
+    MOV R0, R8
+#if OPSZ == 4
+    MOV.W R1, #1
+#else
+    MOV.W R1, #0
+#endif
+    BL x86_pmode_iret
+    CBNZ R0, 1f
+    LDR.W R11, [R8, #EFLAGS_OFFSET]
+    LDR.W R10, [R8, #EIP_OFFSET]
+    LDR.W R3, [R8, #SEG_CS_BASE]
+    ADD.W R10, R10, R3
+    B.W .fetch_decode_loop
+1:  MOV.W R0, #X86_EXIT_GPF
+    STR.W R0, [R8, #CPU_EXIT_REASON]
+    LDR.W R0, [R8, #CPU_PMODE_ERR]
+    STR.W R0, [R8, #CPU_EXIT_INFO]
+    B.W .save_state_and_exit
 
 /* The former L(handle_pit_or_irq) / L(exit_loop) lived here. Both were defined
    and never referenced -- the fetch loop has always branched to the versions in

@@ -303,6 +303,29 @@ def main(args):
             ("  ... a DPL 3 gate at CPL 3 delivers", r[111], 1),
             ("  ... with CS.RPL forced to CPL",     r[112], 0x53),
 
+            # ---- T. THE ROUND TRIP --------------------------------------
+            # Delivery without a return moves the hang rather than fixing it.
+            ("gate in, IRET out, ran to HLT",       r[113], HALT),
+            ("  ... EIP is the instruction after the INT", r[114], 0x104),
+            ("  ... and ESP is back where it began", r[115], 0x8000),
+            ("  ... CS restored from the frame",    r[116], 0x48),
+            ("one gate walked",                     r[117], 1),
+            ("  ... and one IRET completed",        r[118], 1),
+            # STI set it, the gate cleared it, the IRET put it back: three
+            # separate things must be right for this to read 1.
+            ("  ... and IF came back from the frame", r[119], 1),
+
+            # ---- U. IRET's OWN CS rule ----------------------------------
+            # NEGATIVE CONTROL 16. DPL == RPL for a non-conforming target is
+            # STRICTER than L(SET_SREG)'s CS arm, which checks only code and
+            # present -- so this cannot be graded by the far-jump arms.
+            ("IRET to a DPL 3 selector at RPL 0 FAULTS", r[120], GPF),
+            ("  ... with #GP",                      r[121], EX_GP),
+            ("  ... error code is the selector",    r[122], 0x50),
+            # The pops are SPECULATIVE until the CS is known good.
+            ("  ... and ESP was not left consumed", r[123], 0x7FFA),
+            ("  ... the same frame with DPL == RPL returns", r[124], HALT),
+            ("  ... to the offset the frame named", r[125], 0x61),
         ]
 
         bad = 0

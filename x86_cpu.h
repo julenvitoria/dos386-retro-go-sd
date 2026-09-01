@@ -789,9 +789,10 @@ extern volatile uint32_t x86_pmode_faults;     /* walks that raised          */
 
 /* ---- protected-mode INTERRUPT DELIVERY, same privilege (x86_pmode.c) -----
  *
- * Called from the protected-mode arm of L(HANDLE_INTERRUPT), and ONLY when
- * CR0.PE is set -- the real-mode arm is byte-identical to what it was, so real
- * mode pays nothing for this existing (docs/14 Sec.2).
+ * Called from the protected-mode arm of L(HANDLE_INTERRUPT) and from
+ * .op_iret_CF, and ONLY when CR0.PE is set -- the real-mode arms of both are
+ * byte-identical to what they were, so real mode pays nothing for these
+ * existing (docs/14 Sec.2).
  *
  * Same return convention as the walk: 0, or the exception VECTOR with the
  * error code left in cpu->pmode_err. `flags` is DOSBox-X's CPU_Interrupt()
@@ -805,7 +806,10 @@ extern volatile uint32_t x86_pmode_faults;     /* walks that raised          */
 #define X86_INT_HAS_ERROR 2u   /* push an error code word after the frame   */
 int x86_pmode_int_gate(X86CPUState *cpu, uint32_t vec, uint32_t flags,
                        uint32_t err);
+/* `op32` is the INSTRUCTION's operand size, not the gate's. */
+int x86_pmode_iret(X86CPUState *cpu, uint32_t op32);
 extern volatile uint32_t x86_pmode_gates;      /* gates delivered            */
+extern volatile uint32_t x86_pmode_irets;      /* pmode IRETs completed      */
 
 void x86_build_mode_records(void *dtcm_block);
 uint32_t x86_mode_table(int op32, int addr32);

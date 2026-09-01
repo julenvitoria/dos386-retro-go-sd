@@ -99,6 +99,12 @@ ARMS = [
      "Without it a 386 gate reached from a 16-bit code segment pushes six "
      "bytes where twelve are wanted, and the handler's IRET unwinds to the "
      "wrong place. Graded on ESP after the INT."),
+    (16, "IRET CS DPL",
+     "IRET's own CS rule -- DPL == RPL for a non-conforming target, DPL <= "
+     "RPL for a conforming one. STRICTER than L(SET_SREG)'s CS arm, which "
+     "checks only code-ness and present, so nothing else in the suite can "
+     "grade it. Without it an IRET returns into a segment at the wrong "
+     "privilege."),
 ]
 
 

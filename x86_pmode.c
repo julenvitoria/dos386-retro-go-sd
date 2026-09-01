@@ -122,6 +122,7 @@ volatile uint32_t x86_pmode_faults;
  *  13  the gate's present bit
  *  14  a software interrupt may not reach a gate with DPL < CPL
  *  15  the frame WIDTH comes from the gate's type, not the operand size
+ *  16  IRET's CS DPL/RPL rule (== for non-conforming, <= for conforming)
  */
 #ifndef X86_PMODE_NEGCTL
 #define X86_PMODE_NEGCTL 0
@@ -549,6 +550,7 @@ int x86_pmode_lldt(X86CPUState *cpu, uint32_t sel)
  */
 
 volatile uint32_t x86_pmode_gates;      /* gates walked and delivered */
+volatile uint32_t x86_pmode_irets;      /* protected-mode IRETs completed */
 
 /* Gate TYPE values, from DOSBox-X's DESC_* enum (include/cpu.h). Bit 3 of the
    type selects the 386 (32-bit) forms, which is exactly the frame width; bit 0
@@ -605,6 +607,23 @@ static int stack_push(X86CPUState *cpu, uint32_t val, uint32_t width)
     if (x86_guest_copy_in(lin, b, width) != width)
         return fault(cpu, EX_SS, 0);
     cpu->regs[4] = nsp;
+    return 0;
+}
+
+static int stack_pop(X86CPUState *cpu, uint32_t *out, uint32_t width)
+{
+    uint32_t mask = ss_mask(cpu);
+    uint32_t esp = cpu->regs[4];
+    uint32_t lin = cpu->segs[X86_CPU_SEG_SS].base + (esp & mask);
+    uint8_t b[4] = { 0, 0, 0, 0 };
+
+    if (x86_guest_copy_out(b, lin, width) != width)
+        return fault(cpu, EX_SS, 0);
+    *out = (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+           ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+    if (width == 2)
+        *out &= 0xFFFFu;
+    cpu->regs[4] = (esp & ~mask) | ((esp + width) & mask);
     return 0;
 }
 
@@ -806,5 +825,140 @@ int x86_pmode_int_gate(X86CPUState *cpu, uint32_t vec, uint32_t flags,
     cpu->eflags = new_eflags;
 
     x86_pmode_gates++;
+    return 0;
+}
+
+/*
+ * IRET in protected mode, SAME PRIVILEGE.
+ *
+ * Task 1 is useless without this: an interrupt that is delivered and never
+ * returned from has moved the hang, not fixed it. It is a SEPARATE COMMIT for
+ * exactly that reason -- either half failing has to be attributable on its own.
+ *
+ * `op32` is the INSTRUCTION's operand size, and here it really is the operand
+ * size and not the gate's: `CPU_IRET(bool use32, ...)` is called with the
+ * decoder's width (src/cpu/cpu.cpp:1509). The frame width on the way IN is the
+ * gate's and on the way OUT is the instruction's; a guest that mismatches them
+ * is wrong on silicon too, and emulating that faithfully is the point.
+ *
+ * NOT BUILT, and refused rather than approximated: a return to an OUTER ring
+ * (n_cs_rpl > cpl), which pops SS:ESP as well and needs the privilege-change
+ * lane, and a return to V86 mode. Both come back as #GP.
+ */
+int x86_pmode_iret(X86CPUState *cpu, uint32_t op32)
+{
+    uint32_t width = op32 ? 4u : 2u;
+    uint32_t n_eip, n_cs, n_flags, w1, w2, cflags, ctype, cdpl, rpl, cpl;
+    uint32_t saved_esp = cpu->regs[4];
+    uint32_t mask;
+    int rc;
+
+    cpl = cpu->cpl & 3u;
+
+    rc = stack_pop(cpu, &n_eip, width);
+    if (rc)
+        return rc;
+    rc = stack_pop(cpu, &n_cs, width);
+    if (rc)
+        return rc;
+    rc = stack_pop(cpu, &n_flags, width);
+    if (rc)
+        return rc;
+    n_cs &= 0xFFFFu;
+
+    /* A 16-bit IRET restores only the LOW HALF of EFLAGS, and the high half is
+       CARRIED OVER rather than zeroed: `n_flags |= (reg_flags & 0xffff0000)`
+       (src/cpu/cpu.cpp:1683). The assembly's `POP_V R11` zeroed it, which is
+       harmless in real mode -- nothing lives up there -- and is not once a
+       guest is in protected mode, where VM and AC do. */
+    if (!op32)
+        n_flags = (n_flags & 0xFFFFu) | (cpu->eflags & 0xFFFF0000u);
+
+    /* Everything from here can fault, and ESP must then read as it did before
+       the instruction: the three pops above are SPECULATIVE until the CS is
+       known good. DOSBox-X restores `orig_esp` on its fault path
+       (src/cpu/cpu.cpp:1520) for the same reason. */
+    if (n_flags & FLAG_VM) {
+        cpu->regs[4] = saved_esp;
+        return fault(cpu, EX_GP, 0);        /* IRET to V86 is not built */
+    }
+    if (SEL_IS_NULL(n_cs)) {
+        cpu->regs[4] = saved_esp;
+        return fault(cpu, EX_GP, 0);        /* cpu.cpp:1697 */
+    }
+
+    rpl = n_cs & 3u;
+    /* An IRET may return to the SAME or an OUTER ring, never an inner one:
+       `n_cs_rpl < cpu.cpl` is #GP (src/cpu/cpu.cpp:1704). */
+    if (rpl < cpl) {
+        cpu->regs[4] = saved_esp;
+        return fault(cpu, EX_GP, SEL_ERR(n_cs));
+    }
+    /* An OUTER-ring return pops SS:ESP as well and is the privilege-change
+       lane, which is not built. Refused with the selector rather than
+       returned onto a stack that was never switched. */
+    if (rpl > cpl) {
+        cpu->regs[4] = saved_esp;
+        return fault(cpu, EX_GP, SEL_ERR(n_cs));
+    }
+
+    rc = read_desc(cpu, n_cs, &w1, &w2);
+    if (rc) {
+        cpu->regs[4] = saved_esp;
+        return rc;
+    }
+    cflags = desc_flags(w2);
+    ctype = X86_DESC_TYPE(cflags);
+    cdpl = X86_DESC_DPL(cflags);
+
+    /* The type rules here are IRET's OWN and they are not the ones
+       L(SET_SREG)'s CS arm applies -- that arm checks only "is it code" and
+       "is it present", which is right for a far JMP and too loose for a
+       return. A NON-CONFORMING target must have DPL == RPL; a CONFORMING one
+       must have DPL <= RPL (src/cpu/cpu.cpp:1710-1721). */
+    if (!(cflags & X86_DESC_S_FLAG) || !(ctype & X86_TYPE_CODE)) {
+        cpu->regs[4] = saved_esp;
+        return fault(cpu, EX_GP, SEL_ERR(n_cs));
+    }
+    if (!NEGCTL(16)) {
+        if (ctype & X86_TYPE_CODE_CONF) {
+            if (cdpl > rpl) {
+                cpu->regs[4] = saved_esp;
+                return fault(cpu, EX_GP, SEL_ERR(n_cs));
+            }
+        } else if (cdpl != rpl) {
+            cpu->regs[4] = saved_esp;
+            return fault(cpu, EX_GP, SEL_ERR(n_cs));
+        }
+    }
+    if (!(cflags & X86_DESC_P_FLAG)) {
+        cpu->regs[4] = saved_esp;
+        return fault(cpu, EX_NP, SEL_ERR(n_cs));
+    }
+
+    /* ---- COMMIT POINT --------------------------------------------------- */
+    rc = x86_pmode_load_seg(cpu, X86_CPU_SEG_CS, n_cs);
+    if (rc) {
+        cpu->regs[4] = saved_esp;
+        return rc;
+    }
+    cpu->eip = op32 ? n_eip : (n_eip & 0xFFFFu);
+
+    /* WHICH POPPED FLAG BITS ARE ALLOWED TO TAKE EFFECT. At CPL 0 all of them;
+       above it IOPL is protected, and IF is protected once CPL exceeds IOPL.
+       DOSBox-X expresses it as FMASK_ALL vs FMASK_NORMAL|FLAG_NT
+       (src/cpu/cpu.cpp:1739). We are same-privilege, so CPL has not changed --
+       the mask is DERIVED rather than assumed anyway, because "it is always 0
+       here" is exactly the assumption that later hands a ring-3 IRET IOPL 3. */
+    mask = 0xFFFFFFFFu;
+    if (cpl != 0) {
+        mask &= ~FLAG_IOPL;
+        if (cpl > ((cpu->eflags >> 12) & 3u))
+            mask &= ~FLAG_IF;
+    }
+    cpu->eflags = ((cpu->eflags & ~mask) | (n_flags & mask) | FLAGS_FIXED)
+                  & ~FLAG_VM;
+
+    x86_pmode_irets++;
     return 0;
 }
