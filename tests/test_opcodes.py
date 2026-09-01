@@ -3473,6 +3473,224 @@ def run_test(args):
                 "regs_expected": {0: 0x00000400, 2: 0},
                 "expected_eip": 3,
             },
+
+            # ---------------------------------------------------------------
+            # D7 XLAT: it used raw EBX + AL as a LINEAR address -- no DS base,
+            # no override, no wrap of the index at the address size. DS.base is
+            # non-zero in essentially every real-mode program, so every table
+            # lookup in the guest read from the wrong place.
+            # ---------------------------------------------------------------
+            {
+                "name": "XLAT: DS.base is added to BX + AL",
+                # XLAT ; HLT   DS.base=0x1000, EBX=0x400, AL=5
+                # -> must read linear 0x1405, not 0x405.
+                "code": bytes([0xD7, 0xF4]),
+                "segs_initial": {"DS": 0x1000},
+                "ram_setup": [(0x405, bytes([0x11])),      # decoy, unsegmented
+                              (0x1405, bytes([0x77]))],    # the real entry
+                "regs_initial": {3: 0x400, 0: 0x05},
+                "regs_expected": {0: 0x77, 3: 0x400},
+                "expected_eip": 2,
+            },
+            {
+                "name": "XLAT: a 26 ES override redirects the table",
+                # ES: XLAT ; HLT   ES.base=0x2000, DS.base=0x1000
+                "code": bytes([0x26, 0xD7, 0xF4]),
+                "segs_initial": {"ES": 0x2000, "DS": 0x1000},
+                "ram_setup": [(0x1405, bytes([0x77])),     # DS entry: decoy
+                              (0x2405, bytes([0x99]))],    # ES entry: wanted
+                "regs_initial": {3: 0x400, 0: 0x05},
+                "regs_expected": {0: 0x99, 3: 0x400},
+                "expected_eip": 3,
+            },
+            {
+                "name": "XLAT: the index is BX, not EBX, at 16-bit addressing",
+                # EBX carries a non-zero high half. Masked, the table is at
+                # DS.base + 0x0010; unmasked the handler indexes 0x12340010 and
+                # reads somewhere else entirely. segs_initial sets the BASE.
+                "code": bytes([0xD7, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"DS": 0x0100},
+                "ram_setup": [(0x110, bytes([0x5A]))],     # DS.base + BX
+                "regs_initial": {3: 0x12340010, 0: 0x00},
+                "regs_expected": {0: 0x5A, 3: 0x12340010},
+                "expected_eip": 2,
+            },
+
+            # ---------------------------------------------------------------
+            # 69/6B IMUL Gv,Ev,Iv/Ib wrote NO FLAGS. CF and OF are the point of
+            # the three-operand form -- software issues JC/JO straight after it
+            # -- so the overflow test always fell through the same way.
+            # The no-overflow arms start with CF and OF SET, so a handler that
+            # writes no flag at all leaves them set and fails.
+            # ---------------------------------------------------------------
+            {
+                "name": "IMUL Gv,Ev,Iv (0x69): CF/OF set when the product does not fit",
+                # IMUL EAX, EBX, 0x10000 ; HLT   with EBX = 0x10000
+                # -> true product 0x100000000, truncated to 0.
+                "code": bytes([0x69, 0xC3, 0x00, 0x00, 0x01, 0x00, 0xF4]),
+                "regs_initial": {3: 0x10000},
+                "regs_expected": {0: 0, 3: 0x10000},
+                "flags_expected": {"CF": 1, "OF": 1},
+                "eflags_initial": 0,
+                "expected_eip": 7,
+            },
+            {
+                "name": "IMUL Gv,Ev,Iv (0x69): CF/OF cleared when it does fit",
+                # IMUL EAX, EBX, 4 ; HLT   with EBX = 3 -> 12, no overflow.
+                "code": bytes([0x69, 0xC3, 0x04, 0x00, 0x00, 0x00, 0xF4]),
+                "regs_initial": {3: 3},
+                "regs_expected": {0: 12, 3: 3},
+                "flags_expected": {"CF": 0, "OF": 0},
+                "eflags_initial": 0x803,   # CF and OF start SET
+                "expected_eip": 7,
+            },
+            {
+                "name": "IMUL Gv,Ev,Ib (0x6B): CF/OF set when the product does not fit",
+                # IMUL EAX, EBX, 0x40 ; HLT   with EBX = 0x04000000
+                "code": bytes([0x6B, 0xC3, 0x40, 0xF4]),
+                "regs_initial": {3: 0x04000000},
+                "regs_expected": {0: 0, 3: 0x04000000},
+                "flags_expected": {"CF": 1, "OF": 1},
+                "eflags_initial": 0,
+                "expected_eip": 4,
+            },
+            {
+                "name": "IMUL Gv,Ev,Ib (0x6B): a negative immediate is signed",
+                # IMUL EAX, EBX, -2 ; HLT   with EBX = 5 -> -10, no overflow.
+                # A zero-extended immediate would give 5 * 0xFE = 1270.
+                "code": bytes([0x6B, 0xC3, 0xFE, 0xF4]),
+                "regs_initial": {3: 5},
+                "regs_expected": {0: (-10) & 0xFFFFFFFF, 3: 5},
+                "flags_expected": {"CF": 0, "OF": 0},
+                "eflags_initial": 0x803,
+                "expected_eip": 4,
+            },
+            {
+                "name": "IMUL Gv,Ev,Ib (0x6B): 16-bit overflow is judged at 16 bits",
+                # IMUL AX, BX, 0x40 ; HLT   BX = 0x1234 -> 0x48D00, AX = 0x8D00.
+                # The 32-bit test would see no overflow at all.
+                "code": bytes([0x6B, 0xC3, 0x40, 0xF4]),
+                "mode": 16,
+                "regs_initial": {3: 0x1234, 0: 0},
+                "regs_expected": {0: 0x8D00, 3: 0x1234},
+                "flags_expected": {"CF": 1, "OF": 1},
+                "eflags_initial": 0,
+                "expected_eip": 4,
+            },
+            {
+                "name": "IMUL Gv,Ev,Iv (0x69): 16-bit immediate is sign-extended",
+                # IMUL AX, BX, -2 ; HLT   BX = 5 -> -10 in AX, no overflow.
+                "code": bytes([0x69, 0xC3, 0xFE, 0xFF, 0xF4]),
+                "mode": 16,
+                "regs_initial": {3: 5, 0: 0},
+                "regs_expected": {0: 0xFFF6, 3: 5},
+                "flags_expected": {"CF": 0, "OF": 0},
+                "eflags_initial": 0x803,
+                "expected_eip": 5,
+            },
+
+            # ---------------------------------------------------------------
+            # Slots that used to reach .exit_loop and END THE RUN.
+            # ---------------------------------------------------------------
+            {
+                "name": "WAIT (0x9B) is a no-op with no coprocessor fitted",
+                "code": bytes([0x9B, 0xF4]),
+                "regs_initial": {0: 0x1234},
+                "regs_expected": {0: 0x1234},
+                "expected_eip": 2,
+            },
+            {
+                "name": "INT1/ICEBP (0xF1) vectors through IVT entry 1",
+                # Vector 1 -> IVT offset 4. Handler at 0000:3000 HLTs.
+                "code": bytes([0xF1, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x0000},
+                "regs_initial": {4: 0x3800},
+                "ram_setup": [(0x04, bytes([0x00, 0x30, 0x00, 0x00])),
+                              (0x3000, bytes([0xF4]))],
+                "regs_expected": {},
+                "expected_eip": 0x3001,
+            },
+            {
+                "name": "BOUND (0x62): an in-range index falls through",
+                # BOUND AX, [0x400] ; HLT   bounds 10..100, AX = 50
+                "code": bytes([0x62, 0x06, 0x00, 0x04, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x0000},
+                "ram_setup": [(0x400, (10).to_bytes(2, "little")
+                                      + (100).to_bytes(2, "little"))],
+                "regs_initial": {0: 50, 4: 0x3800},
+                "regs_expected": {0: 50},
+                "expected_eip": 5,
+            },
+            {
+                "name": "BOUND (0x62): the range is INCLUSIVE at the upper bound",
+                # AX == upper must NOT fire; this is the BLE-vs-BLT distinction.
+                "code": bytes([0x62, 0x06, 0x00, 0x04, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x0000},
+                "ram_setup": [(0x400, (10).to_bytes(2, "little")
+                                      + (100).to_bytes(2, "little")),
+                              (0x14, bytes([0x00, 0x30, 0x00, 0x00])),
+                              (0x3000, bytes([0xF4]))],
+                "regs_initial": {0: 100, 4: 0x3800},
+                "regs_expected": {0: 100},
+                "expected_eip": 5,
+            },
+            {
+                "name": "BOUND (0x62): an index below the lower bound raises #BR",
+                # Vector 5 -> IVT offset 0x14. Handler at 0000:3000.
+                "code": bytes([0x62, 0x06, 0x00, 0x04, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x0000},
+                "ram_setup": [(0x400, (10).to_bytes(2, "little")
+                                      + (100).to_bytes(2, "little")),
+                              (0x14, bytes([0x00, 0x30, 0x00, 0x00])),
+                              (0x3000, bytes([0xF4]))],
+                "regs_initial": {0: 5, 4: 0x3800},
+                "regs_expected": {},
+                "expected_eip": 0x3001,
+            },
+            {
+                "name": "BOUND (0x62): an index above the upper bound raises #BR",
+                "code": bytes([0x62, 0x06, 0x00, 0x04, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x0000},
+                "ram_setup": [(0x400, (10).to_bytes(2, "little")
+                                      + (100).to_bytes(2, "little")),
+                              (0x14, bytes([0x00, 0x30, 0x00, 0x00])),
+                              (0x3000, bytes([0xF4]))],
+                "regs_initial": {0: 200, 4: 0x3800},
+                "regs_expected": {},
+                "expected_eip": 0x3001,
+            },
+            {
+                "name": "BOUND (0x62): the comparison is SIGNED",
+                # bounds -10..10, AX = -5 -> in range. Compared unsigned,
+                # 0xFFFB is far above 10 and the case would vector to #BR.
+                "code": bytes([0x62, 0x06, 0x00, 0x04, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x0000},
+                "ram_setup": [(0x400, (-10 & 0xFFFF).to_bytes(2, "little")
+                                      + (10).to_bytes(2, "little")),
+                              (0x14, bytes([0x00, 0x30, 0x00, 0x00])),
+                              (0x3000, bytes([0xF4]))],
+                "regs_initial": {0: 0xFFFB, 4: 0x3800},
+                "regs_expected": {0: 0xFFFB},
+                "expected_eip": 5,
+            },
+            {
+                "name": "BOUND (0x62): mod=11 has no encoding and stays #UD",
+                # 62 C3 -> register form; the handler must refuse it.
+                "code": bytes([0x62, 0xC3, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x0000},
+                "regs_initial": {4: 0x3800},
+                "regs_expected": {},
+                "expected_eip": 2,
+                "expected_exit_reason": 4,
+            },
         ])
 
         all_passed = True

@@ -1,3 +1,15 @@
+/* Aliases for handlers added in this file's lane. The shared alias block in
+   cpu_exec_handlers_0f.S is emitted immediately before this include in BOTH
+   passes, so a .set here lands in exactly the same per-pass context; keeping
+   these beside the table they serve avoids editing another lane's file. */
+#ifdef USE_16_BIT
+.set .op_int1_F1, .op_int1_F1_16
+.set .op_bound_62, .op_bound_62_16
+#else
+.set .op_int1_F1, .op_int1_F1_32
+.set .op_bound_62, .op_bound_62_32
+#endif
+
     .align 2
     .word .op_alu_eb_gb + 1 // 0x0
     .word .op_alu_ev_gv + 1 // 0x1
@@ -97,7 +109,7 @@
     .word .op_pop_r32 + 1 // 0x5f
     .word .op_pusha_60 + 1 // 0x60
     .word .op_popa_61 + 1 // 0x61
-    .word .exit_loop + 1 // 0x62
+    .word .op_bound_62 + 1 // 0x62
     .word .exit_loop + 1 // 0x63
     .word .op_seg_fs_64 + 1 // 0x64
     .word .op_seg_gs_65 + 1 // 0x65
@@ -154,7 +166,7 @@
     .word .op_cwde_98 + 1 // 0x98
     .word .op_cdq_99 + 1 // 0x99
     .word .op_call_far_9A + 1 // 0x9a
-    .word .exit_loop + 1 // 0x9b
+    .word .op_wait_9B + 1 // 0x9b
     .word .op_pushfd_9C + 1 // 0x9c
     .word .op_popfd_9D + 1 // 0x9d
     .word .op_sahf_9E + 1 // 0x9e
@@ -240,7 +252,7 @@
     .word .op_out_dx_al_EE + 1 // 0xee
     .word .op_out_dx_eax_EF + 1 // 0xef
     .word .op_lock_F0 + 1 // 0xf0
-    .word .exit_loop + 1 // 0xf1
+    .word .op_int1_F1 + 1 // 0xf1
     .word .op_repne_F2 + 1 // 0xf2
     .word .op_rep_F3 + 1 // 0xf3
     .word .op_hlt_F4 + 1 // 0xf4
