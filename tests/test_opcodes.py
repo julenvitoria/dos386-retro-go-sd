@@ -3473,6 +3473,196 @@ def run_test(args):
                 "regs_expected": {0: 0x00000400, 2: 0},
                 "expected_eip": 3,
             },
+
+            # ---- 0F A0/A1/A8/A9 PUSH/POP FS,GS ------------------------------
+            # EPIC_PINBALL's literal wall: it stopped at 443,391 instructions
+            # with exit_info=0x0FA0. The stack slot is operand-size wide but a
+            # selector is only ever 16 bits, so the pushed value is
+            # zero-extended and the popped one truncated.
+            {
+                "name": "0F A0: PUSH FS pushes the selector zero-extended",
+                # PUSH FS ; POP EBX ; HLT     ESP=0x1000, SS.base=0
+                "code": bytes([0x0F, 0xA0, 0x5B, 0xF4]),
+                "sels_initial": {"FS": 0x1234},
+                "regs_initial": {4: 0x1000},
+                "regs_expected": {3: 0x00001234, 4: 0x1000},
+                # the high half of the dword slot must be CLEAR, not garbage
+                "mem_expected": [(0xFFC, bytes([0x34, 0x12, 0x00, 0x00]))],
+                "expected_eip": 4,
+            },
+            {
+                "name": "O16: PUSH GS moves SP by 2 and goes through SS.base",
+                # PUSH GS ; HLT     SP=0x100, SS.base=0x2000
+                "code": bytes([0x0F, 0xA8, 0xF4]),
+                "mode": 16,
+                "segs_initial": {"SS": 0x2000},
+                "sels_initial": {"GS": 0xBEEF},
+                "regs_initial": {4: 0x100},
+                "regs_expected": {4: 0xFE},
+                # exactly two bytes: the word below must stay clear, or the
+                # push moved SP by four.
+                "mem_expected": [(0x20FC, bytes([0x00, 0x00, 0xEF, 0xBE]))],
+                "expected_eip": 3,
+            },
+            {
+                "name": "0F A1: POP FS installs the selector AND its base",
+                # POP FS ; MOV AX,FS ; MOV EBX,FS:[0x100] ; HLT
+                # selector 0x0020 -> base 0x200, so FS:[0x100] is linear 0x300.
+                "code": bytes([0x0F, 0xA1,
+                               0x8C, 0xE0,
+                               0x64, 0x8B, 0x1D, 0x00, 0x01, 0x00, 0x00,
+                               0xF4]),
+                "ram_setup": [(0x800, bytes([0x20, 0x00, 0x00, 0x00])),
+                              (0x300, bytes([0xEF, 0xBE, 0xAD, 0xDE]))],
+                "regs_initial": {4: 0x800},
+                "regs_expected": {0: 0x0020, 3: 0xDEADBEEF, 4: 0x804},
+                "expected_eip": 12,
+            },
+            {
+                "name": "O16: POP GS pops a WORD and installs the base",
+                # POP GS ; MOV AX,GS ; MOV BX,GS:[0x100] ; HLT
+                # selector 0x0030 -> base 0x300, so GS:[0x100] is linear 0x400.
+                # A 4-byte pop leaves SP at 0x804 and reads the wrong selector.
+                "code": bytes([0x0F, 0xA9,
+                               0x8C, 0xE8,
+                               0x65, 0x8B, 0x1E, 0x00, 0x01,
+                               0xF4]),
+                "mode": 16,
+                "ram_setup": [(0x800, bytes([0x30, 0x00])),
+                              (0x400, bytes([0x34, 0x12]))],
+                "regs_initial": {4: 0x800},
+                "regs_expected": {0: 0x0030, 3: 0x1234, 4: 0x802},
+                "expected_eip": 10,
+            },
+
+            # ---- 0F B2/B4/B5 LSS/LFS/LGS ------------------------------------
+            # LES/LDS with a different segment index. The offset follows the
+            # OPERAND size and the selector is always the 16 bits above it.
+            {
+                "name": "0F B4: LFS loads Gv and FS from one far pointer",
+                # LFS EBX,[0x300] ; MOV EAX,FS:[0x100] ; HLT
+                # [0x300] = 11223344 / selector 0x0040 -> base 0x400,
+                # so FS:[0x100] is linear 0x500.
+                "code": bytes([0x0F, 0xB4, 0x1D, 0x00, 0x03, 0x00, 0x00,
+                               0x64, 0xA1, 0x00, 0x01, 0x00, 0x00,
+                               0xF4]),
+                "ram_setup": [(0x300, bytes([0x44, 0x33, 0x22, 0x11,
+                                             0x40, 0x00])),
+                              (0x500, bytes([0xCA, 0xFE, 0xBA, 0xBE]))],
+                "regs_initial": {},
+                "regs_expected": {3: 0x11223344, 0: 0xBEBAFECA},
+                "expected_eip": 14,
+            },
+            {
+                "name": "O16: LGS takes a WORD offset, selector at +2",
+                # LGS BX,[0x300] ; MOV CX,GS:[0x100] ; HLT
+                # [0x300] = 3344 / selector 0x0050 -> base 0x500, so GS:[0x100]
+                # is linear 0x600. At 32-bit width the offset would be a dword
+                # and the selector would come from +4 instead.
+                "code": bytes([0x0F, 0xB5, 0x1E, 0x00, 0x03,
+                               0x65, 0x8B, 0x0E, 0x00, 0x01,
+                               0xF4]),
+                "mode": 16,
+                "ram_setup": [(0x300, bytes([0x44, 0x33, 0x50, 0x00])),
+                              (0x600, bytes([0x78, 0x56]))],
+                "regs_initial": {},
+                "regs_expected": {3: 0x3344, 1: 0x5678},
+                "expected_eip": 11,
+            },
+            {
+                "name": "O16: LSS switches SS:SP, and the next PUSH proves it",
+                # MOV AX,0x1234 ; LSS SP,[0x300] ; PUSH AX ; HLT
+                # [0x300] = 0800 / selector 0x0060 -> SS.base 0x600, SP 0x800,
+                # so the push lands at linear 0x600 + 0x7FE = 0xDFE.
+                "code": bytes([0xB8, 0x34, 0x12,
+                               0x0F, 0xB2, 0x26, 0x00, 0x03,
+                               0x50,
+                               0xF4]),
+                "mode": 16,
+                "ram_setup": [(0x300, bytes([0x00, 0x08, 0x60, 0x00]))],
+                "regs_initial": {4: 0},
+                "regs_expected": {0: 0x1234, 4: 0x07FE},
+                "mem_expected": [(0xDFE, bytes([0x34, 0x12]))],
+                "expected_eip": 10,
+            },
+            {
+                "name": "LSS/LFS/LGS refuse a register source (#UD)",
+                # 0F B4 C3 -- mod=11. LES/LDS reject this and so must these.
+                "code": bytes([0x0F, 0xB4, 0xC3, 0xF4]),
+                "regs_initial": {},
+                "regs_expected": {},
+                "expected_exit_reason": 4,
+                "expected_eip": 3,
+            },
+
+            # ---- 0F AF IMUL: CF/OF say the discarded half mattered ----------
+            # Software multiplies and then branches on JC/JO. The same gap
+            # remains in the one-byte 69/6B forms, which live in another file.
+            {
+                "name": "0F AF: no overflow CLEARS CF and OF",
+                "code": bytes([0x0F, 0xAF, 0xC3, 0xF4]),   # IMUL EAX,EBX
+                "eflags_initial": (1 << 0) | (1 << 11),    # both set going in
+                "regs_initial": {0: 3, 3: 5},
+                "regs_expected": {0: 15},
+                "flags_expected": {"CF": 0, "OF": 0},
+                "expected_eip": 4,
+            },
+            {
+                "name": "0F AF: a product that does not fit SETS CF and OF",
+                # 0x10000 * 0x10000 = 2^32: the destination keeps 0, and only
+                # CF/OF say the answer was thrown away.
+                "code": bytes([0x0F, 0xAF, 0xC3, 0xF4]),
+                "regs_initial": {0: 0x00010000, 3: 0x00010000},
+                "regs_expected": {0: 0},
+                "flags_expected": {"CF": 1, "OF": 1},
+                "expected_eip": 4,
+            },
+            {
+                "name": "0F AF: a NEGATIVE product that fits leaves CF/OF clear",
+                # -3 * 5 = -15. A `high half != 0` test calls this an overflow;
+                # the correct test is that the high half is the sign extension.
+                "code": bytes([0x0F, 0xAF, 0xC3, 0xF4]),
+                "eflags_initial": (1 << 0) | (1 << 11),
+                "regs_initial": {0: 0xFFFFFFFD, 3: 5},
+                "regs_expected": {0: 0xFFFFFFF1},
+                "flags_expected": {"CF": 0, "OF": 0},
+                "expected_eip": 4,
+            },
+            {
+                "name": "O16: 0F AF overflows at SIXTEEN bits, not thirty-two",
+                # 0x100 * 0x100 = 0x10000, which fits a dword and does not fit
+                # AX. A 32-bit overflow test reports no overflow here.
+                "code": bytes([0x0F, 0xAF, 0xC3, 0xF4]),
+                "mode": 16,
+                "regs_initial": {0: 0x0100, 3: 0x0100},
+                "regs_expected": {0: 0},
+                "flags_expected": {"CF": 1, "OF": 1},
+                "expected_eip": 4,
+            },
+            {
+                "name": "O16: 0F AF signs its operands before testing overflow",
+                # -1 * 2 = -2, no overflow. The operands arrive ZERO-extended
+                # from LDREG_V, so an unsigned test computes 0xFFFF*2 = 0x1FFFE
+                # and reports an overflow that is not there.
+                "code": bytes([0x0F, 0xAF, 0xC3, 0xF4]),
+                "eflags_initial": (1 << 0) | (1 << 11),
+                "mode": 16,
+                "regs_initial": {0: 0xAAAAFFFF, 3: 2},
+                "regs_expected": {0: 0xAAAAFFFE},
+                "flags_expected": {"CF": 0, "OF": 0},
+                "expected_eip": 4,
+            },
+            {
+                "name": "0F AF: the memory form sets the flags too",
+                # IMUL EAX,[0x300] ; HLT
+                "code": bytes([0x0F, 0xAF, 0x05, 0x00, 0x03, 0x00, 0x00,
+                               0xF4]),
+                "ram_setup": [(0x300, bytes([0x00, 0x00, 0x01, 0x00]))],
+                "regs_initial": {0: 0x00010000},
+                "regs_expected": {0: 0},
+                "flags_expected": {"CF": 1, "OF": 1},
+                "expected_eip": 8,
+            },
         ])
 
         all_passed = True

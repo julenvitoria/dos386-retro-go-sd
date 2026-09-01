@@ -159,16 +159,16 @@
     .word .op_0f_setcc + 1 // 0x9d
     .word .op_0f_setcc + 1 // 0x9e
     .word .op_0f_setcc + 1 // 0x9f
-    .word .exit_loop + 1 // 0xa0
-    .word .exit_loop + 1 // 0xa1
+    .word .op_0f_push_fs_A0 + 1 // 0xa0
+    .word .op_0f_pop_fs_A1 + 1 // 0xa1
     .word .op_0f_cpuid_A2 + 1 // 0xa2
     .word .exit_loop + 1 // 0xa3
     .word .exit_loop + 1 // 0xa4
     .word .exit_loop + 1 // 0xa5
     .word .exit_loop + 1 // 0xa6
     .word .exit_loop + 1 // 0xa7
-    .word .exit_loop + 1 // 0xa8
-    .word .exit_loop + 1 // 0xa9
+    .word .op_0f_push_gs_A8 + 1 // 0xa8
+    .word .op_0f_pop_gs_A9 + 1 // 0xa9
     .word .exit_loop + 1 // 0xaa
     .word .exit_loop + 1 // 0xab
     .word .exit_loop + 1 // 0xac
@@ -177,10 +177,10 @@
     .word .op_0f_imul_AF + 1 // 0xaf
     .word .exit_loop + 1 // 0xb0
     .word .exit_loop + 1 // 0xb1
-    .word .exit_loop + 1 // 0xb2
+    .word .op_0f_lss_B2 + 1 // 0xb2
     .word .exit_loop + 1 // 0xb3
-    .word .exit_loop + 1 // 0xb4
-    .word .exit_loop + 1 // 0xb5
+    .word .op_0f_lfs_B4 + 1 // 0xb4
+    .word .op_0f_lgs_B5 + 1 // 0xb5
     .word .op_0f_movzx_gv_eb + 1 // 0xb6
     .word .op_0f_movzx_gv_ew + 1 // 0xb7
     .word .exit_loop + 1 // 0xb8
