@@ -16,7 +16,8 @@ the ones a mantissa normalisation actually produces.
 
 So this fuzzes the instructions such an emulator lives on -- the Grp2 shifts
 and rotates by 1/imm8/CL, the Grp3 multiply and divide, the carry-consuming
-add/subtract and the decimal/sign-extension helpers -- over RANDOM operands,
+add/subtract, the decimal/sign-extension helpers and the 0F bit and
+double-shift set (BT/BTS/BTR/BTC, BSF/BSR, SHLD/SHRD) -- over RANDOM operands,
 and compares registers and flags against Unicorn instruction by instruction.
 
 ## What it does NOT compare, and why
@@ -202,13 +203,23 @@ def gen_misc(rng):
         b = rng.randrange(256)
         return Case("AAD %d" % b, bytes([0xD5, b]), regs, 0, PF | ZF | SF)
     if which == 4:
+        # SHLD/SHRD Ew,Gw. The count is capped at the OPERAND SIZE: above it the
+        # destination is architecturally undefined, and our core follows
+        # dosbox-x's DSHLW/DSHRW there while Unicorn follows QEMU's. Grading
+        # that would be grading two legal answers against each other.
         d, s = rng.randrange(8), rng.randrange(8)
-        n = rng.randrange(0, 40)
-        opc = rng.choice((0xA4, 0xAC))
-        return Case("%s %s,%s,%d" % ("SHLD" if opc == 0xA4 else "SHRD",
-                                     REG16[d], REG16[s], n),
-                    bytes([0x0F, opc, 0xC0 | (s << 3) | d, n]), regs,
-                    0, (CF | PF | ZF | SF) if (n & 31) else 0)
+        n = rng.randrange(0, 17)
+        opc = rng.choice((0xA4, 0xAC, 0xA5, 0xAD))
+        cl = opc in (0xA5, 0xAD)
+        if cl:
+            regs[1] = (regs[1] & 0xFF00) | n
+            code = bytes([0x0F, opc, 0xC0 | (s << 3) | d])
+        else:
+            code = bytes([0x0F, opc, 0xC0 | (s << 3) | d, n])
+        return Case("%s %s,%s,%s" % ("SHLD" if opc in (0xA4, 0xA5) else "SHRD",
+                                     REG16[d], REG16[s],
+                                     "CL=%d" % n if cl else str(n)),
+                    code, regs, 0, (CF | PF | ZF | SF) if (n & 31) else 0)
     r = rng.randrange(8)
     inc = rng.random() < 0.5
     return Case("%s %s" % ("INC" if inc else "DEC", REG16[r]),
@@ -216,7 +227,36 @@ def gen_misc(rng):
                 rng.randrange(2) * CF, PF | ZF | SF | OF | AF)
 
 
-GROUPS = {"grp2": gen_grp2, "grp3": gen_grp3, "alu": gen_alu, "misc": gen_misc}
+def gen_bits(rng):
+    """0F A3/AB/B3/BB BT/BTS/BTR/BTC and 0F BC/BD BSF/BSR, register forms.
+
+    The bit-string offset is deliberately drawn from the FULL signed 16-bit
+    range, not from 0..15: the register form is defined to take it modulo the
+    operand size, and an implementation that instead treats it as an unmasked
+    shift agrees for the small offsets and disagrees for everything else."""
+    regs = {i: rnd16(rng) for i in range(8)}
+    if rng.random() < 0.6:
+        opc, nm = rng.choice(((0xA3, "BT"), (0xAB, "BTS"),
+                              (0xB3, "BTR"), (0xBB, "BTC")))
+        d, s = rng.randrange(8), rng.randrange(8)
+        if d != s:
+            regs[s] = rng.choice((rng.randrange(0x10000), rng.randrange(16)))
+        code = bytes([0x0F, opc, 0xC0 | (s << 3) | d])
+        # Only CF is architecturally defined for the whole group.
+        return Case("%s %s,%s" % (nm, REG16[d], REG16[s]), code, regs,
+                    rng.randrange(2) * CF, CF)
+    opc, nm = rng.choice(((0xBC, "BSF"), (0xBD, "BSR")))
+    d, s = rng.randrange(8), rng.randrange(8)
+    if rng.random() < 0.15:
+        regs[s] = 0                                        # the ZF case
+    code = bytes([0x0F, opc, 0xC0 | (d << 3) | s])
+    # Only ZF is defined; the destination on a zero source is not, and Unicorn
+    # leaves it alone exactly as we do, so the register comparison still holds.
+    return Case("%s %s,%s" % (nm, REG16[d], REG16[s]), code, regs, 0, ZF)
+
+
+GROUPS = {"grp2": gen_grp2, "grp3": gen_grp3, "alu": gen_alu, "misc": gen_misc,
+          "bits": gen_bits}
 
 
 def unicorn_run(case):
@@ -313,9 +353,8 @@ def main():
                 break
 
             # An opcode with no handler exits with X86_EXIT_UNIMPLEMENTED and
-            # leaves the registers alone. That is a LOUD, known gap (SHLD/SHRD
-            # are still `.exit_loop` in opcode_0f_table.S), not a wrong answer,
-            # so it is reported as a gap rather than graded as a disagreement --
+            # leaves the registers alone. That is a LOUD, known gap, not a
+            # wrong answer, so it is reported as a gap rather than graded --
             # otherwise the one real arithmetic bug drowns in 40 of these.
             if b.read_uint32(dtcm + EXIT_REASON_OFFSET) == 4:
                 unimpl.add(case.name.split()[0])

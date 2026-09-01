@@ -3448,6 +3448,266 @@ def run_test(args):
                 "flags_expected": {"CF": 0},
                 "expected_eip": 9,
             },
+            # ---- 0F A3/AB/B3/BB BT/BTS/BTR/BTC, register-source ------------
+            # The bit STRING forms. Unlike 0F BA the offset is a SIGNED Gv that
+            # is NOT masked to the operand width in the memory form: the
+            # addressed operand MOVES by floor(offset/32)*4 and only the low
+            # five bits pick the bit inside it. The register form is the one
+            # that masks, because there is no address to move.
+            {
+                "name": "BT Ev,Gv (0F A3): register form, CF from the bit",
+                "code": bytes([0x0F, 0xA3, 0xD8, 0xF4]),   # BT EAX,EBX
+                "regs_initial": {0: 0x00000020, 3: 5},
+                "regs_expected": {0: 0x00000020, 3: 5},
+                "flags_expected": {"CF": 1},
+                "expected_eip": 4,
+            },
+            {
+                # 37 & 31 == 5. The register form takes the offset MODULO the
+                # operand size; shifting by 37 outright reads zero.
+                "name": "BT Ev,Gv: the register form masks the offset to 32",
+                "code": bytes([0x0F, 0xA3, 0xD8, 0xF4]),
+                "regs_initial": {0: 0x00000020, 3: 37},
+                "regs_expected": {0: 0x00000020, 3: 37},
+                "flags_expected": {"CF": 1},
+                "expected_eip": 4,
+            },
+            {
+                "name": "BTS Ev,Gv (0F AB): register form sets the bit",
+                "code": bytes([0x0F, 0xAB, 0xD8, 0xF4]),   # BTS EAX,EBX
+                "regs_initial": {0: 0x00000001, 3: 5},
+                "regs_expected": {0: 0x00000021, 3: 5},
+                "flags_expected": {"CF": 0},
+                "expected_eip": 4,
+            },
+            {
+                "name": "BTR Ev,Gv (0F B3): register form clears the bit",
+                "code": bytes([0x0F, 0xB3, 0xD8, 0xF4]),   # BTR EAX,EBX
+                "regs_initial": {0: 0x000000FF, 3: 5},
+                "regs_expected": {0: 0x000000DF, 3: 5},
+                "flags_expected": {"CF": 1},
+                "expected_eip": 4,
+            },
+            {
+                "name": "BTC Ev,Gv (0F BB): register form toggles the bit",
+                "code": bytes([0x0F, 0xBB, 0xD8, 0xF4]),   # BTC EAX,EBX
+                "regs_initial": {0: 0x00000000, 3: 5},
+                "regs_expected": {0: 0x00000020, 3: 5},
+                "flags_expected": {"CF": 0},
+                "expected_eip": 4,
+            },
+            {
+                # THE TRAP. Offset 40 is in the SECOND dword above the EA, at
+                # bit 8 of it. An implementation that masks the offset to 32 --
+                # the 0F BA rule -- reads bit 8 of the FIRST dword instead and
+                # reports CF=0 while writing the wrong word.
+                "name": "BTS mem,Gv: a large offset moves the addressed dword",
+                # BTS DWORD [0x0300],EBX ; HLT     EBX = 40
+                "code": bytes([0x0F, 0xAB, 0x1D, 0x00, 0x03, 0x00, 0x00, 0xF4]),
+                "ram_setup": [(0x300, bytes(4) + (0x00000100).to_bytes(4, "little"))],
+                "mem_expected": [(0x300, bytes(4) + (0x00000100).to_bytes(4, "little"))],
+                "regs_initial": {3: 40},
+                "regs_expected": {3: 40},
+                "flags_expected": {"CF": 1},
+                "expected_eip": 8,
+            },
+            {
+                # ...and the same offset with the bit CLEAR must write it into
+                # the second dword, not the first.
+                "name": "BTS mem,Gv: the write-back lands in the moved dword",
+                "code": bytes([0x0F, 0xAB, 0x1D, 0x00, 0x03, 0x00, 0x00, 0xF4]),
+                "ram_setup": [(0x300, bytes(8))],
+                "mem_expected": [(0x300, bytes(4) + (0x00000100).to_bytes(4, "little"))],
+                "regs_initial": {3: 40},
+                "regs_expected": {3: 40},
+                "flags_expected": {"CF": 0},
+                "expected_eip": 8,
+            },
+            {
+                # A NEGATIVE offset walks BACKWARDS: -32 is the dword one below
+                # the EA. A logical shift instead of an arithmetic one puts the
+                # access 0x1FFFFFF dwords away and corrupts something else.
+                "name": "BTR mem,Gv: a negative offset addresses BELOW the EA",
+                # BTR DWORD [0x0304],EBX ; HLT     EBX = -32
+                "code": bytes([0x0F, 0xB3, 0x1D, 0x04, 0x03, 0x00, 0x00, 0xF4]),
+                "ram_setup": [(0x300, (0x000000FF).to_bytes(4, "little") + bytes(4))],
+                "mem_expected": [(0x300, (0x000000FE).to_bytes(4, "little") + bytes(4))],
+                "regs_initial": {3: 0xFFFFFFE0},
+                "regs_expected": {3: 0xFFFFFFE0},
+                "flags_expected": {"CF": 1},
+                "expected_eip": 8,
+            },
+            {
+                # 16-bit operand size: the granule is a WORD, so offset 20 is
+                # word 1, bit 4. A handler that is silently 32-bit in both
+                # passes lands on dword 0 bit 20 instead.
+                "name": "BT mem,Gv at 16 bits: the granule is a word, not a dword",
+                # BT WORD [0x0300],BX ; HLT        BX = 20
+                "code": bytes([0x0F, 0xA3, 0x1E, 0x00, 0x03, 0xF4]),
+                "mode": 16,
+                "ram_setup": [(0x300, bytes([0x00, 0x00, 0x10, 0x00]))],
+                "regs_initial": {3: 20},
+                "regs_expected": {3: 20},
+                "flags_expected": {"CF": 1},
+                "expected_eip": 6,
+            },
+
+            # ---- 0F BC/BD BSF/BSR ------------------------------------------
+            {
+                "name": "BSF Gv,Ev (0F BC): index of the lowest set bit",
+                "code": bytes([0x0F, 0xBC, 0xC3, 0xF4]),   # BSF EAX,EBX
+                "regs_initial": {0: 0xDEADBEEF, 3: 0x00000180},
+                "regs_expected": {0: 7, 3: 0x00000180},
+                "flags_expected": {"ZF": 0},
+                "expected_eip": 4,
+            },
+            {
+                "name": "BSR Gv,Ev (0F BD): index of the highest set bit",
+                "code": bytes([0x0F, 0xBD, 0xC3, 0xF4]),   # BSR EAX,EBX
+                "regs_initial": {0: 0xDEADBEEF, 3: 0x00000180},
+                "regs_expected": {0: 8, 3: 0x00000180},
+                "flags_expected": {"ZF": 0},
+                "expected_eip": 4,
+            },
+            {
+                # A zero source sets ZF and leaves the DESTINATION ALONE, which
+                # is what both references do and what a guest that pre-seeds it
+                # relies on. Writing 32 or 0 there would pass a ZF-only test and
+                # still be wrong.
+                "name": "BSF: a zero source sets ZF and does not write Gv",
+                "code": bytes([0x0F, 0xBC, 0xC3, 0xF4]),
+                "regs_initial": {0: 0x12345678, 3: 0},
+                "regs_expected": {0: 0x12345678, 3: 0},
+                "flags_expected": {"ZF": 1},
+                "expected_eip": 4,
+            },
+            {
+                "name": "BSR: a zero source sets ZF and does not write Gv",
+                "code": bytes([0x0F, 0xBD, 0xC3, 0xF4]),
+                "regs_initial": {0: 0x12345678, 3: 0},
+                "regs_expected": {0: 0x12345678, 3: 0},
+                "flags_expected": {"ZF": 1},
+                "expected_eip": 4,
+            },
+            {
+                "name": "BSR: bit 31 is reachable",
+                "code": bytes([0x0F, 0xBD, 0xC3, 0xF4]),
+                "regs_initial": {0: 0, 3: 0x80000000},
+                "regs_expected": {0: 31, 3: 0x80000000},
+                "flags_expected": {"ZF": 0},
+                "expected_eip": 4,
+            },
+            {
+                # 16 bits: LD_V zero-extends, so CLZ lands in 16..31 and the
+                # 31-CLZ has to still come out as the index within the word.
+                "name": "BSR at 16 bits: bit 15 is the top, not bit 31",
+                "code": bytes([0x0F, 0xBD, 0xC3, 0xF4]),   # BSR AX,BX
+                "mode": 16,
+                "regs_initial": {0: 0, 3: 0x00008000},
+                "regs_expected": {0: 15, 3: 0x00008000},
+                "flags_expected": {"ZF": 0},
+                "expected_eip": 4,
+            },
+            {
+                "name": "BSF Gv,Ev: memory source",
+                # BSF EAX,[0x0300] ; HLT
+                "code": bytes([0x0F, 0xBC, 0x05, 0x00, 0x03, 0x00, 0x00, 0xF4]),
+                "ram_setup": [(0x300, (0x00010000).to_bytes(4, "little"))],
+                "regs_initial": {0: 0},
+                "regs_expected": {0: 16},
+                "flags_expected": {"ZF": 0},
+                "expected_eip": 8,
+            },
+
+            # ---- 0F A4/A5 SHLD, 0F AC/AD SHRD ------------------------------
+            {
+                "name": "SHLD Ev,Gv,imm8 (0F A4): the shifted-in bits come from Gv",
+                # SHLD EAX,EBX,4 ; HLT
+                "code": bytes([0x0F, 0xA4, 0xD8, 0x04, 0xF4]),
+                "regs_initial": {0: 0x12345678, 3: 0x9ABCDEF0},
+                # CF is the last bit out of the DESTINATION: bit 28 of
+                # 0x12345678, which is 1.
+                "regs_expected": {0: 0x23456789, 3: 0x9ABCDEF0},
+                "flags_expected": {"CF": 1},
+                "expected_eip": 5,
+            },
+            {
+                "name": "SHRD Ev,Gv,imm8 (0F AC): the shifted-in bits come from Gv",
+                # SHRD EAX,EBX,4 ; HLT
+                "code": bytes([0x0F, 0xAC, 0xD8, 0x04, 0xF4]),
+                "regs_initial": {0: 0x12345678, 3: 0x9ABCDEF0},
+                "regs_expected": {0: 0x01234567, 3: 0x9ABCDEF0},
+                "flags_expected": {"CF": 1},
+                "expected_eip": 5,
+            },
+            {
+                "name": "SHLD Ev,Gv,CL (0F A5): the CL form",
+                # SHLD EAX,EBX,CL ; HLT
+                "code": bytes([0x0F, 0xA5, 0xD8, 0xF4]),
+                "regs_initial": {0: 0x12345678, 3: 0x9ABCDEF0, 1: 4},
+                "regs_expected": {0: 0x23456789, 3: 0x9ABCDEF0, 1: 4},
+                "expected_eip": 4,
+            },
+            {
+                "name": "SHRD Ev,Gv,CL (0F AD): the CL form",
+                "code": bytes([0x0F, 0xAD, 0xD8, 0xF4]),
+                "regs_initial": {0: 0x12345678, 3: 0x9ABCDEF0, 1: 4},
+                "regs_expected": {0: 0x01234567, 3: 0x9ABCDEF0, 1: 4},
+                "expected_eip": 4,
+            },
+            {
+                # A count that masks to zero must leave EVERY flag alone. CF
+                # goes in set and has to come out set; the instruction still
+                # consumes its imm8.
+                "name": "SHLD with a zero count moves no flag at all",
+                # STC ; SHLD EAX,EBX,0 ; HLT
+                "code": bytes([0xF9, 0x0F, 0xA4, 0xD8, 0x00, 0xF4]),
+                "regs_initial": {0: 0x12345678, 3: 0xFFFFFFFF},
+                "regs_expected": {0: 0x12345678, 3: 0xFFFFFFFF},
+                "flags_expected": {"CF": 1, "ZF": 0, "SF": 0},
+                "expected_eip": 6,
+            },
+            {
+                "name": "SHRD with a count of 32 masks to zero and moves no flag",
+                # STC ; SHRD EAX,EBX,32 ; HLT
+                "code": bytes([0xF9, 0x0F, 0xAC, 0xD8, 0x20, 0xF4]),
+                "regs_initial": {0: 0x12345678, 3: 0xFFFFFFFF},
+                "regs_expected": {0: 0x12345678, 3: 0xFFFFFFFF},
+                "flags_expected": {"CF": 1},
+                "expected_eip": 6,
+            },
+            {
+                # THE 16-BIT TRAP. At 16 bits the pair is a 32-bit
+                # concatenation: AX gets BX's TOP four bits, not zeros and not
+                # bits out of the high half of EAX.
+                "name": "SHLD at 16 bits shifts the WORD pair, not the dword",
+                # SHLD AX,BX,4 ; HLT
+                "code": bytes([0x0F, 0xA4, 0xD8, 0x04, 0xF4]),
+                "mode": 16,
+                "regs_initial": {0: 0xAAAA1234, 3: 0xBBBB9ABC},
+                "regs_expected": {0: 0xAAAA2349, 3: 0xBBBB9ABC},
+                "expected_eip": 5,
+            },
+            {
+                "name": "SHRD at 16 bits shifts the WORD pair, not the dword",
+                # SHRD AX,BX,4 ; HLT
+                "code": bytes([0x0F, 0xAC, 0xD8, 0x04, 0xF4]),
+                "mode": 16,
+                "regs_initial": {0: 0xAAAA1234, 3: 0xBBBB9ABC},
+                "regs_expected": {0: 0xAAAAC123, 3: 0xBBBB9ABC},
+                "expected_eip": 5,
+            },
+            {
+                "name": "SHLD Ev,Gv,imm8: memory destination",
+                # SHLD DWORD [0x0300],EBX,4 ; HLT
+                "code": bytes([0x0F, 0xA4, 0x1D, 0x00, 0x03, 0x00, 0x00,
+                               0x04, 0xF4]),
+                "ram_setup": [(0x300, (0x12345678).to_bytes(4, "little"))],
+                "mem_expected": [(0x300, (0x23456789).to_bytes(4, "little"))],
+                "regs_initial": {3: 0x9ABCDEF0},
+                "regs_expected": {3: 0x9ABCDEF0},
+                "expected_eip": 9,
+            },
             {
                 "name": "BT group: /0 is an undefined encoding and stays #UD",
                 "code": bytes([0x0F, 0xBA, 0xC0, 0x05, 0xF4]),
