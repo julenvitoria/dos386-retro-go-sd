@@ -2708,14 +2708,9 @@ L(IMUL69_MEM):
     LD_V R3, R2
 L(IMUL69_DO):
     CODE_PTR R5
-    LD_V R5, R5
+    LDS_V R5, R5                   @ the immediate is SIGNED (LD_V zero-extends)
     EIP_ADV_V
-    MUL.W R3, R3, R5
-    UBFX R4, R1, #3, #3
-    MOV.W R4, R4, LSL #2
-    ADD.W R4, R4, #8
-    STREG_V R3, R4
-    B.W .fetch_decode_loop
+    B.W L(IMUL_IMM_DO)
 
 OP .op_push_imm8_6A
     CODE_PTR R5
@@ -2746,9 +2741,32 @@ L(IMUL6B_MEM):
     LD_V R3, R2
 L(IMUL6B_DO):
     CODE_PTR R5
-    LDRSB.W R5, [R5]
+    LDRSB.W R5, [R5]               @ already signed
     ADD.W R10, R10, #1
-    MUL.W R3, R3, R5
+
+/* The shared tail of 69 and 6B. CF and OF are set when the true signed product
+   does not fit the destination, and they are the POINT of the three-operand
+   IMUL: software issues JC/JO straight after it to detect overflow. Both
+   handlers wrote no flag at all, so that test always fell through the same way
+   -- a silent wrong answer in exactly the bounds/scaling code that uses it.
+   SF, ZF, AF and PF are architecturally undefined here and are left alone.
+   R1 = ModRM (it survives the decoder), R3 = Ev, R5 = the signed immediate. */
+L(IMUL_IMM_DO):
+#if NSH
+    SXTH R3, R3                    @ LD_V read Ev zero-extended
+    MUL.W R3, R3, R5               @ two signed 16-bit values: the 32-bit
+    SXTH R4, R3                    @ product is EXACT, so this test is exact
+    CMP R4, R3
+#else
+    SMULL R3, R4, R3, R5
+    ASR.W R0, R3, #31              @ the high half must be the sign extension
+    CMP R0, R4
+#endif
+    ITE EQ
+    MOVEQ R0, #0
+    MOVNE R0, #1
+    BFI R11, R0, #0, #1            @ CF
+    BFI R11, R0, #11, #1           @ OF
     UBFX R4, R1, #3, #3
     MOV.W R4, R4, LSL #2
     ADD.W R4, R4, #8
@@ -2861,9 +2879,24 @@ OP_AGNOSTIC .op_salc_D6
     STRB.W R4, [R8, #8]
     B.W .fetch_decode_loop
 
+/* D7 XLAT/XLATB: AL = DS:[BX + AL]. It used raw EBX + AL as a LINEAR address --
+   no DS base, no segment-override support, and no wrap of the index at the
+   address size. DS.base is non-zero in essentially every real-mode program, so
+   the table lookup read from the wrong place whenever the guest's DS was not
+   0, which is what every font/palette/translation table in DOS code depends on.
+   R2 is the live mode record (nothing has clobbered it) and R6 the segment
+   descriptor pointer, exactly as MOFFS_ADDR uses them. */
 OP_AGNOSTIC .op_xlat_D7
-    LDR.W R3, [R8, #20]
-    LDRB.W R4, [R8, #8]
+    LDR.W R3, [R8, #REG_EBX]
+    LDRB.W R4, [R8, #8]            @ AL
+    ADD R3, R4
+    TST.W R2, #ADDRSIZE_XOR
+    IT EQ
+    UXTHEQ R3, R3                  @ BX + AL wraps inside the segment at 16 bits
+    SUBS R4, R6, R8                @ segment override in play?
+    IT EQ
+    ADDEQ R6, R8, #SEG_DS_SEL
+    LDR.W R4, [R6, #4]
     ADD R3, R4
     UBFX R4, R3, #12, #12
     LDR.W R4, [R9, R4, LSL #2]
@@ -2872,6 +2905,64 @@ OP_AGNOSTIC .op_xlat_D7
     LDRB R4, [R4, #0]
     STRB.W R4, [R8, #8]
     B.W .fetch_decode_loop
+
+/* 9B WAIT/FWAIT. It waits for the coprocessor to finish and then takes any
+   pending unmasked FP exception. There is no coprocessor fitted (see the ESC
+   group below) so there is never a pending exception and the instruction is
+   architecturally a no-op -- but it reached .exit_loop, which ENDED THE RUN.
+   Every C runtime that emits `FNSTSW` emits a `WAIT` beside it. */
+OP_AGNOSTIC .op_wait_9B
+    B.W .fetch_decode_loop
+
+/* F1 ICEBP/INT1. Undocumented but real on every 386 and later: it raises
+   vector 1 through the IVT with no imm8 to fetch. Some packers and copy
+   protections issue it precisely because a debugger mishandles it; reaching
+   .exit_loop is the most obvious possible mishandling. */
+OP .op_int1_F1
+    MOV.W R4, #1
+    B.W L(HANDLE_INTERRUPT)
+
+/* 62 BOUND Gv,Ma. The index in Gv is compared SIGNED against a pair of bounds
+   in memory -- lower first, upper second, each operand-size wide -- and an
+   index outside the INCLUSIVE range raises #BR, vector 5. mod=11 has no
+   encoding at all and is #UD.
+   Bounds-checked Pascal and C runtimes emit it on array accesses, so reaching
+   .exit_loop ended the run on the guest's first subscript.
+   The two bounds are folded SEPARATELY rather than as one 2*OPSZ read: the
+   pair spans up to 8 bytes and a single fold is only sound inside one granule
+   (CLAUDE.md, the granule seam). */
+OP .op_bound_62
+    CODE_PTR R1
+    LDRB R1, [R1, #0]
+    ADD.W R10, R10, #1
+    CMP R1, #192                   @ mod==3 iff modrm >= 0xC0 -- no encoding
+    BHS.W .exit_loop
+    LDR.W R12, [R2, #REC_MODRM_FN] @ decoder for the ACTIVE address size
+    BLX R12
+    SEAM_CHECK R2, R7
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    MEM_TRAP_R R2
+    LDS_V R3, R2                   @ lower bound, signed
+    ADD.W R7, R7, #OPSZ
+    SEAM_CHECK R2, R7
+    UBFX R2, R7, #12, #12
+    LDR.W R2, [R9, R2, LSL #2]
+    ADDS R2, R2, R7
+    MEM_TRAP_R R2
+    LDS_V R5, R2                   @ upper bound, signed
+    UBFX R4, R1, #3, #3            @ Gv, decoded AFTER the call
+    MOV.W R4, R4, LSL #2
+    ADD.W R4, R4, #8
+    LDREG_V R0, R4
+    VSEXT(R0)                      @ LDREG_V zero-extends at 16 bits
+    CMP R0, R3
+    BLT.N 1f
+    CMP R0, R5
+    BLE.W .fetch_decode_loop       @ inside [lower, upper]: nothing happens
+1:  MOV.W R4, #5                   @ #BR
+    B.W L(HANDLE_INTERRUPT)
 
 /* D8-DF, the x87 ESCAPE group, ON A MACHINE WITH NO COPROCESSOR.
  *
