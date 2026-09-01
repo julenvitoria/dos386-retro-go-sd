@@ -324,9 +324,11 @@ L(raise_gp_fault):
  * is FLAGS, CS, IP at the operand size; IF and TF are cleared on entry so the
  * handler is not immediately re-interrupted.
  *
- * Protected mode traps out. The gate path needs descriptor validation and a
- * possible stack switch, and quietly treating a gate as an IVT entry would
- * jump somewhere plausible and fail much later.
+ * Protected mode walks an 8-byte IDT GATE -- L(INT_PMODE) below, and every
+ * instruction of it is out of line, so the real-mode arm from here down is
+ * byte-for-byte what it was. Only the branch TARGET of the CR0 test changed,
+ * which is the same move that made the descriptor walk free (docs/14 Sec.2);
+ * that test already stood here to trap protected mode out.
  *
  * R4 = vector number.
  */
@@ -340,7 +342,7 @@ L(raise_gp_fault):
 L(HANDLE_INTERRUPT):
     LDR.W R12, [R8, #CPU_CR0]
     TST.W R12, #1
-    BNE.W .exit_loop
+    BNE.W L(INT_PMODE)
 
     PUSH_V R11, R3, R12            @ FLAGS
     LDRH.W R0, [R8, #SEG_CS_SEL]
@@ -393,6 +395,58 @@ L(HANDLE_INTERRUPT):
     ADD.W R10, R0, R3
     B.W .fetch_decode_loop
 
+/* ---------------------------------------------------------------------------
+ * The PROTECTED-MODE arm. COLD and out of line, so the real-mode fall-through
+ * above keeps its straight-line layout and its exact instruction sequence.
+ *
+ * All of it is C (x86_pmode_int_gate, x86_pmode.c): eight descriptor bytes,
+ * a dozen predicates and a frame whose WIDTH comes from the gate's type rather
+ * than from the operand size -- which is precisely why PUSH_V could not build
+ * it. None of that is anything Thumb-2 would do better, and it runs once per
+ * delivered interrupt in a protected-mode guest and never at all in a
+ * real-mode one.
+ *
+ * THE STATE HANDOFF. R10 is LINEAR EIP and the frame wants the SEGMENT OFFSET,
+ * so CS.base comes off before the call and back on after; R11 is the live
+ * EFLAGS the frame carries. Both are synced through the context fields the
+ * exit path already uses, so there is one convention rather than two.
+ *
+ * Every path out of here LEAVES -- to the fetch loop or to the exit -- so
+ * nothing is pushed and LR is free to be clobbered by the BL. A fault exits
+ * with X86_EXIT_GPF carrying the error code, the way an undeliverable
+ * segmentation fault already does, and .save_state_and_exit restores SP from
+ * cpu->host_sp so the depth this was taken at does not matter (docs/14 Sec.5).
+ *
+ * R4 = vector. The interrupt is delivered as a SOFTWARE one, which is what
+ * every site that reaches here is: INT imm8, INT3, INTO, and #UD from the
+ * hypercall stub with HLE off. A hardware IRQ arrives through the same label
+ * from .handle_pit_or_irq and is treated as software too -- the ONLY thing
+ * that distinguishes them is the gate-DPL check, which cannot fire at CPL 0,
+ * and measuring whether a title ever leaves CPL 0 is the step after this one.
+ * Nothing is guessed here: if it does, this is the line to change.
+ */
+L(INT_PMODE):
+    LDR.W R3, [R8, #SEG_CS_BASE]
+    SUB.W R3, R10, R3
+    STR.W R3, [R8, #EIP_OFFSET]        @ the offset the frame must carry
+    STR.W R11, [R8, #EFLAGS_OFFSET]
+    MOV R0, R8
+    MOV R1, R4
+    MOV.W R2, #X86_INT_SOFTWARE
+    MOV.W R3, #0                       @ no error code
+    BL x86_pmode_int_gate
+    CBNZ R0, 1f
+    LDR.W R11, [R8, #EFLAGS_OFFSET]
+    LDR.W R10, [R8, #EIP_OFFSET]
+    LDR.W R3, [R8, #SEG_CS_BASE]
+    ADD.W R10, R10, R3
+    B.W .fetch_decode_loop
+1:  MOV.W R0, #X86_EXIT_GPF
+    STR.W R0, [R8, #CPU_EXIT_REASON]
+    LDR.W R0, [R8, #CPU_PMODE_ERR]
+    STR.W R0, [R8, #CPU_EXIT_INFO]
+    B.W .save_state_and_exit
+
 OP .op_iret_CF
     /* Pops IP, CS, FLAGS -- the exact inverse of the frame above. The old
        version popped 32-bit values, skipped a word, and never installed CS. */
@@ -420,6 +474,7 @@ OP .op_iret_CF
     LDR.W R3, [R8, #SEG_CS_BASE]
     ADD.W R10, R0, R3
     B.W .fetch_decode_loop
+
 /* The former L(handle_pit_or_irq) / L(exit_loop) lived here. Both were defined
    and never referenced -- the fetch loop has always branched to the versions in
    cpu_exec.S. They are deleted rather than wired up because the "real" one was

@@ -72,6 +72,33 @@ ARMS = [
     (10, "LLDT TYPE",
      "LLDT's descriptor must be type 2. Without it the LDT base can be "
      "pointed at any segment, including a code segment."),
+    # ---- the protected-mode INTERRUPT path ------------------------------
+    # Numbered ON from the walk's rather than renumbered into it, so an arm's
+    # number keeps meaning the same check across commits.
+    (11, "IDT BOUND",
+     "read_gate's `off + 7 > idtr_limit`. Without it a vector past the end "
+     "of the IDT is decoded as a gate out of whatever follows the table. The "
+     "arm places a WELL-FORMED gate one entry past the limit, so removing "
+     "the bound DELIVERS rather than merely failing somewhere else."),
+    (12, "GATE TYPE",
+     "the gate must have S=0 and be one of the four int/trap gates. Without "
+     "it a code/data descriptor -- or a TASK gate, which needs a task switch "
+     "that is not built -- is read as an int gate and its base and limit "
+     "fields are decoded as a selector and an offset."),
+    (13, "GATE PRESENT",
+     "the gate's P bit, and its #NP vector. Without it a vector the guest "
+     "has deliberately left absent is delivered to whatever the empty gate "
+     "happens to name."),
+    (14, "GATE DPL",
+     "a SOFTWARE interrupt may not reach a gate with DPL < CPL. Without it "
+     "ring 3 enters a ring-0 handler by issuing INT by hand. This is the "
+     "only arm that needs CPL != 0, and it is graded on x86_pmode_gates "
+     "rather than on an exit code -- see the note in tests/test_pmode.py."),
+    (15, "FRAME WIDTH",
+     "the frame width comes from the GATE's type, not the operand size. "
+     "Without it a 386 gate reached from a 16-bit code segment pushes six "
+     "bytes where twelve are wanted, and the handler's IRET unwinds to the "
+     "wrong place. Graded on ESP after the INT."),
 ]
 
 

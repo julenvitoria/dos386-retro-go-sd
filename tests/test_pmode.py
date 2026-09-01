@@ -63,13 +63,13 @@ def main(args):
                 return False
 
         time.sleep(0.5)
-        r = run_arm(b, syms, "run_pmode_flag", "pmode_r", 80)
+        r = run_arm(b, syms, "run_pmode_flag", "pmode_r", 128)
         if r is None:
             # A stall here is the arm hard-faulting or a guest that never
             # reaches its HLT, and "never ran" alone cannot tell those apart.
             # The partial results say HOW FAR it got, which names the arm.
             print("FAIL: target never ran the protected-mode test")
-            part = [b.read_uint32(syms["pmode_r"] + 4 * i) for i in range(80)]
+            part = [b.read_uint32(syms["pmode_r"] + 4 * i) for i in range(128)]
             last = max([i for i, v in enumerate(part) if v] or [-1])
             print(f"  last slot written: {last}")
             for n in ("x86_pmode_loads", "x86_pmode_faults"):
@@ -232,6 +232,77 @@ def main(args):
             # very same HLT and look like the success above.
             ("far JMP to a DATA selector FAULTS",   r[78], GPF),
             ("  ... error code",                    r[79], 0x08),
+
+            # ---- O. INT through a 386 INTERRUPT GATE --------------------
+            # The measured demand: Dark Forces and Mortal Kombat both stop on
+            # `INT imm8` with PE set, and this is the walk that answers it.
+            ("INT through a 386 gate ran to HLT",   r[80], HALT),
+            ("  ... CS came from the GATE",         r[81], 0x48),
+            ("  ... with the descriptor's base",    r[82], 0x30000),
+            # Gate offset 0x20; the HLT there has retired, so EIP is 0x21.
+            ("  ... EIP is the GATE's offset",      r[83], 0x21),
+            # NEGATIVE CONTROL 15. THE FRAME WIDTH IS THE GATE'S, not the
+            # operand size -- CS.D is 0 here, so a width taken from the
+            # operand size would push six bytes and leave SP at 0x7FFA.
+            ("  ... a 386 gate pushed 12 bytes",    r[84], 0x7FF4),
+            ("  ... the pushed EIP is the NEXT insn", r[85], 0x0D),
+            ("  ... and the pushed CS is the old one", r[86], 0x00),
+            ("  ... an INTERRUPT gate cleared IF",  r[87], 0),
+            ("exactly one gate walked",             r[88], 1),
+
+            # ---- P. TRAP vs INTERRUPT gate ------------------------------
+            # One bit of the gate type, and it is the whole difference. Both
+            # arms STI first, or neither number can fail.
+            ("INT through a TRAP gate ran to HLT",  r[89], HALT),
+            ("  ... and a TRAP gate KEPT IF",       r[90], 1),
+            ("the same INT through an INT gate ran", r[91], HALT),
+            ("  ... and cleared IF",                r[92], 0),
+
+            # ---- Q. a 286 gate builds a 16-bit frame --------------------
+            ("INT through a 286 gate ran to HLT",   r[93], HALT),
+            ("  ... pushed a 16-bit IP",            r[94], 0x103),
+            ("  ... and a 16-bit CS",               r[95], 0x48),
+
+            # ---- R. the gate's own refusals -----------------------------
+            # NEGATIVE CONTROL 12. Each gate below is well-formed except for
+            # the one thing tested, so removing the check DELIVERS rather
+            # than moving the fault somewhere else.
+            ("an S=1 descriptor in the IDT FAULTS", r[96], GPF),
+            ("  ... with #GP",                      r[97], EX_GP),
+            # The IDT error code is vec*8+2, NOT a selector: 0x23*8+2.
+            ("  ... error code is the IDT form",    r[98], 282),
+            # NEGATIVE CONTROL 13.
+            ("a NOT-PRESENT gate FAULTS",           r[99], GPF),
+            ("  ... with #NP, not #GP",             r[100], EX_NP),
+            ("  ... error code",                    r[101], 290),
+            # NEGATIVE CONTROL 11.
+            ("a vector past the IDT limit FAULTS",  r[102], GPF),
+            ("  ... with #GP",                      r[103], EX_GP),
+            ("  ... error code",                    r[104], 514),
+            # And the same vector with the limit raised by one gate
+            # delivers, so the arm above failed for the BOUND.
+            ("  ... limit +8: the same vector delivers", r[105], HALT),
+
+            # ---- S. a software INT may not reach a more privileged gate --
+            # NEGATIVE CONTROL 14, and the only arm that needs CPL != 0.
+            #
+            # NEITHER ARM IS GRADED ON ITS EXIT REASON. The twin's handler
+            # cannot end in a HLT: HLT is PRIVILEGED, so at CPL 3 it is
+            # itself a #GP -- a perfectly delivered interrupt then exits 13
+            # on the halt and reads exactly like a refusal. What is graded
+            # is DELIVERY, x86_pmode_gates, which is the sharper check
+            # anyway: with the DPL rule compiled out the refused arm
+            # delivers and its counter moves off 0.
+            ("INT 26h at CPL 3 through a DPL 0 gate FAULTS", r[106], GPF),
+            ("  ... and CPL really was 3",          r[107], 3),
+            ("  ... with #GP",                      r[108], EX_GP),
+            ("  ... error code",                    r[109], 306),
+            ("  ... and NOTHING was delivered",     r[110], 0),
+            # The twin: a DPL 3 gate at CPL 3 IS delivered. Without it,
+            # "refused" cannot be told from "protected mode broke at CPL 3".
+            ("  ... a DPL 3 gate at CPL 3 delivers", r[111], 1),
+            ("  ... with CS.RPL forced to CPL",     r[112], 0x53),
+
         ]
 
         bad = 0

@@ -787,6 +787,26 @@ int x86_pmode_limit_ok(const X86CPUSeg *s, uint32_t off, uint32_t bytes);
 extern volatile uint32_t x86_pmode_loads;      /* descriptor walks performed */
 extern volatile uint32_t x86_pmode_faults;     /* walks that raised          */
 
+/* ---- protected-mode INTERRUPT DELIVERY, same privilege (x86_pmode.c) -----
+ *
+ * Called from the protected-mode arm of L(HANDLE_INTERRUPT), and ONLY when
+ * CR0.PE is set -- the real-mode arm is byte-identical to what it was, so real
+ * mode pays nothing for this existing (docs/14 Sec.2).
+ *
+ * Same return convention as the walk: 0, or the exception VECTOR with the
+ * error code left in cpu->pmode_err. `flags` is DOSBox-X's CPU_Interrupt()
+ * `type` narrowed to the two bits that change behaviour.
+ *
+ * On entry cpu->eip must hold the SEGMENT OFFSET the frame is to carry -- the
+ * assembly's R10 is LINEAR -- and cpu->eflags must be live. Both are updated
+ * on success and the assembly rebuilds R10/R11 from them.
+ */
+#define X86_INT_SOFTWARE  1u   /* INT n / INT3 / INTO: check the gate's DPL */
+#define X86_INT_HAS_ERROR 2u   /* push an error code word after the frame   */
+int x86_pmode_int_gate(X86CPUState *cpu, uint32_t vec, uint32_t flags,
+                       uint32_t err);
+extern volatile uint32_t x86_pmode_gates;      /* gates delivered            */
+
 void x86_build_mode_records(void *dtcm_block);
 uint32_t x86_mode_table(int op32, int addr32);
 extern uint8_t *mode_records_ptr;

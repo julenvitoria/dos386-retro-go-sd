@@ -112,6 +112,16 @@ volatile uint32_t x86_pmode_faults;
  *   8  the limit granularity (G) shift
  *   9  CS must be a code segment
  *  10  LLDT's descriptor type check
+ *
+ * The protected-mode INTERRUPT path adds five more. They are numbered on from
+ * the walk's rather than renumbered into it, so an arm's number keeps meaning
+ * the same check across commits and a failure quoted in a log stays readable.
+ *
+ *  11  the IDT table bound in read_gate
+ *  12  the gate TYPE rule (S=0, and one of the four int/trap gates)
+ *  13  the gate's present bit
+ *  14  a software interrupt may not reach a gate with DPL < CPL
+ *  15  the frame WIDTH comes from the gate's type, not the operand size
  */
 #ifndef X86_PMODE_NEGCTL
 #define X86_PMODE_NEGCTL 0
@@ -498,5 +508,303 @@ int x86_pmode_lldt(X86CPUState *cpu, uint32_t sel)
     cpu->ldt_sel = sel;
     cpu->ldt_base = tmp.base;
     cpu->ldt_limit = tmp.limit;
+    return 0;
+}
+
+/* ===========================================================================
+ * PROTECTED-MODE INTERRUPT DELIVERY, SAME PRIVILEGE.
+ * ===========================================================================
+ *
+ * WHY THIS EXISTS NOW AND NOT BEFORE. The descriptor walk above shipped with
+ * nothing in the tree exercising it, and docs/14 said so. That changed: Dark
+ * Forces AND Mortal Kombat both reach CR0.PE=1 through LMSW -- not MOV CR0,
+ * because a DOS extender must also start on a 286 -- and both come out with
+ * CS=0x0070 (a real GDT selector, base 0xA900) and SS=0x0020. Both then stop
+ * on the SAME instruction: `INT imm8` with PE set, which L(HANDLE_INTERRUPT)
+ * refused because there was no gate walk. That is the measured demand this
+ * step answers, and it is the whole of it.
+ *
+ * WHAT IS DELIBERATELY NOT HERE. Call gates, privilege-change stack switches,
+ * the TSS, task gates and paging. Not one of them is stubbed and not one is
+ * half-built: an INT that would change ring returns a fault the caller exits
+ * on, LOUDLY, exactly as an undeliverable segmentation fault already does.
+ * DOS4GW was told NO by DPMI (INT 2Fh AX=1687h), by VCPI (INT 67h AH=DEh) and
+ * by INT 15h, and went raw-mode protected on its own, so there is no DPMI
+ * server here either. The next thing to build is decided by MEASURING what the
+ * title does next, not by reading the manual's table of contents.
+ *
+ * WHY IT IS ALL IN C. Same argument as the walk: this runs once per delivered
+ * interrupt in a protected-mode guest and NEVER in a real-mode one, so the
+ * only thing that matters is that the real-mode arm of L(HANDLE_INTERRUPT) is
+ * untouched -- and it is, byte for byte. The frame width is the GATE's, not
+ * the current operand size, so the dual-emitted PUSH_V could not have built it
+ * anyway: a 16-bit code segment may perfectly well have a 386 trap gate.
+ *
+ * THE AUTHORITY IS DOSBox-X, src/cpu/cpu.cpp:1200 CPU_Interrupt() for delivery
+ * and :1509 CPU_IRET() for the return. tiny386 has its own pmintr/pmiret but
+ * carries the same `// TODO: various permission checks` character as its
+ * set_seg, so it is the shape and DOSBox-X is the rules -- and the rule at
+ * each check below is cited to the line that STATES it, never to a bit
+ * position (docs/14 Sec.4: our flags packing matches neither reference).
+ */
+
+volatile uint32_t x86_pmode_gates;      /* gates walked and delivered */
+
+/* Gate TYPE values, from DOSBox-X's DESC_* enum (include/cpu.h). Bit 3 of the
+   type selects the 386 (32-bit) forms, which is exactly the frame width; bit 0
+   separates TRAP from INT, which is exactly whether IF survives. Both are used
+   as bits below and both are cited here rather than at each use. */
+#define GATE_286_INT    0x6u
+#define GATE_286_TRAP   0x7u
+#define GATE_386_INT    0xEu
+#define GATE_386_TRAP   0xFu
+#define GATE_IS_32(t)   ((t) & 0x8u)    /* cpu.cpp:1443 `gate.Type() & 0x8` */
+#define GATE_IS_TRAP(t) ((t) & 0x1u)    /* cpu.cpp:1471 `!(gate.Type()&1)`  */
+
+/* The EFLAGS bits IRET restores, and the ones it must not let a guest forge. */
+#define FLAG_IF     (1u << 9)
+#define FLAG_IOPL   (3u << 12)
+#define FLAG_NT     (1u << 14)
+#define FLAG_VM     (1u << 17)
+#define FLAG_TF     (1u << 8)
+/* Bit 1 reads 1 on every x86; a popped EFLAGS may not clear it. */
+#define FLAGS_FIXED 0x00000002u
+
+/* ---- the guest stack ------------------------------------------------------
+ *
+ * The stack WIDTH is SS's B bit -- not the operand size and not the gate's.
+ * DOSBox-X carries it in cpu.stack.mask, set from the SS descriptor's Big()
+ * (src/cpu/cpu.cpp:1401-1411). ESP is wrapped to that width BEFORE SS.base is
+ * added, so a 16-bit stack cannot walk out of its segment; that is the same
+ * rule PUSH_V already implements in the assembly.
+ *
+ * The access goes through x86_guest_copy_in/out and NOT through a hand-rolled
+ * fold walk, because a push at the top of a granule straddles the seam and
+ * those two are the only functions that split it (docs/10, and the note at
+ * x86_dos.c:699). A short copy is a memory fault, not a silent partial push,
+ * and nothing is committed to ESP until the write has landed.
+ */
+static uint32_t ss_mask(const X86CPUState *cpu)
+{
+    return (cpu->segs[X86_CPU_SEG_SS].flags & X86_DESC_D_FLAG) ? 0xFFFFFFFFu
+                                                               : 0xFFFFu;
+}
+
+static int stack_push(X86CPUState *cpu, uint32_t val, uint32_t width)
+{
+    uint32_t mask = ss_mask(cpu);
+    uint32_t esp = cpu->regs[4];
+    uint32_t nsp = (esp & ~mask) | ((esp - width) & mask);
+    uint32_t lin = cpu->segs[X86_CPU_SEG_SS].base + (nsp & mask);
+    uint8_t b[4];
+
+    b[0] = (uint8_t)val;
+    b[1] = (uint8_t)(val >> 8);
+    b[2] = (uint8_t)(val >> 16);
+    b[3] = (uint8_t)(val >> 24);
+    if (x86_guest_copy_in(lin, b, width) != width)
+        return fault(cpu, EX_SS, 0);
+    cpu->regs[4] = nsp;
+    return 0;
+}
+
+/*
+ * Fetch the 8 gate bytes for vector `vec`.
+ *
+ * The bound is the SAME rule read_desc uses and for the same reason: all eight
+ * bytes must lie inside the limit. DOSBox-X's DescriptorTable::GetDescriptor
+ * tests `address >= limit` (include/cpu.h:481), accepting a gate whose last
+ * four bytes are past the end; we follow tiny386/Intel and require
+ * `off + 7 <= limit` (docs/14 Sec.3, "three places we are stricter").
+ *
+ * THE ERROR CODE IS NOT THE SELECTOR HERE, and that is the easy thing to get
+ * wrong. An IDT fault's error code is the VECTOR shifted into the index field
+ * with the IDT bit set: DOSBox-X forms it as `num*8+2+EXT`
+ * (src/cpu/cpu.cpp:1312), where the +2 IS the IDT bit and the +1 EXT
+ * distinguishes an external interrupt from a software one. Reusing
+ * `sel & 0xFFFC`, which is what the segment path does and what the eye
+ * expects, yields a number that means a GDT selector and sends whoever reads
+ * it to the wrong table.
+ */
+#define IDT_ERR(vec, soft) (((vec) * 8u) + 2u + ((soft) ? 0u : 1u))
+
+static int read_gate(X86CPUState *cpu, uint32_t vec, uint32_t soft,
+                     uint32_t *w1, uint32_t *w2)
+{
+    uint32_t off = vec * 8u;
+    uint8_t raw[8];
+
+    if (!NEGCTL(11) && off + 7u > (uint32_t)cpu->idtr_limit)
+        return fault(cpu, EX_GP, IDT_ERR(vec, soft));
+    if (x86_guest_copy_out(raw, cpu->idtr_base + off, 8) != 8)
+        return fault(cpu, EX_GP, IDT_ERR(vec, soft));
+    *w1 = (uint32_t)raw[0] | ((uint32_t)raw[1] << 8) |
+          ((uint32_t)raw[2] << 16) | ((uint32_t)raw[3] << 24);
+    *w2 = (uint32_t)raw[4] | ((uint32_t)raw[5] << 8) |
+          ((uint32_t)raw[6] << 16) | ((uint32_t)raw[7] << 24);
+    return 0;
+}
+
+/*
+ * DELIVER an interrupt through the IDT. SAME PRIVILEGE ONLY.
+ *
+ * On entry cpu->eip is the EIP the frame must carry -- the assembly syncs it,
+ * because R10 is LINEAR and the frame wants the segment offset -- and
+ * cpu->eflags is live. On success cpu->eip, cpu->eflags, cpu->regs[4] and the
+ * CS cache are updated and the assembly rebuilds R10/R11 from them.
+ *
+ * `flags` is DOSBox-X's `type` argument narrowed to the two bits that change
+ * behaviour: X86_INT_SOFTWARE selects the gate-DPL check and clears the error
+ * code's EXT bit, X86_INT_HAS_ERROR pushes an error code word after the frame.
+ *
+ * THE ORDER OF CHECKS IS CPU_Interrupt's, and unlike the segment walk the
+ * order is OBSERVABLE: the gate's own faults carry an IDT error code and the
+ * CS descriptor's carry a selector, so a wrong sequence produces a plausible
+ * number pointing at the wrong table.
+ *
+ * A PRIVILEGE CHANGE IS REFUSED, NOT ATTEMPTED. cs_dpl < cpl is the inner-level
+ * gate: it needs the TSS's SS0/ESP0, a stack switch and two more words in the
+ * frame (src/cpu/cpu.cpp:1370-1428). None of that is built, so it comes back
+ * as #GP with the gate's selector rather than being silently delivered onto
+ * the caller's stack. If a title ever reaches it, the exit says so by name.
+ */
+int x86_pmode_int_gate(X86CPUState *cpu, uint32_t vec, uint32_t flags,
+                       uint32_t err)
+{
+    uint32_t soft = (flags & X86_INT_SOFTWARE) != 0;
+    uint32_t g1, g2, gflags, gtype, gsel, goff;
+    uint32_t w1, w2, cflags, ctype, cdpl, cpl, width;
+    uint32_t new_eflags;
+    int rc;
+
+    vec &= 0xFFu;
+    cpl = cpu->cpl & 3u;
+
+    rc = read_gate(cpu, vec, soft, &g1, &g2);
+    if (rc)
+        return rc;
+
+    gflags = desc_flags(g2);
+    gtype = X86_DESC_TYPE(gflags);
+
+    /* A SOFTWARE interrupt may not reach a gate more privileged than the
+       caller -- that is what stops ring 3 issuing INT 0 and entering a ring-0
+       fault handler by hand. An external interrupt or a processor exception is
+       exempt, which is why the check tests the SOFTWARE bit:
+       `(type&CPU_INT_SOFTWARE) && (gate.DPL()<cpu.cpl)`
+       (src/cpu/cpu.cpp:1315), whose comment names the titles that forced it. */
+    if (!NEGCTL(14) && soft && X86_DESC_DPL(gflags) < cpl)
+        return fault(cpu, EX_GP, IDT_ERR(vec, 1));
+
+    /* TYPE. S must be 0 -- a gate is a system descriptor -- and the type one
+       of the four int/trap gates. A TASK GATE is architecturally legal and is
+       NOT built: it needs a full task switch through the TSS, so it is refused
+       here rather than approximated. DOSBox-X's default arm E_Exits on any
+       other type (src/cpu/cpu.cpp:1487), which is the same statement. */
+    if (!NEGCTL(12) && ((gflags & X86_DESC_S_FLAG) ||
+                        (gtype != GATE_286_INT && gtype != GATE_286_TRAP &&
+                         gtype != GATE_386_INT && gtype != GATE_386_TRAP)))
+        return fault(cpu, EX_GP, IDT_ERR(vec, soft));
+
+    /* Present. #NP with the IDT error code, not #GP (cpu.cpp:1328). */
+    if (!NEGCTL(13) && !(gflags & X86_DESC_P_FLAG))
+        return fault(cpu, EX_NP, IDT_ERR(vec, soft));
+
+    /* The offset is split across the two halves of the descriptor and the
+       selector sits between them. A 286 gate has only the low half and its
+       high word is RESERVED -- masking it is what makes a 286 gate work when
+       whoever built the table left that word non-zero. */
+    gsel = (g1 >> 16) & 0xFFFFu;
+    goff = (g1 & 0xFFFFu) | (g2 & 0xFFFF0000u);
+    if (!GATE_IS_32(gtype))
+        goff &= 0xFFFFu;
+
+    /* A null CS selector in the gate is #GP(0) for a software interrupt
+       (src/cpu/cpu.cpp:1338). */
+    if (SEL_IS_NULL(gsel))
+        return fault(cpu, EX_GP, soft ? 0u : 1u);
+
+    rc = read_desc(cpu, gsel, &w1, &w2);
+    if (rc) {
+        /* read_desc has already recorded the SEGMENT form of the error code,
+           which is the right form here: this fault is about the GDT/LDT entry
+           and not about the IDT. Only the EXT bit differs, so it is ADDED
+           rather than the whole code re-derived. */
+        if (!soft)
+            cpu->pmode_err |= 1u;
+        return rc;
+    }
+
+    cflags = desc_flags(w2);
+    ctype = X86_DESC_TYPE(cflags);
+    cdpl = X86_DESC_DPL(cflags);
+
+    /* It must be a code segment (cpu.cpp:1487's default arm) and it may not be
+       LESS privileged than the caller (cpu.cpp:1345). */
+    if (!(cflags & X86_DESC_S_FLAG) || !(ctype & X86_TYPE_CODE))
+        return fault(cpu, EX_GP, SEL_ERR(gsel) + (soft ? 0u : 1u));
+    if (cdpl > cpl)
+        return fault(cpu, EX_GP, SEL_ERR(gsel) + (soft ? 0u : 1u));
+
+    /* SAME PRIVILEGE ONLY. A NON-CONFORMING code segment at a lower DPL is the
+       inner-level gate and needs the TSS stack switch; it is refused rather
+       than delivered onto a stack that was never switched. A CONFORMING
+       segment never changes ring, so it is the same-privilege case whatever
+       its DPL (src/cpu/cpu.cpp:1433-1441). */
+    if (cdpl < cpl && !(ctype & X86_TYPE_CODE_CONF))
+        return fault(cpu, EX_GP, SEL_ERR(gsel) + (soft ? 0u : 1u));
+
+    if (!(cflags & X86_DESC_P_FLAG))
+        return fault(cpu, EX_NP, SEL_ERR(gsel) + (soft ? 0u : 1u));
+
+    /* ---- COMMIT POINT ----------------------------------------------------
+     * Everything above faults with nothing changed. From here the frame is
+     * being built, and a failed push is #SS rather than a half-written stack.
+     *
+     * THE FRAME WIDTH IS THE GATE'S -- not the current operand size and not
+     * CS.D: `if (gate.Type() & 0x8)` (src/cpu/cpu.cpp:1443). A 16-bit code
+     * segment reached through a 386 trap gate gets a 32-bit frame, and its
+     * IRET -- which reads the OPERAND size -- is then the guest's problem to
+     * get right, exactly as it is on silicon. */
+    width = NEGCTL(15) ? 2u : (GATE_IS_32(gtype) ? 4u : 2u);
+
+    rc = stack_push(cpu, cpu->eflags, width);
+    if (rc)
+        return rc;
+    rc = stack_push(cpu, cpu->segs[X86_CPU_SEG_CS].sel, width);
+    if (rc)
+        return rc;
+    rc = stack_push(cpu, cpu->eip, width);
+    if (rc)
+        return rc;
+    if (flags & X86_INT_HAS_ERROR) {
+        rc = stack_push(cpu, err, width);
+        if (rc)
+            return rc;
+    }
+
+    /* CS.RPL is forced to CPL and is NOT taken from the gate: `Segs.val[cs] =
+       (gate_sel & 0xfffc) | cpu.cpl` (src/cpu/cpu.cpp:1461). Installing it
+       through x86_pmode_load_seg rather than writing the cache here is
+       deliberate -- that is the one place that decodes a descriptor, applies
+       G, sets cpu->cpl from the RPL and re-derives the dispatch table from D,
+       and a second decoder is how those four drift apart. */
+    rc = x86_pmode_load_seg(cpu, X86_CPU_SEG_CS, (gsel & 0xFFFCu) | cpl);
+    if (rc)
+        return rc;
+
+    cpu->eip = goff;
+
+    /* An INTERRUPT gate clears IF; a TRAP gate leaves it alone. That one bit
+       is the entire difference between the two types, and it is why a handler
+       reached through a trap gate can be interrupted again
+       (src/cpu/cpu.cpp:1470-1472). TF, NT and VM are cleared either way. */
+    new_eflags = cpu->eflags;
+    if (!GATE_IS_TRAP(gtype))
+        new_eflags &= ~FLAG_IF;
+    new_eflags &= ~(FLAG_TF | FLAG_NT | FLAG_VM);
+    cpu->eflags = new_eflags;
+
+    x86_pmode_gates++;
     return 0;
 }
