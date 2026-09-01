@@ -37,7 +37,7 @@
 // DTCM is a firmware bump pool (mem_ctl(GW_MEM_DTC, ...)), not a load target,
 // so the core allocates at runtime and repoints cpu_state_ptr. The assembly
 // reaches both through the pointer, never the symbol.
-X86CPUState cpu_state_dtcm __attribute__((section(".dtcm_bss")));
+X86CPUState cpu_state_dtcm __attribute__((section(".dtcm_bss.cpu_state_dtcm")));
 
 // What the interpreter actually dereferences. Kept in normal .bss so it is
 // writable in every build.
@@ -154,9 +154,9 @@ void x86_cpu_set_get_tsc(X86CPUState *s,
 typedef uint32_t DeviceReadFunc(void *opaque, uint32_t offset, int size_log2);
 typedef void DeviceWriteFunc(void *opaque, uint32_t offset, uint32_t val, int size_log2);
 
-DeviceReadFunc *io_port_read_table[1024] __attribute__((section(".dtcm_bss")));
-DeviceWriteFunc *io_port_write_table[1024] __attribute__((section(".dtcm_bss")));
-void *io_port_opaque_table[1024] __attribute__((section(".dtcm_bss")));
+DeviceReadFunc *io_port_read_table[1024] __attribute__((section(".dtcm_bss.io_port_read_table")));
+DeviceWriteFunc *io_port_write_table[1024] __attribute__((section(".dtcm_bss.io_port_write_table")));
+void *io_port_opaque_table[1024] __attribute__((section(".dtcm_bss.io_port_opaque_table")));
 
 void x86_cpu_sync_port_map(X86CPUState *s, PhysMemoryMap *port_map)
 {

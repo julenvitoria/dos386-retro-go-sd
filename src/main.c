@@ -1348,6 +1348,36 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
     }
 
     core_ready = (core_dtcm_ok && guest_ram && guest_vram) ? 1 : 0;
+
+    /* SAY IT OUT LOUD. RAM_EMU starvation has been diagnosed as something else
+     * three times in one session, every time because its signature is a BLACK
+     * SCREEN: guest_ram comes back NULL, core_ready stays 0, the frame loop
+     * paints nothing, and every other counter (core_dtcm_ok, pgf_result,
+     * x86_xms_total_kb) still reads healthy. A shortfall that does NOT reach
+     * zero is just as quiet and not cosmetic either -- guest_ram_pages != 160
+     * is what makes the NOR snapshot refuse every attempt with
+     * nor_snap_result=2.
+     *
+     * So the pool reports itself at boot, by name, in the retro-go log,
+     * whatever happened. Reading a counter requires knowing to look; a line in
+     * the log does not. Cost is a handful of bytes of .rodata and no runtime
+     * path -- this runs once, at load. */
+    printf("DOS: guest RAM %u/%u frames (%u short), %u B free at claim, "
+           "stride %u\n",
+           (unsigned)guest_ram_pages, (unsigned)(GUEST_RAM_SIZE / 4096u),
+           (unsigned)guest_ram_pages_short,
+           (unsigned)guest_ram_free_at_claim, (unsigned)X86_PG_STRIDE);
+    if (!guest_ram)
+        printf("DOS: *** RAM_EMU STARVED: guest RAM claim = NULL. The black "
+               "screen IS this. Shrink RAM_EMU (nm __CORE_BSS_END__).\n");
+    else if (guest_ram_pages_short)
+        printf("DOS: *** RAM_EMU SHORT %u frame(s); NOR snapshot disabled. "
+               "Shrink RAM_EMU (nm __CORE_BSS_END__).\n",
+               (unsigned)guest_ram_pages_short);
+    if (!core_dtcm_ok)
+        printf("DOS: *** DTCM claim FAILED (core_dtcm_ok=0).\n");
+    if (!guest_vram)
+        printf("DOS: *** guest VRAM claim FAILED.\n");
 #if X86_OPL_BENCH
     /* MEASUREMENT BUILD ONLY: hold the FM chip at its worst case for the whole
        run so x86_opl_frame_cycles is a BOUND and not a sample of whatever the

@@ -80,6 +80,26 @@ SECTIONS
     *(.bss*)
     *(COMMON)
     . = ALIGN(8);
+
+    /* `.dtcm_bss` is a TEST.ld section name: in the bare-metal harness it
+       lands in real DTCM. THE SHIPPING CORE HAS NO DTCM LOAD SEGMENT (see the
+       note at the top of this file), so anything still carrying that attribute
+       is ordinary core RAM here -- and it MUST be named, because an ORPHAN
+       `.dtcm_bss` is emitted by GCC as PROGBITS and the linker placed it
+       between .data and .bss as a LOADED section. That cost 15,616 bytes of
+       dos.bin payload to ship a block of zeros, and it is why the section is
+       gathered here, inside NOLOAD, rather than left to orphan placement.
+
+       Gathering the wildcard does NOT defeat --gc-sections: collection is per
+       INPUT section, so each variable must also carry its own
+       `.dtcm_bss.<name>` suffix or one live variable pins every dead one.
+       That is exactly what happened -- `cga_expand` held the three
+       1,024-entry `io_port_*_table`s (12,288 B, dead in this build because
+       their only writer, x86_machine.c's port-map sync, is not compiled into
+       the core) resident in RAM_EMU, at four guest page frames. */
+    *(.dtcm_bss)
+    *(.dtcm_bss.*)
+    . = ALIGN(8);
   } >RAM_EMU :data
 
   __CORE_BSS_END__ = .;
