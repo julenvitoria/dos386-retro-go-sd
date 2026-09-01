@@ -492,28 +492,28 @@ project; the slot is nevertheless accounted for individually.
 | 0F 9D | SETNL Eb | 386 | implemented | `.op_0f_setcc` (dual) | IMPLEMENTED. Both register and memory forms; byte destination; EVAL_COND shared with Jcc. Memory path goes through the ModRM decoder so the segment base is applied. Minor: it calls the decoder by symbol, so a 0x67 prefix is ignored. |
 | 0F 9E | SETLE Eb | 386 | implemented | `.op_0f_setcc` (dual) | IMPLEMENTED. Both register and memory forms; byte destination; EVAL_COND shared with Jcc. Memory path goes through the ModRM decoder so the segment base is applied. Minor: it calls the decoder by symbol, so a 0x67 prefix is ignored. |
 | 0F 9F | SETNLE Eb | 386 | implemented | `.op_0f_setcc` (dual) | IMPLEMENTED. Both register and memory forms; byte destination; EVAL_COND shared with Jcc. Memory path goes through the ModRM decoder so the segment base is applied. Minor: it calls the decoder by symbol, so a 0x67 prefix is ignored. |
-| 0F A0 | PUSH FS / POP FS | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F A1 | PUSH FS / POP FS | 386 | unimplemented | `.exit_loop` | Not implemented. |
+| 0F A0 | PUSH FS | 386 | implemented | `.op_0f_push_fs_A0` (dual) | IMPLEMENTED. `L(PUSH_SREG)`/`L(POP_SREG)` with segment index 4 -- the same code path as `06/0E/16/1E`, so the slot is operand-size wide (PUSH_V/POP_V, SS.base applied and SP wrapped at the stack width), the selector is zero-extended out and truncated in, and the load goes through `SET_SREG` so protected mode gets the descriptor walk for free. **Was EPIC PINBALL's wall** -- exit_info 0x0FA0 at 443,391 instructions (docs/13). `tests/test_opcodes.py` 296-299. |
+| 0F A1 | POP FS | 386 | implemented | `.op_0f_pop_fs_A1` (dual) | IMPLEMENTED. `L(PUSH_SREG)`/`L(POP_SREG)` with segment index 4 -- the same code path as `06/0E/16/1E`, so the slot is operand-size wide (PUSH_V/POP_V, SS.base applied and SP wrapped at the stack width), the selector is zero-extended out and truncated in, and the load goes through `SET_SREG` so protected mode gets the descriptor walk for free. **Was EPIC PINBALL's wall** -- exit_info 0x0FA0 at 443,391 instructions (docs/13). `tests/test_opcodes.py` 296-299. |
 | 0F A2 | CPUID | 486+ | out of scope | `.exit_loop` | Out of scope. |
 | 0F A3 | BT Ev,Gv | 386 | unimplemented | `.exit_loop` | Not implemented. |
 | 0F A4 | SHLD | 386 | unimplemented | `.exit_loop` | Not implemented. |
 | 0F A5 | SHLD | 386 | unimplemented | `.exit_loop` | Not implemented. |
 | 0F A6 | (CMPXCHG 486 early) | 486 | out of scope | `.exit_loop` | Out of scope. |
 | 0F A7 | (CMPXCHG 486 early) | 486 | out of scope | `.exit_loop` | Out of scope. |
-| 0F A8 | PUSH GS / POP GS | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F A9 | PUSH GS / POP GS | 386 | unimplemented | `.exit_loop` | Not implemented. |
+| 0F A8 | PUSH GS | 386 | implemented | `.op_0f_push_gs_A8` (dual) | IMPLEMENTED. `L(PUSH_SREG)`/`L(POP_SREG)` with segment index 5 -- the same code path as `06/0E/16/1E`, so the slot is operand-size wide (PUSH_V/POP_V, SS.base applied and SP wrapped at the stack width), the selector is zero-extended out and truncated in, and the load goes through `SET_SREG` so protected mode gets the descriptor walk for free. **Was EPIC PINBALL's wall** -- exit_info 0x0FA0 at 443,391 instructions (docs/13). `tests/test_opcodes.py` 296-299. |
+| 0F A9 | POP GS | 386 | implemented | `.op_0f_pop_gs_A9` (dual) | IMPLEMENTED. `L(PUSH_SREG)`/`L(POP_SREG)` with segment index 5 -- the same code path as `06/0E/16/1E`, so the slot is operand-size wide (PUSH_V/POP_V, SS.base applied and SP wrapped at the stack width), the selector is zero-extended out and truncated in, and the load goes through `SET_SREG` so protected mode gets the descriptor walk for free. **Was EPIC PINBALL's wall** -- exit_info 0x0FA0 at 443,391 instructions (docs/13). `tests/test_opcodes.py` 296-299. |
 | 0F AA | RSM | 486 | out of scope | `.exit_loop` | Out of scope. |
 | 0F AB | BTS Ev,Gv | 386 | unimplemented | `.exit_loop` | Not implemented. |
 | 0F AC | SHRD | 386 | unimplemented | `.exit_loop` | Not implemented. |
 | 0F AD | SHRD | 386 | unimplemented | `.exit_loop` | Not implemented. |
 | 0F AE | Grp15 (FXSAVE etc.) | P2+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F AF | IMUL Gv,Ev | 386 | implemented | `.op_0f_imul_AF` (dual) | **EPIC PINBALL's wall** (docs/13). Low half only, like the `69`/`6B` forms; CF/OF unset, which is the same known gap all three share. `tests/test_opcodes.py` 281-283. |
+| 0F AF | IMUL Gv,Ev | 386 | implemented | `.op_0f_imul_AF` (dual) | **EPIC PINBALL's wall** (docs/13). Low half in the destination, and **CF/OF now SET when the full product does not fit it** -- `SMULL` with the high word checked against `lo>>31` at 32 bits, `SXTH` of the 32-bit product at 16. SF/ZF/AF/PF are architecturally undefined and are left alone. The one-byte `69`/`6B` forms STILL have this gap (rows above). `tests/test_opcodes.py` 281-283, 304-309. |
 | 0F B0 | CMPXCHG | 486 | out of scope | `.exit_loop` | Out of scope. |
 | 0F B1 | CMPXCHG | 486 | out of scope | `.exit_loop` | Out of scope. |
-| 0F B2 | LSS Gv,Mp | 386 | unimplemented | `.exit_loop` | Not implemented. LES/LDS exist; LSS does not. |
+| 0F B2 | LSS Gv,Mp | 386 | implemented | `.op_0f_lss_B2` (dual) | IMPLEMENTED via `L(LOAD_FAR_PTR)`, the same path as LES/LDS: offset at the operand size, selector always the 16 bits above it, both halves SEAM_CHECKed, register source refused as #UD. **Does NOT inhibit interrupts for the following instruction** -- `MOV SS,x` does not either, so it is the same known gap, not a new one. `tests/test_opcodes.py` 302-303. |
 | 0F B3 | BTR Ev,Gv | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F B4 | LFS / LGS Gv,Mp | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F B5 | LFS / LGS Gv,Mp | 386 | unimplemented | `.exit_loop` | Not implemented. |
+| 0F B4 | LFS Gv,Mp | 386 | implemented | `.op_0f_lfs_B4` (dual) | IMPLEMENTED via `L(LOAD_FAR_PTR)`; see 0F B2. `tests/test_opcodes.py` 300. |
+| 0F B5 | LGS Gv,Mp | 386 | implemented | `.op_0f_lgs_B5` (dual) | IMPLEMENTED via `L(LOAD_FAR_PTR)`; see 0F B2. `tests/test_opcodes.py` 301. |
 | 0F B6 | MOVZX Gv,Eb | 386 | DEFECT | `.op_0f_movzx_gv_eb` (dual) | IMPLEMENTED, both forms. DEFECT: the destination is written with a full 32-bit STR.W, so in 16-bit mode MOVZX clobbers the high half of the destination register instead of writing 16 bits. Also calls the ModRM decoder by symbol, ignoring a 0x67 prefix. |
 | 0F B7 | MOVZX Gv,Ew | 386 | DEFECT | `.op_0f_movzx_gv_ew` (dual) | IMPLEMENTED, both forms. Same 32-bit-destination-store defect as 0F B6. |
 | 0F B8 | (reserved) / Grp10 UD | 386 | unimplemented | `.exit_loop` | Not implemented. |
@@ -762,9 +762,9 @@ Segment override coverage on the *destination* of string ops is correctly refuse
 | `F1` ICEBP, `F4` HLT | 2 | Unimplemented in the table. A `.op_hlt_F4` handler exists in the source but is referenced by neither dispatch table — dead code. |
 | 386 bit instructions `0F A3/AB/B3/BB`, `0F BA`, `0F BC/BD` | 7 | Unimplemented: BT/BTS/BTR/BTC/BSF/BSR. |
 | 386 double shifts `0F A4/A5/AC/AD` | 4 | Unimplemented: SHLD/SHRD. |
-| 386 segment loads `0F B2/B4/B5` | 3 | Unimplemented: LSS/LFS/LGS. |
-| 386 `0F AF` IMUL Gv,Ev | 0 | Implemented. |
-| 386 `0F A0/A1/A8/A9` PUSH/POP FS,GS | 4 | Unimplemented. |
+| 386 segment loads `0F B2/B4/B5` | 0 | Implemented: LSS/LFS/LGS. |
+| 386 `0F AF` IMUL Gv,Ev | 0 | Implemented, CF/OF included. |
+| 386 `0F A0/A1/A8/A9` PUSH/POP FS,GS | 0 | Implemented. |
 | 386 control/debug regs `0F 20`–`0F 27` | 8 | Unimplemented — consistent with a real-mode-only core. |
 | 286 protected mode `0F 00`, `0F 02`, `0F 03`, `0F 06` | 4 | Unimplemented. |
 | 486/Pentium+ (`0F 31` RDTSC, `0F A2` CPUID, `0F C8`–`CF` BSWAP, CMPXCHG, XADD, MMX/SSE) | 158 | **Out of scope** for a 386-class target. |
@@ -870,7 +870,9 @@ prints `cpu_exit_info` alongside `cpu_cs_sel`/`cpu_eip`/`cpu_cr0` — the report
 ### P4 — missing flags on less-common instructions
 
 23. **`0x69` / `0x6B` IMUL Gv,Ev,I** set no CF/OF. Software tests these to detect
-    overflow.
+    overflow. **`0F AF` was fixed and these were not** -- the fix is the same
+    shape (SMULL, high word against `lo>>31`; SXTH of the product at 16 bits)
+    but they live in `cpu_exec_handlers.S`, a different lane's file.
 24. **`0xD4` AAM / `0xD5` AAD** set no SF/ZF/PF (all three are architecturally defined
     for these instructions). AAM with an imm8 of 0 exits to the host instead of raising
     `#DE`.
@@ -911,9 +913,7 @@ Ordered by what will bite first when a real binary is pointed at this core.
   linked in, and anything that probes for a coprocessor. There is no partial credit here
   — an FPU is a substantial subsystem. Deciding early whether the target set is
   integer-only matters more than any individual opcode.
-- **`0F BC/BD` BSF/BSR.** Standard compiler output. (`0F AF` IMUL Gv,Ev is now implemented.)
-- **`0F B2/B4/B5` LSS/LFS/LGS.** `LSS` in particular is how 32-bit-aware code switches
-  stacks atomically.
+- **`0F BC/BD` BSF/BSR.** Standard compiler output. (`0F AF` IMUL Gv,Ev, `0F A0/A1/A8/A9` PUSH/POP FS,GS and `0F B2/B4/B5` LSS/LFS/LGS are now implemented.)
 - **`27/2F/37/3F` DAA/DAS/AAA/AAS.** Old-school BCD arithmetic; rarer in games, common in
   business utilities and in hand-written assembly from the era.
 - **`6C`–`6F` INS/OUTS.** Used by disk and video BIOS-style code.

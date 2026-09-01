@@ -792,12 +792,23 @@ L(OP_0F_MOVSX_GV_EW_WRITE):
  * Forces and Mortal Kombat read 0x0F01. Three titles, three different walls.
  *
  * Structurally .op_imul_imm32_69 with the immediate replaced by the
- * destination register's own current value, and it makes the same flag choice
- * the 69/6B forms already make: CF and OF are architecturally defined for
- * IMUL, and none of the three sets them. That is a KNOWN, SHARED gap for
- * docs/07 rather than something new here -- a guest that branches on the
- * overflow of a multiply is wrong on all three today, and fixing it is one
- * change across all three, not a rider on this one. */
+ * destination register's own current value.
+ *
+ * CF AND OF ARE SET HERE, and they are the whole point of the instruction's
+ * flag contract: the destination keeps only the LOW half, so CF=OF=1 is the
+ * only thing that says the discarded half mattered. Software multiplies and
+ * then branches on JC/JO to detect the overflow, so an unset pair is not a
+ * missing nicety, it is a branch that silently takes the wrong arm.
+ *
+ * The test is "the full product sign-extends from the destination width":
+ * at 32 bits SMULL's high word must equal lo>>31 arithmetic; at 16 bits the
+ * full 32-bit product must equal SXTH of its own low half. SF/ZF/AF/PF are
+ * architecturally UNDEFINED for IMUL and are left exactly as they were rather
+ * than invented.
+ *
+ * `69`/`6B` in cpu_exec_handlers.S have the IDENTICAL gap and are NOT fixed
+ * here -- that file belongs to another lane. docs/07 rows 69/6B still read
+ * DEFECT. */
 OP .op_0f_imul_AF
     CODE_PTR R1
     LDRB R1, [R1, #0]
@@ -823,9 +834,75 @@ L(IMULAF_DO):
     MOV.W R4, R4, LSL #2
     ADD.W R4, R4, #8
     LDREG_V R5, R4
-    MUL.W R3, R3, R5
-    STREG_V R3, R4
+    /* Both operands arrived through LD_V/LDREG_V, which ZERO-extend at 16 bits.
+       The low half of the product does not care, but the overflow test does,
+       so the 16-bit pass signs them first. R0 ends up 0 iff the full product
+       fits the destination. */
+#if NSH
+    SXTH R3, R3
+    SXTH R5, R5
+    MUL.W R3, R3, R5               @ the FULL 32-bit signed product
+    SXTH R0, R3
+    SUB.W R0, R0, R3
+#else
+    SMULL R3, R0, R3, R5           @ R3 = low, R0 = high
+    SUB.W R0, R0, R3, ASR #31
+#endif
+    STREG_V R3, R4                 @ destination keeps the low half only
+    CMP R0, #0
+    IT NE
+    MOVNE R0, #1
+    BFI R11, R0, #0, #1            @ CF
+    BFI R11, R0, #11, #1           @ OF
     B.W .fetch_decode_loop
+
+/* 0F A0/A8 PUSH FS,GS   0F A1/A9 POP FS,GS
+ *
+ * MEASURED on EPIC_PINBALL (docs/13): its wall was `0F A0`, exit_info 0x0FA0
+ * at 443,391 instructions. Watcom's real-mode runtime pushes FS around a
+ * routine that borrows it, which is also why 0F B4 (LFS) is next door.
+ *
+ * These are the 06/0E/16/1E forms with a two-byte opcode and a segment index
+ * of 4 or 5, so they REUSE L(PUSH_SREG) / L(POP_SREG) rather than restating
+ * them: the stack slot is operand-size wide (PUSH_V/POP_V are the only stack
+ * primitives that apply SS.base and wrap SP at the stack width), the selector
+ * is zero-extended on the way out and truncated on the way in, and the load
+ * goes through L(SET_SREG) so a protected-mode guest gets the descriptor walk
+ * for free. Three instructions each, per pass. */
+OP .op_0f_push_fs_A0
+    MOV.W R4, #4                   @ FS
+    B.W L(PUSH_SREG)
+OP .op_0f_push_gs_A8
+    MOV.W R4, #5                   @ GS
+    B.W L(PUSH_SREG)
+OP .op_0f_pop_fs_A1
+    MOV.W R0, #4
+    B.W L(POP_SREG)
+OP .op_0f_pop_gs_A9
+    MOV.W R0, #5
+    B.W L(POP_SREG)
+
+/* 0F B2 LSS / 0F B4 LFS / 0F B5 LGS -- Gv <- [mem], Sreg <- [mem + operand
+ * size]. Exactly LES/LDS (C4/C5) with a different segment index, so they enter
+ * the SAME L(LOAD_FAR_PTR): it fetches the ModRM itself, refuses a register
+ * source as #UD, SEAM_CHECKs both halves of the far pointer, writes Gv with
+ * STREG_V and installs the selector through L(SET_SREG). R0 carries the index
+ * in, which is the contract C4/C5 already use.
+ *
+ * LSS is the one that matters beyond FS/GS convenience: it is how code loads
+ * SS:SP in a single instruction so no interrupt can land on a half-switched
+ * stack. We do not model that inhibit -- `MOV SS,x` does not either, and it is
+ * the same known gap (docs/07), not a new one. */
+OP .op_0f_lss_B2
+    MOV.W R0, #2                   @ SS
+    B.W L(LOAD_FAR_PTR)
+OP .op_0f_lfs_B4
+    MOV.W R0, #4                   @ FS
+    B.W L(LOAD_FAR_PTR)
+OP .op_0f_lgs_B5
+    MOV.W R0, #5                   @ GS
+    B.W L(LOAD_FAR_PTR)
+
 #ifndef USE_16_BIT
 
 .align 2
@@ -844,6 +921,13 @@ L(IMULAF_DO):
 .set .op_0f_movsx_gv_eb, .op_0f_movsx_gv_eb_32
 .set .op_0f_movsx_gv_ew, .op_0f_movsx_gv_ew_32
 .set .op_0f_imul_AF, .op_0f_imul_AF_32
+.set .op_0f_push_fs_A0, .op_0f_push_fs_A0_32
+.set .op_0f_push_gs_A8, .op_0f_push_gs_A8_32
+.set .op_0f_pop_fs_A1, .op_0f_pop_fs_A1_32
+.set .op_0f_pop_gs_A9, .op_0f_pop_gs_A9_32
+.set .op_0f_lss_B2, .op_0f_lss_B2_32
+.set .op_0f_lfs_B4, .op_0f_lfs_B4_32
+.set .op_0f_lgs_B5, .op_0f_lgs_B5_32
 .set .op_alu_ev_gv, .op_alu_ev_gv_32
 .set .op_alu_gv_ev, .op_alu_gv_ev_32
 .set .op_alu_eax_imm32, .op_alu_eax_imm32_32
@@ -937,6 +1021,13 @@ opcode_table_0f_32:
 .set .op_0f_movsx_gv_eb, .op_0f_movsx_gv_eb_16
 .set .op_0f_movsx_gv_ew, .op_0f_movsx_gv_ew_16
 .set .op_0f_imul_AF, .op_0f_imul_AF_16
+.set .op_0f_push_fs_A0, .op_0f_push_fs_A0_16
+.set .op_0f_push_gs_A8, .op_0f_push_gs_A8_16
+.set .op_0f_pop_fs_A1, .op_0f_pop_fs_A1_16
+.set .op_0f_pop_gs_A9, .op_0f_pop_gs_A9_16
+.set .op_0f_lss_B2, .op_0f_lss_B2_16
+.set .op_0f_lfs_B4, .op_0f_lfs_B4_16
+.set .op_0f_lgs_B5, .op_0f_lgs_B5_16
 .set .op_alu_ev_gv, .op_alu_ev_gv_16
 .set .op_alu_gv_ev, .op_alu_gv_ev_16
 .set .op_alu_eax_imm32, .op_alu_eax_imm32_16
