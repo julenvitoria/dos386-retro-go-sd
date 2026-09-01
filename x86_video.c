@@ -212,7 +212,7 @@ static void text_alloc_palette(void);
 #endif
 /* 2bpp -> four palette bytes. In DTCM: the blitter hits it once per source
    byte, and DTCM's second port keeps that off the AXI path the source is on. */
-static uint32_t cga_expand[256] __attribute__((section(".dtcm_bss")));
+static uint32_t cga_expand[256] __attribute__((section(".dtcm_bss.cga_expand")));
 /* Mode 6, nibble-indexed: two OR-ed output pixels per entry. 64 bytes. */
 static uint32_t cga1_expand[16];
 

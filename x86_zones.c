@@ -15,7 +15,7 @@ x86_zones_t *x86_zones_ptr;
    firmware bump pool -- and passes a block in instead. Same split as
    x86_profile.c, for the same reason. */
 #ifndef PROJECT_KIND_CORE
-static x86_zones_t x86_zones_block __attribute__((section(".dtcm_bss"),
+static x86_zones_t x86_zones_block __attribute__((section(".dtcm_bss.x86_zones_block"),
                                                   aligned(8)));
 #endif
 

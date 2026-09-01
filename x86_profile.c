@@ -14,7 +14,7 @@ uint32_t *x86_profile_ptr;
    firmware bump pool -- and passes a block in instead. */
 #ifndef PROJECT_KIND_CORE
 static uint32_t x86_profile_block[X86_PROFILE_WORDS]
-    __attribute__((section(".dtcm_bss"), aligned(8)));
+    __attribute__((section(".dtcm_bss.x86_profile_block"), aligned(8)));
 #endif
 
 void x86_profile_reset(void)
