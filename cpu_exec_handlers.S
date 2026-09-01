@@ -3951,10 +3951,14 @@ L(FAR_SET):
     SUB.W R3, R3, #1                   @ a batched element still costs a tick
     STR.W R3, [R8, #CPU_PIT_COUNTER]   @ of the slice
     SUB.W R5, R5, #1
+    /* CX at address size 16, and ECX[31:16] is NOT part of the count -- a
+       full 32-bit store here zeroed it. CNT_STORE's ITE, merged into the
+       truncation's own TST. */
     TST.W R2, #ADDRSIZE_XOR
-    IT EQ
+    ITTE EQ
     UXTHEQ R5, R5
-    STR.W R5, [R8, #REG_ECX]
+    STRHEQ.W R5, [R8, #REG_ECX]
+    STRNE.W R5, [R8, #REG_ECX]
 #ifdef X86_TRACE_ODDSP
     /* The predicate trap's own counter needs the same correction, or its
        X86_TRACE_SKIP arming point is measured on a different (and, before the
@@ -4043,10 +4047,14 @@ L(REP_COUNT):
 
 L(REP_ONE):
     SUB.W R5, R5, #1
+    /* CX at address size 16, and ECX[31:16] is NOT part of the count -- a
+       full 32-bit store here zeroed it. CNT_STORE's ITE, merged into the
+       truncation's own TST. */
     TST.W R2, #ADDRSIZE_XOR
-    IT EQ
+    ITTE EQ
     UXTHEQ R5, R5
-    STR.W R5, [R8, #REG_ECX]
+    STRHEQ.W R5, [R8, #REG_ECX]
+    STRNE.W R5, [R8, #REG_ECX]
     STR.W R4, [R8, #CPU_REP_ZF_SENSE]
     SUB.W R3, R10, #1              @ this prefix, for the rewind
     STR.W R3, [R8, #CPU_REP_RESUME]

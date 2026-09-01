@@ -208,6 +208,24 @@
      * site passes the same one and .ifc catches it at assembly time if one ever
      * does, rather than silently folding a shifted address.
      * ---------------------------------------------------------------- */
+    /* ------------------------------------------------------------------
+     * MODRM_CALL -- the ONLY correct way to reach the ModRM decoder.
+     *
+     * `BL L(DECODE_MODRM_32)` looks like "the 32-bit decoder" and is not: L()
+     * appends the PASS suffix, so it resolves to the 16-bit decoder in the
+     * 16-bit pass. That ties the ADDRESS size to the OPERAND size, which are
+     * independent axes -- `66` alone (32-bit operand, 16-bit address, the
+     * commonest 386 idiom in DOS code) then decodes the wrong grammar, and a
+     * `67` prefix is ignored outright. The mode record's decoder pointer is
+     * the one that tracks 0x67. Costs one load and a BLX over the direct BL.
+     * R2 must still be the live mode record at the call site (see the Reserved
+     * Register Contract), and the decoder clobbers R2-R5 and R12.
+     * ------------------------------------------------------------------ */
+    .macro MODRM_CALL
+        LDR.W R12, [R2, #REC_MODRM_FN]
+        BLX R12
+    .endm
+
     .macro SEAM_CHECK dest_ptr, vaddr
 #if X86_SEAM_FIX
     .ifc \dest_ptr, \vaddr

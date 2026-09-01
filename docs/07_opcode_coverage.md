@@ -96,7 +96,7 @@ only). That leaves roughly **185 one-byte opcodes believed correct**.
 | One-byte slots dispatching to `.exit_loop` | **1 / 256** |
 | Two-byte (0F) slots with a handler | **64 / 256** |
 | Two-byte slots dispatching to `.exit_loop` | **192 / 256** |
-| Implemented slots carrying at least one mechanical warning | **190** |
+| Implemented slots carrying at least one mechanical warning | **194** |
 
 Every row below is DERIVED. `status` is `reached` or `.exit_loop`, taken from
 the dispatch table. `mode` is `OP` (dual-emitted) or `OP_AGNOSTIC`, taken from the
@@ -364,7 +364,7 @@ Warning legend:
 | F0 | reached | `.op_lock_F0` | AGN | - | no flag macro reachable |
 | F1 | reached | `.op_int1_F1` | dual | - | - |
 | F2 | reached | `.op_repne_F2` | AGN | - | REVIEW: no width primitive, 1 bare word op(s), no flag macro reachable |
-| F3 | reached | `.op_rep_F3` | AGN | - | REVIEW: no width primitive, 9 bare word op(s), no flag macro reachable |
+| F3 | reached | `.op_rep_F3` | AGN | - | REVIEW: no width primitive, 8 bare word op(s), no flag macro reachable |
 | F4 | reached | `.op_hlt_F4` | AGN | - | REVIEW: no width primitive, 5 bare word op(s), no flag macro reachable |
 | F5 | reached | `.op_cmc_F5` | AGN | - | no flag macro reachable |
 | F6 | reached | `.op_grp3_eb_F6` | AGN | ARITH, LOGIC | REVIEW: AGN body mixes width primitives with 66 bare word op(s) |
@@ -414,7 +414,7 @@ Warning legend:
 | 0F 1D | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F 1E | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F 1F | **`.exit_loop`** | `.exit_loop` | - | - | - |
-| 0F 20 | reached | `.op_0f_mov_r32_cr_20` | AGN | - | REVIEW: AGN body mixes width primitives with 7 bare word op(s), no flag macro reachable |
+| 0F 20 | reached | `.op_0f_mov_r32_cr_20` | AGN | - | REVIEW: AGN body mixes width primitives with 2 bare word op(s), no flag macro reachable |
 | 0F 21 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F 22 | reached | `.op_0f_mov_cr_r32_22` | AGN | - | REVIEW: no width primitive, 2 bare word op(s), no flag macro reachable |
 | 0F 23 | **`.exit_loop`** | `.exit_loop` | - | - | - |
@@ -526,22 +526,22 @@ Warning legend:
 | 0F 8D | reached | `.op_0f_jcc_rel32` | dual | - | - |
 | 0F 8E | reached | `.op_0f_jcc_rel32` | dual | - | - |
 | 0F 8F | reached | `.op_0f_jcc_rel32` | dual | - | - |
-| 0F 90 | reached | `.op_0f_setcc` | dual | INCDEC | - |
-| 0F 91 | reached | `.op_0f_setcc` | dual | INCDEC | - |
-| 0F 92 | reached | `.op_0f_setcc` | dual | INCDEC | - |
-| 0F 93 | reached | `.op_0f_setcc` | dual | INCDEC | - |
-| 0F 94 | reached | `.op_0f_setcc` | dual | INCDEC | - |
-| 0F 95 | reached | `.op_0f_setcc` | dual | INCDEC | - |
-| 0F 96 | reached | `.op_0f_setcc` | dual | INCDEC | - |
-| 0F 97 | reached | `.op_0f_setcc` | dual | INCDEC | - |
-| 0F 98 | reached | `.op_0f_setcc` | dual | INCDEC | - |
-| 0F 99 | reached | `.op_0f_setcc` | dual | INCDEC | - |
-| 0F 9A | reached | `.op_0f_setcc` | dual | INCDEC | - |
-| 0F 9B | reached | `.op_0f_setcc` | dual | INCDEC | - |
-| 0F 9C | reached | `.op_0f_setcc` | dual | INCDEC | - |
-| 0F 9D | reached | `.op_0f_setcc` | dual | INCDEC | - |
-| 0F 9E | reached | `.op_0f_setcc` | dual | INCDEC | - |
-| 0F 9F | reached | `.op_0f_setcc` | dual | INCDEC | - |
+| 0F 90 | reached | `.op_0f_setcc` | dual | - | - |
+| 0F 91 | reached | `.op_0f_setcc` | dual | - | - |
+| 0F 92 | reached | `.op_0f_setcc` | dual | - | - |
+| 0F 93 | reached | `.op_0f_setcc` | dual | - | - |
+| 0F 94 | reached | `.op_0f_setcc` | dual | - | - |
+| 0F 95 | reached | `.op_0f_setcc` | dual | - | - |
+| 0F 96 | reached | `.op_0f_setcc` | dual | - | - |
+| 0F 97 | reached | `.op_0f_setcc` | dual | - | - |
+| 0F 98 | reached | `.op_0f_setcc` | dual | - | - |
+| 0F 99 | reached | `.op_0f_setcc` | dual | - | - |
+| 0F 9A | reached | `.op_0f_setcc` | dual | - | - |
+| 0F 9B | reached | `.op_0f_setcc` | dual | - | - |
+| 0F 9C | reached | `.op_0f_setcc` | dual | - | - |
+| 0F 9D | reached | `.op_0f_setcc` | dual | - | - |
+| 0F 9E | reached | `.op_0f_setcc` | dual | - | - |
+| 0F 9F | reached | `.op_0f_setcc` | dual | - | - |
 | 0F A0 | reached | `.op_0f_push_fs_A0` | dual | - | no flag macro reachable |
 | 0F A1 | reached | `.op_0f_pop_fs_A1` | dual | - | no flag macro reachable |
 | 0F A2 | reached | `.op_0f_cpuid_A2` | AGN | - | REVIEW: no width primitive, 9 bare word op(s), no flag macro reachable |
@@ -564,16 +564,16 @@ Warning legend:
 | 0F B3 | reached | `.op_0f_btr_B3` | dual | - | no flag macro reachable |
 | 0F B4 | reached | `.op_0f_lfs_B4` | dual | - | no flag macro reachable |
 | 0F B5 | reached | `.op_0f_lgs_B5` | dual | - | no flag macro reachable |
-| 0F B6 | reached | `.op_0f_movzx_gv_eb` | dual | INCDEC | - |
-| 0F B7 | reached | `.op_0f_movzx_gv_ew` | dual | INCDEC | - |
+| 0F B6 | reached | `.op_0f_movzx_gv_eb` | dual | - | no flag macro reachable |
+| 0F B7 | reached | `.op_0f_movzx_gv_ew` | dual | - | no flag macro reachable |
 | 0F B8 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F B9 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F BA | reached | `.op_0f_ba` | dual | - | no flag macro reachable |
 | 0F BB | reached | `.op_0f_btc_BB` | dual | - | no flag macro reachable |
 | 0F BC | reached | `.op_0f_bsf_BC` | dual | - | no flag macro reachable |
 | 0F BD | reached | `.op_0f_bsr_BD` | dual | - | no flag macro reachable |
-| 0F BE | reached | `.op_0f_movsx_gv_eb` | dual | INCDEC | - |
-| 0F BF | reached | `.op_0f_movsx_gv_ew` | dual | INCDEC | - |
+| 0F BE | reached | `.op_0f_movsx_gv_eb` | dual | - | no flag macro reachable |
+| 0F BF | reached | `.op_0f_movsx_gv_ew` | dual | - | no flag macro reachable |
 | 0F C0 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F C1 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F C2 | **`.exit_loop`** | `.exit_loop` | - | - | - |
@@ -832,7 +832,7 @@ and ignored the prefix; that is fixed.)
 | `64` FS: | implemented | as above |
 | `65` GS: | implemented | as above |
 | `66` operand size | implemented | `EOR R2, R2, #OPSIZE_XOR` — one instruction, switches the whole dispatch table (and the 0F table, at `[R2,#-8]`) to the other pass. Applying it twice cancels. |
-| `67` address size | implemented | `EOR R2, R2, #ADDRSIZE_XOR`, independent axis. Honoured by every handler that reaches the decoder via `[R2, #REC_MODRM_FN]`; **ignored** by the five handlers that call `L(DECODE_MODRM_32)` by symbol (`0F 01`, `0F 9x` memory form, `0F B6/B7/BE/BF` memory form). |
+| `67` address size | implemented | `EOR R2, R2, #ADDRSIZE_XOR`, independent axis. Honoured by every handler that reaches the decoder via `[R2, #REC_MODRM_FN]`; honoured everywhere: the last by-symbol decoder calls (`0F 9x` and `0F B6/B7/BE/BF`, memory forms) now use `MODRM_CALL`. |
 | `F0` LOCK | implemented as a no-op | Correct for a uniprocessor, but it branches to `.fetch_decode_loop`, which resets the segment-override register and decrements the PIT again. `ES: LOCK ...` loses the `ES:`. |
 | `F2` REPNE | implemented | Arms `CPU_REP_ACTIVE`/`CPU_REP_ZF_SENSE`/`CPU_REP_RESUME`; one element per pass through the main loop, then EIP is rewound to the prefix. Keeps the PIT serviceable inside a long REP. Counter is CX or ECX **by address size**. Ignored on non-string opcodes, as on hardware. |
 | `F3` REP/REPE | implemented | Same machinery, ZF sense 1; sense 2 ("no ZF test") selected for `A4/A5` MOVS and `AA..AD` STOS/LODS. |
@@ -947,8 +947,10 @@ prints `cpu_exit_info` alongside `cpu_cs_sel`/`cpu_eip`/`cpu_cr0` — the report
     later-era games) that uses a near conditional jump will derail.
 16. **`0x8D` LEA** writes the computed address with a bare 32-bit `STR` rather than
     `STREG_V`.
-17. **`0x0F B6/B7/BE/BF` MOVZX/MOVSX** write the destination with a full 32-bit `STR.W`,
-    clobbering the high half of the destination register in 16-bit mode.
+17. ~~**`0x0F B6/B7/BE/BF` MOVZX/MOVSX** write the destination with a full 32-bit `STR.W`,
+    clobbering the high half of the destination register in 16-bit mode.~~ **FIXED** --
+    they use `STREG_V`. `tests/test_opcodes.py` "leaves the high half of EAX alone" (three
+    arms, one per form).
 18. **`0xA1` MOV eAX,Ov** writes EAX with a full 32-bit store.
 19. **`0x61` POPA** writes every restored register with a full 32-bit store.
 
@@ -957,12 +959,22 @@ prints `cpu_exit_info` alongside `cpu_cs_sel`/`cpu_eip`/`cpu_cr0` — the report
 20. **Register-form-only handlers**: `85` TEST Ev,Gv, `86`/`87` XCHG, `8F` POP Ev,
     `C6`/`C7` MOV E,imm. The MOV family (`88/89/8A/8B`) had exactly this bug and has been
     fixed; these five were not swept in the same pass.
-21. **`E0`–`E3` LOOP/LOOPZ/LOOPNZ/JCXZ use the full 32-bit ECX** regardless of address
-    size. In 16-bit code they must use CX. They happen to work whenever the upper half of
-    ECX is already zero, which is most of the time — a classic latent failure.
-22. **Five handlers call `L(DECODE_MODRM_32)` by symbol** instead of through
-    `[R2, #REC_MODRM_FN]`, so they follow the *pass's* address size and ignore a `0x67`
-    prefix: `0F 01`, `0F 9x` SETcc (memory form), `0F B6/B7/BE/BF` (memory form).
+21. ~~**`E0`–`E3` LOOP/LOOPZ/LOOPNZ/JCXZ use the full 32-bit ECX** regardless of address
+    size.~~ **FIXED** -- all four go through `CNT_LOAD`/`CNT_STORE`, which truncate and
+    store at the address size. (The REP prefix and the `.str_exit` batch path had the
+    same bug in open-coded form and now store `STRH` at address size 16;
+    `tests/test_opcodes.py` "REP MOVSB (16-bit) preserves the high half of ECX".)
+22. ~~**Five handlers call `L(DECODE_MODRM_32)` by symbol**~~ **FIXED** -- `0F 9x` SETcc
+    (memory form) and `0F B6/B7/BE/BF` (memory form) now reach the decoder through the
+    mode record via the `MODRM_CALL` macro; `0F 01` was fixed earlier. `L()` appends the
+    PASS suffix, so `L(DECODE_MODRM_32)` was never "the 32-bit decoder" -- it tied the
+    ADDRESS size to the OPERAND size, so a `66` prefix alone (32-bit operand, 16-bit
+    address: the commonest 386 idiom in DOS code) already picked the wrong grammar, and
+    `67` was ignored outright. SETcc had to be restructured for it: the condition code
+    now lives in `R5` until the decode is done, because putting it in `R2` destroyed the
+    mode record and is what forced the by-symbol call in the first place.
+    `tests/test_opcodes.py` "honours 0x67 in 16-bit code" (MOVZX and SETcc arms).
+    **New sites must use `MODRM_CALL`, never `BL L(DECODE_MODRM_32)`.**
 
 ### P4 — missing flags on less-common instructions
 
