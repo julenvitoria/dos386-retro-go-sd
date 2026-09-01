@@ -1121,6 +1121,54 @@ Counts are occurrences in the IMAGE, never execution counts: it ranks what a
 title COULD need. `profile_opcodes.py` ranks what it DOES need. Neither
 substitutes for the other.
 
+#### `--library` — the whole roms tree in one pass
+
+```bash
+python3 scripts/opcode_demand.py --library \
+    --report build/artifacts/opcode_demand_library.md \
+    --json   build/artifacts/opcode_demand_library.json
+
+python3 scripts/opcode_demand.py --library --title WOLF3D --title KEEN4
+```
+
+Scans every `.dsk`, writes a per-title gap table plus a cross-title ranking of
+missing opcodes and a list of titles with no strongly-evidenced gap. Takes
+about five minutes for the full tree. Four things it does that the per-title
+mode does not, each of which changed an answer:
+
+* **It classifies the executable format and takes the decode width from it.**
+  The tree is not all real-mode MZ: `SCRIPTIN.EXE` and `JAZZ2.EXE` are Win32
+  PE, Tyrian's installer and all of WIN311 are Win16 NE, `WIN386.EXE` is a W3
+  bundle, and Dark Forces and Mortal Kombat are DOS/4GW-bound LINEAR
+  EXECUTABLES. Non-DOS files are excluded with a printed reason; an LE's code
+  comes from the objects the header FLAGS as executable, at the width its BIG
+  bit declares. `--from-entry` restores the old CS:IP rule.
+* **It validates an LE header rather than searching for the signature.**
+  `MK1.EXE`'s stub has no usable `e_lfanew`, so the payload is found by
+  search — but `PRINCE.EXE` contains the bytes `LE\0\0` too, at an offset
+  whose page size reads `0x414f4259`. Only a candidate with a 4096-byte page
+  size, a sane object count and an in-file object table is accepted.
+* **It keeps only the 4 KB windows that DECODE LIKE CODE** (`code_windows()`),
+  scored by the fraction of instructions using common opcodes. Data blobs
+  score 0.07, real code 0.32-0.94. This removed every phantom in one step:
+  Epic Pinball's `0F 0F` PI2FD went from 217 occurrences to 4. `WOLF3D.EXE`
+  is rejected entirely and correctly — it is LZEXE-packed, so there is no x86
+  in the file to count. `--no-code-filter` opts out.
+* **It reports `rel`, not raw `enrich`.** Shuffling preserves single bytes but
+  destroys ordered pairs, so raw enrichment is not comparable across opcode
+  lengths: `8B` MOV scores 1.27 and `0F 0F` scores 217 in the same file. `rel`
+  divides by the median enrichment of the same opcode LENGTH. **Read `rel`.**
+
+STRONG requires all three of count >= 20, `ctx` >= 14 and `rel` >= 4. `ctx` is
+the median count of distinct byte values in the 24 bytes around each hit; it
+exists because the shuffle control is blind to byte CLUSTERING, which is how
+`0F 0D` PREFETCHW once scored 5.3x at the edge of a run of `0D` bytes.
+
+`x87_idioms()` answers the FPU question without decoding at all, by searching
+for fixed byte sequences (`DF E0 9E` = `FNSTSW AX; SAHF`, `DB E3` = `FNINIT`)
+that are x87 and nothing else. Needed because both statistical controls have
+opposite blind spots on x87 and both are wrong about it.
+
 ### `profile_all.py` — ONE command, one workload, one full report
 
 ```bash
