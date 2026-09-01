@@ -844,22 +844,29 @@ Segment override coverage on the *destination* of string ops is correctly refuse
 
 ## x87 and other whole-block gaps
 
+**Checked against the generated table above on 2026-09-02.** This section is
+hand-written and therefore rots; when it disagrees with the generated table, the
+GENERATED TABLE WINS and this section is the thing to fix.
+
 | Block | Slots | Status |
 |---|---|---|
-| `D8`–`DF` x87 escapes | 8 | **Entirely unimplemented.** No FPU state exists in the CPU struct; all eight escape opcodes exit to the host as UNIMPLEMENTED. Any program that probes for a coprocessor or emits floating point will stop here. `9B` WAIT/FWAIT is also unimplemented, so even the "no FPU present" idiom (`FNINIT` / `FNSTSW`) cannot run. |
-| BCD adjusts `27 2F 37 3F` (DAA/DAS/AAA/AAS) | 4 | Unimplemented. `D4`/`D5` (AAM/AAD) *are* implemented but set no flags. |
-| String port I/O `6C`–`6F` | 4 | Unimplemented. |
-| `62` BOUND, `63` ARPL | 2 | Unimplemented. |
-| `9B` WAIT | 1 | Unimplemented. |
-| `F1` ICEBP, `F4` HLT | 2 | Unimplemented in the table. A `.op_hlt_F4` handler exists in the source but is referenced by neither dispatch table — dead code. |
-| 386 bit instructions `0F A3/AB/B3/BB`, `0F BA`, `0F BC/BD` | 7 | Unimplemented: BT/BTS/BTR/BTC/BSF/BSR. |
-| 386 double shifts `0F A4/A5/AC/AD` | 4 | Unimplemented: SHLD/SHRD. |
-| 386 segment loads `0F B2/B4/B5` | 3 | Unimplemented: LSS/LFS/LGS. |
-| 386 `0F AF` IMUL Gv,Ev | 0 | Implemented. |
-| 386 `0F A0/A1/A8/A9` PUSH/POP FS,GS | 4 | Unimplemented. |
-| 386 control/debug regs `0F 20`–`0F 27` | 8 | Unimplemented — consistent with a real-mode-only core. |
-| 286 protected mode `0F 00`, `0F 02`, `0F 03`, `0F 06` | 0 | Implemented: all of Grp6, `LAR`, `LSL`, `CLTS`. `LAR`/`LSL`/`VERR`/`VERW` exit as unimplemented in REAL mode, where they are not instructions. |
-| 486/Pentium+ (`0F 31` RDTSC, `0F A2` CPUID, `0F C8`–`CF` BSWAP, CMPXCHG, XADD, MMX/SSE) | 158 | **Out of scope** for a 386-class target. |
+| `D8`-`DF` x87 escapes | 8 | No FPU state exists in the CPU struct. All eight dispatch to `.op_esc_x87`, a stub — a program that emits floating point gets wrong answers or stops here. |
+| `0F 20`-`0F 27` control/debug regs | varies | `0F 20`/`0F 22` (`MOV r32,CR` / `MOV CR,r32`) are implemented — the protected-mode walk needs them. The debug-register slots are not. |
+| 486/Pentium+ (`0F 31` RDTSC, `0F A2` CPUID, `0F C8`-`CF` BSWAP, CMPXCHG, XADD, MMX/SSE) | 158 | **Out of scope** for a 386-class target — not gaps. |
+| `63` ARPL | 1 | **The only one-byte slot still dispatching to `.exit_loop`.** |
+
+**Formerly listed here as unimplemented and NOW IMPLEMENTED** — do not task a
+lane from an older copy of this section: BCD adjusts `27`/`2F`/`37`/`3F`;
+`D4`/`D5` AAM/AAD; string port I/O `6C`-`6F`; `62` BOUND; `9B` WAIT; `F1` ICEBP;
+`F4` HLT (reached by the table, not dead code); `0F A0`/`A1`/`A8`/`A9` PUSH/POP
+FS,GS; `0F B2`/`B4`/`B5` LSS/LFS/LGS; `0F AF` IMUL Gv,Ev; the 386 bit set
+`0F A3`/`AB`/`B3`/`BB`, `0F BA`, `0F BC`/`BD` (BT/BTS/BTR/BTC/BSF/BSR); the 386
+double shifts `0F A4`/`A5`/`AC`/`AD` (SHLD/SHRD); and all of group 6 plus
+`0F 02`/`03`/`06` (`LAR`/`LSL`/`CLTS`), which exit as unimplemented in REAL mode
+because they are not instructions there.
+
+**"Implemented" is a dispatch fact, not a correctness verdict** — see "What the
+generator will NOT tell you" above, and the defect sections below.
 
 ## Defects, prioritised
 

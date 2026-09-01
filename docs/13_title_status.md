@@ -7,6 +7,32 @@ Measure with `scripts/probe_report.py --title <name>`, which leads with what we
 did **not** answer. Judge pictures with `scripts/screenshot.py`; judge a text
 screen's *shading* with `--attr`, never `--text`.
 
+> ## THE MEASUREMENTS IN THIS FILE ARE VALID. TIER 2 IS DOWN, AND THE BREAK IS DATED.
+>
+> **Tier 2 does not launch a game today**, and the cause is a **board-variant
+> disagreement**, not a bug in either project: gwemu deliberately holds GPIOC
+> pin 5 low as the charger's active-low PGOOD sense (commit `a35a9b9acc`,
+> **2026-08-19**, "gpio: TIME is PA2 only; hold PC5 (PGOOD) low" — the version
+> our runs report), while our retro-go reads TIME from PC5
+> (`references/game-and-watch-retro-go-sd/Core/Inc/main.h:155-156`). So
+> `boot_buttons` = `B_TIME` on every run, `force_launcher` skips auto-launch,
+> and `B_TIME` -> `ODROID_INPUT_SELECT` latches `last_key` in a dialog that never
+> re-opens, so even a timeline's fallback A-presses are dead. Evidence, the three
+> candidate resolutions and the retired red herrings: [`STATUS.md`](../STATUS.md),
+> first section. **The fix is an open question for the user, not a bug with a
+> known owner. Do not change either project's pin mapping on your own.**
+>
+> **The boundary is 2026-08-19, and every measurement in this file predates it.**
+> Every dated entry below is 2026-08-14 or 2026-08-15, so **all of it is VALID and
+> none of it needs re-running on this account.** Checked, not assumed.
+>
+> What IS unmeasured is the work done after the break — the 2026-09-01/02 sprint.
+> Where each title stops *now* is unknown, because three of the walls recorded
+> below have since been built (protected-mode IDT gate dispatch and
+> same-privilege `IRET`; `0F A0`/`A1`/`A8`/`A9` PUSH/POP FS,GS). Those rows are
+> marked in place. Tier-1 results, silicon results and static analysis
+> (`opcode_demand.py`, `disasm_diff.py`) never boot retro-go and are unaffected.
+
 ## THE "THREE TITLES CONVERGE ON ONE ADDRESS" FINDING IS RETRACTED — MEASURED 2026-08-15
 
 Dark Forces, Mortal Kombat and Epic Pinball were all recorded as dying on
@@ -66,7 +92,16 @@ which we have had all along — is never issued.
 
 ### Where all three stop NOW
 
-| title | insns | `CR0` | `CS:EIP` | stops on | needs |
+**These measurements are SOUND — 2026-08-15, before the tier-2 break — but all
+three blockers have since been BUILT.** `INT imm8` with `CR0.PE` set is now
+delivered through an IDT gate with a same-privilege `IRET` (`3688f69`,
+`e6789b2`), and `0F A0`/`A1`/`A8`/`A9` PUSH/POP FS,GS are in (`e70db05`). So
+none of these three titles stops where this table says any more, and **where
+each stops NOW IS UNMEASURED** — it is the next measurement on the list and it
+is blocked on tier 2. Kept for the `CR0`/`CS:EIP` evidence that the descriptor
+walk held, not as a current verdict.
+
+| title | insns | `CR0` | `CS:EIP` | stopped on (SUPERSEDED) | needed |
 |---|---:|---:|---|---|---|
 | Dark Forces | 102,517 | **1** | `0070:5403` | `exit_info=0xCD`, `INT imm8` with PE set | protected-mode **IDT gate dispatch** |
 | Mortal Kombat | 42,188 | **1** | `0070:559D` | `exit_info=0xCD`, same | the same one thing |
@@ -662,7 +697,15 @@ Why DPMI/VCPI/XMS stays unbuilt:
 
 **Do not half-build DPMI.**
 
-## Epic Pinball — PAST the EXEC wall; next stop is an unimplemented opcode
+## Epic Pinball — PAST the EXEC wall; its next wall has since been BUILT
+
+**UPDATE 2026-09-02, documentation only.** The opcode that ended the run below
+was later read correctly as `exit_info=0x0FA0` = `PUSH FS`, and **`0F A0`/`A1`/
+`A8`/`A9` PUSH/POP FS,GS are now implemented (`e70db05`)**. The `IN 0x22A`
+64,000-read spin is also gone (6 reads; the DSP resets twice, issues 5 commands
+with none unknown, programs the mixer and 22,050 Hz). **Where Epic Pinball stops
+now is UNMEASURED and blocked on tier 2** (banner at the top of this file).
+Everything below it is a valid 2026-08-15 measurement and is the before-picture.
 
 **UPDATE 2026-08-15, after `X86_DOS_EXEC` became the shipping default.** The
 `AH=4Bh` blocker described below is CLEARED. Measured at tier 2 on the shipping
