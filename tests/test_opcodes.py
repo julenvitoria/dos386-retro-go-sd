@@ -734,6 +734,74 @@ def run_test(args):
                 "expected_eip": 4,
             },
             {
+                # 0F B6/B7/BE/BF called L(DECODE_MODRM_32) BY SYMBOL, which is
+                # per-PASS -- so the address size followed the OPERAND size and
+                # a 0x67 prefix was ignored. In 16-bit code `67 0F B6 05 disp32`
+                # must decode the 32-bit grammar's disp32 form; with the bug the
+                # 16-bit decoder read ModRM 0x05 as [DI] and consumed no
+                # displacement at all.
+                "name": "0x0F B6 MOVZX honours 0x67 in 16-bit code",
+                "mode": 16,
+                "code": bytes([0x67, 0x0F, 0xB6, 0x05, 0x00, 0x10, 0x00, 0x00, 0xF4]),
+                "regs_initial": {0: 0, 7: 0x2000},
+                "regs_expected": {0: 0x5A},
+                "expected_eip": 9,
+                "ram_setup": [(0x1000, bytes([0x5A])), (0x2000, bytes([0x11]))],
+            },
+            {
+                # SETcc's memory form had the same by-symbol decoder call.
+                "name": "0x0F 94 SETZ mem honours 0x67 in 16-bit code",
+                "mode": 16,
+                "code": bytes([0x67, 0x0F, 0x94, 0x05, 0x00, 0x10, 0x00, 0x00, 0xF4]),
+                "regs_initial": {7: 0x2000},
+                "eflags_initial": (1 << 6),
+                "regs_expected": {},
+                "expected_eip": 9,
+                "ram_setup": [(0x1000, bytes([0x00])), (0x2000, bytes([0x00]))],
+                "mem_expected": [(0x1000, bytes([0x01])), (0x2000, bytes([0x00]))],
+            },
+            {
+                # MOVZX/MOVSX wrote the destination with a bare 32-bit STR.W in
+                # BOTH passes. `MOVZX AX, BL` writes 16 bits; the high half of
+                # EAX is architecturally untouched.
+                "name": "0x0F B6 MOVZX AX,BL leaves the high half of EAX alone",
+                "mode": 16,
+                "code": bytes([0x0F, 0xB6, 0xC3, 0xF4]),
+                "regs_initial": {0: 0xAAAA0000, 3: 0x88},
+                "regs_expected": {0: 0xAAAA0088},
+                "expected_eip": 4,
+            },
+            {
+                "name": "0x0F BE MOVSX AX,BL leaves the high half of EAX alone",
+                "mode": 16,
+                "code": bytes([0x0F, 0xBE, 0xC3, 0xF4]),
+                "regs_initial": {0: 0xAAAA0000, 3: 0x88},
+                "regs_expected": {0: 0xAAAAFF88},
+                "expected_eip": 4,
+            },
+            {
+                "name": "0x0F B7 MOVZX AX,BX leaves the high half of EAX alone",
+                "mode": 16,
+                "code": bytes([0x0F, 0xB7, 0xC3, 0xF4]),
+                "regs_initial": {0: 0xAAAA0000, 3: 0x1234},
+                "regs_expected": {0: 0xAAAA1234},
+                "expected_eip": 4,
+            },
+            {
+                # The REP count is CX at address size 16, and the high half of
+                # ECX is not part of it. Both decrement sites (the prefix and
+                # the .str_exit batch path) truncated the count and then wrote
+                # it back with a full 32-bit STR.W, zeroing ECX[31:16].
+                "name": "REP MOVSB (16-bit) preserves the high half of ECX",
+                "mode": 16,
+                "code": bytes([0xF3, 0xA4, 0xF4]),
+                "regs_initial": {1: 0x00050003, 6: 0x1000, 7: 0x2000},
+                "regs_expected": {1: 0x00050000},
+                "expected_eip": 3,
+                "ram_setup": [(0x1000, bytes([0xAA, 0xBB, 0xCC]))],
+                "mem_expected": [(0x2000, bytes([0xAA, 0xBB, 0xCC]))],
+            },
+            {
                 "name": "Grp3 F7 MUL EBX",
                 # F7 E3 -> MUL EBX (Reg=4, R/M=3 -> Mod=11, Reg=100, R/M=011 -> 11 100 011 = 0xE3)
                 "code": bytes([0xF7, 0xE3, 0xF4]), 

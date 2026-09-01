@@ -765,16 +765,19 @@ OP .op_0f_jcc_rel32
     EIP_WRAP
     B.W .fetch_decode_loop
 
+/* The condition code is kept in R5, NOT in R2: R2 is the live mode record and
+   the memory form must still reach the decoder through it. Extracting the
+   condition into R2 first is what forced the old code to call the decoder by
+   symbol, which tied the address size to the operand size. */
 OP .op_0f_setcc
-    UBFX R2, R1, #0, #4
+    AND.W R5, R1, #15              @ cond -- R1 is about to become the ModRM
     CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
     CMP R1, #192                   @ mod==3 iff modrm >= 0xC0
     BLO.N L(OP_0F_SETCC_MEM)
-    PUSH {R2}
+    MOV R2, R5
     BL L(EVAL_COND)
-    POP {R2}
     AND.W R4, R1, #7
     AND.W R5, R4, #3
     MOV.W R4, R4, LSR #2
@@ -784,9 +787,9 @@ OP .op_0f_setcc
     B.W .fetch_decode_loop
 
 L(OP_0F_SETCC_MEM):
-    PUSH {R2}
-    BL L(DECODE_MODRM_32)
-    POP {R2}
+    PUSH {R5}                      @ the decoder clobbers R2-R5
+    MODRM_CALL
+    POP {R2}                       @ ...and the condition lands in R2 for EVAL_COND
     PUSH {R7}
     BL L(EVAL_COND)
     POP {R7}
@@ -1298,7 +1301,7 @@ OP .op_0f_movzx_gv_eb
     B.N L(OP_0F_MOVZX_GV_EB_WRITE)
 
 L(OP_0F_MOVZX_GV_EB_MEM):
-    BL L(DECODE_MODRM_32)
+    MODRM_CALL
     UBFX R4, R7, #12, #12
     LDR.W R4, [R9, R4, LSL #2]
     ADDS R4, R4, R7
@@ -1309,7 +1312,7 @@ L(OP_0F_MOVZX_GV_EB_WRITE):
     UBFX R3, R1, #3, #3
     MOV.W R3, R3, LSL #2
     ADD.W R3, R3, #8
-    STR.W R4, [R8, R3]
+    STREG_V R4, R3
     B.W .fetch_decode_loop
 
 OP .op_0f_movzx_gv_ew
@@ -1325,7 +1328,7 @@ OP .op_0f_movzx_gv_ew
     B.N L(OP_0F_MOVZX_GV_EW_WRITE)
 
 L(OP_0F_MOVZX_GV_EW_MEM):
-    BL L(DECODE_MODRM_32)
+    MODRM_CALL
     SEAM_CHECK R4, R7
     UBFX R4, R7, #12, #12
     LDR.W R4, [R9, R4, LSL #2]
@@ -1337,7 +1340,7 @@ L(OP_0F_MOVZX_GV_EW_WRITE):
     UBFX R3, R1, #3, #3
     MOV.W R3, R3, LSL #2
     ADD.W R3, R3, #8
-    STR.W R4, [R8, R3]
+    STREG_V R4, R3
     B.W .fetch_decode_loop
 
 OP .op_0f_movsx_gv_eb
@@ -1355,7 +1358,7 @@ OP .op_0f_movsx_gv_eb
     B.N L(OP_0F_MOVSX_GV_EB_WRITE)
 
 L(OP_0F_MOVSX_GV_EB_MEM):
-    BL L(DECODE_MODRM_32)
+    MODRM_CALL
     UBFX R4, R7, #12, #12
     LDR.W R4, [R9, R4, LSL #2]
     ADDS R4, R4, R7
@@ -1366,7 +1369,7 @@ L(OP_0F_MOVSX_GV_EB_WRITE):
     UBFX R3, R1, #3, #3
     MOV.W R3, R3, LSL #2
     ADD.W R3, R3, #8
-    STR.W R4, [R8, R3]
+    STREG_V R4, R3
     B.W .fetch_decode_loop
 
 OP .op_0f_movsx_gv_ew
@@ -1382,7 +1385,7 @@ OP .op_0f_movsx_gv_ew
     B.N L(OP_0F_MOVSX_GV_EW_WRITE)
 
 L(OP_0F_MOVSX_GV_EW_MEM):
-    BL L(DECODE_MODRM_32)
+    MODRM_CALL
     SEAM_CHECK R4, R7
     UBFX R4, R7, #12, #12
     LDR.W R4, [R9, R4, LSL #2]
@@ -1394,7 +1397,7 @@ L(OP_0F_MOVSX_GV_EW_WRITE):
     UBFX R3, R1, #3, #3
     MOV.W R3, R3, LSL #2
     ADD.W R3, R3, #8
-    STR.W R4, [R8, R3]
+    STREG_V R4, R3
     B.W .fetch_decode_loop
 
 /* 0F AF /r -- IMUL Gv, Ev. The two-operand form: Gv = Gv * Ev, low half only.
