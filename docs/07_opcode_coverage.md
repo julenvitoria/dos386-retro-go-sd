@@ -1,42 +1,50 @@
 # 07 — x86 Opcode Coverage Audit
 
-Read-only audit of the hand-written Thumb-2 core as of the working tree at the time of
-writing (`opcode_table.S`, `opcode_0f_table.S`, `cpu_exec_handlers.S`,
-`cpu_exec_handlers_0f.S`, `cpu_exec.S`). Every entry below was produced by parsing the
-two dispatch tables programmatically and then reading the body of each named handler.
-Nothing here is inferred from a handler's name.
+**The per-opcode tables in this document are GENERATED. Do not hand-edit them.**
 
-Target class is **386 real mode**. 486/Pentium+ instructions are listed as *out of
-scope* rather than as gaps.
+    python3 scripts/gen_opcode_coverage.py --write     # regenerate
+    python3 scripts/gen_opcode_coverage.py --check     # CI: is this stale?
 
-## Hard numbers
+Everything between the `BEGIN GENERATED` / `END GENERATED` markers is derived
+from `opcode_table.S`, `opcode_0f_table.S` and the handler bodies in
+`cpu_exec_handlers.S` / `cpu_exec_handlers_0f.S` by parsing them. The sections
+after the markers are hand-written analysis that a parser cannot produce.
 
-| Metric | Count |
-|---|---|
-| One-byte slots with a handler | **235 / 256** |
-| One-byte slots dispatching to `.exit_loop` | **21 / 256** |
-| Two-byte (0F) slots with a handler | **38 / 256** |
-| Two-byte slots dispatching to `.exit_loop` | **218 / 256** (of which 158 are 486/Pentium+ and out of scope) |
-| Group `/reg` sub-opcode slots audited | **122** |
-| Group `/reg` slots reaching real code | **104** |
-| Group `/reg` slots missing or stubbed | **18** |
+## Why this document is generated now
 
-### Defects by category (implemented but wrong — these fail *silently*)
+It was hand-written, and it rotted twice.
 
-| Category | Count of affected opcode slots | Examples |
-|---|---|---|
-| Missing flags entirely | 13 | `84`, `A8`, `A9`, `F6 /0`, `FE /0 /1`, `FF /0 /1`, `69`, `6B`, `D4`, `D5` |
-| Silently 32-bit in 16-bit mode (`OP_AGNOSTIC` on a width-sensitive body, or bare `LDR`/`STR`/`#4`) | 21 | `87`, `91`–`97`, `98`, `99`, `8D`, `A1`, `CA`, `C1`, `D1`, `D3`, `0F 80`–`0F 8F` |
-| Stack accessed as a raw linear address (no `SS.base`, hard-coded ±4) | 13 | `60`, `61`, `68`, `6A`, `8F`, `9C`, `9D`, `C2`, `C8`, `C9`, `CA`, `FF /2`, `FF /6` |
-| Memory ModRM form missing (register form only) | 6 | `85`, `86`, `87`, `8F`, `C6`, `C7` |
-| Non-stack memory operand used without a segment base | 5 | `A0`, `A1`, `A2`, `A3`, `D7` |
-| Address-size axis ignored (uses full `ECX`/32-bit moffs) | 6 | `E0`, `E1`, `E2`, `E3`, `A0`, `A2` |
-| CS.base mishandled on a control transfer | 4 | `C2`, `CA`, `FF /2`, `FF /4` |
-| Implemented as a silent no-op | 1 | `84` (TEST). `0F 01 /2` LGDT is no longer a no-op. |
+Commit `7f4c12a` fixed the `0F 8x` near-`Jcc` rel16 defect and the `E0`–`E3`
+`LOOP`/`JCXZ` address-size gap. **249 commits later this document still listed
+both as DEFECT.** `60` PUSHA, `61` POPA, `68` PUSH Iv and `84`/`85` TEST were
+likewise repaired while the table still called them broken, and `27`/`2F`/`37`/
+`3F` (BCD), `D4`/`D5` (AAM/AAD) and `6C`–`6F` (INS/OUTS) were implemented while
+the table still called them `.exit_loop`. A sprint was planned against those
+rows and an agent was mis-tasked as a result.
 
-Slots can appear in more than one row. Counting distinct one-byte slots, **43 of the 235
-implemented opcodes have at least one defect** and **7 more are partial** (register form
-only). That leaves roughly **185 one-byte opcodes believed correct**.
+A stale coverage document is worse than no coverage document: it is confidently
+wrong, and it is read by people deciding what to build. Hence the generator.
+
+Target class is **386 real mode**. 486/Pentium+ instructions are out of scope
+rather than gaps.
+
+## What the generator will NOT tell you
+
+It reports mechanical properties of the source text — which dispatch slot
+reaches a handler, whether that handler is emitted once or per operand size,
+which width primitives and flag macros are reachable from its body. It follows
+one handler's delegation into shared cores (`L(ALU_DISPATCH_8)`,
+`L(SHIFT_TBH_32)`, …) so an ALU handler is not falsely reported as writing no
+flags.
+
+**It never claims a handler is CORRECT.** Whether a flag computation matches
+the 386, whether a segment base is applied in the right place, whether an
+addressing mode is decoded at the right width — none of that is derivable by
+grep, and all of it is marked UNKNOWN. A `REVIEW:` marker means "a human should
+read this handler", not "this handler is broken"; an empty warnings cell means
+"no marker fired", not "verified correct". `tests/test_opcodes.py` and the
+hand-written sections below are where semantic verdicts live.
+
 
 ## How the two operand-size passes work (and how to read the "dual/AGN" column)
 
@@ -61,536 +69,616 @@ flagged below.
 stack width. Thirteen handlers still open-code the stack with `LDR R4,[R8,#24]` /
 `SUB #4` and are listed as defects.
 
----
+### Defects by category (implemented but wrong — these fail *silently*)
 
-## One-byte opcodes — all 256
+| Category | Count of affected opcode slots | Examples |
+|---|---|---|
+| Missing flags entirely | 13 | `84`, `A8`, `A9`, `F6 /0`, `FE /0 /1`, `FF /0 /1`, `69`, `6B`, `D4`, `D5` |
+| Silently 32-bit in 16-bit mode (`OP_AGNOSTIC` on a width-sensitive body, or bare `LDR`/`STR`/`#4`) | 21 | `87`, `91`–`97`, `98`, `99`, `8D`, `A1`, `CA`, `C1`, `D1`, `D3`, `0F 80`–`0F 8F` |
+| Stack accessed as a raw linear address (no `SS.base`, hard-coded ±4) | 13 | `60`, `61`, `68`, `6A`, `8F`, `9C`, `9D`, `C2`, `C8`, `C9`, `CA`, `FF /2`, `FF /6` |
+| Memory ModRM form missing (register form only) | 6 | `85`, `86`, `87`, `8F`, `C6`, `C7` |
+| Non-stack memory operand used without a segment base | 5 | `A0`, `A1`, `A2`, `A3`, `D7` |
+| Address-size axis ignored (uses full `ECX`/32-bit moffs) | 6 | `E0`, `E1`, `E2`, `E3`, `A0`, `A2` |
+| CS.base mishandled on a control transfer | 4 | `C2`, `CA`, `FF /2`, `FF /4` |
+| Implemented as a silent no-op | 1 | `84` (TEST). `0F 01 /2` LGDT is no longer a no-op. |
 
-| Op | Mnemonic | Status | Handler | Notes |
-|---|---|---|---|---|
-| 00 | ADD Eb,Gb | implemented | `.op_alu_eb_gb` (AGN) | 8-bit, OP_AGNOSTIC and correctly so. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 01 | ADD Ev,Gv | implemented | `.op_alu_ev_gv` (dual) | Dual-emitted (OP); LD_V/LDREG_V/ST_V throughout. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 02 | ADD Gb,Eb | implemented | `.op_alu_gb_eb` (AGN) | 8-bit, OP_AGNOSTIC and correctly so. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 03 | ADD Gv,Ev | implemented | `.op_alu_gv_ev` (dual) | Dual-emitted; width-correct. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 04 | ADD AL,Ib | implemented | `.op_alu_al_imm8` (AGN) | 8-bit immediate; full flags. |
-| 05 | ADD eAX,Iv | implemented | `.op_alu_eax_imm32` (dual) | Dual-emitted; immediate read with LD_V + EIP_ADV_V, so imm16 in 16-bit mode. Full flags. |
-| 06 | PUSH ES | implemented | `.op_push_es_06` (dual) | Dual-emitted; PUSH_V, so SS.base + width-correct SP. Selector zero-extended to the operand size. |
-| 07 | POP ES | implemented | `.op_pop_es_07` (dual) | Dual-emitted; POP_V + SET_SREG (real mode only; #GP-free trap to host if CR0.PE=1). |
-| 08 | OR Eb,Gb | implemented | `.op_alu_eb_gb` (AGN) | 8-bit, OP_AGNOSTIC and correctly so. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 09 | OR Ev,Gv | implemented | `.op_alu_ev_gv` (dual) | Dual-emitted (OP); LD_V/LDREG_V/ST_V throughout. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 0A | OR Gb,Eb | implemented | `.op_alu_gb_eb` (AGN) | 8-bit, OP_AGNOSTIC and correctly so. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 0B | OR Gv,Ev | implemented | `.op_alu_gv_ev` (dual) | Dual-emitted; width-correct. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 0C | OR AL,Ib | implemented | `.op_alu_al_imm8` (AGN) | 8-bit immediate; full flags. |
-| 0D | OR eAX,Iv | implemented | `.op_alu_eax_imm32` (dual) | Dual-emitted; immediate read with LD_V + EIP_ADV_V, so imm16 in 16-bit mode. Full flags. |
-| 0E | PUSH CS | implemented | `.op_push_cs_0E` (dual) | Dual-emitted; PUSH_V, so SS.base + width-correct SP. Selector zero-extended to the operand size. |
-| 0F | two-byte escape 0F | implemented | `.op_0f_0F` (dual) | Escape: loads the 0F table from the mode record and re-dispatches. Dual-emitted so the 0F table follows operand size. |
-| 10 | ADC Eb,Gb | implemented | `.op_alu_eb_gb` (AGN) | 8-bit, OP_AGNOSTIC and correctly so. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 11 | ADC Ev,Gv | implemented | `.op_alu_ev_gv` (dual) | Dual-emitted (OP); LD_V/LDREG_V/ST_V throughout. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 12 | ADC Gb,Eb | implemented | `.op_alu_gb_eb` (AGN) | 8-bit, OP_AGNOSTIC and correctly so. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 13 | ADC Gv,Ev | implemented | `.op_alu_gv_ev` (dual) | Dual-emitted; width-correct. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 14 | ADC AL,Ib | implemented | `.op_alu_al_imm8` (AGN) | 8-bit immediate; full flags. |
-| 15 | ADC eAX,Iv | implemented | `.op_alu_eax_imm32` (dual) | Dual-emitted; immediate read with LD_V + EIP_ADV_V, so imm16 in 16-bit mode. Full flags. |
-| 16 | PUSH SS | implemented | `.op_push_ss_16` (dual) | Dual-emitted; PUSH_V, so SS.base + width-correct SP. Selector zero-extended to the operand size. |
-| 17 | POP SS | implemented | `.op_pop_ss_17` (dual) | Dual-emitted; POP_V + SET_SREG (real mode only; #GP-free trap to host if CR0.PE=1). POP SS does NOT inhibit interrupts for the following instruction. |
-| 18 | SBB Eb,Gb | implemented | `.op_alu_eb_gb` (AGN) | 8-bit, OP_AGNOSTIC and correctly so. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 19 | SBB Ev,Gv | implemented | `.op_alu_ev_gv` (dual) | Dual-emitted (OP); LD_V/LDREG_V/ST_V throughout. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 1A | SBB Gb,Eb | implemented | `.op_alu_gb_eb` (AGN) | 8-bit, OP_AGNOSTIC and correctly so. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 1B | SBB Gv,Ev | implemented | `.op_alu_gv_ev` (dual) | Dual-emitted; width-correct. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 1C | SBB AL,Ib | implemented | `.op_alu_al_imm8` (AGN) | 8-bit immediate; full flags. |
-| 1D | SBB eAX,Iv | implemented | `.op_alu_eax_imm32` (dual) | Dual-emitted; immediate read with LD_V + EIP_ADV_V, so imm16 in 16-bit mode. Full flags. |
-| 1E | PUSH DS | implemented | `.op_push_ds_1E` (dual) | Dual-emitted; PUSH_V, so SS.base + width-correct SP. Selector zero-extended to the operand size. |
-| 1F | POP DS | implemented | `.op_pop_ds_1F` (dual) | Dual-emitted; POP_V + SET_SREG (real mode only; #GP-free trap to host if CR0.PE=1). |
-| 20 | AND Eb,Gb | implemented | `.op_alu_eb_gb` (AGN) | 8-bit, OP_AGNOSTIC and correctly so. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 21 | AND Ev,Gv | implemented | `.op_alu_ev_gv` (dual) | Dual-emitted (OP); LD_V/LDREG_V/ST_V throughout. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 22 | AND Gb,Eb | implemented | `.op_alu_gb_eb` (AGN) | 8-bit, OP_AGNOSTIC and correctly so. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 23 | AND Gv,Ev | implemented | `.op_alu_gv_ev` (dual) | Dual-emitted; width-correct. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 24 | AND AL,Ib | implemented | `.op_alu_al_imm8` (AGN) | 8-bit immediate; full flags. |
-| 25 | AND eAX,Iv | implemented | `.op_alu_eax_imm32` (dual) | Dual-emitted; immediate read with LD_V + EIP_ADV_V, so imm16 in 16-bit mode. Full flags. |
-| 26 | ES: prefix | implemented | `.op_seg_es_26` (AGN) | Points R6 at the descriptor and re-enters at .fetch_next_byte_no_reset, so the override lives exactly one instruction. No PIT double-decrement. |
-| 27 | DAA | unimplemented | `.exit_loop` | BCD adjust. Not implemented; exits to host as UNIMPLEMENTED. |
-| 28 | SUB Eb,Gb | implemented | `.op_alu_eb_gb` (AGN) | 8-bit, OP_AGNOSTIC and correctly so. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 29 | SUB Ev,Gv | implemented | `.op_alu_ev_gv` (dual) | Dual-emitted (OP); LD_V/LDREG_V/ST_V throughout. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 2A | SUB Gb,Eb | implemented | `.op_alu_gb_eb` (AGN) | 8-bit, OP_AGNOSTIC and correctly so. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 2B | SUB Gv,Ev | implemented | `.op_alu_gv_ev` (dual) | Dual-emitted; width-correct. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 2C | SUB AL,Ib | implemented | `.op_alu_al_imm8` (AGN) | 8-bit immediate; full flags. |
-| 2D | SUB eAX,Iv | implemented | `.op_alu_eax_imm32` (dual) | Dual-emitted; immediate read with LD_V + EIP_ADV_V, so imm16 in 16-bit mode. Full flags. |
-| 2E | CS: prefix | implemented | `.op_seg_cs_2E` (AGN) | Points R6 at the descriptor and re-enters at .fetch_next_byte_no_reset, so the override lives exactly one instruction. No PIT double-decrement. |
-| 2F | DAS | unimplemented | `.exit_loop` | BCD adjust. Not implemented; exits to host as UNIMPLEMENTED. |
-| 30 | XOR Eb,Gb | implemented | `.op_alu_eb_gb` (AGN) | 8-bit, OP_AGNOSTIC and correctly so. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 31 | XOR Ev,Gv | implemented | `.op_alu_ev_gv` (dual) | Dual-emitted (OP); LD_V/LDREG_V/ST_V throughout. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 32 | XOR Gb,Eb | implemented | `.op_alu_gb_eb` (AGN) | 8-bit, OP_AGNOSTIC and correctly so. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 33 | XOR Gv,Ev | implemented | `.op_alu_gv_ev` (dual) | Dual-emitted; width-correct. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 34 | XOR AL,Ib | implemented | `.op_alu_al_imm8` (AGN) | 8-bit immediate; full flags. |
-| 35 | XOR eAX,Iv | implemented | `.op_alu_eax_imm32` (dual) | Dual-emitted; immediate read with LD_V + EIP_ADV_V, so imm16 in 16-bit mode. Full flags. |
-| 36 | SS: prefix | implemented | `.op_seg_ss_36` (AGN) | Points R6 at the descriptor and re-enters at .fetch_next_byte_no_reset, so the override lives exactly one instruction. No PIT double-decrement. |
-| 37 | AAA | unimplemented | `.exit_loop` | BCD adjust. Not implemented; exits to host as UNIMPLEMENTED. |
-| 38 | CMP Eb,Gb | implemented | `.op_alu_eb_gb` (AGN) | 8-bit, OP_AGNOSTIC and correctly so. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 39 | CMP Ev,Gv | implemented | `.op_alu_ev_gv` (dual) | Dual-emitted (OP); LD_V/LDREG_V/ST_V throughout. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 3A | CMP Gb,Eb | implemented | `.op_alu_gb_eb` (AGN) | 8-bit, OP_AGNOSTIC and correctly so. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 3B | CMP Gv,Ev | implemented | `.op_alu_gv_ev` (dual) | Dual-emitted; width-correct. reg+mem forms; full flags via the ALU8/ALU cores; memory path uses the mode record ModRM decoder, so the segment base is applied. |
-| 3C | CMP AL,Ib | implemented | `.op_alu_al_imm8` (AGN) | 8-bit immediate; full flags. |
-| 3D | CMP eAX,Iv | implemented | `.op_alu_eax_imm32` (dual) | Dual-emitted; immediate read with LD_V + EIP_ADV_V, so imm16 in 16-bit mode. Full flags. |
-| 3E | DS: prefix | implemented | `.op_seg_ds_3E` (AGN) | Points R6 at the descriptor and re-enters at .fetch_next_byte_no_reset, so the override lives exactly one instruction. No PIT double-decrement. |
-| 3F | AAS | unimplemented | `.exit_loop` | BCD adjust. Not implemented; exits to host as UNIMPLEMENTED. |
-| 40 | INC eAX | implemented | `.op_inc_r32` (dual) | Dual-emitted; LDREG_V/STREG_V; X86_FLAGS_INCDEC leaves CF alone and sets OF/SF/ZF/AF/PF. |
-| 41 | INC eCX | implemented | `.op_inc_r32` (dual) | Dual-emitted; LDREG_V/STREG_V; X86_FLAGS_INCDEC leaves CF alone and sets OF/SF/ZF/AF/PF. |
-| 42 | INC eDX | implemented | `.op_inc_r32` (dual) | Dual-emitted; LDREG_V/STREG_V; X86_FLAGS_INCDEC leaves CF alone and sets OF/SF/ZF/AF/PF. |
-| 43 | INC eBX | implemented | `.op_inc_r32` (dual) | Dual-emitted; LDREG_V/STREG_V; X86_FLAGS_INCDEC leaves CF alone and sets OF/SF/ZF/AF/PF. |
-| 44 | INC eSP | implemented | `.op_inc_r32` (dual) | Dual-emitted; LDREG_V/STREG_V; X86_FLAGS_INCDEC leaves CF alone and sets OF/SF/ZF/AF/PF. |
-| 45 | INC eBP | implemented | `.op_inc_r32` (dual) | Dual-emitted; LDREG_V/STREG_V; X86_FLAGS_INCDEC leaves CF alone and sets OF/SF/ZF/AF/PF. |
-| 46 | INC eSI | implemented | `.op_inc_r32` (dual) | Dual-emitted; LDREG_V/STREG_V; X86_FLAGS_INCDEC leaves CF alone and sets OF/SF/ZF/AF/PF. |
-| 47 | INC eDI | implemented | `.op_inc_r32` (dual) | Dual-emitted; LDREG_V/STREG_V; X86_FLAGS_INCDEC leaves CF alone and sets OF/SF/ZF/AF/PF. |
-| 48 | DEC eAX | implemented | `.op_dec_r32` (dual) | Dual-emitted; LDREG_V/STREG_V; X86_FLAGS_INCDEC leaves CF alone and sets OF/SF/ZF/AF/PF. |
-| 49 | DEC eCX | implemented | `.op_dec_r32` (dual) | Dual-emitted; LDREG_V/STREG_V; X86_FLAGS_INCDEC leaves CF alone and sets OF/SF/ZF/AF/PF. |
-| 4A | DEC eDX | implemented | `.op_dec_r32` (dual) | Dual-emitted; LDREG_V/STREG_V; X86_FLAGS_INCDEC leaves CF alone and sets OF/SF/ZF/AF/PF. |
-| 4B | DEC eBX | implemented | `.op_dec_r32` (dual) | Dual-emitted; LDREG_V/STREG_V; X86_FLAGS_INCDEC leaves CF alone and sets OF/SF/ZF/AF/PF. |
-| 4C | DEC eSP | implemented | `.op_dec_r32` (dual) | Dual-emitted; LDREG_V/STREG_V; X86_FLAGS_INCDEC leaves CF alone and sets OF/SF/ZF/AF/PF. |
-| 4D | DEC eBP | implemented | `.op_dec_r32` (dual) | Dual-emitted; LDREG_V/STREG_V; X86_FLAGS_INCDEC leaves CF alone and sets OF/SF/ZF/AF/PF. |
-| 4E | DEC eSI | implemented | `.op_dec_r32` (dual) | Dual-emitted; LDREG_V/STREG_V; X86_FLAGS_INCDEC leaves CF alone and sets OF/SF/ZF/AF/PF. |
-| 4F | DEC eDI | implemented | `.op_dec_r32` (dual) | Dual-emitted; LDREG_V/STREG_V; X86_FLAGS_INCDEC leaves CF alone and sets OF/SF/ZF/AF/PF. |
-| 50 | PUSH eAX | implemented | `.op_push_r32` (dual) | Dual-emitted; PUSH_V. PUSH eSP pushes the pre-decrement value, as the ISA requires. |
-| 51 | PUSH eCX | implemented | `.op_push_r32` (dual) | Dual-emitted; PUSH_V. PUSH eSP pushes the pre-decrement value, as the ISA requires. |
-| 52 | PUSH eDX | implemented | `.op_push_r32` (dual) | Dual-emitted; PUSH_V. PUSH eSP pushes the pre-decrement value, as the ISA requires. |
-| 53 | PUSH eBX | implemented | `.op_push_r32` (dual) | Dual-emitted; PUSH_V. PUSH eSP pushes the pre-decrement value, as the ISA requires. |
-| 54 | PUSH eSP | implemented | `.op_push_r32` (dual) | Dual-emitted; PUSH_V. PUSH eSP pushes the pre-decrement value, as the ISA requires. |
-| 55 | PUSH eBP | implemented | `.op_push_r32` (dual) | Dual-emitted; PUSH_V. PUSH eSP pushes the pre-decrement value, as the ISA requires. |
-| 56 | PUSH eSI | implemented | `.op_push_r32` (dual) | Dual-emitted; PUSH_V. PUSH eSP pushes the pre-decrement value, as the ISA requires. |
-| 57 | PUSH eDI | implemented | `.op_push_r32` (dual) | Dual-emitted; PUSH_V. PUSH eSP pushes the pre-decrement value, as the ISA requires. |
-| 58 | POP eAX | implemented | `.op_pop_r32` (dual) | Dual-emitted; POP_V + STREG_V (16-bit pop preserves the high half of the 32-bit reg). |
-| 59 | POP eCX | implemented | `.op_pop_r32` (dual) | Dual-emitted; POP_V + STREG_V (16-bit pop preserves the high half of the 32-bit reg). |
-| 5A | POP eDX | implemented | `.op_pop_r32` (dual) | Dual-emitted; POP_V + STREG_V (16-bit pop preserves the high half of the 32-bit reg). |
-| 5B | POP eBX | implemented | `.op_pop_r32` (dual) | Dual-emitted; POP_V + STREG_V (16-bit pop preserves the high half of the 32-bit reg). |
-| 5C | POP eSP | implemented | `.op_pop_r32` (dual) | Dual-emitted; POP_V + STREG_V (16-bit pop preserves the high half of the 32-bit reg). |
-| 5D | POP eBP | implemented | `.op_pop_r32` (dual) | Dual-emitted; POP_V + STREG_V (16-bit pop preserves the high half of the 32-bit reg). |
-| 5E | POP eSI | implemented | `.op_pop_r32` (dual) | Dual-emitted; POP_V + STREG_V (16-bit pop preserves the high half of the 32-bit reg). |
-| 5F | POP eDI | implemented | `.op_pop_r32` (dual) | Dual-emitted; POP_V + STREG_V (16-bit pop preserves the high half of the 32-bit reg). |
-| 60 | PUSHA/PUSHAD | DEFECT | `.op_pusha_60` (dual) | PUSHA: raw ESP used as a linear address (no SS.base) and a hard-coded 4-byte stride, while the value is stored with ST_V. In the 16-bit pass it therefore strides 4 bytes but writes 2 -- every other slot is garbage - and it breaks entirely when SS.base != 0. |
-| 61 | POPA/POPAD | DEFECT | `.op_popa_61` (dual) | POPA: same raw-ESP/no-SS.base and hard-coded +4 stride as PUSHA; additionally writes each register back with a full 32-bit STR.W, clobbering the high halves in 16-bit mode. ESP slot correctly skipped. |
-| 62 | BOUND Gv,Ma | unimplemented | `.exit_loop` | BOUND. Not implemented. |
-| 63 | ARPL Ew,Gw | unimplemented | `.exit_loop` | ARPL. Protected mode only; not implemented. |
-| 64 | FS: prefix | implemented | `.op_seg_fs_64` (AGN) | Points R6 at the descriptor and re-enters at .fetch_next_byte_no_reset, so the override lives exactly one instruction. No PIT double-decrement. |
-| 65 | GS: prefix | implemented | `.op_seg_gs_65` (AGN) | Points R6 at the descriptor and re-enters at .fetch_next_byte_no_reset, so the override lives exactly one instruction. No PIT double-decrement. |
-| 66 | operand-size prefix | implemented | `.op_pfx_66` (AGN) | Single EOR of the mode record with OPSIZE_XOR, then re-enter the fetch below the reset. Applying it twice cancels, as on hardware. |
-| 67 | address-size prefix | implemented | `.op_pfx_67` (AGN) | Single EOR with ADDRSIZE_XOR. Independent of 66. Note: handlers that call the ModRM decoder by symbol rather than through REC_MODRM_FN ignore this prefix -- see the defects list. |
-| 68 | PUSH Iv | DEFECT | `.op_push_imm32_68` (dual) | PUSH Iv: immediate is width-correct (LD_V/EIP_ADV_V) but the push is open-coded with raw ESP, no SS.base and a hard-coded -4. |
-| 69 | IMUL Gv,Ev,Iv | DEFECT | `.op_imul_imm32_69` (dual) | IMUL Gv,Ev,Iv: reg and mem forms present and width-correct, but NO FLAGS are written. CF/OF must be set when the result does not fit the destination; software uses JC/JO after IMUL to detect overflow. |
-| 6A | PUSH Ib | DEFECT | `.op_push_imm8_6A` (dual) | PUSH Ib: sign-extended immediate is correct; the push is open-coded with raw ESP, no SS.base and a hard-coded -4. |
-| 6B | IMUL Gv,Ev,Ib | DEFECT | `.op_imul_imm8_6B` (dual) | IMUL Gv,Ev,Ib: as 0x69 -- no CF/OF. |
-| 6C | INSB | unimplemented | `.exit_loop` | String port I/O. Not implemented. |
-| 6D | INSW/INSD | unimplemented | `.exit_loop` | String port I/O. Not implemented. |
-| 6E | OUTSB | unimplemented | `.exit_loop` | String port I/O. Not implemented. |
-| 6F | OUTSW/OUTSD | unimplemented | `.exit_loop` | String port I/O. Not implemented. |
-| 70 | JO Jb | implemented | `.op_jcc_rel8_7X` (AGN) | OP_AGNOSTIC, correct (rel8 is byte-sized in both modes). EVAL_COND covers all 16 conditions. Minor: no EIP_WRAP, so a taken branch that crosses 0xFFFF in a 16-bit segment does not wrap. |
-| 71 | JNO Jb | implemented | `.op_jcc_rel8_7X` (AGN) | OP_AGNOSTIC, correct (rel8 is byte-sized in both modes). EVAL_COND covers all 16 conditions. Minor: no EIP_WRAP, so a taken branch that crosses 0xFFFF in a 16-bit segment does not wrap. |
-| 72 | JB Jb | implemented | `.op_jcc_rel8_7X` (AGN) | OP_AGNOSTIC, correct (rel8 is byte-sized in both modes). EVAL_COND covers all 16 conditions. Minor: no EIP_WRAP, so a taken branch that crosses 0xFFFF in a 16-bit segment does not wrap. |
-| 73 | JNB Jb | implemented | `.op_jcc_rel8_7X` (AGN) | OP_AGNOSTIC, correct (rel8 is byte-sized in both modes). EVAL_COND covers all 16 conditions. Minor: no EIP_WRAP, so a taken branch that crosses 0xFFFF in a 16-bit segment does not wrap. |
-| 74 | JZ Jb | implemented | `.op_jcc_rel8_7X` (AGN) | OP_AGNOSTIC, correct (rel8 is byte-sized in both modes). EVAL_COND covers all 16 conditions. Minor: no EIP_WRAP, so a taken branch that crosses 0xFFFF in a 16-bit segment does not wrap. |
-| 75 | JNZ Jb | implemented | `.op_jcc_rel8_7X` (AGN) | OP_AGNOSTIC, correct (rel8 is byte-sized in both modes). EVAL_COND covers all 16 conditions. Minor: no EIP_WRAP, so a taken branch that crosses 0xFFFF in a 16-bit segment does not wrap. |
-| 76 | JBE Jb | implemented | `.op_jcc_rel8_7X` (AGN) | OP_AGNOSTIC, correct (rel8 is byte-sized in both modes). EVAL_COND covers all 16 conditions. Minor: no EIP_WRAP, so a taken branch that crosses 0xFFFF in a 16-bit segment does not wrap. |
-| 77 | JNBE Jb | implemented | `.op_jcc_rel8_7X` (AGN) | OP_AGNOSTIC, correct (rel8 is byte-sized in both modes). EVAL_COND covers all 16 conditions. Minor: no EIP_WRAP, so a taken branch that crosses 0xFFFF in a 16-bit segment does not wrap. |
-| 78 | JS Jb | implemented | `.op_jcc_rel8_7X` (AGN) | OP_AGNOSTIC, correct (rel8 is byte-sized in both modes). EVAL_COND covers all 16 conditions. Minor: no EIP_WRAP, so a taken branch that crosses 0xFFFF in a 16-bit segment does not wrap. |
-| 79 | JNS Jb | implemented | `.op_jcc_rel8_7X` (AGN) | OP_AGNOSTIC, correct (rel8 is byte-sized in both modes). EVAL_COND covers all 16 conditions. Minor: no EIP_WRAP, so a taken branch that crosses 0xFFFF in a 16-bit segment does not wrap. |
-| 7A | JP Jb | implemented | `.op_jcc_rel8_7X` (AGN) | OP_AGNOSTIC, correct (rel8 is byte-sized in both modes). EVAL_COND covers all 16 conditions. Minor: no EIP_WRAP, so a taken branch that crosses 0xFFFF in a 16-bit segment does not wrap. |
-| 7B | JNP Jb | implemented | `.op_jcc_rel8_7X` (AGN) | OP_AGNOSTIC, correct (rel8 is byte-sized in both modes). EVAL_COND covers all 16 conditions. Minor: no EIP_WRAP, so a taken branch that crosses 0xFFFF in a 16-bit segment does not wrap. |
-| 7C | JL Jb | implemented | `.op_jcc_rel8_7X` (AGN) | OP_AGNOSTIC, correct (rel8 is byte-sized in both modes). EVAL_COND covers all 16 conditions. Minor: no EIP_WRAP, so a taken branch that crosses 0xFFFF in a 16-bit segment does not wrap. |
-| 7D | JNL Jb | implemented | `.op_jcc_rel8_7X` (AGN) | OP_AGNOSTIC, correct (rel8 is byte-sized in both modes). EVAL_COND covers all 16 conditions. Minor: no EIP_WRAP, so a taken branch that crosses 0xFFFF in a 16-bit segment does not wrap. |
-| 7E | JLE Jb | implemented | `.op_jcc_rel8_7X` (AGN) | OP_AGNOSTIC, correct (rel8 is byte-sized in both modes). EVAL_COND covers all 16 conditions. Minor: no EIP_WRAP, so a taken branch that crosses 0xFFFF in a 16-bit segment does not wrap. |
-| 7F | JNLE Jb | implemented | `.op_jcc_rel8_7X` (AGN) | OP_AGNOSTIC, correct (rel8 is byte-sized in both modes). EVAL_COND covers all 16 conditions. Minor: no EIP_WRAP, so a taken branch that crosses 0xFFFF in a 16-bit segment does not wrap. |
-| 80 | Grp1 Eb,Ib | implemented | `.op_alu_eb_imm8_80` (AGN) | Grp1 Eb,Ib: all eight /reg implemented, reg+mem forms, full flags. See the group table. |
-| 81 | Grp1 Ev,Iv | implemented | `.op_alu_ev_imm32_81` (dual) | Grp1 Ev,Iv: all eight /reg, reg+mem, dual-emitted, immediate follows operand size. |
-| 82 | Grp1 Eb,Ib (alias of 80) | implemented | `.op_alu_eb_imm8_80` (AGN) | Aliased to the 0x80 handler, which is the correct 386 behaviour. |
-| 83 | Grp1 Ev,Ib | implemented | `.op_alu_ev_imm8_83` (dual) | Grp1 Ev,Ib: all eight /reg, reg+mem, immediate sign-extended with LDRSB. |
-| 84 | TEST Eb,Gb | DEFECT | `.op_test_eb_gb_84` (AGN) | TEST Eb,Gb: the register form fetches the ModRM and then falls straight through to the next instruction -- no AND, NO FLAGS AT ALL. The memory form exits as unimplemented. This is a silent wrong-answer on one of the most common instructions in DOS code. |
-| 85 | TEST Ev,Gv | partial | `.op_test_ev_gv_85` (dual) | TEST Ev,Gv: register form correct with full logic flags; the MEMORY form goes to .exit_loop. |
-| 86 | XCHG Eb,Gb | partial | `.op_xchg_eb_gb_86` (AGN) | XCHG Eb,Gb: register form only; memory form exits. |
-| 87 | XCHG Ev,Gv | DEFECT | `.op_xchg_ev_gv_87` (AGN) | XCHG Ev,Gv: register form only (memory exits), AND declared OP_AGNOSTIC with bare LDR.W/STR.W -- so it is a 32-bit exchange in 16-bit mode. |
-| 88 | MOV Eb,Gb | implemented | `.op_mov_eb_gb_88` (AGN) | Both reg and mem forms; byte-sized so OP_AGNOSTIC is correct; mem path via the decoder (segment base applied). |
-| 89 | MOV Ev,Gv | implemented | `.op_mov_ev_gv_89` (dual) | Dual-emitted, both forms, LDREG_V/ST_V. Source register deliberately read after the decode call. |
-| 8A | MOV Gb,Eb | implemented | `.op_mov_gb_eb_8A` (AGN) | Both forms; byte-sized; correct. |
-| 8B | MOV Gv,Ev | implemented | `.op_mov_gv_ev_8B` (dual) | Dual-emitted, both forms, LD_V/STREG_V. |
-| 8C | MOV Ew,Sw | implemented | `.op_mov_Ew_seg_8C` (AGN) | MOV Ew,Sreg: always a 16-bit store, both forms, correct. |
-| 8D | LEA Gv,M | DEFECT | `.op_lea_8D` (dual) | LEA Gv,M: register ModRM correctly rejected. But the address is written with a bare `STR R7,[R4]` instead of STREG_V, so in 16-bit mode LEA writes a 32-bit value into the destination register instead of 16 bits. |
-| 8E | MOV Sw,Ew | implemented | `.op_mov_seg_Ew_8E` (AGN) | MOV Sreg,Ew: both forms; goes through SET_SREG (real-mode base = sel<<4). Traps to host if CR0.PE=1. |
-| 8F | POP Ev | DEFECT | `.op_pop_ev_8F` (dual) | POP Ev: register form only (memory exits); pop is open-coded with raw ESP as a linear address (no SS.base) and a hard-coded +4, so it is wrong in 16-bit mode and wrong whenever SS.base != 0. |
-| 90 | NOP (XCHG eAX,eAX) | implemented | `.op_nop` (AGN) | NOP; OP_AGNOSTIC, correct. |
-| 91 | XCHG eAX,eCX | DEFECT | `.op_xchg_eax_r32` (AGN) | XCHG eAX,r: OP_AGNOSTIC with bare LDR.W/STR.W -- always a 32-bit exchange, so `XCHG AX,BX` in 16-bit mode also swaps the high halves of EAX/EBX. |
-| 92 | XCHG eAX,eDX | DEFECT | `.op_xchg_eax_r32` (AGN) | XCHG eAX,r: OP_AGNOSTIC with bare LDR.W/STR.W -- always a 32-bit exchange, so `XCHG AX,BX` in 16-bit mode also swaps the high halves of EAX/EBX. |
-| 93 | XCHG eAX,eBX | DEFECT | `.op_xchg_eax_r32` (AGN) | XCHG eAX,r: OP_AGNOSTIC with bare LDR.W/STR.W -- always a 32-bit exchange, so `XCHG AX,BX` in 16-bit mode also swaps the high halves of EAX/EBX. |
-| 94 | XCHG eAX,eSP | DEFECT | `.op_xchg_eax_r32` (AGN) | XCHG eAX,r: OP_AGNOSTIC with bare LDR.W/STR.W -- always a 32-bit exchange, so `XCHG AX,BX` in 16-bit mode also swaps the high halves of EAX/EBX. |
-| 95 | XCHG eAX,eBP | DEFECT | `.op_xchg_eax_r32` (AGN) | XCHG eAX,r: OP_AGNOSTIC with bare LDR.W/STR.W -- always a 32-bit exchange, so `XCHG AX,BX` in 16-bit mode also swaps the high halves of EAX/EBX. |
-| 96 | XCHG eAX,eSI | DEFECT | `.op_xchg_eax_r32` (AGN) | XCHG eAX,r: OP_AGNOSTIC with bare LDR.W/STR.W -- always a 32-bit exchange, so `XCHG AX,BX` in 16-bit mode also swaps the high halves of EAX/EBX. |
-| 97 | XCHG eAX,eDI | DEFECT | `.op_xchg_eax_r32` (AGN) | XCHG eAX,r: OP_AGNOSTIC with bare LDR.W/STR.W -- always a 32-bit exchange, so `XCHG AX,BX` in 16-bit mode also swaps the high halves of EAX/EBX. |
-| 98 | CBW/CWDE | DEFECT | `.op_cwde_98` (dual) | CBW/CWDE: dual-emitted but the body is fixed -- SXTH of EAX then a full 32-bit store. In the 16-bit pass 0x98 must be CBW (AL->AX); it executes CWDE instead, and clobbers the high half of EAX. |
-| 99 | CWD/CDQ | DEFECT | `.op_cdq_99` (dual) | CWD/CDQ: dual-emitted but the body is fixed -- ASR #31 of the full EAX into a full 32-bit EDX. In the 16-bit pass 0x99 must be CWD (sign of AX into DX only). |
-| 9A | CALL FAR Ap | implemented | `.op_call_far_9A` (dual) | CALL FAR ptr16:v: offset at operand size, selector 16-bit, return CS:IP pushed with PUSH_V, CS installed via SET_SREG, EIP rebuilt from the new base. Real mode only. |
-| 9B | WAIT/FWAIT | unimplemented | `.exit_loop` | WAIT/FWAIT. Not implemented; would be safe as a NOP. |
-| 9C | PUSHF/PUSHFD | DEFECT | `.op_pushfd_9C` (dual) | PUSHF/PUSHFD: value stored with ST_V (width-correct) but the stack pointer is raw ESP with a hard-coded -4 and no SS.base. Mismatched stride vs store width in 16-bit mode. |
-| 9D | POPF/POPFD | DEFECT | `.op_popfd_9D` (dual) | POPF/POPFD: raw ESP, no SS.base, full 32-bit LDR and a hard-coded +4. Also loads EFLAGS wholesale with no mask, so a guest can set reserved/IOPL/VM bits directly. |
-| 9E | SAHF | implemented | `.op_sahf_9E` (AGN) | SAHF: BFI of AH into EFLAGS[7:0]. |
-| 9F | LAHF | implemented | `.op_lahf_9F` (AGN) | LAHF. |
-| A0 | MOV AL,Ob | DEFECT | `.op_mov_al_moffs8_A0` (AGN) | MOV AL,Ob: the moffs is read as a fixed 32-bit value (address size ignored -- it must be 16-bit under 16-bit addressing) and is used as a LINEAR address with no DS base and no segment override support. |
-| A1 | MOV eAX,Ov | DEFECT | `.op_mov_eax_moffs32_A1` (dual) | MOV eAX,Ov: moffs read with LD_V, i.e. it follows OPERAND size when it must follow ADDRESS size; no DS base/override; and the destination is written with a full 32-bit STR.W, clobbering the high half of EAX in 16-bit mode. |
-| A2 | MOV Ob,AL | DEFECT | `.op_mov_moffs8_al_A2` (AGN) | MOV Ob,AL: as 0xA0 -- fixed 32-bit moffs, no DS base, no override. |
-| A3 | MOV Ov,eAX | DEFECT | `.op_mov_moffs32_eax_A3` (dual) | MOV Ov,eAX: moffs follows operand size instead of address size; no DS base/override. |
-| A4 | MOVSB | implemented | `.op_movsb_A4` (AGN) | MOVSB: STR_SRC applies DS (or an override) + address-size wrap; STR_DST applies ES and correctly ignores overrides. DF-driven delta. Repeats via the REP machinery. |
-| A5 | MOVSW/MOVSD | implemented | `.op_movsd_A5` (dual) | MOVSW/MOVSD: dual-emitted, LD_V/ST_V, delta = OPSZ. Segments and wrap as A4. |
-| A6 | CMPSB | implemented | `.op_cmpsb_A6` (AGN) | CMPSB: full arith flags, normalized to bit 24 so SF/ZF/CF/OF/AF/PF are byte-correct. |
-| A7 | CMPSW/CMPSD | implemented | `.op_cmpsd_A7` (dual) | CMPSW/CMPSD: dual-emitted with VNORM/VDENORM, full flags at the right width. |
-| A8 | TEST AL,Ib | DEFECT | `.op_test_al_imm8_A8` (AGN) | TEST AL,Ib: computes the AND and then writes NO FLAGS. Silently wrong; `TEST AL,imm8 / JZ` is everywhere in DOS code. |
-| A9 | TEST eAX,Iv | DEFECT | `.op_test_eax_imm32_A9` (dual) | TEST eAX,Iv: computes the AND and writes NO FLAGS. |
-| AA | STOSB | implemented | `.op_stosb_AA` (AGN) | STOSB: ES:(E)DI with base and wrap; no flags (correct). |
-| AB | STOSW/STOSD | implemented | `.op_stosd_AB` (dual) | STOSW/STOSD: dual-emitted, LDREG_V/ST_V, delta = OPSZ. |
-| AC | LODSB | implemented | `.op_lodsb_AC` (AGN) | LODSB. |
-| AD | LODSW/LODSD | implemented | `.op_lodsd_AD` (dual) | LODSW/LODSD: dual-emitted, STREG_V so the high half of EAX survives in 16-bit mode. |
-| AE | SCASB | implemented | `.op_scasb_AE` (AGN) | SCASB: full arith flags at byte width. |
-| AF | SCASW/SCASD | implemented | `.op_scasd_AF` (dual) | SCASW/SCASD: dual-emitted, VNORM/VDENORM, full flags. |
-| B0 | MOV AL,Ib | implemented | `.op_mov_r8_imm8` (AGN) | 8-bit; correct high/low byte register indexing. |
-| B1 | MOV CL,Ib | implemented | `.op_mov_r8_imm8` (AGN) | 8-bit; correct high/low byte register indexing. |
-| B2 | MOV DL,Ib | implemented | `.op_mov_r8_imm8` (AGN) | 8-bit; correct high/low byte register indexing. |
-| B3 | MOV BL,Ib | implemented | `.op_mov_r8_imm8` (AGN) | 8-bit; correct high/low byte register indexing. |
-| B4 | MOV AH,Ib | implemented | `.op_mov_r8_imm8` (AGN) | 8-bit; correct high/low byte register indexing. |
-| B5 | MOV CH,Ib | implemented | `.op_mov_r8_imm8` (AGN) | 8-bit; correct high/low byte register indexing. |
-| B6 | MOV DH,Ib | implemented | `.op_mov_r8_imm8` (AGN) | 8-bit; correct high/low byte register indexing. |
-| B7 | MOV BH,Ib | implemented | `.op_mov_r8_imm8` (AGN) | 8-bit; correct high/low byte register indexing. |
-| B8 | MOV eAX,Iv | implemented | `.op_mov_r32_imm32` (dual) | Dual-emitted; LD_V immediate + EIP_ADV_V + STREG_V. |
-| B9 | MOV eCX,Iv | implemented | `.op_mov_r32_imm32` (dual) | Dual-emitted; LD_V immediate + EIP_ADV_V + STREG_V. |
-| BA | MOV eDX,Iv | implemented | `.op_mov_r32_imm32` (dual) | Dual-emitted; LD_V immediate + EIP_ADV_V + STREG_V. |
-| BB | MOV eBX,Iv | implemented | `.op_mov_r32_imm32` (dual) | Dual-emitted; LD_V immediate + EIP_ADV_V + STREG_V. |
-| BC | MOV eSP,Iv | implemented | `.op_mov_r32_imm32` (dual) | Dual-emitted; LD_V immediate + EIP_ADV_V + STREG_V. |
-| BD | MOV eBP,Iv | implemented | `.op_mov_r32_imm32` (dual) | Dual-emitted; LD_V immediate + EIP_ADV_V + STREG_V. |
-| BE | MOV eSI,Iv | implemented | `.op_mov_r32_imm32` (dual) | Dual-emitted; LD_V immediate + EIP_ADV_V + STREG_V. |
-| BF | MOV eDI,Iv | implemented | `.op_mov_r32_imm32` (dual) | Dual-emitted; LD_V immediate + EIP_ADV_V + STREG_V. |
-| C0 | Grp2 Eb,Ib | implemented | `.op_shift_eb_imm8_C0` (AGN) | Grp2 Eb,Ib: all eight /reg, reg+mem, CF/OF/SF/ZF/PF handled; count masked to 5 bits before the zero test so a masked-to-zero count leaves flags alone. |
-| C1 | Grp2 Ev,Ib | DEFECT | `.op_shift_ev_imm8_C1` (dual) | Grp2 Ev,Ib: dual-emitted, all eight /reg, reg+mem -- but the operand is loaded with a bare 32-bit LDR on BOTH paths. In the 16-bit pass this reads 4 bytes of memory for a 16-bit operand and the whole 32-bit register, so SHR/SAR/ROR/RCR results and the flags are wrong whenever the upper half is non-zero. Store-back is ST_V, so only the low half is written. |
-| C2 | RET Iw | DEFECT | `.op_ret_imm16_C2` (dual) | RET Iw: raw ESP as a linear address (no SS.base), hard-coded 32-bit pop and +4 regardless of operand size, and the popped offset becomes EIP WITHOUT adding CS.base. Correct only when CS.base = SS.base = 0 and the stack is 32-bit. |
-| C3 | RET | implemented | `.op_ret_C3` (dual) | RET: POP_V then CS.base re-added. Correct in both widths. |
-| C4 | LES Gv,Mp | implemented | `.op_les_C4` (dual) | LES: memory-only (register form correctly #UD-exits); offset at operand size, selector 16-bit; SET_SREG. |
-| C5 | LDS Gv,Mp | implemented | `.op_lds_C5` (dual) | LDS: as LES. |
-| C6 | MOV Eb,Ib | partial | `.op_mov_eb_imm8_C6` (AGN) | MOV Eb,Ib: register form only. The MEMORY form goes to .exit_loop -- `MOV BYTE PTR [bx],imm8` does not run. |
-| C7 | MOV Ev,Iv | partial | `.op_mov_ev_imm32_C7` (dual) | MOV Ev,Iv: register form only. The MEMORY form goes to .exit_loop -- `MOV WORD PTR [bx],imm16` does not run. One of the most common instructions in DOS code. |
-| C8 | ENTER Iw,Ib | DEFECT | `.op_enter_C8` (dual) | ENTER: nesting level fetched and discarded (documented); frame push uses raw ESP/EBP with no SS.base and a hard-coded -4 while storing with ST_V. |
-| C9 | LEAVE | DEFECT | `.op_leave_C9` (dual) | LEAVE: raw ESP/EBP with no SS.base, hard-coded +4, and EBP written back with a full 32-bit STR.W. |
-| CA | RETF Iw | DEFECT | `.op_retf_imm16_CA` (AGN) | RETF Iw: OP_AGNOSTIC, so it is a 32-bit far return in both modes; raw ESP with no SS.base; the popped CS is loaded into R3 and THROWN AWAY (no SET_SREG), so the segment never changes; and the new EIP is installed without CS.base. Compare 0xCB, which does all of this correctly. |
-| CB | RETF | implemented | `.op_retf_CB` (dual) | RETF: POP_V for IP and CS, SET_SREG installs CS and recomputes the base, EIP rebuilt. Correct. |
-| CC | INT3 | implemented | `.op_int3_CC` (dual) | INT3: real-mode IVT dispatch (4-byte entries, FLAGS/CS/IP at operand size, IF+TF cleared). Traps to host if CR0.PE=1. |
-| CD | INT Ib | implemented | `.op_int_imm8_CD` (dual) | INT Ib: as INT3. |
-| CE | INTO | implemented | `.op_into_CE` (dual) | INTO: checks OF then the same dispatch. |
-| CF | IRET | implemented | `.op_iret_CF` (dual) | IRET: pops IP/CS/FLAGS with POP_V and installs CS via SET_SREG. Note: EFLAGS restored unmasked, and the handler still contains debug instrumentation writing to x86_iret_log on every execution. |
-| D0 | Grp2 Eb,1 | implemented | `.op_shift_eb_1_D0` (AGN) | Grp2 Eb,1: all eight /reg, reg+mem, flags correct. |
-| D1 | Grp2 Ev,1 | DEFECT | `.op_shift_ev_1_D1` (dual) | Grp2 Ev,1: same bare-32-bit-LDR operand fetch as 0xC1 -- see that entry. |
-| D2 | Grp2 Eb,CL | implemented | `.op_shift_eb_cl_D2` (AGN) | Grp2 Eb,CL: all eight /reg, reg+mem, count masked to 5 bits. |
-| D3 | Grp2 Ev,CL | DEFECT | `.op_shift_ev_cl_D3` (dual) | Grp2 Ev,CL: same bare-32-bit-LDR operand fetch as 0xC1. |
-| D4 | AAM Ib | DEFECT | `.op_aam_D4` (AGN) | AAM: divides correctly but sets NO FLAGS (SF/ZF/PF are architecturally defined). An imm8 of 0 exits to the host instead of raising #DE. |
-| D5 | AAD Ib | DEFECT | `.op_aad_D5` (AGN) | AAD: computes correctly but sets NO FLAGS (SF/ZF/PF defined). |
-| D6 | SALC (undocumented) | implemented | `.op_salc_D6` (AGN) | SALC (undocumented): AL = CF ? 0xFF : 0. Correct. |
-| D7 | XLAT | DEFECT | `.op_xlat_D7` (AGN) | XLAT: uses raw EBX + AL as a LINEAR address -- no DS base, no segment-override support, and no 16-bit masking of BX. Wrong whenever DS.base != 0, which is always in real mode. |
-| D8 | x87 ESC 0 | unimplemented | `.exit_loop` | x87 escape. No FPU is modelled at all; all eight escape opcodes exit to the host. |
-| D9 | x87 ESC 1 | unimplemented | `.exit_loop` | x87 escape. No FPU is modelled at all; all eight escape opcodes exit to the host. |
-| DA | x87 ESC 2 | unimplemented | `.exit_loop` | x87 escape. No FPU is modelled at all; all eight escape opcodes exit to the host. |
-| DB | x87 ESC 3 | unimplemented | `.exit_loop` | x87 escape. No FPU is modelled at all; all eight escape opcodes exit to the host. |
-| DC | x87 ESC 4 | unimplemented | `.exit_loop` | x87 escape. No FPU is modelled at all; all eight escape opcodes exit to the host. |
-| DD | x87 ESC 5 | unimplemented | `.exit_loop` | x87 escape. No FPU is modelled at all; all eight escape opcodes exit to the host. |
-| DE | x87 ESC 6 | unimplemented | `.exit_loop` | x87 escape. No FPU is modelled at all; all eight escape opcodes exit to the host. |
-| DF | x87 ESC 7 | unimplemented | `.exit_loop` | x87 escape. No FPU is modelled at all; all eight escape opcodes exit to the host. |
-| E0 | LOOPNZ Jb | DEFECT | `.op_loopnz_E0` (AGN) | LOOPNZ: decrements the full 32-bit ECX regardless of address size -- must be CX under 16-bit addressing. No EIP_WRAP. |
-| E1 | LOOPZ Jb | DEFECT | `.op_loopz_E1` (AGN) | LOOPZ: as LOOPNZ. |
-| E2 | LOOP Jb | DEFECT | `.op_loop_E2` (AGN) | LOOP: as LOOPNZ. This is the single most common loop construct in 16-bit DOS code; it works only because the high half of ECX is usually already zero. |
-| E3 | JCXZ/JECXZ Jb | DEFECT | `.op_jcxz_E3` (AGN) | JCXZ/JECXZ: tests the full 32-bit ECX regardless of address size. |
-| E4 | IN AL,Ib | implemented | `.op_in_al_imm8_E4` (AGN) | IN AL,Ib: IOPL checked, dispatches to x86_port_read. |
-| E5 | IN eAX,Ib | implemented | `.op_in_eax_imm8_E5` (dual) | IN eAX,Ib: dual-emitted, width passed as OPSZ, result stored with STREG_V. |
-| E6 | OUT Ib,AL | implemented | `.op_out_imm8_al_E6` (AGN) | OUT Ib,AL. |
-| E7 | OUT Ib,eAX | implemented | `.op_out_imm8_eax_E7` (dual) | OUT Ib,eAX: dual-emitted, LDREG_V + OPSZ. |
-| E8 | CALL Jv | implemented | `.op_call_rel32_E8` (dual) | CALL Jv: LDS_V (signed displacement at operand size), PUSH_V of the segment-relative return IP, EIP_WRAP. Correct in both widths. |
-| E9 | JMP Jv | implemented | `.op_jmp_rel32_E9` (dual) | JMP Jv: LDS_V + EIP_WRAP. |
-| EA | JMP FAR Ap | implemented | `.op_jmp_far_EA` (dual) | JMP FAR ptr16:v: offset at operand size, 16-bit selector, SET_SREG. |
-| EB | JMP Jb | implemented | `.op_jmp_rel8_EB` (AGN) | JMP Jb: correct; minor -- no EIP_WRAP. |
-| EC | IN AL,DX | implemented | `.op_in_al_dx_EC` (AGN) | IN AL,DX (reads DX from REG_EDX). |
-| ED | IN eAX,DX | implemented | `.op_in_eax_dx_ED` (dual) | IN eAX,DX: dual-emitted. |
-| EE | OUT DX,AL | implemented | `.op_out_dx_al_EE` (AGN) | OUT DX,AL. |
-| EF | OUT DX,eAX | implemented | `.op_out_dx_eax_EF` (dual) | OUT DX,eAX: dual-emitted. |
-| F0 | LOCK prefix | partial | `.op_lock_F0` (AGN) | LOCK: accepted and ignored (correct for a uniprocessor). Minor: it branches to .fetch_decode_loop rather than the no-reset re-entry, so it clears a preceding segment override and decrements the PIT a second time. |
-| F1 | ICEBP/INT1 | unimplemented | `.exit_loop` | ICEBP/INT1. Not implemented. |
-| F2 | REPNE prefix | implemented | `.op_repne_F2` (AGN) | REPNE: arms a one-element-per-iteration rewind (CPU_REP_*), counter is CX/ECX by ADDRESS size, ZF sense 0. Ignored on non-string opcodes, as on hardware. |
-| F3 | REP/REPE prefix | implemented | `.op_rep_F3` (AGN) | REP/REPE: as F2 with ZF sense 1; sense 2 (no ZF test) selected for MOVS/STOS/LODS. |
-| F4 | HLT | unimplemented | `.exit_loop` | HLT: the opcode table entry is .exit_loop. A .op_hlt_F4 handler with the CR0/CPL check EXISTS in cpu_exec_handlers.S but is not referenced by either table -- dead code. Behaviour is the same exit-to-host either way, minus the #GP check. |
-| F5 | CMC | implemented | `.op_cmc_F5` (AGN) | CMC. |
-| F6 | Grp3 Eb | partial | `.op_grp3_eb_F6` (AGN) | Grp3 Eb: /1 unimplemented and /0 TEST is a no-op -- see the group table. |
-| F7 | Grp3 Ev | partial | `.op_grp3_ev_F7` (dual) | Grp3 Ev: /1 unimplemented; the rest are implemented -- see the group table. |
-| F8 | CLC | implemented | `.op_clc_F8` (AGN) | CLC. |
-| F9 | STC | implemented | `.op_stc_F9` (AGN) | STC. |
-| FA | CLI | implemented | `.op_cli_FA` (AGN) | CLI: IOPL checked when CR0.PE=1. |
-| FB | STI | implemented | `.op_sti_FB` (AGN) | STI: IOPL checked when CR0.PE=1. Does not implement the one-instruction interrupt shadow. |
-| FC | CLD | implemented | `.op_cld_FC` (AGN) | CLD. |
-| FD | STD | implemented | `.op_std_FD` (AGN) | STD. |
-| FE | Grp4 Eb | DEFECT | `.op_grp4_FE` (AGN) | Grp4 Eb: /0 INC and /1 DEC are implemented for both reg and mem, but write NO FLAGS. /2../7 correctly exit as invalid. |
-| FF | Grp5 Ev | DEFECT | `.op_grp5_FF` (dual) | Grp5 Ev: /0../6 dispatch, /7 correctly invalid -- but /0 INC and /1 DEC write no flags, and /2 CALL near and /4 JMP near mishandle CS.base and use raw ESP. See the group table. |
----
+Slots can appear in more than one row. Counting distinct one-byte slots, **43 of the 235
+implemented opcodes have at least one defect** and **7 more are partial** (register form
+only). That leaves roughly **185 one-byte opcodes believed correct**.
 
-## Two-byte (0F) opcodes — all 256
+<!-- BEGIN GENERATED -- scripts/gen_opcode_coverage.py -->
 
-"Out of scope" means the instruction did not exist on a 386 and is not required by this
-project; the slot is nevertheless accounted for individually.
+### Generated hard numbers
 
-| Op | Mnemonic | Era | Status | Handler | Notes |
+| Metric | Count |
+|---|---|
+| One-byte slots with a handler | **252 / 256** |
+| One-byte slots dispatching to `.exit_loop` | **4 / 256** |
+| Two-byte (0F) slots with a handler | **44 / 256** |
+| Two-byte slots dispatching to `.exit_loop` | **212 / 256** |
+| Implemented slots carrying at least one mechanical warning | **170** |
+
+Every row below is DERIVED. `status` is `reached` or `.exit_loop`, taken from
+the dispatch table. `mode` is `OP` (dual-emitted) or `OP_AGNOSTIC`, taken from the
+handler declaration. `warnings` are greps over the handler body, listed in the
+legend below. **Semantic correctness of a flag or an addressing computation is
+not derivable and is reported as UNKNOWN -- an empty `warnings` cell means no
+mechanical warning fired, NOT that the handler is correct.**
+
+Warning legend:
+
+| warning | what was grepped |
+|---|---|
+| `AGN+raw32` | declared `OP_AGNOSTIC` yet the body mixes width primitives with a bare `LDR.W`/`STR.W` or a hard-coded `#4` |
+| `AGN, bare 32-bit body` | declared `OP_AGNOSTIC` and uses no width primitive at all -- 32-bit in both passes unless the instruction is byte-sized |
+| `dual but no width primitive` | declared `OP` but the body has no `LD_V`/`ST_V`/`LDREG_V`/...  |
+| `open-coded stack` | touches ESP as `[R8, #24]` and never calls `PUSH_V`/`POP_V` |
+| `ModRM by symbol (ignores 0x67)` | calls `L(DECODE_MODRM_16/32)` directly instead of through `[R2, #REC_MODRM_FN]` |
+| `no X86_FLAGS_* macro` | the body invokes no flag macro; benign for MOV/PUSH/JMP, a real gap for ALU |
+
+
+### One-byte opcodes -- all 256 (generated)
+
+| Op | Status | Handler | Mode | Flag macros | Warnings |
 |---|---|---|---|---|---|
-| 0F 00 | Grp6 (SLDT/STR/LLDT/LTR/VERR/VERW) | 286 | unimplemented | `.exit_loop` | Entire group unimplemented. |
-| 0F 01 | Grp7 (SGDT/SIDT/LGDT/LIDT/SMSW/LMSW) | 286 | partial | `.op_0f_01` (dual) | /2 LGDT, /3 LIDT, /4 SMSW and **/6 LMSW** are in; /0, /1, /7 exit, naming the ModRM. See group table. |
-| 0F 02 | LAR/LSL | 286 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 03 | LAR/LSL | 286 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 04 | (reserved) / LOADALL | 286 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 05 | (reserved) / LOADALL | 286 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 06 | CLTS | 286 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 07 | (reserved) | - | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 08 | (reserved) | - | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 09 | (reserved) | - | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 0A | (reserved) | - | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 0B | UD2 -> HLE hypercall | 386 | implemented | `.op_hypercall_0F0B` (AGN) | IMPLEMENTED as the project hypercall escape (0F 0B imm8). Exits with X86_EXIT_HLE_INT; raises #UD via the IVT when HLE is disabled. |
-| 0F 0C | (reserved) | - | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 0D | (reserved) | - | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 0E | (reserved) | - | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 0F | (reserved) | - | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 10 | (reserved / SSE on later CPUs) | P3+ | out of scope | `.exit_loop` | Out of scope for a 386-class target. |
-| 0F 11 | (reserved / SSE on later CPUs) | P3+ | out of scope | `.exit_loop` | Out of scope for a 386-class target. |
-| 0F 12 | (reserved / SSE on later CPUs) | P3+ | out of scope | `.exit_loop` | Out of scope for a 386-class target. |
-| 0F 13 | (reserved / SSE on later CPUs) | P3+ | out of scope | `.exit_loop` | Out of scope for a 386-class target. |
-| 0F 14 | (reserved / SSE on later CPUs) | P3+ | out of scope | `.exit_loop` | Out of scope for a 386-class target. |
-| 0F 15 | (reserved / SSE on later CPUs) | P3+ | out of scope | `.exit_loop` | Out of scope for a 386-class target. |
-| 0F 16 | (reserved / SSE on later CPUs) | P3+ | out of scope | `.exit_loop` | Out of scope for a 386-class target. |
-| 0F 17 | (reserved / SSE on later CPUs) | P3+ | out of scope | `.exit_loop` | Out of scope for a 386-class target. |
-| 0F 18 | (reserved / SSE on later CPUs) | P3+ | out of scope | `.exit_loop` | Out of scope for a 386-class target. |
-| 0F 19 | (reserved / SSE on later CPUs) | P3+ | out of scope | `.exit_loop` | Out of scope for a 386-class target. |
-| 0F 1A | (reserved / SSE on later CPUs) | P3+ | out of scope | `.exit_loop` | Out of scope for a 386-class target. |
-| 0F 1B | (reserved / SSE on later CPUs) | P3+ | out of scope | `.exit_loop` | Out of scope for a 386-class target. |
-| 0F 1C | (reserved / SSE on later CPUs) | P3+ | out of scope | `.exit_loop` | Out of scope for a 386-class target. |
-| 0F 1D | (reserved / SSE on later CPUs) | P3+ | out of scope | `.exit_loop` | Out of scope for a 386-class target. |
-| 0F 1E | (reserved / SSE on later CPUs) | P3+ | out of scope | `.exit_loop` | Out of scope for a 386-class target. |
-| 0F 1F | (reserved / SSE on later CPUs) | P3+ | out of scope | `.exit_loop` | Out of scope for a 386-class target. |
-| 0F 20 | MOV r32,CRn / MOV r32,DRn | 386 | unimplemented | `.exit_loop` | Not implemented. Without 0F 22 the guest cannot enter protected mode, which is consistent with the real-mode-only segment layer. |
-| 0F 21 | MOV r32,CRn / MOV r32,DRn | 386 | unimplemented | `.exit_loop` | Not implemented. Without 0F 22 the guest cannot enter protected mode, which is consistent with the real-mode-only segment layer. |
-| 0F 22 | MOV CRn,r32 / MOV DRn,r32 | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 23 | MOV CRn,r32 / MOV DRn,r32 | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 24 | MOV TRn (386/486 test regs) | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 25 | MOV TRn (386/486 test regs) | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 26 | MOV TRn (386/486 test regs) | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 27 | MOV TRn (386/486 test regs) | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 28 | (reserved / SSE) | P3+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 29 | (reserved / SSE) | P3+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 2A | (reserved / SSE) | P3+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 2B | (reserved / SSE) | P3+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 2C | (reserved / SSE) | P3+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 2D | (reserved / SSE) | P3+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 2E | (reserved / SSE) | P3+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 2F | (reserved / SSE) | P3+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 30 | WRMSR | P5 | out of scope | `.exit_loop` | Out of scope (Pentium). |
-| 0F 31 | RDTSC | P5 | out of scope | `.exit_loop` | Out of scope (Pentium). |
-| 0F 32 | RDMSR/RDPMC/SYSENTER | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 33 | RDMSR/RDPMC/SYSENTER | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 34 | RDMSR/RDPMC/SYSENTER | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 35 | (reserved) | - | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 36 | (reserved) | - | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 37 | (reserved) | - | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 38 | (reserved) | - | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 39 | (reserved) | - | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 3A | (reserved) | - | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 3B | (reserved) | - | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 3C | (reserved) | - | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 3D | (reserved) | - | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 3E | (reserved) | - | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 3F | (reserved) | - | unimplemented | `.exit_loop` | Not implemented. |
-| 0F 40 | CMOVcc | P6 | out of scope | `.exit_loop` | Out of scope (Pentium Pro). |
-| 0F 41 | CMOVcc | P6 | out of scope | `.exit_loop` | Out of scope (Pentium Pro). |
-| 0F 42 | CMOVcc | P6 | out of scope | `.exit_loop` | Out of scope (Pentium Pro). |
-| 0F 43 | CMOVcc | P6 | out of scope | `.exit_loop` | Out of scope (Pentium Pro). |
-| 0F 44 | CMOVcc | P6 | out of scope | `.exit_loop` | Out of scope (Pentium Pro). |
-| 0F 45 | CMOVcc | P6 | out of scope | `.exit_loop` | Out of scope (Pentium Pro). |
-| 0F 46 | CMOVcc | P6 | out of scope | `.exit_loop` | Out of scope (Pentium Pro). |
-| 0F 47 | CMOVcc | P6 | out of scope | `.exit_loop` | Out of scope (Pentium Pro). |
-| 0F 48 | CMOVcc | P6 | out of scope | `.exit_loop` | Out of scope (Pentium Pro). |
-| 0F 49 | CMOVcc | P6 | out of scope | `.exit_loop` | Out of scope (Pentium Pro). |
-| 0F 4A | CMOVcc | P6 | out of scope | `.exit_loop` | Out of scope (Pentium Pro). |
-| 0F 4B | CMOVcc | P6 | out of scope | `.exit_loop` | Out of scope (Pentium Pro). |
-| 0F 4C | CMOVcc | P6 | out of scope | `.exit_loop` | Out of scope (Pentium Pro). |
-| 0F 4D | CMOVcc | P6 | out of scope | `.exit_loop` | Out of scope (Pentium Pro). |
-| 0F 4E | CMOVcc | P6 | out of scope | `.exit_loop` | Out of scope (Pentium Pro). |
-| 0F 4F | CMOVcc | P6 | out of scope | `.exit_loop` | Out of scope (Pentium Pro). |
-| 0F 50 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 51 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 52 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 53 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 54 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 55 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 56 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 57 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 58 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 59 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 5A | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 5B | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 5C | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 5D | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 5E | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 5F | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 60 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 61 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 62 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 63 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 64 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 65 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 66 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 67 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 68 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 69 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 6A | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 6B | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 6C | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 6D | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 6E | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 6F | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 70 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 71 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 72 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 73 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 74 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 75 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 76 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 77 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 78 | (reserved / MMX) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 79 | (reserved / MMX) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 7A | (reserved / MMX) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 7B | (reserved / MMX) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 7C | (reserved / MMX) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 7D | (reserved / MMX) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 7E | (reserved / MMX) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 7F | (reserved / MMX) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F 80 | JO Jv (near) | 386 | DEFECT | `.op_0f_jcc_rel32` (dual) | DEFECT: implemented and dual-emitted, but the displacement is read with a hard-coded `LDR` + `ADD R10,#4` instead of LDS_V/EIP_ADV_V. 0F 8x takes a rel16 under 16-bit operand size, so in 16-bit mode it consumes 4 bytes and uses a 32-bit displacement. Minor: no EIP_WRAP. |
-| 0F 81 | JNO Jv (near) | 386 | DEFECT | `.op_0f_jcc_rel32` (dual) | DEFECT: implemented and dual-emitted, but the displacement is read with a hard-coded `LDR` + `ADD R10,#4` instead of LDS_V/EIP_ADV_V. 0F 8x takes a rel16 under 16-bit operand size, so in 16-bit mode it consumes 4 bytes and uses a 32-bit displacement. Minor: no EIP_WRAP. |
-| 0F 82 | JB Jv (near) | 386 | DEFECT | `.op_0f_jcc_rel32` (dual) | DEFECT: implemented and dual-emitted, but the displacement is read with a hard-coded `LDR` + `ADD R10,#4` instead of LDS_V/EIP_ADV_V. 0F 8x takes a rel16 under 16-bit operand size, so in 16-bit mode it consumes 4 bytes and uses a 32-bit displacement. Minor: no EIP_WRAP. |
-| 0F 83 | JNB Jv (near) | 386 | DEFECT | `.op_0f_jcc_rel32` (dual) | DEFECT: implemented and dual-emitted, but the displacement is read with a hard-coded `LDR` + `ADD R10,#4` instead of LDS_V/EIP_ADV_V. 0F 8x takes a rel16 under 16-bit operand size, so in 16-bit mode it consumes 4 bytes and uses a 32-bit displacement. Minor: no EIP_WRAP. |
-| 0F 84 | JZ Jv (near) | 386 | DEFECT | `.op_0f_jcc_rel32` (dual) | DEFECT: implemented and dual-emitted, but the displacement is read with a hard-coded `LDR` + `ADD R10,#4` instead of LDS_V/EIP_ADV_V. 0F 8x takes a rel16 under 16-bit operand size, so in 16-bit mode it consumes 4 bytes and uses a 32-bit displacement. Minor: no EIP_WRAP. |
-| 0F 85 | JNZ Jv (near) | 386 | DEFECT | `.op_0f_jcc_rel32` (dual) | DEFECT: implemented and dual-emitted, but the displacement is read with a hard-coded `LDR` + `ADD R10,#4` instead of LDS_V/EIP_ADV_V. 0F 8x takes a rel16 under 16-bit operand size, so in 16-bit mode it consumes 4 bytes and uses a 32-bit displacement. Minor: no EIP_WRAP. |
-| 0F 86 | JBE Jv (near) | 386 | DEFECT | `.op_0f_jcc_rel32` (dual) | DEFECT: implemented and dual-emitted, but the displacement is read with a hard-coded `LDR` + `ADD R10,#4` instead of LDS_V/EIP_ADV_V. 0F 8x takes a rel16 under 16-bit operand size, so in 16-bit mode it consumes 4 bytes and uses a 32-bit displacement. Minor: no EIP_WRAP. |
-| 0F 87 | JNBE Jv (near) | 386 | DEFECT | `.op_0f_jcc_rel32` (dual) | DEFECT: implemented and dual-emitted, but the displacement is read with a hard-coded `LDR` + `ADD R10,#4` instead of LDS_V/EIP_ADV_V. 0F 8x takes a rel16 under 16-bit operand size, so in 16-bit mode it consumes 4 bytes and uses a 32-bit displacement. Minor: no EIP_WRAP. |
-| 0F 88 | JS Jv (near) | 386 | DEFECT | `.op_0f_jcc_rel32` (dual) | DEFECT: implemented and dual-emitted, but the displacement is read with a hard-coded `LDR` + `ADD R10,#4` instead of LDS_V/EIP_ADV_V. 0F 8x takes a rel16 under 16-bit operand size, so in 16-bit mode it consumes 4 bytes and uses a 32-bit displacement. Minor: no EIP_WRAP. |
-| 0F 89 | JNS Jv (near) | 386 | DEFECT | `.op_0f_jcc_rel32` (dual) | DEFECT: implemented and dual-emitted, but the displacement is read with a hard-coded `LDR` + `ADD R10,#4` instead of LDS_V/EIP_ADV_V. 0F 8x takes a rel16 under 16-bit operand size, so in 16-bit mode it consumes 4 bytes and uses a 32-bit displacement. Minor: no EIP_WRAP. |
-| 0F 8A | JP Jv (near) | 386 | DEFECT | `.op_0f_jcc_rel32` (dual) | DEFECT: implemented and dual-emitted, but the displacement is read with a hard-coded `LDR` + `ADD R10,#4` instead of LDS_V/EIP_ADV_V. 0F 8x takes a rel16 under 16-bit operand size, so in 16-bit mode it consumes 4 bytes and uses a 32-bit displacement. Minor: no EIP_WRAP. |
-| 0F 8B | JNP Jv (near) | 386 | DEFECT | `.op_0f_jcc_rel32` (dual) | DEFECT: implemented and dual-emitted, but the displacement is read with a hard-coded `LDR` + `ADD R10,#4` instead of LDS_V/EIP_ADV_V. 0F 8x takes a rel16 under 16-bit operand size, so in 16-bit mode it consumes 4 bytes and uses a 32-bit displacement. Minor: no EIP_WRAP. |
-| 0F 8C | JL Jv (near) | 386 | DEFECT | `.op_0f_jcc_rel32` (dual) | DEFECT: implemented and dual-emitted, but the displacement is read with a hard-coded `LDR` + `ADD R10,#4` instead of LDS_V/EIP_ADV_V. 0F 8x takes a rel16 under 16-bit operand size, so in 16-bit mode it consumes 4 bytes and uses a 32-bit displacement. Minor: no EIP_WRAP. |
-| 0F 8D | JNL Jv (near) | 386 | DEFECT | `.op_0f_jcc_rel32` (dual) | DEFECT: implemented and dual-emitted, but the displacement is read with a hard-coded `LDR` + `ADD R10,#4` instead of LDS_V/EIP_ADV_V. 0F 8x takes a rel16 under 16-bit operand size, so in 16-bit mode it consumes 4 bytes and uses a 32-bit displacement. Minor: no EIP_WRAP. |
-| 0F 8E | JLE Jv (near) | 386 | DEFECT | `.op_0f_jcc_rel32` (dual) | DEFECT: implemented and dual-emitted, but the displacement is read with a hard-coded `LDR` + `ADD R10,#4` instead of LDS_V/EIP_ADV_V. 0F 8x takes a rel16 under 16-bit operand size, so in 16-bit mode it consumes 4 bytes and uses a 32-bit displacement. Minor: no EIP_WRAP. |
-| 0F 8F | JNLE Jv (near) | 386 | DEFECT | `.op_0f_jcc_rel32` (dual) | DEFECT: implemented and dual-emitted, but the displacement is read with a hard-coded `LDR` + `ADD R10,#4` instead of LDS_V/EIP_ADV_V. 0F 8x takes a rel16 under 16-bit operand size, so in 16-bit mode it consumes 4 bytes and uses a 32-bit displacement. Minor: no EIP_WRAP. |
-| 0F 90 | SETO Eb | 386 | implemented | `.op_0f_setcc` (dual) | IMPLEMENTED. Both register and memory forms; byte destination; EVAL_COND shared with Jcc. Memory path goes through the ModRM decoder so the segment base is applied. Minor: it calls the decoder by symbol, so a 0x67 prefix is ignored. |
-| 0F 91 | SETNO Eb | 386 | implemented | `.op_0f_setcc` (dual) | IMPLEMENTED. Both register and memory forms; byte destination; EVAL_COND shared with Jcc. Memory path goes through the ModRM decoder so the segment base is applied. Minor: it calls the decoder by symbol, so a 0x67 prefix is ignored. |
-| 0F 92 | SETB Eb | 386 | implemented | `.op_0f_setcc` (dual) | IMPLEMENTED. Both register and memory forms; byte destination; EVAL_COND shared with Jcc. Memory path goes through the ModRM decoder so the segment base is applied. Minor: it calls the decoder by symbol, so a 0x67 prefix is ignored. |
-| 0F 93 | SETNB Eb | 386 | implemented | `.op_0f_setcc` (dual) | IMPLEMENTED. Both register and memory forms; byte destination; EVAL_COND shared with Jcc. Memory path goes through the ModRM decoder so the segment base is applied. Minor: it calls the decoder by symbol, so a 0x67 prefix is ignored. |
-| 0F 94 | SETZ Eb | 386 | implemented | `.op_0f_setcc` (dual) | IMPLEMENTED. Both register and memory forms; byte destination; EVAL_COND shared with Jcc. Memory path goes through the ModRM decoder so the segment base is applied. Minor: it calls the decoder by symbol, so a 0x67 prefix is ignored. |
-| 0F 95 | SETNZ Eb | 386 | implemented | `.op_0f_setcc` (dual) | IMPLEMENTED. Both register and memory forms; byte destination; EVAL_COND shared with Jcc. Memory path goes through the ModRM decoder so the segment base is applied. Minor: it calls the decoder by symbol, so a 0x67 prefix is ignored. |
-| 0F 96 | SETBE Eb | 386 | implemented | `.op_0f_setcc` (dual) | IMPLEMENTED. Both register and memory forms; byte destination; EVAL_COND shared with Jcc. Memory path goes through the ModRM decoder so the segment base is applied. Minor: it calls the decoder by symbol, so a 0x67 prefix is ignored. |
-| 0F 97 | SETNBE Eb | 386 | implemented | `.op_0f_setcc` (dual) | IMPLEMENTED. Both register and memory forms; byte destination; EVAL_COND shared with Jcc. Memory path goes through the ModRM decoder so the segment base is applied. Minor: it calls the decoder by symbol, so a 0x67 prefix is ignored. |
-| 0F 98 | SETS Eb | 386 | implemented | `.op_0f_setcc` (dual) | IMPLEMENTED. Both register and memory forms; byte destination; EVAL_COND shared with Jcc. Memory path goes through the ModRM decoder so the segment base is applied. Minor: it calls the decoder by symbol, so a 0x67 prefix is ignored. |
-| 0F 99 | SETNS Eb | 386 | implemented | `.op_0f_setcc` (dual) | IMPLEMENTED. Both register and memory forms; byte destination; EVAL_COND shared with Jcc. Memory path goes through the ModRM decoder so the segment base is applied. Minor: it calls the decoder by symbol, so a 0x67 prefix is ignored. |
-| 0F 9A | SETP Eb | 386 | implemented | `.op_0f_setcc` (dual) | IMPLEMENTED. Both register and memory forms; byte destination; EVAL_COND shared with Jcc. Memory path goes through the ModRM decoder so the segment base is applied. Minor: it calls the decoder by symbol, so a 0x67 prefix is ignored. |
-| 0F 9B | SETNP Eb | 386 | implemented | `.op_0f_setcc` (dual) | IMPLEMENTED. Both register and memory forms; byte destination; EVAL_COND shared with Jcc. Memory path goes through the ModRM decoder so the segment base is applied. Minor: it calls the decoder by symbol, so a 0x67 prefix is ignored. |
-| 0F 9C | SETL Eb | 386 | implemented | `.op_0f_setcc` (dual) | IMPLEMENTED. Both register and memory forms; byte destination; EVAL_COND shared with Jcc. Memory path goes through the ModRM decoder so the segment base is applied. Minor: it calls the decoder by symbol, so a 0x67 prefix is ignored. |
-| 0F 9D | SETNL Eb | 386 | implemented | `.op_0f_setcc` (dual) | IMPLEMENTED. Both register and memory forms; byte destination; EVAL_COND shared with Jcc. Memory path goes through the ModRM decoder so the segment base is applied. Minor: it calls the decoder by symbol, so a 0x67 prefix is ignored. |
-| 0F 9E | SETLE Eb | 386 | implemented | `.op_0f_setcc` (dual) | IMPLEMENTED. Both register and memory forms; byte destination; EVAL_COND shared with Jcc. Memory path goes through the ModRM decoder so the segment base is applied. Minor: it calls the decoder by symbol, so a 0x67 prefix is ignored. |
-| 0F 9F | SETNLE Eb | 386 | implemented | `.op_0f_setcc` (dual) | IMPLEMENTED. Both register and memory forms; byte destination; EVAL_COND shared with Jcc. Memory path goes through the ModRM decoder so the segment base is applied. Minor: it calls the decoder by symbol, so a 0x67 prefix is ignored. |
-| 0F A0 | PUSH FS / POP FS | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F A1 | PUSH FS / POP FS | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F A2 | CPUID | 486+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F A3 | BT Ev,Gv | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F A4 | SHLD | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F A5 | SHLD | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F A6 | (CMPXCHG 486 early) | 486 | out of scope | `.exit_loop` | Out of scope. |
-| 0F A7 | (CMPXCHG 486 early) | 486 | out of scope | `.exit_loop` | Out of scope. |
-| 0F A8 | PUSH GS / POP GS | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F A9 | PUSH GS / POP GS | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F AA | RSM | 486 | out of scope | `.exit_loop` | Out of scope. |
-| 0F AB | BTS Ev,Gv | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F AC | SHRD | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F AD | SHRD | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F AE | Grp15 (FXSAVE etc.) | P2+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F AF | IMUL Gv,Ev | 386 | implemented | `.op_0f_imul_AF` (dual) | **EPIC PINBALL's wall** (docs/13). Low half only, like the `69`/`6B` forms; CF/OF unset, which is the same known gap all three share. `tests/test_opcodes.py` 281-283. |
-| 0F B0 | CMPXCHG | 486 | out of scope | `.exit_loop` | Out of scope. |
-| 0F B1 | CMPXCHG | 486 | out of scope | `.exit_loop` | Out of scope. |
-| 0F B2 | LSS Gv,Mp | 386 | unimplemented | `.exit_loop` | Not implemented. LES/LDS exist; LSS does not. |
-| 0F B3 | BTR Ev,Gv | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F B4 | LFS / LGS Gv,Mp | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F B5 | LFS / LGS Gv,Mp | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F B6 | MOVZX Gv,Eb | 386 | DEFECT | `.op_0f_movzx_gv_eb` (dual) | IMPLEMENTED, both forms. DEFECT: the destination is written with a full 32-bit STR.W, so in 16-bit mode MOVZX clobbers the high half of the destination register instead of writing 16 bits. Also calls the ModRM decoder by symbol, ignoring a 0x67 prefix. |
-| 0F B7 | MOVZX Gv,Ew | 386 | DEFECT | `.op_0f_movzx_gv_ew` (dual) | IMPLEMENTED, both forms. Same 32-bit-destination-store defect as 0F B6. |
-| 0F B8 | (reserved) / Grp10 UD | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F B9 | (reserved) / Grp10 UD | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F BA | Grp8 BT/BTS/BTR/BTC Ev,Ib | 386 | unimplemented | `.exit_loop` | Not implemented -- all four defined /reg (4..7) are missing. |
-| 0F BB | BTC Ev,Gv | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F BC | BSF / BSR Gv,Ev | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F BD | BSF / BSR Gv,Ev | 386 | unimplemented | `.exit_loop` | Not implemented. |
-| 0F BE | MOVSX Gv,Eb | 386 | DEFECT | `.op_0f_movsx_gv_eb` (dual) | IMPLEMENTED, both forms. Same 32-bit-destination-store defect as 0F B6. |
-| 0F BF | MOVSX Gv,Ew | 386 | DEFECT | `.op_0f_movsx_gv_ew` (dual) | IMPLEMENTED, both forms. Same 32-bit-destination-store defect as 0F B6. |
-| 0F C0 | XADD | 486 | out of scope | `.exit_loop` | Out of scope. |
-| 0F C1 | XADD | 486 | out of scope | `.exit_loop` | Out of scope. |
-| 0F C2 | (SSE / CMPXCHG8B) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F C3 | (SSE / CMPXCHG8B) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F C4 | (SSE / CMPXCHG8B) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F C5 | (SSE / CMPXCHG8B) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F C6 | (SSE / CMPXCHG8B) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F C7 | (SSE / CMPXCHG8B) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F C8 | BSWAP r32 | 486 | out of scope | `.exit_loop` | Out of scope (486). |
-| 0F C9 | BSWAP r32 | 486 | out of scope | `.exit_loop` | Out of scope (486). |
-| 0F CA | BSWAP r32 | 486 | out of scope | `.exit_loop` | Out of scope (486). |
-| 0F CB | BSWAP r32 | 486 | out of scope | `.exit_loop` | Out of scope (486). |
-| 0F CC | BSWAP r32 | 486 | out of scope | `.exit_loop` | Out of scope (486). |
-| 0F CD | BSWAP r32 | 486 | out of scope | `.exit_loop` | Out of scope (486). |
-| 0F CE | BSWAP r32 | 486 | out of scope | `.exit_loop` | Out of scope (486). |
-| 0F CF | BSWAP r32 | 486 | out of scope | `.exit_loop` | Out of scope (486). |
-| 0F D0 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F D1 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F D2 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F D3 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F D4 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F D5 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F D6 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F D7 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F D8 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F D9 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F DA | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F DB | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F DC | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F DD | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F DE | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F DF | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F E0 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F E1 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F E2 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F E3 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F E4 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F E5 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F E6 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F E7 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F E8 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F E9 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F EA | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F EB | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F EC | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F ED | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F EE | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F EF | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F F0 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F F1 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F F2 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F F3 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F F4 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F F5 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F F6 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F F7 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F F8 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F F9 | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F FA | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F FB | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F FC | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F FD | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F FE | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
-| 0F FF | (MMX/SSE) | P5+ | out of scope | `.exit_loop` | Out of scope. |
+| 00 | reached | `.op_alu_eb_gb` | AGN | - | - |
+| 01 | reached | `.op_alu_ev_gv` | dual | - | - |
+| 02 | reached | `.op_alu_gb_eb` | AGN | - | - |
+| 03 | reached | `.op_alu_gv_ev` | dual | - | - |
+| 04 | reached | `.op_alu_al_imm8` | AGN | - | - |
+| 05 | reached | `.op_alu_eax_imm32` | dual | - | - |
+| 06 | reached | `.op_push_es_06` | dual | - | no flag macro reachable |
+| 07 | reached | `.op_pop_es_07` | dual | - | no flag macro reachable |
+| 08 | reached | `.op_alu_eb_gb` | AGN | - | - |
+| 09 | reached | `.op_alu_ev_gv` | dual | - | - |
+| 0A | reached | `.op_alu_gb_eb` | AGN | - | - |
+| 0B | reached | `.op_alu_gv_ev` | dual | - | - |
+| 0C | reached | `.op_alu_al_imm8` | AGN | - | - |
+| 0D | reached | `.op_alu_eax_imm32` | dual | - | - |
+| 0E | reached | `.op_push_cs_0E` | dual | - | no flag macro reachable |
+| 0F | reached | `.op_0f_0F` | dual | - | no flag macro reachable |
+| 10 | reached | `.op_alu_eb_gb` | AGN | - | - |
+| 11 | reached | `.op_alu_ev_gv` | dual | - | - |
+| 12 | reached | `.op_alu_gb_eb` | AGN | - | - |
+| 13 | reached | `.op_alu_gv_ev` | dual | - | - |
+| 14 | reached | `.op_alu_al_imm8` | AGN | - | - |
+| 15 | reached | `.op_alu_eax_imm32` | dual | - | - |
+| 16 | reached | `.op_push_ss_16` | dual | - | no flag macro reachable |
+| 17 | reached | `.op_pop_ss_17` | dual | - | no flag macro reachable |
+| 18 | reached | `.op_alu_eb_gb` | AGN | - | - |
+| 19 | reached | `.op_alu_ev_gv` | dual | - | - |
+| 1A | reached | `.op_alu_gb_eb` | AGN | - | - |
+| 1B | reached | `.op_alu_gv_ev` | dual | - | - |
+| 1C | reached | `.op_alu_al_imm8` | AGN | - | - |
+| 1D | reached | `.op_alu_eax_imm32` | dual | - | - |
+| 1E | reached | `.op_push_ds_1E` | dual | - | no flag macro reachable |
+| 1F | reached | `.op_pop_ds_1F` | dual | - | no flag macro reachable |
+| 20 | reached | `.op_alu_eb_gb` | AGN | - | - |
+| 21 | reached | `.op_alu_ev_gv` | dual | - | - |
+| 22 | reached | `.op_alu_gb_eb` | AGN | - | - |
+| 23 | reached | `.op_alu_gv_ev` | dual | - | - |
+| 24 | reached | `.op_alu_al_imm8` | AGN | - | - |
+| 25 | reached | `.op_alu_eax_imm32` | dual | - | - |
+| 26 | reached | `.op_seg_es_26` | AGN | - | no flag macro reachable |
+| 27 | reached | `.op_daa_27` | AGN | - | no flag macro reachable |
+| 28 | reached | `.op_alu_eb_gb` | AGN | - | - |
+| 29 | reached | `.op_alu_ev_gv` | dual | - | - |
+| 2A | reached | `.op_alu_gb_eb` | AGN | - | - |
+| 2B | reached | `.op_alu_gv_ev` | dual | - | - |
+| 2C | reached | `.op_alu_al_imm8` | AGN | - | - |
+| 2D | reached | `.op_alu_eax_imm32` | dual | - | - |
+| 2E | reached | `.op_seg_cs_2E` | AGN | - | no flag macro reachable |
+| 2F | reached | `.op_das_2F` | AGN | - | no flag macro reachable |
+| 30 | reached | `.op_alu_eb_gb` | AGN | - | - |
+| 31 | reached | `.op_alu_ev_gv` | dual | - | - |
+| 32 | reached | `.op_alu_gb_eb` | AGN | - | - |
+| 33 | reached | `.op_alu_gv_ev` | dual | - | - |
+| 34 | reached | `.op_alu_al_imm8` | AGN | - | - |
+| 35 | reached | `.op_alu_eax_imm32` | dual | - | - |
+| 36 | reached | `.op_seg_ss_36` | AGN | - | no flag macro reachable |
+| 37 | reached | `.op_aaa_37` | AGN | - | no flag macro reachable |
+| 38 | reached | `.op_alu_eb_gb` | AGN | - | - |
+| 39 | reached | `.op_alu_ev_gv` | dual | - | - |
+| 3A | reached | `.op_alu_gb_eb` | AGN | - | - |
+| 3B | reached | `.op_alu_gv_ev` | dual | - | - |
+| 3C | reached | `.op_alu_al_imm8` | AGN | - | - |
+| 3D | reached | `.op_alu_eax_imm32` | dual | - | - |
+| 3E | reached | `.op_seg_ds_3E` | AGN | - | no flag macro reachable |
+| 3F | reached | `.op_aas_3F` | AGN | - | no flag macro reachable |
+| 40 | reached | `.op_inc_r32` | dual | INCDEC | - |
+| 41 | reached | `.op_inc_r32` | dual | INCDEC | - |
+| 42 | reached | `.op_inc_r32` | dual | INCDEC | - |
+| 43 | reached | `.op_inc_r32` | dual | INCDEC | - |
+| 44 | reached | `.op_inc_r32` | dual | INCDEC | - |
+| 45 | reached | `.op_inc_r32` | dual | INCDEC | - |
+| 46 | reached | `.op_inc_r32` | dual | INCDEC | - |
+| 47 | reached | `.op_inc_r32` | dual | INCDEC | - |
+| 48 | reached | `.op_dec_r32` | dual | INCDEC | - |
+| 49 | reached | `.op_dec_r32` | dual | INCDEC | - |
+| 4A | reached | `.op_dec_r32` | dual | INCDEC | - |
+| 4B | reached | `.op_dec_r32` | dual | INCDEC | - |
+| 4C | reached | `.op_dec_r32` | dual | INCDEC | - |
+| 4D | reached | `.op_dec_r32` | dual | INCDEC | - |
+| 4E | reached | `.op_dec_r32` | dual | INCDEC | - |
+| 4F | reached | `.op_dec_r32` | dual | INCDEC | - |
+| 50 | reached | `.op_push_r32` | dual | - | no flag macro reachable |
+| 51 | reached | `.op_push_r32` | dual | - | no flag macro reachable |
+| 52 | reached | `.op_push_r32` | dual | - | no flag macro reachable |
+| 53 | reached | `.op_push_r32` | dual | - | no flag macro reachable |
+| 54 | reached | `.op_push_r32` | dual | - | no flag macro reachable |
+| 55 | reached | `.op_push_r32` | dual | - | no flag macro reachable |
+| 56 | reached | `.op_push_r32` | dual | - | no flag macro reachable |
+| 57 | reached | `.op_push_r32` | dual | - | no flag macro reachable |
+| 58 | reached | `.op_pop_r32` | dual | - | no flag macro reachable |
+| 59 | reached | `.op_pop_r32` | dual | - | no flag macro reachable |
+| 5A | reached | `.op_pop_r32` | dual | - | no flag macro reachable |
+| 5B | reached | `.op_pop_r32` | dual | - | no flag macro reachable |
+| 5C | reached | `.op_pop_r32` | dual | - | no flag macro reachable |
+| 5D | reached | `.op_pop_r32` | dual | - | no flag macro reachable |
+| 5E | reached | `.op_pop_r32` | dual | - | no flag macro reachable |
+| 5F | reached | `.op_pop_r32` | dual | - | no flag macro reachable |
+| 60 | reached | `.op_pusha_60` | dual | - | no flag macro reachable |
+| 61 | reached | `.op_popa_61` | dual | - | no flag macro reachable |
+| 62 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 63 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 64 | reached | `.op_seg_fs_64` | AGN | - | no flag macro reachable |
+| 65 | reached | `.op_seg_gs_65` | AGN | - | no flag macro reachable |
+| 66 | reached | `.op_pfx_66` | AGN | - | no flag macro reachable |
+| 67 | reached | `.op_pfx_67` | AGN | - | REVIEW: AGN body mixes width primitives with 26 bare word op(s), no flag macro reachable |
+| 68 | reached | `.op_push_imm32_68` | dual | - | no flag macro reachable |
+| 69 | reached | `.op_imul_imm32_69` | dual | - | no flag macro reachable |
+| 6A | reached | `.op_push_imm8_6A` | dual | - | no flag macro reachable |
+| 6B | reached | `.op_imul_imm8_6B` | dual | - | no flag macro reachable |
+| 6C | reached | `.op_insb_6C` | AGN | - | no flag macro reachable |
+| 6D | reached | `.op_insv_6D` | dual | - | no flag macro reachable |
+| 6E | reached | `.op_outsb_6E` | AGN | - | no flag macro reachable |
+| 6F | reached | `.op_outsv_6F` | dual | - | no flag macro reachable |
+| 70 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
+| 71 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
+| 72 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
+| 73 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
+| 74 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
+| 75 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
+| 76 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
+| 77 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
+| 78 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
+| 79 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
+| 7A | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
+| 7B | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
+| 7C | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
+| 7D | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
+| 7E | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
+| 7F | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
+| 80 | reached | `.op_alu_eb_imm8_80` | AGN | - | - |
+| 81 | reached | `.op_alu_ev_imm32_81` | dual | - | - |
+| 82 | reached | `.op_alu_eb_imm8_80` | AGN | - | - |
+| 83 | reached | `.op_alu_ev_imm8_83` | dual | - | - |
+| 84 | reached | `.op_test_eb_gb_84` | AGN | LOGIC | - |
+| 85 | reached | `.op_test_ev_gv_85` | dual | LOGIC | - |
+| 86 | reached | `.op_xchg_eb_gb_86` | AGN | - | REVIEW: AGN body mixes width primitives with 1 bare word op(s), no flag macro reachable |
+| 87 | reached | `.op_xchg_ev_gv_87` | dual | - | no flag macro reachable |
+| 88 | reached | `.op_mov_eb_gb_88` | AGN | - | REVIEW: AGN body mixes width primitives with 1 bare word op(s), no flag macro reachable |
+| 89 | reached | `.op_mov_ev_gv_89` | dual | ARITH, LOGIC | - |
+| 8A | reached | `.op_mov_gb_eb_8A` | AGN | ARITH, LOGIC | REVIEW: AGN body mixes width primitives with 10 bare word op(s) |
+| 8B | reached | `.op_mov_gv_ev_8B` | dual | ARITH, LOGIC | - |
+| 8C | reached | `.op_mov_Ew_seg_8C` | AGN | - | REVIEW: AGN body mixes width primitives with 13 bare word op(s), no flag macro reachable |
+| 8D | reached | `.op_lea_8D` | dual | - | no flag macro reachable |
+| 8E | reached | `.op_mov_seg_Ew_8E` | AGN | - | REVIEW: AGN body mixes width primitives with 13 bare word op(s), no flag macro reachable |
+| 8F | reached | `.op_pop_ev_8F` | dual | ARITH, LOGIC | - |
+| 90 | reached | `.op_nop` | AGN | - | no flag macro reachable |
+| 91 | reached | `.op_xchg_eax_r32` | dual | - | no flag macro reachable |
+| 92 | reached | `.op_xchg_eax_r32` | dual | - | no flag macro reachable |
+| 93 | reached | `.op_xchg_eax_r32` | dual | - | no flag macro reachable |
+| 94 | reached | `.op_xchg_eax_r32` | dual | - | no flag macro reachable |
+| 95 | reached | `.op_xchg_eax_r32` | dual | - | no flag macro reachable |
+| 96 | reached | `.op_xchg_eax_r32` | dual | - | no flag macro reachable |
+| 97 | reached | `.op_xchg_eax_r32` | dual | - | no flag macro reachable |
+| 98 | reached | `.op_cwde_98` | dual | - | no flag macro reachable |
+| 99 | reached | `.op_cdq_99` | dual | - | no flag macro reachable |
+| 9A | reached | `.op_call_far_9A` | dual | - | no flag macro reachable |
+| 9B | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 9C | reached | `.op_pushfd_9C` | dual | - | no flag macro reachable |
+| 9D | reached | `.op_popfd_9D` | dual | - | no flag macro reachable |
+| 9E | reached | `.op_sahf_9E` | AGN | - | no flag macro reachable |
+| 9F | reached | `.op_lahf_9F` | AGN | - | no flag macro reachable |
+| A0 | reached | `.op_mov_al_moffs8_A0` | AGN | - | no flag macro reachable |
+| A1 | reached | `.op_mov_eax_moffs32_A1` | dual | - | no flag macro reachable |
+| A2 | reached | `.op_mov_moffs8_al_A2` | AGN | - | no flag macro reachable |
+| A3 | reached | `.op_mov_moffs32_eax_A3` | dual | - | no flag macro reachable |
+| A4 | reached | `.op_movsb_A4` | AGN | - | no flag macro reachable |
+| A5 | reached | `.op_movsd_A5` | dual | - | no flag macro reachable |
+| A6 | reached | `.op_cmpsb_A6` | AGN | ARITH | - |
+| A7 | reached | `.op_cmpsd_A7` | dual | ARITH | - |
+| A8 | reached | `.op_test_al_imm8_A8` | AGN | LOGIC | - |
+| A9 | reached | `.op_test_eax_imm32_A9` | dual | LOGIC | - |
+| AA | reached | `.op_stosb_AA` | AGN | - | no flag macro reachable |
+| AB | reached | `.op_stosd_AB` | dual | - | no flag macro reachable |
+| AC | reached | `.op_lodsb_AC` | AGN | - | no flag macro reachable |
+| AD | reached | `.op_lodsd_AD` | dual | - | no flag macro reachable |
+| AE | reached | `.op_scasb_AE` | AGN | ARITH | - |
+| AF | reached | `.op_scasd_AF` | dual | ARITH | - |
+| B0 | reached | `.op_mov_r8_imm8` | AGN | - | no flag macro reachable |
+| B1 | reached | `.op_mov_r8_imm8` | AGN | - | no flag macro reachable |
+| B2 | reached | `.op_mov_r8_imm8` | AGN | - | no flag macro reachable |
+| B3 | reached | `.op_mov_r8_imm8` | AGN | - | no flag macro reachable |
+| B4 | reached | `.op_mov_r8_imm8` | AGN | - | no flag macro reachable |
+| B5 | reached | `.op_mov_r8_imm8` | AGN | - | no flag macro reachable |
+| B6 | reached | `.op_mov_r8_imm8` | AGN | - | no flag macro reachable |
+| B7 | reached | `.op_mov_r8_imm8` | AGN | - | no flag macro reachable |
+| B8 | reached | `.op_mov_r32_imm32` | dual | - | no flag macro reachable |
+| B9 | reached | `.op_mov_r32_imm32` | dual | - | no flag macro reachable |
+| BA | reached | `.op_mov_r32_imm32` | dual | - | no flag macro reachable |
+| BB | reached | `.op_mov_r32_imm32` | dual | - | no flag macro reachable |
+| BC | reached | `.op_mov_r32_imm32` | dual | - | no flag macro reachable |
+| BD | reached | `.op_mov_r32_imm32` | dual | - | no flag macro reachable |
+| BE | reached | `.op_mov_r32_imm32` | dual | - | no flag macro reachable |
+| BF | reached | `.op_mov_r32_imm32` | dual | - | no flag macro reachable |
+| C0 | reached | `.op_shift_eb_imm8_C0` | AGN | - | no flag macro reachable |
+| C1 | reached | `.op_shift_ev_imm8_C1` | dual | - | no flag macro reachable |
+| C2 | reached | `.op_ret_imm16_C2` | dual | - | no flag macro reachable |
+| C3 | reached | `.op_ret_C3` | dual | - | no flag macro reachable |
+| C4 | reached | `.op_les_C4` | dual | - | no flag macro reachable |
+| C5 | reached | `.op_lds_C5` | dual | - | no flag macro reachable |
+| C6 | reached | `.op_mov_eb_imm8_C6` | AGN | - | no flag macro reachable |
+| C7 | reached | `.op_mov_ev_imm32_C7` | dual | - | no flag macro reachable |
+| C8 | reached | `.op_enter_C8` | dual | - | no flag macro reachable |
+| C9 | reached | `.op_leave_C9` | dual | - | no flag macro reachable |
+| CA | reached | `.op_retf_imm16_CA` | dual | - | no flag macro reachable |
+| CB | reached | `.op_retf_CB` | dual | - | no flag macro reachable |
+| CC | reached | `.op_int3_CC` | dual | - | - |
+| CD | reached | `.op_int_imm8_CD` | dual | - | - |
+| CE | reached | `.op_into_CE` | dual | - | - |
+| CF | reached | `.op_iret_CF` | dual | - | no flag macro reachable |
+| D0 | reached | `.op_shift_eb_1_D0` | AGN | - | no flag macro reachable |
+| D1 | reached | `.op_shift_ev_1_D1` | dual | - | no flag macro reachable |
+| D2 | reached | `.op_shift_eb_cl_D2` | AGN | - | - |
+| D3 | reached | `.op_shift_ev_cl_D3` | dual | - | - |
+| D4 | reached | `.op_aam_D4` | AGN | - | no flag macro reachable |
+| D5 | reached | `.op_aad_D5` | AGN | - | no flag macro reachable |
+| D6 | reached | `.op_salc_D6` | AGN | - | no flag macro reachable |
+| D7 | reached | `.op_xlat_D7` | AGN | - | REVIEW: no width primitive, 1 bare word op(s), no flag macro reachable |
+| D8 | reached | `.op_esc_x87` | AGN | - | REVIEW: no width primitive, 2 bare word op(s), no flag macro reachable |
+| D9 | reached | `.op_esc_x87` | AGN | - | REVIEW: no width primitive, 2 bare word op(s), no flag macro reachable |
+| DA | reached | `.op_esc_x87` | AGN | - | REVIEW: no width primitive, 2 bare word op(s), no flag macro reachable |
+| DB | reached | `.op_esc_x87` | AGN | - | REVIEW: no width primitive, 2 bare word op(s), no flag macro reachable |
+| DC | reached | `.op_esc_x87` | AGN | - | REVIEW: no width primitive, 2 bare word op(s), no flag macro reachable |
+| DD | reached | `.op_esc_x87` | AGN | - | REVIEW: no width primitive, 2 bare word op(s), no flag macro reachable |
+| DE | reached | `.op_esc_x87` | AGN | - | REVIEW: no width primitive, 2 bare word op(s), no flag macro reachable |
+| DF | reached | `.op_esc_x87` | AGN | - | REVIEW: no width primitive, 2 bare word op(s), no flag macro reachable |
+| E0 | reached | `.op_loopnz_E0` | AGN | - | REVIEW: no width primitive, 4 bare word op(s), no flag macro reachable |
+| E1 | reached | `.op_loopz_E1` | AGN | - | REVIEW: no width primitive, 4 bare word op(s), no flag macro reachable |
+| E2 | reached | `.op_loop_E2` | AGN | - | REVIEW: no width primitive, 4 bare word op(s), no flag macro reachable |
+| E3 | reached | `.op_jcxz_E3` | AGN | - | REVIEW: no width primitive, 4 bare word op(s), no flag macro reachable |
+| E4 | reached | `.op_in_al_imm8_E4` | AGN | - | no flag macro reachable |
+| E5 | reached | `.op_in_eax_imm8_E5` | dual | - | no flag macro reachable |
+| E6 | reached | `.op_out_imm8_al_E6` | AGN | - | no flag macro reachable |
+| E7 | reached | `.op_out_imm8_eax_E7` | dual | - | no flag macro reachable |
+| E8 | reached | `.op_call_rel32_E8` | dual | - | no flag macro reachable |
+| E9 | reached | `.op_jmp_rel32_E9` | dual | - | no flag macro reachable |
+| EA | reached | `.op_jmp_far_EA` | dual | - | no flag macro reachable |
+| EB | reached | `.op_jmp_rel8_EB` | AGN | - | no flag macro reachable |
+| EC | reached | `.op_in_al_dx_EC` | AGN | - | no flag macro reachable |
+| ED | reached | `.op_in_eax_dx_ED` | dual | - | no flag macro reachable |
+| EE | reached | `.op_out_dx_al_EE` | AGN | ARITH, LOGIC | - |
+| EF | reached | `.op_out_dx_eax_EF` | dual | ARITH, LOGIC | - |
+| F0 | reached | `.op_lock_F0` | AGN | - | no flag macro reachable |
+| F1 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| F2 | reached | `.op_repne_F2` | AGN | - | REVIEW: no width primitive, 1 bare word op(s), no flag macro reachable |
+| F3 | reached | `.op_rep_F3` | AGN | - | REVIEW: no width primitive, 9 bare word op(s), no flag macro reachable |
+| F4 | reached | `.op_hlt_F4` | AGN | - | REVIEW: no width primitive, 5 bare word op(s), no flag macro reachable |
+| F5 | reached | `.op_cmc_F5` | AGN | - | no flag macro reachable |
+| F6 | reached | `.op_grp3_eb_F6` | AGN | ARITH, LOGIC | REVIEW: AGN body mixes width primitives with 56 bare word op(s) |
+| F7 | reached | `.op_grp3_ev_F7` | dual | ARITH, LOGIC | - |
+| F8 | reached | `.op_clc_F8` | AGN | - | no flag macro reachable |
+| F9 | reached | `.op_stc_F9` | AGN | - | no flag macro reachable |
+| FA | reached | `.op_cli_FA` | AGN | - | REVIEW: AGN body mixes width primitives with 2 bare word op(s), no flag macro reachable |
+| FB | reached | `.op_sti_FB` | AGN | - | REVIEW: AGN body mixes width primitives with 1 bare word op(s), no flag macro reachable |
+| FC | reached | `.op_cld_FC` | AGN | - | no flag macro reachable |
+| FD | reached | `.op_std_FD` | AGN | ARITH, INCDEC, LOGIC | REVIEW: AGN body mixes width primitives with 15 bare word op(s) |
+| FE | reached | `.op_grp4_FE` | AGN | INCDEC | REVIEW: AGN body mixes width primitives with 3 bare word op(s) |
+| FF | reached | `.op_grp5_FF` | dual | INCDEC | - |
+
+### Two-byte (0F) opcodes -- all 256 (generated)
+
+| Op | Status | Handler | Mode | Flag macros | Warnings |
+|---|---|---|---|---|---|
+| 0F 00 | reached | `.op_0f_00` | dual | - | - |
+| 0F 01 | reached | `.op_0f_01` | dual | - | - |
+| 0F 02 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 03 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 04 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 05 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 06 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 07 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 08 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 09 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 0A | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 0B | reached | `.op_hypercall_0F0B` | AGN | - | REVIEW: AGN body mixes width primitives with 50 bare word op(s) |
+| 0F 0C | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 0D | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 0E | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 0F | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 10 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 11 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 12 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 13 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 14 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 15 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 16 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 17 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 18 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 19 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 1A | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 1B | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 1C | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 1D | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 1E | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 1F | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 20 | reached | `.op_0f_mov_r32_cr_20` | AGN | - | REVIEW: AGN body mixes width primitives with 7 bare word op(s), no flag macro reachable |
+| 0F 21 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 22 | reached | `.op_0f_mov_cr_r32_22` | AGN | - | REVIEW: no width primitive, 2 bare word op(s), no flag macro reachable |
+| 0F 23 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 24 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 25 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 26 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 27 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 28 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 29 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 2A | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 2B | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 2C | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 2D | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 2E | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 2F | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 30 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 31 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 32 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 33 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 34 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 35 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 36 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 37 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 38 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 39 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 3A | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 3B | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 3C | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 3D | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 3E | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 3F | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 40 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 41 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 42 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 43 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 44 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 45 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 46 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 47 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 48 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 49 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 4A | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 4B | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 4C | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 4D | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 4E | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 4F | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 50 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 51 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 52 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 53 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 54 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 55 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 56 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 57 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 58 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 59 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 5A | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 5B | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 5C | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 5D | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 5E | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 5F | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 60 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 61 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 62 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 63 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 64 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 65 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 66 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 67 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 68 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 69 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 6A | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 6B | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 6C | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 6D | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 6E | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 6F | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 70 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 71 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 72 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 73 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 74 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 75 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 76 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 77 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 78 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 79 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 7A | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 7B | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 7C | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 7D | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 7E | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 7F | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 80 | reached | `.op_0f_jcc_rel32` | dual | - | - |
+| 0F 81 | reached | `.op_0f_jcc_rel32` | dual | - | - |
+| 0F 82 | reached | `.op_0f_jcc_rel32` | dual | - | - |
+| 0F 83 | reached | `.op_0f_jcc_rel32` | dual | - | - |
+| 0F 84 | reached | `.op_0f_jcc_rel32` | dual | - | - |
+| 0F 85 | reached | `.op_0f_jcc_rel32` | dual | - | - |
+| 0F 86 | reached | `.op_0f_jcc_rel32` | dual | - | - |
+| 0F 87 | reached | `.op_0f_jcc_rel32` | dual | - | - |
+| 0F 88 | reached | `.op_0f_jcc_rel32` | dual | - | - |
+| 0F 89 | reached | `.op_0f_jcc_rel32` | dual | - | - |
+| 0F 8A | reached | `.op_0f_jcc_rel32` | dual | - | - |
+| 0F 8B | reached | `.op_0f_jcc_rel32` | dual | - | - |
+| 0F 8C | reached | `.op_0f_jcc_rel32` | dual | - | - |
+| 0F 8D | reached | `.op_0f_jcc_rel32` | dual | - | - |
+| 0F 8E | reached | `.op_0f_jcc_rel32` | dual | - | - |
+| 0F 8F | reached | `.op_0f_jcc_rel32` | dual | - | - |
+| 0F 90 | reached | `.op_0f_setcc` | dual | INCDEC | - |
+| 0F 91 | reached | `.op_0f_setcc` | dual | INCDEC | - |
+| 0F 92 | reached | `.op_0f_setcc` | dual | INCDEC | - |
+| 0F 93 | reached | `.op_0f_setcc` | dual | INCDEC | - |
+| 0F 94 | reached | `.op_0f_setcc` | dual | INCDEC | - |
+| 0F 95 | reached | `.op_0f_setcc` | dual | INCDEC | - |
+| 0F 96 | reached | `.op_0f_setcc` | dual | INCDEC | - |
+| 0F 97 | reached | `.op_0f_setcc` | dual | INCDEC | - |
+| 0F 98 | reached | `.op_0f_setcc` | dual | INCDEC | - |
+| 0F 99 | reached | `.op_0f_setcc` | dual | INCDEC | - |
+| 0F 9A | reached | `.op_0f_setcc` | dual | INCDEC | - |
+| 0F 9B | reached | `.op_0f_setcc` | dual | INCDEC | - |
+| 0F 9C | reached | `.op_0f_setcc` | dual | INCDEC | - |
+| 0F 9D | reached | `.op_0f_setcc` | dual | INCDEC | - |
+| 0F 9E | reached | `.op_0f_setcc` | dual | INCDEC | - |
+| 0F 9F | reached | `.op_0f_setcc` | dual | INCDEC | - |
+| 0F A0 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F A1 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F A2 | reached | `.op_0f_cpuid_A2` | AGN | - | REVIEW: no width primitive, 9 bare word op(s), no flag macro reachable |
+| 0F A3 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F A4 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F A5 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F A6 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F A7 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F A8 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F A9 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F AA | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F AB | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F AC | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F AD | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F AE | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F AF | reached | `.op_0f_imul_AF` | dual | - | no flag macro reachable |
+| 0F B0 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F B1 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F B2 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F B3 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F B4 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F B5 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F B6 | reached | `.op_0f_movzx_gv_eb` | dual | INCDEC | - |
+| 0F B7 | reached | `.op_0f_movzx_gv_ew` | dual | INCDEC | - |
+| 0F B8 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F B9 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F BA | reached | `.op_0f_ba` | dual | - | no flag macro reachable |
+| 0F BB | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F BC | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F BD | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F BE | reached | `.op_0f_movsx_gv_eb` | dual | INCDEC | - |
+| 0F BF | reached | `.op_0f_movsx_gv_ew` | dual | INCDEC | - |
+| 0F C0 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F C1 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F C2 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F C3 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F C4 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F C5 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F C6 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F C7 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F C8 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F C9 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F CA | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F CB | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F CC | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F CD | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F CE | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F CF | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F D0 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F D1 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F D2 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F D3 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F D4 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F D5 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F D6 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F D7 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F D8 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F D9 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F DA | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F DB | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F DC | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F DD | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F DE | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F DF | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F E0 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F E1 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F E2 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F E3 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F E4 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F E5 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F E6 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F E7 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F E8 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F E9 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F EA | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F EB | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F EC | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F ED | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F EE | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F EF | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F F0 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F F1 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F F2 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F F3 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F F4 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F F5 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F F6 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F F7 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F F8 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F F9 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F FA | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F FB | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F FC | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F FD | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F FE | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F FF | **`.exit_loop`** | `.exit_loop` | - | - | - |
+
+### Group `/reg` reachability (generated)
+
+`Grp1` and `Grp2` dispatch through an 8-entry `TBH` indexed by a 3-bit field, so
+all eight `/reg` values reach code by construction and no chain appears here.
+`Grp3`/`Grp4`/`Grp5` use a `CMP`/`BEQ` chain: any `/reg` the chain does not name falls
+to `.exit_loop`. The chains below are extracted from the source.
+
+| Dispatch | /reg reached | /reg falling to `.exit_loop` |
+|---|---|---|
+| `GRP3_F6_DISPATCH` | /0 -> `GRP3_F6_TEST`, /2 -> `GRP3_F6_NOT`, /3 -> `GRP3_F6_NEG`, /4 -> `GRP3_F6_MUL`, /5 -> `GRP3_F6_IMUL`, /6 -> `GRP3_F6_DIV`, /7 -> `GRP3_F6_IDIV` | /1 |
+| `GRP3_F7_DISPATCH` | /0 -> `GRP3_F7_TEST`, /2 -> `GRP3_F7_NOT`, /3 -> `GRP3_F7_NEG`, /4 -> `GRP3_F7_MUL`, /5 -> `GRP3_F7_IMUL`, /6 -> `GRP3_F7_DIV`, /7 -> `GRP3_F7_IDIV` | /1 |
+| `GRP4_DISPATCH` | /0 -> `GRP4_INC`, /1 -> `GRP4_DEC` | /2, /3, /4, /5, /6, /7 |
+| `GRP5_DISPATCH` | /0 -> `GRP5_INC`, /1 -> `GRP5_DEC`, /2 -> `GRP5_CALL`, /3 -> `GRP5_CALLF`, /4 -> `GRP5_JMP`, /5 -> `GRP5_JMPF`, /6 -> `GRP5_PUSH` | /7 |
+
+<!-- END GENERATED -->
+
+
 ---
 
-## Group opcodes — every `/reg` individually
+# Hand-written analysis (NOT generated)
+
+Everything below is human analysis that a parser cannot produce. It is kept
+because it is genuinely useful — and it is **dated**, because it was written
+against an older tree.
+
+> **WARNING — the prioritised defect list below has NOT been re-derived against
+> the current tree.** Several entries in it are known to be FIXED: `0F 8x`
+> near-`Jcc`, `E0`–`E3` address size, `60`/`61` PUSHA/POPA, `68` PUSH Iv,
+> `84`/`85` TEST, the BCD group, and INS/OUTS. Treat every individual claim as
+> a HYPOTHESIS to check against the generated table above and against the
+> handler body, not as a statement about today's code. It is retained for its
+> reasoning and its taxonomy, not for its status column.
+
+
+## Group opcodes — every `/reg` individually (hand-written, DATED)
+
+Reachability of each `/reg` is GENERATED above. This section is the semantic
+commentary the generator cannot produce — what each member does, and the
+structural lessons. Its status claims are dated; check them against the
+generated reachability table before acting on one.
 
 Dispatch mechanism matters here. `Grp1` and `Grp2` use a `TBH` jump table with exactly
 eight entries indexed by a 3-bit field, so **no `/reg` value can fall through** — all
@@ -769,8 +857,6 @@ Segment override coverage on the *destination* of string ops is correctly refuse
 | 286 protected mode `0F 00`, `0F 02`, `0F 03`, `0F 06` | 4 | Unimplemented. |
 | 486/Pentium+ (`0F 31` RDTSC, `0F A2` CPUID, `0F C8`–`CF` BSWAP, CMPXCHG, XADD, MMX/SSE) | 158 | **Out of scope** for a 386-class target. |
 
----
-
 ## Defects, prioritised
 
 Ordered by likely impact on real DOS software. These matter more than the unimplemented
@@ -896,8 +982,6 @@ prints `cpu_exit_info` alongside `cpu_cs_sel`/`cpu_eip`/`cpu_cr0` — the report
 30. **`0xF4` HLT's handler exists but is unreachable**; the table entry is `.exit_loop`.
     Net behaviour is nearly the same, minus the CR0/CPL `#GP` check.
 31. **`0xF0` LOCK clears a preceding segment override** and double-decrements the PIT.
-
----
 
 ## What a real DOS game or utility actually needs
 

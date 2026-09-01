@@ -959,6 +959,81 @@ WOLF3D the answer was **90% mix, 10% cost** — see [`docs/09`](docs/09_frame_pa
 Requires both profiles to come from the same core and the same clock. Comparing
 across builds compares the builds.
 
+### `gen_opcode_coverage.py` — regenerate `docs/07` FROM SOURCE
+
+`docs/07_opcode_coverage.md` was hand-written and rotted twice: it listed the
+`0F 8x` near-`Jcc` and `E0`-`E3` address-size defects as open 249 commits after
+`7f4c12a` fixed them, and called `60`/`61`/`68`/`84`/`85`, the BCD group and
+INS/OUTS broken or missing when they were implemented. A sprint was planned
+against those rows. The per-opcode tables are now generated and must not be
+hand-edited.
+
+```bash
+python3 scripts/gen_opcode_coverage.py              # print the tables
+python3 scripts/gen_opcode_coverage.py --write      # rewrite the block in docs/07
+python3 scripts/gen_opcode_coverage.py --check      # exit 1 if docs/07 is stale
+python3 scripts/gen_opcode_coverage.py --json build/artifacts/coverage.json
+```
+
+It parses `opcode_table.S`, `opcode_0f_table.S` and every `OP`/`OP_AGNOSTIC`
+handler body in `cpu_exec_handlers.S` / `cpu_exec_handlers_0f.S`, following one
+handler's branches into shared cores so an ALU handler is not falsely reported
+as writing no flags. It emits, per slot: reached vs `.exit_loop`, the handler
+symbol, dual vs AGN, the reachable flag macros, and mechanical `REVIEW:`
+markers (no width primitive, open-coded stack, ModRM decoder called by symbol).
+It also extracts the `CMP`/`BEQ` group dispatch chains, which is what decides
+whether a `/reg` is reachable at all.
+
+**It never claims a handler is correct.** Semantic questions — is this flag
+computation right, is the segment base applied in the right place — are not
+derivable by grep and are reported as UNKNOWN. `--check` belongs in CI: it is
+the thing that stops the document rotting a third time.
+
+Only the block between the `BEGIN GENERATED` / `END GENERATED` markers is
+rewritten; the hand-written analysis after it is preserved.
+
+### `opcode_demand.py` — what does a title's binary actually CONTAIN
+
+Replaces serial discovery. Instead of running a title, hitting
+`guest_exit_reason=4`, reading `exit_info`, implementing that one opcode and
+running again — one round trip per opcode, and only ever the first blocker —
+this disassembles the shipped binaries out of the `.dsk` and ranks every opcode
+and group `/reg` against what the core has.
+
+```bash
+# Epic Pinball: the launcher plus the 13 table binaries, 16-bit real mode
+python3 scripts/opcode_demand.py --dsk EPIC_PINBALL --bits 16 --problems
+
+# a DOS extender's load image is 32-bit; mixing the widths is the main way
+# this scan goes wrong
+python3 scripts/opcode_demand.py --dsk STAR_WARS_DARKFORCES \
+    --file DF/DOS4GW.EXE --bits 32 --raw --pmode
+```
+
+Status comes from `gen_opcode_coverage.py`, never from docs/07's prose.
+
+Three things it does that a naive `objdump` sweep does not, each of which
+changed the answer materially:
+
+* **It starts at the entry point.** Epic Pinball's `EP*.EXE` are ~250 KB whose
+  first ~200 KB is a data blob beginning with the literal string `"STACK   "`;
+  only the last ~40 KB at `CS:IP` is code. Sweeping from byte 0 reports 19,000
+  `DAS` because `0x2F` is a common data byte. `--whole-image` opts out.
+* **It subtracts a null model.** Every count is also taken over a SHUFFLED copy
+  of the same bytes — the count the sweep would report if the region were pure
+  data with that byte frequency. `enrich = count/noise` separates real code
+  (`enrich >= 3`) from data noise (`enrich < 2`, marked `weak`).
+  `--no-null-model` skips it.
+* **`--pmode` adds a phase-independent byte-level privilege census** over the
+  whole file — every `0F 00`/`0F 01` group member, `LAR`/`LSL`/`CLTS`,
+  `MOV CRn`/`DRn` — each hit re-disassembled at its offset in both widths. For
+  "does this extender ever change ring", one genuine `LTR` is decisive and a
+  phase-dependent sweep can miss it.
+
+Counts are occurrences in the IMAGE, never execution counts: it ranks what a
+title COULD need. `profile_opcodes.py` ranks what it DOES need. Neither
+substitutes for the other.
+
 ### `profile_all.py` — ONE command, one workload, one full report
 
 ```bash
@@ -2398,6 +2473,15 @@ naming each such press rather than letting it silently do nothing. The shortest
 press in any checked-in timeline is 40 ms.
 
 ## Modules (`scripts/common/`)
+
+`dosimage.py` also carries **`FatVolume`**, a FAT12/FAT16 reader with partition
+and subdirectory support. `Fat12` in the same module is floppy-only: an
+unpartitioned volume, root directory only, which is all a 1.44 MB `.dsk` needs.
+The larger titles ship as partitioned hard-disk images instead — an MBR at LBA
+0, one FAT16 primary at LBA 63 — and keep their executables in subdirectories
+(`DF/DOS4GW.EXE`), so `Fat12` cannot see them at all and returns an empty
+listing rather than an error. `FatVolume(data).walk()` enumerates the whole
+volume; `.read(path)` takes a `/`- or `\`-separated path.
 
 Importable support only — no CLIs.
 
