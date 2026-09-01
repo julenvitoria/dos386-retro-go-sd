@@ -40,6 +40,45 @@ python3 scripts/asm_metrics.py --top 20
 python3 scripts/asm_metrics.py --cycles --target hardware
 ```
 
+### `disasm_diff.py` — "did this change cost the hot path anything?"
+
+```bash
+# on the base commit
+python3 scripts/disasm_diff.py --dump build/run/before.json
+# after the change
+python3 scripts/disasm_diff.py --dump build/run/after.json
+python3 scripts/disasm_diff.py --compare build/run/before.json build/run/after.json --hot
+```
+
+Per-symbol normalised disassembly, and the diff between two of them. `--hot`
+restricts the report to the symbols the "real mode pays nothing" claim covers:
+`.fetch_decode_loop`, every `.op_*` handler, the ModRM decoders and the dispatch
+tables. `--elf` selects the ELF (default `build/core/dos_core.elf`), `--quiet`
+names changed symbols without showing the first difference.
+
+**This exists because `tests/test_benchmark.py` cannot decide the question and
+must not be quoted for it** — under gwemu it spans 10.30–11.88 M cycles on the
+BASELINE alone, a 15% spread that swallows anything a cold-path change could
+cost. What CAN be decided exactly is whether the hot path's instructions changed
+at all, which is the claim [`docs/14`](docs/14_protected_mode.md) §2 makes.
+
+Three normalisations, each of which was a false positive before it was added:
+
+* **branch targets → symbol names.** Adding cold code moves every later symbol,
+  so a raw `objdump` diff is nothing but address noise.
+* **jump-table entries → the symbol they point at.** The dispatch tables
+  disassemble as `.word` literals and every one of them moves when any handler
+  moves; resolved, a table that still dispatches every opcode to the same
+  handler compares EQUAL, and one that re-points an entry is still caught.
+* **trailing NOPs dropped.** `objdump` gives a symbol everything up to the next
+  one, so alignment padding counts as code and a handler nobody touched reports
+  "8 -> 7 instructions".
+
+Symbols that differ ONLY in a moved address literal are reported as
+`RELOCATED ONLY` rather than `CHANGED`, so "the handler gained an instruction"
+stays a distinct, reviewable event from "a literal it loads moved". Exit status
+is 1 when anything in scope changed.
+
 ### `probe.py` — see what a running target is doing
 
 `--watch` reads globals. `--deref SYM+OFF` follows a pointer into a struct.

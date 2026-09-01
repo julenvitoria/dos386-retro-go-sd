@@ -1,8 +1,8 @@
 # Protected mode
 
 State: [`STATUS.md`](../STATUS.md). Roadmap: [`PLAN.md`](../PLAN.md) Queue C 4.
-Code: `x86_pmode.c`, `L(SET_SREG)` in `cpu_exec_handlers.S`, group 6/7 in
-`cpu_exec_handlers_0f.S`. Tests: `tests/test_pmode.py`,
+Code: `x86_pmode.c`, `L(SET_SREG)` in `cpu_exec_handlers.S`, group 6/7 plus
+`L(HANDLE_INTERRUPT)` and `.op_iret_CF` in `cpu_exec_handlers_0f.S`. Tests: `tests/test_pmode.py`,
 `scripts/run_pmode_controls.py`.
 
 ## 1. What is built, and what is not
@@ -11,19 +11,27 @@ Code: `x86_pmode.c`, `L(SET_SREG)` in `cpu_exec_handlers.S`, group 6/7 in
 fetch and its bound; the S/type/DPL/present rules with the correct vector and
 error code for each; the per-segment descriptor cache (base, limit with the G
 shift applied, rights); `MOV Sreg,Ev`, `POP Sreg`, `LES`/`LDS`; `CR0.PE` in
-both directions; and a same-privilege far `JMP` — the transfer that installs CS
-and flushes the pipeline.
+both directions; a same-privilege far `JMP` — the transfer that installs CS and
+flushes the pipeline — and, since the gate work below, **same-privilege
+interrupt DELIVERY through an IDT gate and the `IRET` that returns from it**.
 
-**Not built, and not stubbed.** Call gates, `IRET` across privilege, stack
-switches, task switches, paging, and per-access **segment limit enforcement**.
-Each is its own step. V86 and the TSS are not needed at all: INT 21h is HLE'd.
+**Not built, and not stubbed.** Call gates, privilege-change stack switches,
+the TSS, task gates, `IRET` across privilege, paging, and per-access **segment
+limit enforcement**. Each is its own step, and each is REFUSED rather than
+approximated: an `INT` or `IRET` that would change ring comes back as `#GP` and
+exits loudly. V86 is not needed at all: INT 21h is HLE'd.
 
-**Nothing here is sized against a title.** No guest in this tree executes a
-protected-mode instruction today. The ~1,225-line estimate that used to sit in
-`PLAN.md` had no measured demand behind it, and Dark Forces was subsequently
-measured never reaching protected mode at all — it dies at `INT 21h AH=4Bh`.
-This is the foundation every protected-mode path needs; build the rest when
-something asks.
+**This is now sized against a title, and that is new.** Dark Forces and Mortal
+Kombat both reach `CR0.PE=1` through `LMSW` — not `MOV CR0`, because a DOS
+extender must also start on a 286, which is why the walk sat unexercised for so
+long — and both stop on the same `INT imm8`. The ~1,225-line estimate that used
+to sit in `PLAN.md` still has no measured demand behind it; **what the titles
+ask for NEXT is a measurement nobody has yet taken** (see §8).
+
+**And it is very likely NOT DPMI.** DOS4GW was told no by DPMI
+(`INT 2Fh AX=1687h`), by VCPI (`INT 67h AH=DEh`) and by `INT 15h`, and went
+raw-mode protected on its own. Do not build a DPMI server on the strength of the
+extender's name.
 
 ## 2. Why real mode pays nothing
 
@@ -46,17 +54,31 @@ It is avoided **structurally, not carefully**:
   eventually wants them.
 
 **Proven by disassembly diff against master**, per function, mnemonics
-normalised for address shifts:
+normalised for address shifts. The tool is `scripts/disasm_diff.py`
+([`TOOLING.md`](../TOOLING.md)) — it resolves jump-table entries to the symbol
+they point at and strips alignment padding, so a symbol that merely MOVED
+compares equal:
 
 | path | change |
 |---|---|
 | `.fetch_decode_loop` | byte-identical |
-| every `.op_*` handler, `decode_modrm_addr16/32`, the ALU/SHIFT/string tables | byte-identical |
+| every `.op_*` handler **except `.op_iret_CF`**, `decode_modrm_addr16/32`, the ALU/SHIFT/string tables, all four 256-entry dispatch tables | byte-identical |
 | `L(SET_SREG)` real-mode arm | one `STRH` → `STR` — same instruction, same cost |
+| `L(HANDLE_INTERRUPT)` real-mode arm | instruction-for-instruction identical; the one difference is the TARGET of the `CR0.PE` test that already stood there |
+| `.op_iret_CF` / `_32` | **+3 instructions** — `LDR` CR0, `TST`, not-taken branch |
 | `x86_cpu_interp_asm` | +2 instructions, **per interp CALL** |
 | `.save_state_and_exit` | +1 instruction, **per EXIT** |
 
-Cost: **+912 B ITCM** (all cold), **+704 B RAM_EMU**.
+Cost: **+912 B ITCM** for the walk, **+296 B** for the gate and `IRET` work
+(all cold); **+704 B** and **+1,024 B** RAM_EMU respectively.
+
+**`.op_iret_CF`'s three instructions are the only thing protected mode costs
+real mode anywhere**, and they are per IRET — per interrupt, not per
+instruction. They cannot be moved onto the mode-record axis §6 describes: that
+would have to DOUBLE the record block, 8 KB → 16 KB of DTCM against 5,856 B
+free. And they cannot go below the pops, because the CS validation and the
+16-bit EFLAGS carry-over are both decisions that must be made before anything
+commits.
 
 **`tests/test_benchmark.py` cannot decide this and must not be quoted for it.**
 Under gwemu its cycle count measured 10,583,983 / 10,302,184 / 11,884,810 for
@@ -178,7 +200,7 @@ free enough to do without measuring.
 
 ## 7. Negative controls
 
-`scripts/run_pmode_controls.py`. Ten checks, each compiled out individually by
+`scripts/run_pmode_controls.py`. Sixteen checks, each compiled out individually by
 `X86_PMODE_NEGCTL=n`, each required to make `tests/test_pmode.py` FAIL. It runs
 a baseline arm first — with everything on the suite must PASS, or every arm
 below "fails" for an unrelated reason.
@@ -201,3 +223,84 @@ exercise:
 A fourth, granularity, was caught only because the test uses a limit **field of
 zero** with G set: with a non-zero field an ignored G still yields a distinct
 number and the check looks live.
+
+Sixteen now, not ten: the interrupt path adds 11 IDT bound, 12 gate type,
+13 gate present, 14 gate DPL and 15 frame width, and `IRET` adds 16. They are
+numbered ON from the walk's rather than renumbered into it, so an arm's number
+keeps meaning the same check across commits.
+
+**A fifth survivor-shaped trap, caught in the gate work**: the gate-DPL arm's
+positive twin cannot end in a `HLT`. `HLT` is a **privileged** instruction, so
+at CPL 3 it is itself a `#GP` — the twin delivered its interrupt perfectly and
+then exited 13 on its own halt, which reads exactly like a refusal. There is no
+ring-3-legal way to stop the interpreter, so both arms are graded on
+`x86_pmode_gates` instead. That is the sharper check anyway: with the DPL rule
+compiled out, the REFUSED arm delivers and its counter moves off zero.
+
+## 8. Interrupt delivery, and the two things that decide the frame
+
+`x86_pmode_int_gate()` and `x86_pmode_iret()`. The authority is DOSBox-X's
+`CPU_Interrupt()` (`src/cpu/cpu.cpp:1200`) and `CPU_IRET()` (`:1509`).
+
+**The frame WIDTH on the way in is the GATE's, not the operand size** —
+`gate.Type() & 0x8` (`cpu.cpp:1443`). A 16-bit code segment may perfectly well
+have a 386 trap gate, which is why the dual-emitted `PUSH_V` could not have
+built this frame and why the whole path is C. On the way OUT it is the
+INSTRUCTION's operand size (`cpu.cpp:1509`). The two need not agree, and a guest
+that mismatches them is wrong on silicon too.
+
+**The STACK width is neither: it is SS's B bit** (`cpu.cpp:1401-1411`). ESP is
+wrapped to that width *before* SS.base is added, so a 16-bit stack cannot walk
+out of its segment. The pushes go through `x86_guest_copy_in/out` and not a
+hand-rolled fold walk, because a push at the top of a granule straddles the seam
+and those two are the only functions that split it (`docs/10`).
+
+**The IDT error code is NOT a selector.** It is `vec*8 + 2 + EXT`
+(`cpu.cpp:1312`) — the `+2` IS the IDT bit, and the `+1` EXT separates an
+external interrupt from a software one. Reusing `sel & 0xFFFC`, which is what
+the segment path does and what the eye expects, produces a number that means a
+GDT selector and sends whoever reads it to the wrong table.
+
+**`IRET`'s CS rules are STRICTER than `L(SET_SREG)`'s CS arm.** That arm checks
+only "is it code" and "is it present", which is right for a far `JMP` and too
+loose for a return: a non-conforming target must have DPL == RPL and a
+conforming one DPL <= RPL (`cpu.cpp:1710-1721`). Nothing else in the suite can
+grade that, which is what negative control 16 is for.
+
+**`IRET`'s pops are SPECULATIVE.** A CS that fails must leave ESP reading
+exactly as it did before the instruction, so the pops happen inside the C
+function rather than being handed to it; DOSBox-X restores `orig_esp` on its
+fault path (`cpu.cpp:1520`) for the same reason.
+
+**Two things the assembly was getting wrong, both invisible in real mode.**
+`POP_V R11` at 16 bits ZEROED the high half of EFLAGS — nothing lives up there
+in real mode, VM and AC do in protected mode, and a 16-bit `IRET` carries the
+high half over (`cpu.cpp:1683`). And which popped bits may take effect is
+CPL-dependent: at CPL 0 all of them, above it IOPL is protected and IF is
+protected once CPL exceeds IOPL. The mask is DERIVED even though this path is
+same-privilege, because "it is always 0 here" is the assumption that later hands
+a ring-3 `IRET` IOPL 3.
+
+**A hardware IRQ arrives through the same label and is treated as a SOFTWARE
+interrupt.** The only thing that distinguishes them is the gate-DPL check, which
+cannot fire at CPL 0. This is a known, bounded divergence and it is one line to
+fix — but fixing it before measuring whether any title ever leaves CPL 0 would
+be building for a case nobody has shown exists.
+
+### What has NOT been measured, and it is the next thing to do
+
+**Where Dark Forces stops now is unknown.** The tier-2 run
+(`probe_report.py --title darkforces`) does not reach the guest in a fresh
+worktree: retro-go boots, registers the core and lists the ROM, and then sits in
+its launcher with `core_magic` never set. **Reproduced identically on stock
+master (`d2b82d1`), so it is not a protected-mode regression** — the retro-go
+firmware and its SD content live in `references/game-and-watch-retro-go-sd`,
+which a worktree reaches by symlink and must not rebuild while other agents are
+working in the shared tree.
+
+Until that is unblocked, **do not start call gates, stack switches, the TSS or
+paging.** `docs/13` sizes them at ~1,225 lines and nothing above has measured
+demand. The question worth answering first is the cheap one: *does the extender
+ever change ring at all?* If DOS4GW runs everything at CPL 0 — which its refusal
+of DPMI, VCPI and `INT 15h` makes likely — the entire privilege-change lane is
+deleted rather than built.
