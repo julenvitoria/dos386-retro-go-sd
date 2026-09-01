@@ -3019,20 +3019,68 @@ OP .op_bound_62
  * runs (its result is then discarded); mod=11 is the whole instruction and must
  * NOT be walked -- L(OP_SLDT) avoids the same call for the same reason. */
 OP_AGNOSTIC .op_esc_x87
-    MOVW R3, #:lower16:x86_x87_escapes
-    MOVT R3, #:upper16:x86_x87_escapes
-    LDR R4, [R3]
-    ADD R4, R4, #1
-    STR R4, [R3]
     CODE_PTR R1
     LDRB R1, [R1, #0]
     ADD.W R10, R10, #1
+    MOV.W R4, #0                   @ mod==3 hands the core a NULL operand
     CMP R1, #192
-    BLO.N 1f
-    B.W .fetch_decode_loop
-1:  LDR.W R12, [R2, #REC_MODRM_FN]
+    BHS.N 7f
+    PUSH {R0, R1}                  @ 8-byte aligned; R0 is not in the walk's
+    LDR.W R12, [R2, #REC_MODRM_FN] @ contract, R1 is but costs nothing to keep
     BLX R12
+    POP {R0, R1}
+    /* An m64 operand is EIGHT bytes and is exactly the shape the granule seam
+       eats: bytes=8 widens the predicate to offsets 0xFF8 and up. */
+    SEAM_CHECK R3, R7, 8
+    /* Read or write is a property of the SUB-OPCODE here, not of the site, so
+       the trap is chosen from a bitmask per escape: bit /reg set means that
+       memory form STORES. Asking for the write trap on a pure load would COW a
+       clean page on every FLD, and this core has 154-160 frames to spend.
+
+       THE ORDER MATTERS AND IT COST AN HOUR: MEM_TRAP's first instruction is
+       `BMI`, reading the N flag that `ADDS R3, R3, R7` sets. Anything that
+       touches the flags between the two silently disarms the trap -- the first
+       cut computed the mask there and every store landed on a stale pointer.
+       So the predicate is resolved BEFORE the fold and the ADDS is the last
+       flag-setting instruction on both arms.
+
+       The labels are 5/6/7 rather than 1/2/3 because MEM_TRAP's own expansion
+       defines `1:` inside a pushsection between the branch and its target. */
+    ADR.W R5, L(X87_STORE_MASK)
+    AND.W R12, R0, #7
+    LDRB R12, [R5, R12]
+    UBFX R5, R1, #3, #3
+    LSR.W R12, R12, R5
+    AND.W R12, R12, #1
+    UBFX R3, R7, #12, #12
+    LDR.W R3, [R9, R3, LSL #2]
+    CMP R12, #0
+    BNE.N 5f
+    ADDS R3, R3, R7
+    MEM_TRAP_R R3
+    B.N 6f
+5:  ADDS R3, R3, R7
+    MEM_TRAP_W R3
+6:  MOV R4, R3
+7:  PUSH {R0-R3, R12, LR}
+    MOV R2, R1                     @ the ModRM byte
+    MOV R1, R0                     @ the escape opcode
+    MOV R3, R4                     @ the folded operand, or NULL
+    MOV R0, R8
+    BL x86_x87_exec
+    POP {R0-R3, R12, LR}
     B.W .fetch_decode_loop
+
+/* Per escape opcode (D8..DF), a bitmask over /reg of the memory forms that
+   WRITE: D9 /2 FST /3 FSTP /6 FNSTENV /7 FNSTCW; DB /2 FIST /3 FISTP /7 FSTP
+   m80; DD /2 FST /3 FSTP /6 FNSAVE /7 FNSTSW; DF /2 FIST /3 FISTP /6 FBSTP /7
+   FISTP m64. D8/DA/DC/DE never store. An OP_AGNOSTIC handler's LABEL is
+   emitted once but its BODY is assembled in both passes, so the table is
+   L()-named and emitted per pass alongside it -- eight bytes, twice. */
+    .p2align 2
+L(X87_STORE_MASK):
+    .byte 0x00, 0xCC, 0x00, 0x8C, 0x00, 0xCC, 0x00, 0xCC
+    .p2align 1
 
 OP_AGNOSTIC .op_loopnz_E0
     CODE_PTR R5

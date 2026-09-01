@@ -855,7 +855,19 @@ extern volatile uint32_t x86_seam_flushes;
    the last fifteen bytes of its granule, so cpu->code_k cannot cover the whole
    instruction; stages sixteen bytes into DTCM and re-points code_k. */
 void *x86_code_reloc(uint32_t lin);
-extern volatile uint32_t x86_x87_escapes; /* D8-DF ignored: no x87 fitted */
+extern volatile uint32_t x86_x87_escapes; /* D8-DF the x87 core did NOT run  */
+extern volatile uint32_t x86_x87_ops;     /* D8-DF it DID run (x86_x87.c)    */
+
+/* The x87 escape group. Registers are 64-bit doubles, not 80-bit extended --
+   the trade, and the cases where it is observable, are stated in full at the
+   top of x86_x87.c. Returns 0 when the instruction was executed. */
+int      x86_x87_exec(X86CPUState *cpu, uint32_t op, uint32_t modrm, void *mem);
+void     x86_x87_init(void);
+uint16_t x86_x87_status(void);
+double   x86_x87_peek_st(unsigned i);
+unsigned x86_x87_peek_top(void);
+unsigned x86_x87_peek_tag(unsigned i);
+uint16_t x86_x87_peek_cw(void);
 
 extern volatile uint32_t x86_code_relocs;       /* instructions staged        */
 extern volatile uint32_t x86_code_reloc_faults; /* bytes that would not fold  */

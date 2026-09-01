@@ -4208,6 +4208,119 @@ def run_test(args):
                 "expected_eip": 2,
                 "expected_exit_reason": 4,
             },
+            # ---------------------------------------------------------------
+            # x87 (D8-DF). The lane that built these: `D8`-`DF` used to reach
+            # `.op_esc_x87`, a no-coprocessor STUB that did not fault -- so
+            # Dark Forces' compare at DF.EXE+0xa7608 SILENTLY TOOK THE WRONG
+            # BRANCH. The bug being fixed is a wrong BRANCH from a wrong
+            # condition code, so the compare is graded in all four outcomes
+            # (<, >, ==, unordered) AND through the SAHF/JAE that consumes it,
+            # in both branch directions. Registers here are 64-bit doubles,
+            # not 80-bit extended; the trade is stated at the top of x86_x87.c.
+            # ---------------------------------------------------------------
+            {
+                "name": "FCOMP m64: ST(0) < src sets C0 alone (0.0 vs +1.0)",
+                "code": bytes([0xDB, 0xE3, 0xD9, 0xEE, 0xDC, 0x1D, 0x00, 0x04, 0x00, 0x00, 0xDF, 0xE0, 0xF4]),
+                'ram_setup': [(0x400, b'\x00\x00\x00\x00\x00\x00\xf0?')],
+                'regs_initial': {0: 0xDEADFFFF},
+                'regs_expected': {0: 0xDEAD0100},
+                'expected_eip': 13,
+            },
+            {
+                "name": "FCOMP m64: ST(0) > src clears C3/C2/C0 (0.0 vs -1.0)",
+                "code": bytes([0xDB, 0xE3, 0xD9, 0xEE, 0xDC, 0x1D, 0x00, 0x04, 0x00, 0x00, 0xDF, 0xE0, 0xF4]),
+                'ram_setup': [(0x400, b'\x00\x00\x00\x00\x00\x00\xf0\xbf')],
+                'regs_initial': {0: 0xDEADFFFF},
+                'regs_expected': {0: 0xDEAD0000},
+                'expected_eip': 13,
+            },
+            {
+                "name": "FCOMP m64: ST(0) == src sets C3 alone (0.0 vs 0.0)",
+                "code": bytes([0xDB, 0xE3, 0xD9, 0xEE, 0xDC, 0x1D, 0x00, 0x04, 0x00, 0x00, 0xDF, 0xE0, 0xF4]),
+                'ram_setup': [(0x400, b'\x00\x00\x00\x00\x00\x00\x00\x00')],
+                'regs_initial': {0: 0xDEADFFFF},
+                'regs_expected': {0: 0xDEAD4000},
+                'expected_eip': 13,
+            },
+            {
+                "name": "FCOMP m64: a NaN is UNORDERED -- C3|C2|C0 all set, plus IE|ES",
+                "code": bytes([0xDB, 0xE3, 0xD9, 0xEE, 0xDC, 0x1D, 0x00, 0x04, 0x00, 0x00, 0xDF, 0xE0, 0xF4]),
+                'ram_setup': [(0x400, b'\x01\x00\x00\x00\x00\x00\xf8\x7f')],
+                'regs_initial': {0: 0xDEADFFFF},
+                'regs_expected': {0: 0xDEAD4581},
+                'expected_eip': 13,
+            },
+            {
+                "name": "DF idiom FLDZ/FCOMP/FNSTSW/SAHF/JAE: 0.0 vs +1.0 -> CF=1, NOT taken",
+                "code": bytes([0xDB, 0xE3, 0xD9, 0xEE, 0xDC, 0x1D, 0x00, 0x04, 0x00, 0x00, 0xDF, 0xE0, 0x9E, 0x73, 0x05, 0xBB, 0x11, 0x00, 0x00, 0x00, 0xF4]),
+                'ram_setup': [(0x400, b'\x00\x00\x00\x00\x00\x00\xf0?')],
+                'regs_initial': {0: 0xDEADFFFF},
+                'regs_expected': {0: 0xDEAD0100, 3: 0x11},
+                'flags_expected': {"CF": 1, "ZF": 0, "PF": 0},
+                'expected_eip': 21,
+            },
+            {
+                "name": "DF idiom FLDZ/FCOMP/FNSTSW/SAHF/JAE: 0.0 vs -1.0 -> CF=0, TAKEN",
+                "code": bytes([0xDB, 0xE3, 0xD9, 0xEE, 0xDC, 0x1D, 0x00, 0x04, 0x00, 0x00, 0xDF, 0xE0, 0x9E, 0x73, 0x05, 0xBB, 0x11, 0x00, 0x00, 0x00, 0xF4]),
+                'ram_setup': [(0x400, b'\x00\x00\x00\x00\x00\x00\xf0\xbf')],
+                'regs_initial': {0: 0xDEADFFFF},
+                'regs_expected': {0: 0xDEAD0000, 3: 0},
+                'flags_expected': {"CF": 0, "ZF": 0, "PF": 0},
+                'expected_eip': 21,
+            },
+            {
+                "name": "DF idiom: unordered looks BELOW to JAE -- CF=ZF=PF=1, NOT taken",
+                "code": bytes([0xDB, 0xE3, 0xD9, 0xEE, 0xDC, 0x1D, 0x00, 0x04, 0x00, 0x00, 0xDF, 0xE0, 0x9E, 0x73, 0x05, 0xBB, 0x11, 0x00, 0x00, 0x00, 0xF4]),
+                'ram_setup': [(0x400, b'\x01\x00\x00\x00\x00\x00\xf8\x7f')],
+                'regs_initial': {0: 0xDEADFFFF},
+                'regs_expected': {0: 0xDEAD4581, 3: 0x11},
+                'flags_expected': {"CF": 1, "ZF": 1, "PF": 1},
+                'expected_eip': 21,
+            },
+            {
+                "name": "FLD m64 / FADD m64 / FSTP m64: 1.5 + 2.25 = 3.75",
+                "code": bytes([0xDB, 0xE3, 0xDD, 0x05, 0x00, 0x04, 0x00, 0x00, 0xDC, 0x05, 0x08, 0x04, 0x00, 0x00, 0xDD, 0x1D, 0x10, 0x04, 0x00, 0x00, 0xF4]),
+                'regs_initial': {},
+                'ram_setup': [(0x400, b'\x00\x00\x00\x00\x00\x00\xf8?'), (0x408, b'\x00\x00\x00\x00\x00\x00\x02@')],
+                'regs_expected': {},
+                'mem_expected': [(0x410, b'\x00\x00\x00\x00\x00\x00\x0e@')],
+                'expected_eip': 21,
+            },
+            {
+                "name": "FISTP m32 rounds to NEAREST-EVEN by default: 3.5 -> 4, not 3",
+                "code": bytes([0xDB, 0xE3, 0xDD, 0x05, 0x00, 0x04, 0x00, 0x00, 0xDB, 0x1D, 0x10, 0x04, 0x00, 0x00, 0xF4]),
+                'regs_initial': {},
+                'ram_setup': [(0x400, b'\x00\x00\x00\x00\x00\x00\x0c@')],
+                'regs_expected': {},
+                'mem_expected': [(0x410, bytes([0x04, 0x00, 0x00, 0x00]))],
+                'expected_eip': 15,
+            },
+            {
+                "name": "FLDCW switches RC to truncate: 3.5 -> 3",
+                "code": bytes([0xDB, 0xE3, 0xD9, 0x2D, 0x20, 0x04, 0x00, 0x00, 0xDD, 0x05, 0x00, 0x04, 0x00, 0x00, 0xDB, 0x1D, 0x10, 0x04, 0x00, 0x00, 0xF4]),
+                'regs_initial': {},
+                'ram_setup': [(0x400, b'\x00\x00\x00\x00\x00\x00\x0c@'), (0x420, bytes([0x7F, 0x0F]))],
+                'regs_expected': {},
+                'mem_expected': [(0x410, bytes([0x03, 0x00, 0x00, 0x00]))],
+                'expected_eip': 21,
+            },
+            {
+                "name": "FLD1 / FSTP m32 stores single precision 1.0",
+                "code": bytes([0xDB, 0xE3, 0xD9, 0xE8, 0xD9, 0x1D, 0x10, 0x04, 0x00, 0x00, 0xF4]),
+                'regs_initial': {},
+                'regs_expected': {},
+                'mem_expected': [(0x410, b'\x00\x00\x80?')],
+                'expected_eip': 11,
+            },
+            {
+                "name": "FSUBP st(1),st is ST(1)-ST(0), NOT ST(0)-ST(1): 10-3 = 7",
+                'regs_initial': {},
+                'regs_expected': {},
+                "code": bytes([0xDB, 0xE3, 0xDD, 0x05, 0x00, 0x04, 0x00, 0x00, 0xDD, 0x05, 0x08, 0x04, 0x00, 0x00, 0xDE, 0xE9, 0xDD, 0x1D, 0x10, 0x04, 0x00, 0x00, 0xF4]),
+                'ram_setup': [(0x400, b'\x00\x00\x00\x00\x00\x00$@'), (0x408, b'\x00\x00\x00\x00\x00\x00\x08@')],
+                'mem_expected': [(0x410, b'\x00\x00\x00\x00\x00\x00\x1c@')],
+                'expected_eip': 23,
+            },
         ])
 
         all_passed = True

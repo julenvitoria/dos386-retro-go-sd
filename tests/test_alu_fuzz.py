@@ -85,12 +85,19 @@ REG16 = ["AX", "CX", "DX", "BX", "SP", "BP", "SI", "DI"]
 class Case:
     """One instruction, its operands, and which flags are architecturally defined."""
 
-    def __init__(self, name, code, regs, flags_in, flag_mask):
+    def __init__(self, name, code, regs, flags_in, flag_mask,
+                 mem=None, count=1):
         self.name = name
         self.code = code
         self.regs = regs                # index -> 32-bit value
         self.flags_in = flags_in
         self.flag_mask = flag_mask      # flags worth comparing
+        # An x87 case is not one instruction and its operands are not in
+        # registers, so a case may carry memory to plant on BOTH sides and a
+        # count of instructions to run. Everything else keeps count == 1 and
+        # no memory, which is the shape every group before x87 had.
+        self.mem = mem or {}
+        self.count = count
 
 
 def rnd16(rng):
@@ -255,8 +262,67 @@ def gen_bits(rng):
     return Case("%s %s,%s" % (nm, REG16[d], REG16[s]), code, regs, 0, ZF)
 
 
+
+# ---------------------------------------------------------------------------
+# x87 (D8-DF). What is graded here is the CONDITION CODE, because the defect
+# this group was written for is a wrong BRANCH: `FNSTSW AX` moves C0/C2/C3 into
+# AH and `SAHF` then makes them CF/PF/ZF. AX is a general register, so the
+# harness's existing register comparison grades the whole status word for free.
+#
+# WHY THE OPERANDS ARE EXACT INTEGERS AND POWERS OF TWO. Unicorn is QEMU and
+# QEMU's x87 is 80-BIT EXTENDED; ours is 64-bit double (the trade is argued at
+# the top of x86_x87.c). For any value and any result exactly representable in
+# a double the two widths agree bit for bit, so restricting the fuzz to exact
+# operands makes this a real differential rather than a flaky one. A last-ULP
+# disagreement is EXPECTED here, and grading it would only teach the suite to
+# ignore failures.
+# ---------------------------------------------------------------------------
+X87_ARITH = ((0, "FADD"), (1, "FMUL"), (4, "FSUB"), (5, "FSUBR"))
+
+
+def x87_exact(rng):
+    """A value both a double and an 80-bit extended hold exactly."""
+    r = rng.random()
+    if r < 0.15:
+        return 0.0
+    if r < 0.30:
+        return float(rng.choice((1, -1, 2, -2, 256, -256, 1 << 20, -(1 << 20))))
+    if r < 0.45:
+        return float(rng.randrange(-8, 9)) / 4.0            # exact quarters
+    return float(rng.randrange(-(1 << 22), 1 << 22))
+
+
+def gen_x87(rng):
+    import struct
+    a, b = x87_exact(rng), x87_exact(rng)
+    if rng.random() < 0.25:
+        b = a                                               # force the equal case
+    mem = {0x400: struct.pack("<d", a), 0x408: struct.pack("<d", b)}
+    # fninit ; fld qword [0x400] ; ... ; fnstsw ax
+    code = bytes([0xDB, 0xE3, 0xDD, 0x06, 0x00, 0x04])
+    if rng.random() < 0.35:
+        sub, nm = rng.choice(X87_ARITH)
+        c = x87_exact(rng)
+        mem[0x410] = struct.pack("<d", c)
+        code += bytes([0xDC, 0x06 | (sub << 3), 0x08, 0x04])
+        code += bytes([0xDC, 0x1E, 0x10, 0x04])             # fcomp qword [0x410]
+        name = "FLD/%s/FCOMP m64 %r %r %r" % (nm, a, b, c)
+        n = 5
+    else:
+        cmpsub, nm = rng.choice(((2, "FCOM"), (3, "FCOMP")))
+        code += bytes([0xDC, 0x06 | (cmpsub << 3), 0x08, 0x04])
+        name = "FLD/%s m64 %r %r" % (nm, a, b)
+        n = 4
+    code += bytes([0xDF, 0xE0])                             # fnstsw ax
+    # AX starts non-zero so an implementation that leaves it alone -- exactly
+    # what the old no-coprocessor stub did -- cannot pass by accident.
+    regs = {i: rnd16(rng) for i in range(8)}
+    regs[0] = 0xFFFF
+    return Case(name, code, regs, 0, 0, mem=mem, count=n)
+
+
 GROUPS = {"grp2": gen_grp2, "grp3": gen_grp3, "alu": gen_alu, "misc": gen_misc,
-          "bits": gen_bits}
+          "bits": gen_bits, "x87": gen_x87}
 
 
 def unicorn_run(case):
@@ -278,8 +344,10 @@ def unicorn_run(case):
         uc.reg_write(rid, case.regs.get(i, 0) & 0xFFFF)
     uc.reg_write(UC_X86_REG_EFLAGS, 0x2 | case.flags_in)
     uc.reg_write(UC_X86_REG_IP, 0)
+    for addr, data in case.mem.items():
+        uc.mem_write(addr, data)
     try:
-        uc.emu_start(0, len(case.code), count=1)
+        uc.emu_start(0, len(case.code), count=case.count)
     except UcError:
         return None
     return ([uc.reg_read(r) & 0xFFFF for r in ids],
@@ -328,6 +396,8 @@ def main():
             checked += 1
 
             b.write_memory(ram, case.code + bytes([0xF4]))
+            for addr, data in case.mem.items():
+                b.write_memory(ram + addr, data)
             b.write_uint32(dtcm + 0, 0)
             b.write_uint32(dtcm + 4, case.flags_in)
             for i in range(8):

@@ -233,22 +233,22 @@ Warning legend:
 | 6D | reached | `.op_insv_6D` | dual | - | no flag macro reachable |
 | 6E | reached | `.op_outsb_6E` | AGN | - | no flag macro reachable |
 | 6F | reached | `.op_outsv_6F` | dual | - | no flag macro reachable |
-| 70 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
-| 71 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
-| 72 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
-| 73 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
-| 74 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
-| 75 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
-| 76 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
-| 77 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
-| 78 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
-| 79 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
-| 7A | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
-| 7B | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
-| 7C | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
-| 7D | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
-| 7E | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
-| 7F | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
+| 70 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
+| 71 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
+| 72 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
+| 73 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
+| 74 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
+| 75 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
+| 76 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
+| 77 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
+| 78 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
+| 79 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
+| 7A | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
+| 7B | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
+| 7C | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
+| 7D | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
+| 7E | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
+| 7F | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
 | 80 | reached | `.op_alu_eb_imm8_80` | AGN | - | - |
 | 81 | reached | `.op_alu_ev_imm32_81` | dual | - | - |
 | 82 | reached | `.op_alu_eb_imm8_80` | AGN | - | - |
@@ -337,14 +337,14 @@ Warning legend:
 | D5 | reached | `.op_aad_D5` | AGN | - | no flag macro reachable |
 | D6 | reached | `.op_salc_D6` | AGN | - | no flag macro reachable |
 | D7 | reached | `.op_xlat_D7` | AGN | - | REVIEW: no width primitive, 2 bare word op(s), no flag macro reachable |
-| D8 | reached | `.op_esc_x87` | AGN | - | REVIEW: no width primitive, 2 bare word op(s), no flag macro reachable |
-| D9 | reached | `.op_esc_x87` | AGN | - | REVIEW: no width primitive, 2 bare word op(s), no flag macro reachable |
-| DA | reached | `.op_esc_x87` | AGN | - | REVIEW: no width primitive, 2 bare word op(s), no flag macro reachable |
-| DB | reached | `.op_esc_x87` | AGN | - | REVIEW: no width primitive, 2 bare word op(s), no flag macro reachable |
-| DC | reached | `.op_esc_x87` | AGN | - | REVIEW: no width primitive, 2 bare word op(s), no flag macro reachable |
-| DD | reached | `.op_esc_x87` | AGN | - | REVIEW: no width primitive, 2 bare word op(s), no flag macro reachable |
-| DE | reached | `.op_esc_x87` | AGN | - | REVIEW: no width primitive, 2 bare word op(s), no flag macro reachable |
-| DF | reached | `.op_esc_x87` | AGN | - | REVIEW: no width primitive, 2 bare word op(s), no flag macro reachable |
+| D8 | reached | `.op_esc_x87` | AGN | - | no flag macro reachable |
+| D9 | reached | `.op_esc_x87` | AGN | - | no flag macro reachable |
+| DA | reached | `.op_esc_x87` | AGN | - | no flag macro reachable |
+| DB | reached | `.op_esc_x87` | AGN | - | no flag macro reachable |
+| DC | reached | `.op_esc_x87` | AGN | - | no flag macro reachable |
+| DD | reached | `.op_esc_x87` | AGN | - | no flag macro reachable |
+| DE | reached | `.op_esc_x87` | AGN | - | no flag macro reachable |
+| DF | reached | `.op_esc_x87` | AGN | - | no flag macro reachable |
 | E0 | reached | `.op_loopnz_E0` | AGN | - | REVIEW: no width primitive, 4 bare word op(s), no flag macro reachable |
 | E1 | reached | `.op_loopz_E1` | AGN | - | REVIEW: no width primitive, 4 bare word op(s), no flag macro reachable |
 | E2 | reached | `.op_loop_E2` | AGN | - | REVIEW: no width primitive, 4 bare word op(s), no flag macro reachable |
@@ -850,7 +850,7 @@ GENERATED TABLE WINS and this section is the thing to fix.
 
 | Block | Slots | Status |
 |---|---|---|
-| `D8`-`DF` x87 escapes | 8 | No FPU state exists in the CPU struct. All eight dispatch to `.op_esc_x87`, a stub — a program that emits floating point gets wrong answers or stops here. |
+| `D8`-`DF` x87 escapes | 8 | **IMPLEMENTED to the depth the library demands** — `.op_esc_x87` now folds the operand and calls `x86_x87_exec()` (`x86_x87.c`). See the section below for exactly what is in and what still counts into `x86_x87_escapes`. |
 | `0F 20`-`0F 27` control/debug regs | varies | `0F 20`/`0F 22` (`MOV r32,CR` / `MOV CR,r32`) are implemented — the protected-mode walk needs them. The debug-register slots are not. |
 | 486/Pentium+ (`0F 31` RDTSC, `0F A2` CPUID, `0F C8`-`CF` BSWAP, CMPXCHG, XADD, MMX/SSE) | 158 | **Out of scope** for a 386-class target — not gaps. |
 | `63` ARPL | 1 | **The only one-byte slot still dispatching to `.exit_loop`.** |
@@ -867,6 +867,101 @@ because they are not instructions there.
 
 **"Implemented" is a dispatch fact, not a correctness verdict** — see "What the
 generator will NOT tell you" above, and the defect sections below.
+
+## x87 — what is built, and THE PRECISION DECISION
+
+Landed 2026-09-02 (lane `agent/x87`). One title in the shipped library computes
+in floating point and it is **Dark Forces**: `DF E0 9E` (`FNSTSW AX; SAHF`), an
+idiom that can only be x87, appears 32x in `DF/DF.EXE` and 12x in
+`DF/KEYCONFI.EXE` and **zero times in every other image**
+([`docs/15`](15_library_demand_scan.md)). `DF.EXE+0xa7608` is a real
+double-precision compare — `FLDZ / FCOMP qword / FNSTSW AX / SAHF / JAE`.
+
+**What the old stub actually did, and why this was not a clean gap.** `D8`-`DF`
+reached `.op_esc_x87`, a no-coprocessor stub that advanced EIP and did NOT
+fault. So that compare did not stop the guest: `FLDZ` and `FCOMP` did nothing,
+`FNSTSW` left AX alone, and `SAHF` set the flags from whatever was in AH. Dark
+Forces **silently took the wrong branch**. What replaced it is therefore judged
+against a wrong answer, not against a trap.
+
+### THE PRECISION DECISION — 64-bit doubles, not 80-bit extended
+
+**x87 registers here are IEEE doubles.** A real x87 register is 80-bit extended
+(64-bit significand, 15-bit exponent), and the difference is observable:
+
+* the significand is 53 bits, not 64, so a long accumulation can differ from
+  real silicon in the last few ULPs;
+* the exponent range is smaller, so an unnormalised extended intermediate a 387
+  held may overflow or underflow here;
+* `FLD m80` / `FSTP m80` cannot round-trip a width we never hold, and are not
+  implemented.
+
+**Why:** this part's FPv5-D16 FPU is hardware DOUBLE precision and the core is
+built `-mfpu=fpv5-d16 -mfloat-abi=hard` (`sdk/Makefile:64-65`), with
+`SystemInit` granting CP10/CP11 full access — verified at the object level,
+`x86_x87.o` contains 32 VFP instructions and **zero** soft-float calls for its
+arithmetic. True 80-bit would be a software significand library on the
+interpreter's path, for a title whose floating point is geometry and mixing.
+DOSBox and DOSBox-X made the same call for the same reason. **If a title ever
+disagrees with hardware in the last few bits, this paragraph is the answer and
+80-bit is the fix** — do not re-derive it from a bug report.
+
+ABI: the interpreter's assembly holds no FP registers, so nothing is saved
+across the call. Executing VFP sets `CONTROL.FPCA`, so a later exception entry
+stacks an FP frame; with lazy stacking (the reset default) that is address
+space, not cycles, unless the handler touches the FPU itself.
+
+### In
+
+Taken from a census of Dark Forces' LE code object, not from the 387 manual.
+`FLD`/`FST`/`FSTP` (m32/m64/ST(i)), `FILD`/`FIST`/`FISTP` (m16/m32/m64),
+`FLDZ`/`FLD1` and the five other constants, `FADD`/`FSUB`/`FSUBR`/`FMUL`/
+`FDIV`/`FDIVR` in the m32/m64/integer/register forms (including the DC/DE
+register-form operand REVERSAL), `FCOM`/`FCOMP`/`FCOMPP`/`FICOM`/`FICOMP`/
+`FUCOM`/`FUCOMP`/`FTST`, `FNSTSW AX` and `FNSTSW m16`, `FLDCW`/`FNSTCW`,
+`FNINIT`/`FNCLEX`, `FXCH`, `FCHS`, `FABS`, `FXAM`, `FFREE`, `FNOP`,
+`FINCSTP`/`FDECSTP`, `FRNDINT`. Rounding control (CW bits 11:10) is honoured by
+every float-to-int conversion.
+
+### Out — and COUNTED, never silently ignored
+
+Each of these still increments `x86_x87_escapes`, which keeps its old meaning
+exactly: *an ESC the interpreter did not execute*. **A non-zero
+`x86_x87_escapes` after a Dark Forces run means one of these was reached and
+the arithmetic downstream of it is wrong.** Static site counts in `DF.EXE` in
+brackets.
+
+| Not built | Why |
+|---|---|
+| `FSIN` [1], `FCOS`, `FPTAN` [1], `FPATAN` [2], `F2XM1` [1], `FYL2X` [2], `FSCALE` [1] | 1-2 static sites each, all in phase-ambiguous regions of the sweep; no evidence of a hot path |
+| `FPREM` [2] / `FPREM1` | same |
+| `FBLD` / `FBSTP` (BCD) | zero sites |
+| `FSAVE` [1] / `FRSTOR` [1] / `FLDENV` / `FNSTENV` [1] | the 94/108-byte environment images; would need a real tag word and IP/operand pointers |
+| `FLD m80` / `FSTP m80` | the precision decision above |
+| exception masking, `#MF`, denormal/precision reporting | the status word carries what `FNSTSW` needs and no more. `IE`/`ES` ARE raised for stack faults and NaN compares, because the condition codes depend on it |
+| `DA` register forms (`FCMOVcc`) | 686, not a 386-class instruction |
+
+### How it is graded
+
+Twelve arms in `tests/test_opcodes.py` (352-363) and an `x87` group in
+`tests/test_alu_fuzz.py`. The arms cover the compare in **all four** outcomes —
+less-than, greater-than, equal and unordered — and then again through the
+`FNSTSW AX; SAHF; JAE` that consumes it, in **both** branch directions, because
+the defect being fixed is a wrong BRANCH. Every arm was seen to fail with the
+core stubbed back out; the `TAKEN` arm initially passed under the stub (CF=0
+either way) and now starts with `AH = 0xFF` so it cannot.
+
+The fuzz group is a differential against **Unicorn**, whose x87 is QEMU's
+80-bit extended. Its operands are restricted to values exactly representable in
+a double, where the two widths agree bit for bit — a last-ULP disagreement is
+EXPECTED behaviour and grading it would only teach the suite to ignore
+failures. 400/400 agree.
+
+### What it cost
+
++384 B ITCM (the handler is `OP_AGNOSTIC` but its body is still assembled in
+both operand-size passes) and ~3.7 KB RAM_EMU, which `dos_core.ld` makes **one
+pager frame** taken from the guest. `tests/budgets.json` was updated for both.
 
 ## Defects, prioritised
 

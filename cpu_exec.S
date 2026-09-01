@@ -225,14 +225,19 @@
         LDR.W R12, [R2, #REC_MODRM_FN]
         BLX R12
     .endm
-
-    .macro SEAM_CHECK dest_ptr, vaddr
+    .macro SEAM_CHECK dest_ptr, vaddr, bytes=4
 #if X86_SEAM_FIX
     .ifc \dest_ptr, \vaddr
         .error "SEAM_CHECK needs dest_ptr != vaddr"
     .endif
         LSLS \dest_ptr, \vaddr, #20
-        CMN \dest_ptr, #0x400000
+        /* The predicate is "offset > 0x1000 - bytes", and 0x1000 - bytes as a
+           carry threshold is (bytes << 20) -- so the WIDTH of the access is
+           the immediate, and 4 is merely the common case rather than the only
+           one. An x87 m64 load is EIGHT bytes and must pass bytes=8, or it is
+           silently wrong at offsets 0xFF8-0xFFB. The pull-in covers it either
+           way: X86_PG_SLACK is 8 (x86_pager.h). */
+        CMN \dest_ptr, #(\bytes << 20)
         BCS 97f
 96:
         .pushsection .itcram_hot.norslow, "ax", %progbits
