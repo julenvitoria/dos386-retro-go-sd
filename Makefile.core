@@ -26,6 +26,7 @@ x86_pager.c \
 x86_pgfile.c \
 x86_seam.c \
 x86_pmode.c \
+x86_x87.c \
 x86_nor.c \
 x86_video.c \
 x86_video_planar.c \
