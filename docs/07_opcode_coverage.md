@@ -94,9 +94,9 @@ only). That leaves roughly **185 one-byte opcodes believed correct**.
 |---|---|
 | One-byte slots with a handler | **255 / 256** |
 | One-byte slots dispatching to `.exit_loop` | **1 / 256** |
-| Two-byte (0F) slots with a handler | **54 / 256** |
-| Two-byte slots dispatching to `.exit_loop` | **202 / 256** |
-| Implemented slots carrying at least one mechanical warning | **180** |
+| Two-byte (0F) slots with a handler | **64 / 256** |
+| Two-byte slots dispatching to `.exit_loop` | **192 / 256** |
+| Implemented slots carrying at least one mechanical warning | **190** |
 
 Every row below is DERIVED. `status` is `reached` or `.exit_loop`, taken from
 the dispatch table. `mode` is `OP` (dual-emitted) or `OP_AGNOSTIC`, taken from the
@@ -545,23 +545,23 @@ Warning legend:
 | 0F A0 | reached | `.op_0f_push_fs_A0` | dual | - | no flag macro reachable |
 | 0F A1 | reached | `.op_0f_pop_fs_A1` | dual | - | no flag macro reachable |
 | 0F A2 | reached | `.op_0f_cpuid_A2` | AGN | - | REVIEW: no width primitive, 9 bare word op(s), no flag macro reachable |
-| 0F A3 | **`.exit_loop`** | `.exit_loop` | - | - | - |
-| 0F A4 | **`.exit_loop`** | `.exit_loop` | - | - | - |
-| 0F A5 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F A3 | reached | `.op_0f_bt_A3` | dual | - | no flag macro reachable |
+| 0F A4 | reached | `.op_0f_shld_imm_A4` | dual | - | no flag macro reachable |
+| 0F A5 | reached | `.op_0f_shld_cl_A5` | dual | - | no flag macro reachable |
 | 0F A6 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F A7 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F A8 | reached | `.op_0f_push_gs_A8` | dual | - | no flag macro reachable |
 | 0F A9 | reached | `.op_0f_pop_gs_A9` | dual | - | no flag macro reachable |
 | 0F AA | **`.exit_loop`** | `.exit_loop` | - | - | - |
-| 0F AB | **`.exit_loop`** | `.exit_loop` | - | - | - |
-| 0F AC | **`.exit_loop`** | `.exit_loop` | - | - | - |
-| 0F AD | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F AB | reached | `.op_0f_bts_AB` | dual | - | no flag macro reachable |
+| 0F AC | reached | `.op_0f_shrd_imm_AC` | dual | - | no flag macro reachable |
+| 0F AD | reached | `.op_0f_shrd_cl_AD` | dual | - | no flag macro reachable |
 | 0F AE | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F AF | reached | `.op_0f_imul_AF` | dual | - | no flag macro reachable |
 | 0F B0 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F B1 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F B2 | reached | `.op_0f_lss_B2` | dual | - | no flag macro reachable |
-| 0F B3 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F B3 | reached | `.op_0f_btr_B3` | dual | - | no flag macro reachable |
 | 0F B4 | reached | `.op_0f_lfs_B4` | dual | - | no flag macro reachable |
 | 0F B5 | reached | `.op_0f_lgs_B5` | dual | - | no flag macro reachable |
 | 0F B6 | reached | `.op_0f_movzx_gv_eb` | dual | INCDEC | - |
@@ -569,9 +569,9 @@ Warning legend:
 | 0F B8 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F B9 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F BA | reached | `.op_0f_ba` | dual | - | no flag macro reachable |
-| 0F BB | **`.exit_loop`** | `.exit_loop` | - | - | - |
-| 0F BC | **`.exit_loop`** | `.exit_loop` | - | - | - |
-| 0F BD | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F BB | reached | `.op_0f_btc_BB` | dual | - | no flag macro reachable |
+| 0F BC | reached | `.op_0f_bsf_BC` | dual | - | no flag macro reachable |
+| 0F BD | reached | `.op_0f_bsr_BD` | dual | - | no flag macro reachable |
 | 0F BE | reached | `.op_0f_movsx_gv_eb` | dual | INCDEC | - |
 | 0F BF | reached | `.op_0f_movsx_gv_ew` | dual | INCDEC | - |
 | 0F C0 | **`.exit_loop`** | `.exit_loop` | - | - | - |
