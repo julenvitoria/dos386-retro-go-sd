@@ -20,12 +20,7 @@ Strictly in this order — `TOOLING.md`, and `CLAUDE.md` on never skipping a tie
 + Retro-Go (ABI, DTCM, SD, video, input, audio) · **3.** hardware — the only
 tier that sees the pipeline, peripheral init or real memory ordering.
 
-**TIER 2 IS CURRENTLY DOWN AND THE CAUSE IS gwemu's, NOT OURS** — a stuck GPIOC
-pin 5 (`BTN_TIME`) held low from boot makes retro-go skip auto-launch and eats
-every fallback keypress, so no game launches. Evidence, consequences and the
-retired red herrings: [`STATUS.md`](STATUS.md), first section. **Every item in
-the backlog whose next step is "measure where it stops now" is blocked on it,
-and every tier-2 number dated after ~2026-08-14 needs re-running.**
+**TIER 2 IS CURRENTLY DOWN, AND IT IS A BOARD-VARIANT DISAGREEMENT, NOT A BUG IN EITHER PROJECT** — gwemu holds GPIOC pin 5 low as the charger's PGOOD sense (`a35a9b9acc`, 2026-08-19) while our retro-go reads TIME from PC5, so `boot_buttons` = `B_TIME`, retro-go skips auto-launch and every fallback keypress is eaten. Evidence, the three candidate resolutions and the retired red herrings: [`STATUS.md`](STATUS.md), first section. **Which project is right is an open question for the user; do not change either pin mapping on your own initiative.** Every backlog item whose next step is "measure where it stops now" is blocked on it. **Measurements dated before 2026-08-19 — which is all of `docs/13` — are VALID and were checked; nothing is lost.**
 
 ## Backlog
 

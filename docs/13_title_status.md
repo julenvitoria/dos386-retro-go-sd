@@ -7,36 +7,31 @@ Measure with `scripts/probe_report.py --title <name>`, which leads with what we
 did **not** answer. Judge pictures with `scripts/screenshot.py`; judge a text
 screen's *shading* with `--attr`, never `--text`.
 
-> ## EVERY TIER-2 MEASUREMENT IN THIS FILE DATED AFTER ~2026-08-14 IS SUSPECT
+> ## THE MEASUREMENTS IN THIS FILE ARE VALID. TIER 2 IS DOWN, AND THE BREAK IS DATED.
 >
-> **Tier 2 is down, and the cause is gwemu's, not ours.** gwemu drives **GPIOC
-> pin 5 low from boot** — `GPIOC_IDR` reads `0xFFDF`, bit 5 clear, identically
-> at t+0.3 s and t+26 s. PC5 is `BTN_TIME`, so `boot_buttons` = 64 = `B_TIME`
-> on every run, retro-go's `force_launcher` skips auto-launch, and `B_TIME` ->
-> `ODROID_INPUT_SELECT` latches `last_key` in a dialog that never re-opens, so
-> even a timeline's fallback A-presses are dead. It is a lone stuck pin, not a
-> modelled press (`GPIOA_IDR` = `0xFFFF`, and gwemu drives PC5+PA2 together for
-> a real TIME press). Reproduced by `probe_report.py` and `screenshot.py`, on
-> current master and on `e539d31`. Full evidence and the retired red herrings:
-> [`STATUS.md`](../STATUS.md), first section. **The fix is in the owner's gwemu
-> repo — do not touch it.**
+> **Tier 2 does not launch a game today**, and the cause is a **board-variant
+> disagreement**, not a bug in either project: gwemu deliberately holds GPIOC
+> pin 5 low as the charger's active-low PGOOD sense (commit `a35a9b9acc`,
+> **2026-08-19**, "gpio: TIME is PA2 only; hold PC5 (PGOOD) low" — the version
+> our runs report), while our retro-go reads TIME from PC5
+> (`references/game-and-watch-retro-go-sd/Core/Inc/main.h:155-156`). So
+> `boot_buttons` = `B_TIME` on every run, `force_launcher` skips auto-launch,
+> and `B_TIME` -> `ODROID_INPUT_SELECT` latches `last_key` in a dialog that never
+> re-opens, so even a timeline's fallback A-presses are dead. Evidence, the three
+> candidate resolutions and the retired red herrings: [`STATUS.md`](../STATUS.md),
+> first section. **The fix is an open question for the user, not a bug with a
+> known owner. Do not change either project's pin mapping on your own.**
 >
-> **What that means for THIS file.** No game can have launched under gwemu in
-> that window, so every per-title number below that came from a tier-2 run —
-> which is most of them — needs re-running before it is quoted or built on.
-> They are kept, not deleted, precisely so they can be re-run.
+> **The boundary is 2026-08-19, and every measurement in this file predates it.**
+> Every dated entry below is 2026-08-14 or 2026-08-15, so **all of it is VALID and
+> none of it needs re-running on this account.** Checked, not assumed.
 >
-> **The date boundary is itself unverified.** Several entries below are stamped
-> "MEASURED 2026-08-15" and carry register-level detail that a dead tier 2
-> could not have produced. Either the break is later than Aug 14, or those runs
-> predate it and the stamp is the write-up date. Nobody has established which.
-> Until someone does, treat **anything after 2026-08-14** as needing a re-run,
-> and treat a disagreement between one of these entries and a fresh run as the
-> entry being wrong.
->
-> Tier-1 results (`tests/*.py` under `gwemu_run.py` bare-metal), silicon
-> results, and static analysis (`opcode_demand.py`, `disasm_diff.py`) are
-> **unaffected** — none of them boot retro-go.
+> What IS unmeasured is the work done after the break — the 2026-09-01/02 sprint.
+> Where each title stops *now* is unknown, because three of the walls recorded
+> below have since been built (protected-mode IDT gate dispatch and
+> same-privilege `IRET`; `0F A0`/`A1`/`A8`/`A9` PUSH/POP FS,GS). Those rows are
+> marked in place. Tier-1 results, silicon results and static analysis
+> (`opcode_demand.py`, `disasm_diff.py`) never boot retro-go and are unaffected.
 
 ## THE "THREE TITLES CONVERGE ON ONE ADDRESS" FINDING IS RETRACTED — MEASURED 2026-08-15
 
@@ -97,8 +92,8 @@ which we have had all along — is never issued.
 
 ### Where all three stop NOW
 
-**STALE — every row below is a tier-2 measurement inside the suspect window, AND
-all three blockers have since been BUILT.** `INT imm8` with `CR0.PE` set is
+**These measurements are SOUND — 2026-08-15, before the tier-2 break — but all
+three blockers have since been BUILT.** `INT imm8` with `CR0.PE` set is now
 delivered through an IDT gate with a same-privilege `IRET` (`3688f69`,
 `e6789b2`), and `0F A0`/`A1`/`A8`/`A9` PUSH/POP FS,GS are in (`e70db05`). So
 none of these three titles stops where this table says any more, and **where
@@ -709,8 +704,8 @@ was later read correctly as `exit_info=0x0FA0` = `PUSH FS`, and **`0F A0`/`A1`/
 `A8`/`A9` PUSH/POP FS,GS are now implemented (`e70db05`)**. The `IN 0x22A`
 64,000-read spin is also gone (6 reads; the DSP resets twice, issues 5 commands
 with none unknown, programs the mixer and 22,050 Hz). **Where Epic Pinball stops
-now is UNMEASURED and blocked on tier 2** (see the banner at the top of this
-file). Everything below is the before-picture.
+now is UNMEASURED and blocked on tier 2** (banner at the top of this file).
+Everything below it is a valid 2026-08-15 measurement and is the before-picture.
 
 **UPDATE 2026-08-15, after `X86_DOS_EXEC` became the shipping default.** The
 `AH=4Bh` blocker described below is CLEARED. Measured at tier 2 on the shipping

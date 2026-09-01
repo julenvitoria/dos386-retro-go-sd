@@ -362,15 +362,25 @@ registers the core and lists the ROM, and then sits in its launcher with
 `core_magic` never set.
 
 **CAUSE FOUND 2026-09-02, and the "fresh worktree" explanation this paragraph
-used to give was WRONG.** It is gwemu: **GPIOC pin 5 is held low from boot**
-(`GPIOC_IDR` = `0xFFDF`), PC5 is `BTN_TIME`, so `boot_buttons` = `B_TIME`,
-retro-go's `force_launcher` skips auto-launch, and `B_TIME` ->
-`ODROID_INPUT_SELECT` latches `last_key` in a dialog that never re-opens so even
-the timeline's fallback A-presses are dead. Nothing to do with worktrees,
+used to give was WRONG.** It is a **board-variant disagreement**, not a bug in
+either project. gwemu deliberately holds GPIOC pin 5 low as the charger's
+active-low PGOOD sense (commit `a35a9b9acc`, **2026-08-19**, "gpio: TIME is PA2
+only; hold PC5 (PGOOD) low" — the version our runs report), while our retro-go
+reads TIME from PC5 (`references/game-and-watch-retro-go-sd/Core/Inc/main.h:155-156`).
+`GPIOC_IDR` reads `0xFFDF` and `GPIOA_IDR` `0xFFFF`, so `boot_buttons` =
+`B_TIME`, retro-go's `force_launcher` skips auto-launch, and `B_TIME` ->
+`ODROID_INPUT_SELECT` latches `last_key` in a dialog that never re-opens, so
+even the timeline's fallback A-presses are dead. Nothing to do with worktrees,
 symlinks or a rebuild of `references/game-and-watch-retro-go-sd`, which is why
-it reproduced identically on stock master. Full evidence and the retired red
-herrings: [`STATUS.md`](../STATUS.md), first section. **The fix is in the
-owner's gwemu repo — do not touch it.**
+it reproduced identically on stock master. Evidence, the three candidate
+resolutions and the retired red herrings: [`STATUS.md`](../STATUS.md), first
+section. **Which project is right about this board is an OPEN QUESTION for the
+user — not a bug with a known owner. Do not change either project's pin mapping
+on your own initiative, and do not touch the gwemu repo.**
+
+The break is dated **2026-08-19**, so the protected-mode measurements in
+[`docs/13`](13_title_status.md) (2026-08-15) predate it and stand; what is
+unmeasured is where the titles stop AFTER this sprint's work.
 
 **That cheap question has since been ANSWERED, statically, without tier 2.**
 `opcode_demand.py` over DOS4GW.EXE finds all 256 IDT template entries at DPL 0
