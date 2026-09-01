@@ -7,6 +7,37 @@ Measure with `scripts/probe_report.py --title <name>`, which leads with what we
 did **not** answer. Judge pictures with `scripts/screenshot.py`; judge a text
 screen's *shading* with `--attr`, never `--text`.
 
+> ## EVERY TIER-2 MEASUREMENT IN THIS FILE DATED AFTER ~2026-08-14 IS SUSPECT
+>
+> **Tier 2 is down, and the cause is gwemu's, not ours.** gwemu drives **GPIOC
+> pin 5 low from boot** — `GPIOC_IDR` reads `0xFFDF`, bit 5 clear, identically
+> at t+0.3 s and t+26 s. PC5 is `BTN_TIME`, so `boot_buttons` = 64 = `B_TIME`
+> on every run, retro-go's `force_launcher` skips auto-launch, and `B_TIME` ->
+> `ODROID_INPUT_SELECT` latches `last_key` in a dialog that never re-opens, so
+> even a timeline's fallback A-presses are dead. It is a lone stuck pin, not a
+> modelled press (`GPIOA_IDR` = `0xFFFF`, and gwemu drives PC5+PA2 together for
+> a real TIME press). Reproduced by `probe_report.py` and `screenshot.py`, on
+> current master and on `e539d31`. Full evidence and the retired red herrings:
+> [`STATUS.md`](../STATUS.md), first section. **The fix is in the owner's gwemu
+> repo — do not touch it.**
+>
+> **What that means for THIS file.** No game can have launched under gwemu in
+> that window, so every per-title number below that came from a tier-2 run —
+> which is most of them — needs re-running before it is quoted or built on.
+> They are kept, not deleted, precisely so they can be re-run.
+>
+> **The date boundary is itself unverified.** Several entries below are stamped
+> "MEASURED 2026-08-15" and carry register-level detail that a dead tier 2
+> could not have produced. Either the break is later than Aug 14, or those runs
+> predate it and the stamp is the write-up date. Nobody has established which.
+> Until someone does, treat **anything after 2026-08-14** as needing a re-run,
+> and treat a disagreement between one of these entries and a fresh run as the
+> entry being wrong.
+>
+> Tier-1 results (`tests/*.py` under `gwemu_run.py` bare-metal), silicon
+> results, and static analysis (`opcode_demand.py`, `disasm_diff.py`) are
+> **unaffected** — none of them boot retro-go.
+
 ## THE "THREE TITLES CONVERGE ON ONE ADDRESS" FINDING IS RETRACTED — MEASURED 2026-08-15
 
 Dark Forces, Mortal Kombat and Epic Pinball were all recorded as dying on
@@ -66,7 +97,16 @@ which we have had all along — is never issued.
 
 ### Where all three stop NOW
 
-| title | insns | `CR0` | `CS:EIP` | stops on | needs |
+**STALE — every row below is a tier-2 measurement inside the suspect window, AND
+all three blockers have since been BUILT.** `INT imm8` with `CR0.PE` set is
+delivered through an IDT gate with a same-privilege `IRET` (`3688f69`,
+`e6789b2`), and `0F A0`/`A1`/`A8`/`A9` PUSH/POP FS,GS are in (`e70db05`). So
+none of these three titles stops where this table says any more, and **where
+each stops NOW IS UNMEASURED** — it is the next measurement on the list and it
+is blocked on tier 2. Kept for the `CR0`/`CS:EIP` evidence that the descriptor
+walk held, not as a current verdict.
+
+| title | insns | `CR0` | `CS:EIP` | stopped on (SUPERSEDED) | needed |
 |---|---:|---:|---|---|---|
 | Dark Forces | 102,517 | **1** | `0070:5403` | `exit_info=0xCD`, `INT imm8` with PE set | protected-mode **IDT gate dispatch** |
 | Mortal Kombat | 42,188 | **1** | `0070:559D` | `exit_info=0xCD`, same | the same one thing |
@@ -662,7 +702,15 @@ Why DPMI/VCPI/XMS stays unbuilt:
 
 **Do not half-build DPMI.**
 
-## Epic Pinball — PAST the EXEC wall; next stop is an unimplemented opcode
+## Epic Pinball — PAST the EXEC wall; its next wall has since been BUILT
+
+**UPDATE 2026-09-02, documentation only.** The opcode that ended the run below
+was later read correctly as `exit_info=0x0FA0` = `PUSH FS`, and **`0F A0`/`A1`/
+`A8`/`A9` PUSH/POP FS,GS are now implemented (`e70db05`)**. The `IN 0x22A`
+64,000-read spin is also gone (6 reads; the DSP resets twice, issues 5 commands
+with none unknown, programs the mixer and 22,050 Hz). **Where Epic Pinball stops
+now is UNMEASURED and blocked on tier 2** (see the banner at the top of this
+file). Everything below is the before-picture.
 
 **UPDATE 2026-08-15, after `X86_DOS_EXEC` became the shipping default.** The
 `AH=4Bh` blocker described below is CLEARED. Measured at tier 2 on the shipping

@@ -357,17 +357,24 @@ read `guest_ram_pages_short` before adding more.
 ### What has NOT been measured, and it is the next thing to do
 
 **Where Dark Forces stops now is unknown.** The tier-2 run
-(`probe_report.py --title darkforces`) does not reach the guest in a fresh
-worktree: retro-go boots, registers the core and lists the ROM, and then sits in
-its launcher with `core_magic` never set. **Reproduced identically on stock
-master (`d2b82d1`), so it is not a protected-mode regression** — the retro-go
-firmware and its SD content live in `references/game-and-watch-retro-go-sd`,
-which a worktree reaches by symlink and must not rebuild while other agents are
-working in the shared tree.
+(`probe_report.py --title darkforces`) does not reach the guest: retro-go boots,
+registers the core and lists the ROM, and then sits in its launcher with
+`core_magic` never set.
 
-Until that is unblocked, **do not start call gates, stack switches, the TSS or
-paging.** `docs/13` sizes them at ~1,225 lines and nothing above has measured
-demand. The question worth answering first is the cheap one: *does the extender
-ever change ring at all?* If DOS4GW runs everything at CPL 0 — which its refusal
-of DPMI, VCPI and `INT 15h` makes likely — the entire privilege-change lane is
-deleted rather than built.
+**CAUSE FOUND 2026-09-02, and the "fresh worktree" explanation this paragraph
+used to give was WRONG.** It is gwemu: **GPIOC pin 5 is held low from boot**
+(`GPIOC_IDR` = `0xFFDF`), PC5 is `BTN_TIME`, so `boot_buttons` = `B_TIME`,
+retro-go's `force_launcher` skips auto-launch, and `B_TIME` ->
+`ODROID_INPUT_SELECT` latches `last_key` in a dialog that never re-opens so even
+the timeline's fallback A-presses are dead. Nothing to do with worktrees,
+symlinks or a rebuild of `references/game-and-watch-retro-go-sd`, which is why
+it reproduced identically on stock master. Full evidence and the retired red
+herrings: [`STATUS.md`](../STATUS.md), first section. **The fix is in the
+owner's gwemu repo — do not touch it.**
+
+**That cheap question has since been ANSWERED, statically, without tier 2.**
+`opcode_demand.py` over DOS4GW.EXE finds all 256 IDT template entries at DPL 0
+and no DPL-3 code descriptor: **DOS/4GW runs entirely at CPL 0**, so call gates,
+TSS stack switches, task switching and `IRET`-across-privilege were **deleted
+(~1,225 lines), not deferred**. Paging and per-access limit enforcement stay
+unbuilt and unstarted until something measures demand for them.
