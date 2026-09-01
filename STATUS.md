@@ -66,6 +66,10 @@ was plausible and each measured to nothing.
 
 ## Budgets — measure these before and after any core change
 
+**`python3 scripts/budget_gate.py` IS that measurement** and exits non-zero when
+ITCM, `__CORE_BSS_END__`, the implied frame count or `docs/07` regressed. It
+forces a real re-link and refuses a stale ELF. Thresholds: `tests/budgets.json`.
+
 | | value | note |
 |---|---|---|
 | ITCM | ~**11.3 KB** free of 65,536 | `__CORE_ITCM_CODE_END__` = **0xD580** (54,656 B used; 0xD2D8 before LMSW/IMUL added +680 B, all cold) — MEASURED on this tree; the 0xCD08 quoted here for several passes was stale. The protected-mode walk cost **+912 B**, all of it cold: the out-of-line `SET_SREG_PMODE`, group 6/7 (`LLDT`/`SLDT`/`LGDT`/`LIDT`) and the `MOV CRn` transition |

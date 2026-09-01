@@ -31,7 +31,55 @@ Defaults to retro-go's release parameters with `INTFLASH_BANK=1` (boots
 directly) and a 64 MB part. Give `--extflash-part-mb` and `--extflash-offset-mb`;
 the size is derived. Builds `gwemu_release`, so emulator and device media match.
 
+### `budget_gate.py` — the one command that fails when a budget regressed
+
+```bash
+python3 scripts/budget_gate.py                 # rebuild, then gate
+python3 scripts/budget_gate.py --clean         # after a build-FLAG change
+python3 scripts/budget_gate.py --no-build      # gate an existing ELF
+python3 scripts/budget_gate.py --asm           # + the advisory baseline report
+python3 scripts/budget_gate.py --update        # record today's numbers
+```
+
+Exits non-zero when any of these regressed. **Run it before you merge a core
+change**, and read what it prints even when it passes.
+
+| gated | against |
+|---|---|
+| `__CORE_ITCM_CODE_END__` | `itcm_code_end_max` in `tests/budgets.json` |
+| `__CORE_BSS_END__` | `core_bss_end_max` — RAM_EMU overshoot is SILENT (`guest_ram` NULL, `core_ready` 0, a black frame loop). Three instrumented builds have died of it |
+| pager frames implied by `__CORE_BSS_END__` | `frames_implied_min` |
+| `docs/07`'s generated block | `gen_opcode_coverage.py --check`, so the table cannot rot again |
+
+It also prints ITCM bytes free of 65,536, RAM_EMU headroom, and how many
+**4,104**-byte frames that headroom implies (stride is 4,104, not 4,096 — the
+granule-seam slack). **That frame count is an UPPER BOUND**: other RAM_EMU
+claims land before the guest pool, so the live `guest_ram_pages` is lower. It
+is a necessary condition, not the pool size; the pool size is a tier-2
+measurement of `guest_ram_pages` / `guest_ram_pages_short`.
+
+**It forces a real re-link.** `make: Nothing to be done` gave stale symbols
+once and they were briefly reported as real, so the gate deletes the ELF before
+building — which no make shortcut can satisfy. With `--no-build` it instead
+compares the ELF's mtime against every tracked source and **refuses** (exit 2)
+rather than reporting numbers it cannot stand behind; `--allow-stale` overrides
+and says so on every line of output.
+
+Thresholds live in `tests/budgets.json` so a deliberate increase is a
+**reviewable diff**, not silent drift. Raise them with `--update` and say in the
+commit message what grew and why. Build flags are not dependencies here, so the
+recorded numbers are for a STOCK build; `--make VAR=VAL` marks the comparison
+advisory.
+
 ### `asm_metrics.py` — per-handler assembly metrics
+
+`tests/asm_baseline.json` is **ADVISORY**, not a gate. It is a review aid: a
+handler gaining instructions should be a visible event. But it drifts with
+every legitimate merge, and a lane refreshing it inside its own change would
+fold pre-existing drift under its own diff and hide its additions. So it is
+refreshed as a **standalone commit** that names what drifted, and
+`budget_gate.py --asm` only reports it — the report never affects exit status.
+Re-baseline (`--update`) alone, never as part of a feature commit.
 
 ```bash
 python3 scripts/asm_metrics.py                        # compare to baseline
@@ -2553,6 +2601,7 @@ Importable support only — no CLIs.
 | `rglog.py` | Read retro-go's in-memory log ring |
 | `faults.py` | Decode latched CPU faults |
 | `asm_metrics.py` | Instruction counts, DWT capture |
+| `budgets.py` | Host side of the budget gate: force a real re-link (or refuse a stale ELF), read `__CORE_ITCM_CODE_END__` / `__CORE_BSS_END__` / `__RAM_EMU_END__` via `nm`, derive ITCM free and the pager-frame upper bound, and compare against `tests/budgets.json`. The docstring records why the frame count is a bound and not a count |
 | `zones.py` | Host side of the frame-loop zone accounting: locate the block, ask the TARGET to reset it at its own frame boundary (a host-side memset would race the stack marks), read it back, and derive the shares, the residual and the instrument's own overhead. Layout mirrors `x86_zones.h` |
 | `opcode_profile.py` | Host side of the per-opcode DWT profile: locate/reset/read the DTCM table, resolve slots to handler symbols off the live dispatch tables, render table/JSON/CSV. Layout and the on-target half live in `x86_profile.h` / `cpu_exec.S` |
 | `probe.py` | Sample PC, globals, pointer derefs and array dumps on a running target; `read_faults` decodes CFSR/HFSR/BFAR |
@@ -2596,7 +2645,9 @@ Importable support only — no CLIs.
 - **Measure `__CORE_BSS_END__` after any change to the core.** The core's TEXT
   lives in RAM_EMU too, so code growth counts. Overshooting is SILENT: the
   guest RAM allocation returns NULL, `core_ready` stays 0 and the emulator
-  never starts.
+  never starts. **`python3 scripts/budget_gate.py` is that measurement**, plus
+  ITCM and `docs/07` — run it before merging a core change, and never quote a
+  size from a build you did not force.
 - Green under gwemu ≠ hardware ready; gwemu does not model peripheral setup.
 - Never use raw GDB subprocesses or `gnwmanager monitor`; use the backends.
 - Never run concurrent builds or tests from one directory.
