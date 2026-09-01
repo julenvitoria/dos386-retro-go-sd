@@ -92,11 +92,11 @@ only). That leaves roughly **185 one-byte opcodes believed correct**.
 
 | Metric | Count |
 |---|---|
-| One-byte slots with a handler | **252 / 256** |
-| One-byte slots dispatching to `.exit_loop` | **4 / 256** |
-| Two-byte (0F) slots with a handler | **44 / 256** |
-| Two-byte slots dispatching to `.exit_loop` | **212 / 256** |
-| Implemented slots carrying at least one mechanical warning | **170** |
+| One-byte slots with a handler | **255 / 256** |
+| One-byte slots dispatching to `.exit_loop` | **1 / 256** |
+| Two-byte (0F) slots with a handler | **51 / 256** |
+| Two-byte slots dispatching to `.exit_loop` | **205 / 256** |
+| Implemented slots carrying at least one mechanical warning | **177** |
 
 Every row below is DERIVED. `status` is `reached` or `.exit_loop`, taken from
 the dispatch table. `mode` is `OP` (dual-emitted) or `OP_AGNOSTIC`, taken from the
@@ -219,36 +219,36 @@ Warning legend:
 | 5F | reached | `.op_pop_r32` | dual | - | no flag macro reachable |
 | 60 | reached | `.op_pusha_60` | dual | - | no flag macro reachable |
 | 61 | reached | `.op_popa_61` | dual | - | no flag macro reachable |
-| 62 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 62 | reached | `.op_bound_62` | dual | - | - |
 | 63 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 64 | reached | `.op_seg_fs_64` | AGN | - | no flag macro reachable |
 | 65 | reached | `.op_seg_gs_65` | AGN | - | no flag macro reachable |
 | 66 | reached | `.op_pfx_66` | AGN | - | no flag macro reachable |
 | 67 | reached | `.op_pfx_67` | AGN | - | REVIEW: AGN body mixes width primitives with 26 bare word op(s), no flag macro reachable |
 | 68 | reached | `.op_push_imm32_68` | dual | - | no flag macro reachable |
-| 69 | reached | `.op_imul_imm32_69` | dual | - | no flag macro reachable |
+| 69 | reached | `.op_imul_imm32_69` | dual | - | - |
 | 6A | reached | `.op_push_imm8_6A` | dual | - | no flag macro reachable |
 | 6B | reached | `.op_imul_imm8_6B` | dual | - | no flag macro reachable |
 | 6C | reached | `.op_insb_6C` | AGN | - | no flag macro reachable |
 | 6D | reached | `.op_insv_6D` | dual | - | no flag macro reachable |
 | 6E | reached | `.op_outsb_6E` | AGN | - | no flag macro reachable |
 | 6F | reached | `.op_outsv_6F` | dual | - | no flag macro reachable |
-| 70 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
-| 71 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
-| 72 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
-| 73 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
-| 74 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
-| 75 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
-| 76 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
-| 77 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
-| 78 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
-| 79 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
-| 7A | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
-| 7B | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
-| 7C | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
-| 7D | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
-| 7E | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
-| 7F | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 28 bare word op(s) |
+| 70 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
+| 71 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
+| 72 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
+| 73 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
+| 74 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
+| 75 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
+| 76 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
+| 77 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
+| 78 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
+| 79 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
+| 7A | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
+| 7B | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
+| 7C | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
+| 7D | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
+| 7E | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
+| 7F | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 37 bare word op(s) |
 | 80 | reached | `.op_alu_eb_imm8_80` | AGN | - | - |
 | 81 | reached | `.op_alu_ev_imm32_81` | dual | - | - |
 | 82 | reached | `.op_alu_eb_imm8_80` | AGN | - | - |
@@ -276,7 +276,7 @@ Warning legend:
 | 98 | reached | `.op_cwde_98` | dual | - | no flag macro reachable |
 | 99 | reached | `.op_cdq_99` | dual | - | no flag macro reachable |
 | 9A | reached | `.op_call_far_9A` | dual | - | no flag macro reachable |
-| 9B | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 9B | reached | `.op_wait_9B` | AGN | - | no flag macro reachable |
 | 9C | reached | `.op_pushfd_9C` | dual | - | no flag macro reachable |
 | 9D | reached | `.op_popfd_9D` | dual | - | no flag macro reachable |
 | 9E | reached | `.op_sahf_9E` | AGN | - | no flag macro reachable |
@@ -328,7 +328,7 @@ Warning legend:
 | CC | reached | `.op_int3_CC` | dual | - | - |
 | CD | reached | `.op_int_imm8_CD` | dual | - | - |
 | CE | reached | `.op_into_CE` | dual | - | - |
-| CF | reached | `.op_iret_CF` | dual | - | no flag macro reachable |
+| CF | reached | `.op_iret_CF` | dual | - | - |
 | D0 | reached | `.op_shift_eb_1_D0` | AGN | - | no flag macro reachable |
 | D1 | reached | `.op_shift_ev_1_D1` | dual | - | no flag macro reachable |
 | D2 | reached | `.op_shift_eb_cl_D2` | AGN | - | - |
@@ -336,7 +336,7 @@ Warning legend:
 | D4 | reached | `.op_aam_D4` | AGN | - | no flag macro reachable |
 | D5 | reached | `.op_aad_D5` | AGN | - | no flag macro reachable |
 | D6 | reached | `.op_salc_D6` | AGN | - | no flag macro reachable |
-| D7 | reached | `.op_xlat_D7` | AGN | - | REVIEW: no width primitive, 1 bare word op(s), no flag macro reachable |
+| D7 | reached | `.op_xlat_D7` | AGN | - | REVIEW: no width primitive, 2 bare word op(s), no flag macro reachable |
 | D8 | reached | `.op_esc_x87` | AGN | - | REVIEW: no width primitive, 2 bare word op(s), no flag macro reachable |
 | D9 | reached | `.op_esc_x87` | AGN | - | REVIEW: no width primitive, 2 bare word op(s), no flag macro reachable |
 | DA | reached | `.op_esc_x87` | AGN | - | REVIEW: no width primitive, 2 bare word op(s), no flag macro reachable |
@@ -362,12 +362,12 @@ Warning legend:
 | EE | reached | `.op_out_dx_al_EE` | AGN | ARITH, LOGIC | - |
 | EF | reached | `.op_out_dx_eax_EF` | dual | ARITH, LOGIC | - |
 | F0 | reached | `.op_lock_F0` | AGN | - | no flag macro reachable |
-| F1 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| F1 | reached | `.op_int1_F1` | dual | - | - |
 | F2 | reached | `.op_repne_F2` | AGN | - | REVIEW: no width primitive, 1 bare word op(s), no flag macro reachable |
 | F3 | reached | `.op_rep_F3` | AGN | - | REVIEW: no width primitive, 9 bare word op(s), no flag macro reachable |
 | F4 | reached | `.op_hlt_F4` | AGN | - | REVIEW: no width primitive, 5 bare word op(s), no flag macro reachable |
 | F5 | reached | `.op_cmc_F5` | AGN | - | no flag macro reachable |
-| F6 | reached | `.op_grp3_eb_F6` | AGN | ARITH, LOGIC | REVIEW: AGN body mixes width primitives with 56 bare word op(s) |
+| F6 | reached | `.op_grp3_eb_F6` | AGN | ARITH, LOGIC | REVIEW: AGN body mixes width primitives with 66 bare word op(s) |
 | F7 | reached | `.op_grp3_ev_F7` | dual | ARITH, LOGIC | - |
 | F8 | reached | `.op_clc_F8` | AGN | - | no flag macro reachable |
 | F9 | reached | `.op_stc_F9` | AGN | - | no flag macro reachable |
@@ -382,7 +382,7 @@ Warning legend:
 
 | Op | Status | Handler | Mode | Flag macros | Warnings |
 |---|---|---|---|---|---|
-| 0F 00 | reached | `.op_0f_00` | dual | - | - |
+| 0F 00 | reached | `.op_0f_00` | dual | - | no flag macro reachable |
 | 0F 01 | reached | `.op_0f_01` | dual | - | - |
 | 0F 02 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F 03 | **`.exit_loop`** | `.exit_loop` | - | - | - |
@@ -393,7 +393,7 @@ Warning legend:
 | 0F 08 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F 09 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F 0A | **`.exit_loop`** | `.exit_loop` | - | - | - |
-| 0F 0B | reached | `.op_hypercall_0F0B` | AGN | - | REVIEW: AGN body mixes width primitives with 50 bare word op(s) |
+| 0F 0B | reached | `.op_hypercall_0F0B` | AGN | - | REVIEW: AGN body mixes width primitives with 60 bare word op(s) |
 | 0F 0C | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F 0D | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F 0E | **`.exit_loop`** | `.exit_loop` | - | - | - |
@@ -542,16 +542,16 @@ Warning legend:
 | 0F 9D | reached | `.op_0f_setcc` | dual | INCDEC | - |
 | 0F 9E | reached | `.op_0f_setcc` | dual | INCDEC | - |
 | 0F 9F | reached | `.op_0f_setcc` | dual | INCDEC | - |
-| 0F A0 | **`.exit_loop`** | `.exit_loop` | - | - | - |
-| 0F A1 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F A0 | reached | `.op_0f_push_fs_A0` | dual | - | no flag macro reachable |
+| 0F A1 | reached | `.op_0f_pop_fs_A1` | dual | - | no flag macro reachable |
 | 0F A2 | reached | `.op_0f_cpuid_A2` | AGN | - | REVIEW: no width primitive, 9 bare word op(s), no flag macro reachable |
 | 0F A3 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F A4 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F A5 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F A6 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F A7 | **`.exit_loop`** | `.exit_loop` | - | - | - |
-| 0F A8 | **`.exit_loop`** | `.exit_loop` | - | - | - |
-| 0F A9 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F A8 | reached | `.op_0f_push_gs_A8` | dual | - | no flag macro reachable |
+| 0F A9 | reached | `.op_0f_pop_gs_A9` | dual | - | no flag macro reachable |
 | 0F AA | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F AB | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F AC | **`.exit_loop`** | `.exit_loop` | - | - | - |
@@ -560,10 +560,10 @@ Warning legend:
 | 0F AF | reached | `.op_0f_imul_AF` | dual | - | no flag macro reachable |
 | 0F B0 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F B1 | **`.exit_loop`** | `.exit_loop` | - | - | - |
-| 0F B2 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F B2 | reached | `.op_0f_lss_B2` | dual | - | no flag macro reachable |
 | 0F B3 | **`.exit_loop`** | `.exit_loop` | - | - | - |
-| 0F B4 | **`.exit_loop`** | `.exit_loop` | - | - | - |
-| 0F B5 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F B4 | reached | `.op_0f_lfs_B4` | dual | - | no flag macro reachable |
+| 0F B5 | reached | `.op_0f_lgs_B5` | dual | - | no flag macro reachable |
 | 0F B6 | reached | `.op_0f_movzx_gv_eb` | dual | INCDEC | - |
 | 0F B7 | reached | `.op_0f_movzx_gv_ew` | dual | INCDEC | - |
 | 0F B8 | **`.exit_loop`** | `.exit_loop` | - | - | - |
