@@ -16,7 +16,9 @@ target arm here installs the fold BY HAND with the two granules 48 KB apart.
 THREE ARMS, and the second and third are the controls:
 
   1. NON-CONTIGUOUS, fix on   -- the real case. Must read and write the
-     neighbour's bytes.
+     neighbour's bytes. Arms 1b/1c/1d are the STACK: a straddling PUSH, a
+     straddling POP, and a far return whose frame straddles. PUSH_V/POP_V
+     carry SEAM_CHECK for exactly these; all three fail without it.
   2. CONTIGUOUS, fix on       -- the same guest program on a fold where no seam
      exists. Proves the program and the expectations are right about something
      other than the seam.
@@ -202,10 +204,9 @@ def main(args):
             ok &= good
 
         # ---- arm 1b: THE STACK STRADDLE -------------------------------
-        # PUSH_V/POP_V carry no SEAM_CHECK -- zero occurrences -- and they
-        # are multi-byte fold sites. Nothing aligns SP on x86, so a push
-        # can land its two bytes either side of a granule boundary. This
-        # arm makes one do so deliberately.
+        # PUSH_V/POP_V are multi-byte fold sites. Nothing aligns SP on
+        # x86, so a push can land its two bytes either side of a granule
+        # boundary. This arm makes one do so deliberately.
         #
         # NOTE WHAT IS AND IS NOT GRADED. The round trip (r[14]) passes
         # either way: the POP walks off the top of the same frame in the
@@ -213,37 +214,49 @@ def main(args):
         # guest's own view is intact and the defect is invisible from
         # inside the program. The question is the NEIGHBOUR.
         #
-        # IT IS A REAL HOLE, and this arm is the demonstration. It is
-        # REPORTED rather than FAILED by default, with --stack-seam to
-        # grade it: fixing it means a SEAM_CHECK on every push and every
-        # pop, which is a hot-path cost on a machine where 29.4% of wall is
-        # ordinary opcodes, and that is a decision to take with a number
-        # rather than a side effect of a test going red.
-        print("non-contiguous fold, STRADDLING PUSH/POP "
-              "(PUSH_V/POP_V have no SEAM_CHECK -- zero occurrences):")
+        # IT WAS A REAL HOLE and it is now GRADED, in the default run.
+        # PUSH_V and POP_V carry SEAM_CHECK; this arm failed on the tree
+        # that did not have it (the neighbour read 0xBB and the low
+        # frame's slack held the pushed 0x56) and passes on the tree that
+        # does. Backing the two SEAM_CHECKs out is the way to see it fail.
+        print("non-contiguous fold, STRADDLING PUSH (arm 1b):")
         ok &= check("guest ran to HLT", r[13], HALT)
         ok &= check("the PUSH/POP round trip is intact either way",
                     r[14], 0x5678)
         ok &= check("the pushed low byte landed", r[15], 0x78)
-        holed = r[16] != 0x56 or r[17] != 0xEE
-        if args.stack_seam:
-            ok &= check("the pushed HIGH byte reached the NEIGHBOUR",
-                        r[16], 0x56, want)
-            ok &= check("... and did NOT go into the low frame's slack",
-                        r[17], 0xEE, want)
-        elif holed:
-            print(f"  KNOWN DEFECT (reported, not graded -- pass "
-                  f"--stack-seam to fail on it): the neighbour still reads "
-                  f"{r[16]:#x} and the low frame's slack {r[17]:#x}. The "
-                  f"pushed high byte went off the top of the LOW frame. A "
-                  f"push is a multi-byte fold site and has no SEAM_CHECK; "
-                  f"nothing aligns SP, so this is one stack address in "
-                  f"2,048. The guest's own POP reads it back correctly, "
-                  f"which is why it has never shown.")
-        else:
-            print("  the stack straddle is now SERVED "
-                  "(PUSH_V/POP_V must have gained a SEAM_CHECK)")
+        ok &= check("the pushed HIGH byte reached the NEIGHBOUR",
+                    r[16], 0x56, want)
+        # The slack is NOT graded, and deliberately. The fix works by
+        # writing THROUGH the slack and pushing the changed bytes into the
+        # neighbour at the instruction boundary, so after a served straddle
+        # the slack legitimately holds the pushed byte -- the same value the
+        # DEFECT leaves there. Only the neighbour distinguishes them, and
+        # that is r[16] above. Printed so the mechanism is visible.
+        print(f"       (low frame's slack now {r[17]:#x}; with the straddle "
+              f"SERVED the byte passes through here on its way to the "
+              f"neighbour, so this value is not itself a verdict)")
         ok &= check("SP is back where it started", r[18], 0x1001)
+
+        # ---- arm 1c: the POP side -------------------------------------
+        # The push arm cannot grade the pop: they make the same mistake
+        # symmetrically and the round trip passes either way. Here the
+        # straddling slot is written by the HOST and only READ by the
+        # guest, so a pop with no SEAM_CHECK returns 0xEE78 -- the low
+        # frame's painted slack in place of the neighbour's byte.
+        print("non-contiguous fold, STRADDLING POP (arm 1c):")
+        ok &= check("the popped word came from BOTH granules",
+                    r[19], 0x5678, want)
+
+        # ---- arm 1d: a FAR TRANSFER's frame ---------------------------
+        # A fix that covers PUSH_V and misses the RETF/IRET frame would be
+        # believed and still be wrong. The IP word of a far-return frame
+        # straddles the boundary; a correct RETF lands on the HLT at
+        # linear 0x100, a broken one takes IP = 0xEE00 out of the slack
+        # and runs until the PIT budget stops it.
+        print("non-contiguous fold, STRADDLING RETF FRAME (arm 1d):")
+        ok &= check("the far return reached its HLT", r[20], HALT, want)
+        ok &= check("linear EIP after the far return", r[21], 0x101, want)
+        ok &= check("CS base after the far return", r[22], 0)
 
         # ---- arm 2: the contiguous control ----------------------------
         # Always asserted POSITIVELY, in both builds: with the granules laid
@@ -261,6 +274,9 @@ def main(args):
         # The stack arm's control: with the granules back to back there is
         # no seam, so the straddling push is correct with no machinery.
         ok &= check("straddling PUSH, high byte landed", r[16], 0x56)
+        ok &= check("straddling POP, both granules read", r[19], 0x5678)
+        ok &= check("straddling RETF frame, reached its HLT", r[20], HALT)
+        ok &= check("straddling RETF frame, linear EIP", r[21], 0x101)
     finally:
         runner.stop()
     print("PASS" if ok else "FAIL")
@@ -270,11 +286,6 @@ def main(args):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     add_runner_args(p)
-    p.add_argument("--stack-seam", action="store_true",
-                   help="GRADE the straddling PUSH/POP arm rather than "
-                        "merely reporting it. It fails on today's tree: "
-                        "PUSH_V/POP_V have no SEAM_CHECK, and fixing that "
-                        "is a hot-path cost to decide with a number")
     p.add_argument("--negative", action="store_true",
                    help="expect the DEFECT: for a -DX86_SEAM_FIX=0 build")
     p.add_argument("--code-negative", action="store_true",

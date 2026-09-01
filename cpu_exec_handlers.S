@@ -284,7 +284,31 @@
 /* Stack primitives. Both widths, both passes.
    PUSH_V: val is stored; tsp/tptr are scratch and are clobbered.
    The linear address is SS.base + SP, with SP wrapped to the stack width
-   BEFORE the base is added -- a 16-bit stack cannot walk out of its segment. */
+   BEFORE the base is added -- a 16-bit stack cannot walk out of its segment.
+
+   THEY ARE MULTI-BYTE FOLD SITES AND THEREFORE CARRY SEAM_CHECK. Nothing on
+   x86 aligns SP and nothing here does either, so SS.base+SP lands on granule
+   offset 0xFFF (16-bit) or 0xFFD-0xFFF (32-bit) once in every 2,048 stack
+   addresses, and without the check the second byte runs off the top of the low
+   frame into its slack. The guest's own POP walks off the SAME frame in the
+   SAME direction and reads back what the PUSH wrote, so the round trip is
+   intact and the defect is invisible from inside the program -- what is lost
+   is the NEIGHBOUR granule's byte, read stale later. Demonstrated by
+   tests/test_seam.py arms 1b/1c/1d; docs/10 section 7.
+
+   THE PREDICATE CANNOT BE MADE CHEAPER FROM SP ALONE. The straddle is a
+   property of the LINEAR address, and SS.base is only paragraph-aligned in
+   real mode and arbitrary in protected mode, so the granule offset is not
+   knowable until SS.base has been added -- which is exactly where the check
+   sits. It costs the standard three instructions (LSLS/CMN/BCS) and a branch
+   that is not taken 2,047 times in 2,048; the scratch is free, because
+   \tsp (push) and \dest (pop) are both dead at that point and about to be
+   overwritten by the fold.
+
+   EVERY stack path in the machine goes through these two macros -- PUSHA,
+   POPA, ENTER, LEAVE, CALL/RET, the far CALL/RETF/INT/IRET frames and the
+   protected-mode gate. Grep confirms SEG_SS_BASE is read nowhere else in a
+   fold site. */
     .macro PUSH_V val, tsp, tptr
         LDR.W \tsp, [R8, #CPU_ESP]
         SP_DEC \tsp
@@ -292,6 +316,7 @@
         STR.W \tsp, [R8, #CPU_ESP]
         LDR.W \tptr, [R8, #SEG_SS_BASE]
         ADD.W \tptr, \tptr, \tsp
+        SEAM_CHECK \tsp, \tptr
         UBFX \tsp, \tptr, #12, #12
         LDR.W \tsp, [R9, \tsp, LSL #2]
         ADDS \tsp, \tsp, \tptr
@@ -303,6 +328,7 @@
         LDR.W \tsp, [R8, #CPU_ESP]
         LDR.W \tptr, [R8, #SEG_SS_BASE]
         ADD.W \tptr, \tptr, \tsp
+        SEAM_CHECK \dest, \tptr
         UBFX \dest, \tptr, #12, #12
         LDR.W \dest, [R9, \dest, LSL #2]
         ADDS \dest, \dest, \tptr
@@ -2474,11 +2500,11 @@ L(GRP5_DISPATCH):
     CMP R12, #3
     BEQ.W L(GRP5_CALLF)
     CMP R12, #4
-    BEQ.N L(GRP5_JMP)
+    BEQ.W L(GRP5_JMP)
     CMP R12, #5
     BEQ.W L(GRP5_JMPF)
     CMP R12, #6
-    BEQ.N L(GRP5_PUSH)
+    BEQ.W L(GRP5_PUSH)
     B.W .exit_loop
 /* INC/DEC Ev set the same five flags their r/m8 twins do, and set none
    before. CALL/JMP near indirect take an OFFSET in CS, not a linear address,

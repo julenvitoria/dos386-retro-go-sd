@@ -6222,6 +6222,94 @@ static void seam_test_run(void)
         seam_r[17] = slack ? slack[0] : 0xFFFFFFFFu;        /* 0xEE        */
         seam_r[18] = cpu_state_dtcm.regs[4] & 0xFFFFu;      /* 0x1001      */
     }
+
+    /* ---- arm 1c: THE STRADDLING POP ---------------------------------------
+     *
+     * The push arm above cannot grade the pop, because the two make the same
+     * mistake symmetrically. So this one builds the straddling stack slot
+     * from the HOST -- 0x78 at the low granule's last byte, 0x56 at the
+     * neighbour's first -- and asks the guest to POP it. A pop with no
+     * SEAM_CHECK reads the low frame's SLACK for its high byte and comes back
+     * with 0xEE78 instead of 0x5678. The value is written where a later,
+     * non-straddling read can fetch it.
+     */
+    seam_poke(lo + 0xFFF, 0x78);
+    seam_poke(hi + 0,     0x56);
+    slack = x86_pager_slack(SEAM_FIRST);
+    if (slack)
+        memset(slack, 0xEE, X86_PG_SLACK);
+    {
+        /*   mov ax,0C000h    B8 00 C0
+         *   mov ds,ax        8E D8
+         *   mov ss,ax        8E D0
+         *   mov sp,0FFFh     BC FF 0F
+         *   pop ax           58            <- reads 0FFFh and 1000h
+         *   mov [0014h],ax   A3 14 00
+         *   hlt              F4
+         */
+        static const uint8_t pprog[] = {
+            0xB8, 0x00, 0xC0,  0x8E, 0xD8,  0x8E, 0xD0,
+            0xBC, 0xFF, 0x0F,
+            0x58,
+            0xA3, 0x14, 0x00,
+            0xF4,
+        };
+        memcpy(test_ram, pprog, sizeof(pprog));
+        memset(&cpu_state_dtcm, 0, sizeof(cpu_state_dtcm));
+        for (int i = 0; i < 6; i++)
+            cpu_state_dtcm.segs[i].limit = 0xFFFFFFFF;
+        cpu_state_dtcm.pit_reload = 0xFFFFFFFF;
+        cpu_state_dtcm.pit_counter = 0xFFFFFFFF;
+        x86_cpu_interp_asm();
+        seam_r[19] = seam_peek(lo + 0x14) | (seam_peek(lo + 0x15) << 8);
+                                                            /* 0x5678      */
+    }
+
+    /* ---- arm 1d: A FAR TRANSFER'S FRAME -----------------------------------
+     *
+     * A fix that covers PUSH_V and misses the RETF/IRET frame is a fix that
+     * will be believed and still be wrong, so this arm straddles the boundary
+     * with the IP word of a FAR RETURN frame rather than with a plain push.
+     * The frame is laid down by the host: IP = 0x0100 with its low byte at
+     * the low granule's last address and its high byte in the NEIGHBOUR, then
+     * CS = 0x0000 entirely inside the neighbour.
+     *
+     * A correct RETF lands at linear 0x100, where a HLT is waiting. A pop
+     * that reads the low frame's slack gets IP = 0xEE00 and executes whatever
+     * is at linear 0xEE00 -- so the PIT budget is finite here, and an arm
+     * that derails exits X86_EXIT_TIMER rather than hanging the harness.
+     */
+    seam_poke(lo + 0xFFF, 0x00);        /* IP low                            */
+    seam_poke(hi + 0,     0x01);        /* IP high -- the straddling byte    */
+    seam_poke(hi + 1,     0x00);        /* CS low                            */
+    seam_poke(hi + 2,     0x00);        /* CS high                           */
+    slack = x86_pager_slack(SEAM_FIRST);
+    if (slack)
+        memset(slack, 0xEE, X86_PG_SLACK);
+    {
+        /*   mov ax,0C000h    B8 00 C0
+         *   mov ss,ax        8E D0
+         *   mov sp,0FFFh     BC FF 0F
+         *   retf             CB
+         *   ... (linear 0100h)  hlt   F4
+         */
+        static const uint8_t fprog[] = {
+            0xB8, 0x00, 0xC0,  0x8E, 0xD0,
+            0xBC, 0xFF, 0x0F,
+            0xCB,
+        };
+        memcpy(test_ram, fprog, sizeof(fprog));
+        test_ram[0x100] = 0xF4;                 /* the far return's target */
+        memset(&cpu_state_dtcm, 0, sizeof(cpu_state_dtcm));
+        for (int i = 0; i < 6; i++)
+            cpu_state_dtcm.segs[i].limit = 0xFFFFFFFF;
+        cpu_state_dtcm.pit_reload = 200000;
+        cpu_state_dtcm.pit_counter = 200000;
+        x86_cpu_interp_asm();
+        seam_r[20] = cpu_state_dtcm.exit_reason;            /* 6 = HLT     */
+        seam_r[21] = cpu_state_dtcm.eip;                    /* 0x101       */
+        seam_r[22] = cpu_state_dtcm.segs[1].base;           /* CS base, 0  */
+    }
     seam_r[8] = x86_seam_syncs - s0;
     seam_r[9] = x86_seam_writes - w0;
     seam_r[10] = x86_seam_overflow - o0;
