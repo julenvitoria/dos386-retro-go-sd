@@ -1868,7 +1868,7 @@ python3 tests/test_dos.py --negative     # 13 controls: rollback, largest,
                                          # x86_dos_execs stays 0 and the arena
                                          # is untouched -- an overlay is not a
                                          # process and allocates nothing.
-python3 tests/test_sound.py              # THREE ARMS, all driven by GUEST code.
+python3 tests/test_sound.py              # FOUR ARMS, all driven by GUEST code.
                                          # The third is FM SYNTHESIS: guest code
                                          # programs one voice through OUT
                                          # 0x388/0x389 and the arm grades the
@@ -1913,6 +1913,29 @@ python3 tests/test_sound.py              # THREE ARMS, all driven by GUEST code.
                                          # The host loop is the FRAME LOOP in
                                          # miniature, because the engine has no
                                          # other clock (docs/03 §4b-2).
+                                         # ADPCM: the same transport, with the
+                                         # DSP command byte chosen by the HOST
+                                         # so one guest program grades 0x75
+                                         # (4-bit +ref), 0x74 (4-bit, NO ref),
+                                         # 0x77 (2.6-bit +ref) and 0x17 (2-bit
+                                         # +ref). Creative ADPCM is NOT IMA
+                                         # ADPCM; the arm carries its own
+                                         # reference decoder written from the
+                                         # RULE (DOSBox-X's
+                                         # decode_ADPCM_{2,3,4}_sample), not a
+                                         # copy of x86_io.c. The source block
+                                         # is a closed formula both sides
+                                         # derive, so nothing crosses the debug
+                                         # link but four command bytes. It
+                                         # grades three LAYERS that fail
+                                         # differently: not silence, not a
+                                         # CONSTANT (a DC offset and real
+                                         # silence are different failures --
+                                         # an all-zero expectation would accept
+                                         # both), and then sample for sample
+                                         # against the reference decode, held
+                                         # 2 apiece at 24,000 into 48,000 Hz.
+                                         # x86_sb_adpcm_silenced must read 0.
 python3 tests/test_sound.py --negative    # the DSP's 0xAA push
 python3 tests/test_sound.py --negative-opl # the OPL timer-1 flag
 python3 tests/test_sound.py --negative-tc  # the 8237's TERMINAL COUNT
@@ -1921,13 +1944,29 @@ python3 tests/test_sound.py --negative-rate # the resampler step forced to 1:1
 python3 tests/test_sound.py --negative-fm-env  # the FM envelope's RELEASE
 python3 tests/test_sound.py --negative-fm-freq # the FM frequency multiple
 python3 tests/test_sound.py --negative-f2  # the DSP's F2h IRQ REQUEST
+python3 tests/test_sound.py --negative-adpcm      # 4-bit ADPCM back on the
+                                         # SILENT STUB it shipped as
+python3 tests/test_sound.py --negative-adpcm-ref  # the REFERENCE BYTE never
+                                         # consumed as a reference. Every
+                                         # counter stays green and the output
+                                         # is neither silent nor constant, so
+                                         # ONLY the sample-exact layer sees it
+python3 tests/test_sound.py --negative-adpcm-pack # the 2.6-bit format's third
+                                         # code read without its shift
+python3 tests/test_sound.py --negative-adpcm-blk  # the block ticked per OUTPUT
+                                         # sample instead of per DMA byte --
+                                         # caught by dma_bytes, a third layer
 python3 tests/test_sound.py --negative-f2-now # F2h's IMMEDIATE delivery -- the
                                          # line is still asserted, so every
                                          # counter stays green and only the
                                          # guest's ten-iteration window sees it
                                          # Each rebuilds with that one link
                                          # broken and requires a FAIL; source
-                                         # restored in a finally. ALL SEVEN
+                                         # restored in a finally, and the
+                                         # helper asserts the target occurs
+                                         # EXACTLY ONCE -- a control that
+                                         # patches the wrong copy, or nothing,
+                                         # passes for free. ALL ELEVEN
                                          # SEEN TO FAIL. --negative-rate and
                                          # --negative-f2-now are the two
                                          # that matter most: each leaves every

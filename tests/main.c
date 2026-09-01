@@ -2042,6 +2042,151 @@ static void sbdma_test_run(void)
 
 
 /* ---------------------------------------------------------------------------
+ * CREATIVE ADPCM PLAYBACK -- the same transport as the arm above, with the
+ * DSP command byte and the block length chosen BY THE HOST so one guest
+ * program grades all three formats and both reference spellings.
+ *
+ * The source bytes are generated here by a closed formula, (i * 37 + 11) & 255,
+ * so the Python side can re-derive the exact same input and run its own
+ * reference decoder over it without shipping a buffer across the debug link.
+ * 24,000 Hz into 48,000 Hz is exactly TWO output samples per decoded sample,
+ * so the expected waveform is arithmetic and the hold is itself checkable.
+ */
+#define APC_CMD     0x3320u          /* host-written: the DSP command byte  */
+#define APC_LENLO   0x3321u
+#define APC_LENHI   0x3322u
+#define APC_BYTES   20u              /* the DMA block, in BYTES             */
+
+volatile uint32_t run_sbadpcm_flag __attribute__((section(".test_bss")));
+volatile uint32_t apc_in[4] __attribute__((section(".test_bss")));
+volatile uint32_t apc_r[12] __attribute__((section(".test_bss")));
+volatile uint32_t apc_pcm[32] __attribute__((section(".test_bss")));
+
+static const uint8_t sbadpcm_code[] = {
+    /* -- DSP reset ------------------------------------------------------- */
+    0xBA, 0x26, 0x02,             /* MOV DX,0226h                          */
+    0xB0, 0x01, 0xEE,             /* MOV AL,1  / OUT DX,AL                 */
+    0xB0, 0x00, 0xEE,             /* MOV AL,0  / OUT DX,AL                 */
+    0xBA, 0x2A, 0x02,             /* MOV DX,022Ah                          */
+    0xEC,                         /* IN AL,DX                              */
+    0xA2, 0x00, 0x33,             /* MOV [3300h],AL   MUST BE 0xAA         */
+    /* -- install the INT 0Dh (IRQ 5) vector ------------------------------ */
+    0xC7, 0x06, 0x34, 0x00, 0x00, 0x32,   /* MOV WORD [0034h],3200h        */
+    0xC7, 0x06, 0x36, 0x00, 0x00, 0x00,   /* MOV WORD [0036h],0000h        */
+    0xE4, 0x21, 0x24, 0xDF, 0xE6, 0x21,   /* unmask IRQ 5 at the 8259      */
+    0xFB,                         /* STI                                   */
+    /* -- 8237 channel 1, count taken from the HOST-written length -------- */
+    0xB0, 0x05, 0xE6, 0x0A,       /* mask ch1                              */
+    0xB0, 0x00, 0xE6, 0x0C,       /* clear the flip-flop                   */
+    0xB0, 0x49, 0xE6, 0x0B,       /* single / increment / read / ch1       */
+    0xB0, 0x00, 0xE6, 0x02,       /* addr lo                               */
+    0xB0, 0x40, 0xE6, 0x02,       /* addr hi  -> 0:4000                    */
+    0xB0, 0x00, 0xE6, 0x83,       /* page (channel 1's port is 83h)        */
+    0xA0, 0x21, 0x33, 0xE6, 0x03, /* MOV AL,[3321h] / OUT 03h,AL  count lo */
+    0xA0, 0x22, 0x33, 0xE6, 0x03, /* MOV AL,[3322h] / OUT 03h,AL  count hi */
+    0xB0, 0x01, 0xE6, 0x0A,       /* unmask ch1                            */
+    /* -- speaker on, 24,000 Hz ------------------------------------------- */
+    0xBA, 0x2C, 0x02,             /* MOV DX,022Ch                          */
+    0xB0, 0xD1, 0xEE,             /* speaker on                            */
+    0xB0, 0x41, 0xEE,             /* 41h: set output rate                  */
+    0xB0, 0x5D, 0xEE,             /* 24000 >> 8                            */
+    0xB0, 0xC0, 0xEE,             /* 24000 & FF                            */
+    /* -- THE ADPCM COMMAND, chosen by the host --------------------------- */
+    0xA0, 0x20, 0x33, 0xEE,       /* MOV AL,[3320h] / OUT DX,AL            */
+    0xA0, 0x21, 0x33, 0xEE,       /* MOV AL,[3321h] / OUT DX,AL   len-1 lo */
+    0xA0, 0x22, 0x33, 0xEE,       /* MOV AL,[3322h] / OUT DX,AL   len-1 hi */
+    /* -- the bounded wait for the completion interrupt ------------------- */
+    0xB9, 0x40, 0x9C,             /* MOV CX,40000                          */
+    0xA0, 0x08, 0x33,             /* wait: MOV AL,[3308h]                  */
+    0x84, 0xC0,                   /*       TEST AL,AL                      */
+    0x75, 0x02,                   /*       JNZ done                        */
+    0xE2, 0xF7,                   /*       LOOP wait                       */
+    0x89, 0x0E, 0x04, 0x33,       /* done: MOV [3304h],CX  polls left      */
+    0xE4, 0x08,                   /* IN AL,08h   the 8237 status           */
+    0xA2, 0x09, 0x33,             /* MOV [3309h],AL                        */
+    0xF4,                         /* HLT                                   */
+};
+
+static void sbadpcm_test_run(void)
+{
+    static const uint8_t hle_vectors[] = { 0x08, 0x09, 0x10, 0x16, 0x1A, 0x20, 0x21 };
+
+    x86_video_init(cga_test_vram, cga_test_palette);
+    x86_video_set_aperture(vga_test_aperture, vga_test_pal);
+    x86_bios_init();
+    x86_hle_install(hle_vectors, sizeof(hle_vectors));
+
+    memset(&test_ram[SBD_RES], 0, 64);
+    memset(&test_ram[SBD_BUF], 0, 256);
+    for (unsigned i = 0; i < APC_BYTES; i++)
+        test_ram[SBD_BUF + i] = (uint8_t)((i * 37u + 11u) & 0xFFu);
+    test_ram[APC_CMD]   = (uint8_t)apc_in[0];
+    test_ram[APC_LENLO] = (uint8_t)((APC_BYTES - 1u) & 0xFFu);
+    test_ram[APC_LENHI] = (uint8_t)(((APC_BYTES - 1u) >> 8) & 0xFFu);
+    memcpy(&test_ram[SBD_CODE], sbadpcm_code, sizeof(sbadpcm_code));
+    memcpy(&test_ram[SBD_ISR],  sbdma_isr,  sizeof(sbdma_isr));
+    for (unsigned i = 0; i < 32; i++)
+        apc_pcm[i] = 0;
+
+    kbd_test_reset_cpu(SBD_CODE);
+    cpu_state_dtcm.pit_counter = cpu_state_dtcm.pit_reload = 1200;
+
+    /* The engine's counters are FREE-RUNNING and this arm runs four times on
+       one target, after the digitised-playback arm has already used them. So
+       snapshot and report DELTAS: an absolute reading here would grow with the
+       order the arms happen to run in, which is not a property of anything. */
+    uint32_t b_starts = x86_sb_starts, b_blocks = x86_sb_blocks;
+    uint32_t b_bytes = x86_sb_dma_bytes, b_samples = x86_sb_samples;
+    uint32_t b_under = x86_sb_underruns, b_silent = x86_sb_adpcm_silenced;
+
+    unsigned captured = 0;
+    uint32_t reason = 0xFFFFFFFFu;
+    int guard;
+    for (guard = 0; guard < 600; guard++) {
+        x86_cpu_interp_asm();
+        uint32_t er = cpu_state_dtcm.exit_reason;
+        if (er == X86_EXIT_HLE_INT) {
+            cpu_state_dtcm.exit_reason = 0;
+            x86_hle_service();
+            if (cpu_state_dtcm.exit_reason != 0) {
+                reason = cpu_state_dtcm.exit_reason;
+                break;
+            }
+        } else if (er == X86_EXIT_TIMER) {
+            cpu_state_dtcm.exit_reason = 0;
+            cpu_state_dtcm.pit_counter = 1200;
+        } else {
+            reason = er;
+            break;
+        }
+        memset(sbd_audio, 0, sizeof(sbd_audio));
+        unsigned got = x86_sb_render_mix(sbd_audio, SBD_FRAMES, SBD_RATE, 32767);
+        if (got && !captured) {
+            for (unsigned i = 0; i < 32; i++)
+                apc_pcm[i] = (uint32_t)(uint16_t)sbd_audio[i * 2] |
+                             ((uint32_t)(uint16_t)sbd_audio[i * 2 + 1] << 16);
+            captured = 1;
+        }
+        x86_sb_raise_irq(&cpu_state_dtcm);
+    }
+
+    apc_r[0]  = test_ram[SBD_RES + 0];                  /* the 0xAA        */
+    apc_r[1]  = test_ram[SBD_RES + 8];                  /* ISR entry count */
+    apc_r[2]  = (uint32_t)(test_ram[SBD_RES + 4] |
+                           (test_ram[SBD_RES + 5] << 8));   /* polls left  */
+    apc_r[3]  = test_ram[SBD_RES + 9];                  /* 8237 status     */
+    apc_r[4]  = x86_sb_starts - b_starts;
+    apc_r[5]  = x86_sb_blocks - b_blocks;
+    apc_r[6]  = x86_sb_dma_bytes - b_bytes;
+    apc_r[7]  = x86_sb_samples - b_samples;
+    apc_r[8]  = x86_sb_underruns - b_under;
+    apc_r[9]  = x86_sb_adpcm_silenced - b_silent;
+    apc_r[10] = captured;
+    apc_r[11] = reason;
+}
+
+
+/* ---------------------------------------------------------------------------
  * OPL2 FM SYNTHESIS -- and this arm grades the SAMPLES, not a counter.
  *
  * The guest programs one voice through its own OUT instructions to 0x388 /
@@ -7033,6 +7178,11 @@ void Reset_Handler(void) {
         if (run_sbdma_flag == 1) {
             sbdma_test_run();
             run_sbdma_flag = 0;
+        }
+
+        if (run_sbadpcm_flag == 1) {
+            sbadpcm_test_run();
+            run_sbadpcm_flag = 0;
         }
 
         if (run_fm_flag == 1) {

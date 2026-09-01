@@ -104,10 +104,31 @@ half of it, and takes an interrupt at each half. Driving the IRQ off terminal
 count gives it one interrupt per two blocks and it plays the same stale half
 for ever.
 
-**ADPCM RUNS BUT IS SILENT.** `0x16`/`0x17`/`0x74`-`0x77`/`0x1F`/`0x2C`/`0x7D`/
-`0x7F` drain the DMA, complete the block and raise the interrupt, and emit
-silence, counted in `x86_sb_adpcm_silenced`. Refusing them mid-transfer would
-reinstate the hang; decoding them is separate, gradeable work.
+**ADPCM IS DECODED.** `0x16`/`0x17`, `0x74`-`0x77`, `0x1F`, `0x7D` and `0x7F`
+run Creative's 4-bit, 2.6-bit and 2-bit formats through their own step and
+adjust tables. **This is NOT IMA/DVI ADPCM** and reaching for an IMA decoder is
+the standard way to get it wrong. The rule: a code is ADDED to a running step
+index, the sum is clamped to the table, the step entry is added to a running
+unsigned 8-bit reference (clamped 0..255) and IS the sample, and the adjust
+entry is added to the step index MODULO 256 -- which is why its "shrink" values
+are 240/248/252 and not -16/-8/-4. The ODD command of each pair, and every
+auto-init form, is the **"with reference byte"** spelling: the FIRST byte of the
+transfer is an absolute sample and resets the step. Consuming it as data, or not
+consuming it at all, does not produce silence -- it produces a wrong,
+non-constant waveform, which is why `tests/test_sound.py`'s ADPCM arm compares
+sample for sample against an independently written reference decoder rather than
+measuring energy.
+
+**Two things an ADPCM block does NOT share with a PCM one.** Its length is in
+DMA **bytes**, not decoded samples, so `sb_block_tick()` ticks per byte here and
+per sample frame for PCM; and one byte yields two, three or four samples, so the
+decoder buffers them and the transfer advances only when that buffer is dry.
+
+`x86_sb_adpcm_silenced` survives as a **regression detector**: no ADPCM command
+can reach the silent path any more, so a non-zero reading means one did. The one
+remaining caller is `0x2C`, which is auto-init 8-bit **A/D (recording)** on real
+hardware, not ADPCM; there is no input source here and it keeps the old silent
+behaviour deliberately.
 
 ### 4b-2. The engine has ONE clock, and it is the frame loop
 
@@ -146,7 +167,7 @@ render, because between two calls the pager may move any page.
 | `_irqs_acked` / `x86_sb_eois` | the DSP ack / the 8259 ack -- BOTH are needed |
 | `x86_sb_dma_bytes` | bytes actually pulled out of guest RAM |
 | `x86_sb_underruns` | the source ran dry mid-render |
-| `x86_sb_adpcm_silenced` | a block that ran but could not be decoded |
+| `x86_sb_adpcm_silenced` | a block that ran but could not be decoded. **Expected 0** now that ADPCM decodes; only `0x2C` (A/D, no input source) can raise it |
 | `x86_sb_dma_refused` | **narrowed**: only what this model CANNOT run (record, direct DAC). It is no longer "asked for audio and got silence" |
 | `x86_dos_env_seg` | whether `BLASTER` was reachable at all |
 | `x86_opl_t1_gap` vs 96 | **the AdLib probe's delay, in ticks.** Under 96 means the guest's wait was too short for our clock, not that the card refused -- 4e |
