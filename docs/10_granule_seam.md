@@ -132,37 +132,93 @@ table rather than a base:
 2. **Pool exhaustion.** Their seam re-asked an exhausted pool once per straddling
    access and turned `dos_cow_lost` into 16,392. Ours is sticky.
 
-## 7. THE STACK IS A HOLE. Demonstrated, not argued.
+## 7. THE STACK. Was a hole; now checked.
 
-`PUSH_V` and `POP_V` (`cpu_exec_handlers.S:288`, `:302`) are multi-byte fold
-sites and carry **NO `SEAM_CHECK`** — zero occurrences in the tree. Nobody
-owned the question; the answer is that it is real.
+`PUSH_V` and `POP_V` (`cpu_exec_handlers.S`) are multi-byte fold sites and for
+a long time carried **no `SEAM_CHECK`** — zero occurrences in the tree. Nobody
+owned the question; the answer was that it was real.
 
 **The demonstration** is `tests/test_seam.py`'s arm 1b, on the same
 deliberately non-contiguous fold as arm 1: `SS = 0xC000`, `SP = 0x1001`, so
 `PUSH AX` writes the low byte at the last byte of one granule and the high byte
-at the first byte of the next. On today's tree the neighbour reads **0xBB**
-(untouched) and the low frame's **slack** holds the pushed **0x56** — the high
-byte went off the top of the low frame. The contiguous control passes, so it is
-the seam and not the program.
+at the first byte of the next. On the unfixed tree the neighbour read **0xBB**
+(untouched) and the low frame's **slack** held the pushed **0x56** — the high
+byte went off the top of the low frame. The contiguous control passed, so it
+was the seam and not the program.
 
 **Nothing prevents it.** SP is not aligned on x86 and nothing in the
 interpreter aligns it: a 16-bit push at offset 0xFFF straddles, a 32-bit one at
 0xFFD-0xFFF straddles. One stack address in 2,048, exactly as CLAUDE.md's rule
 predicts for a fold site without the check.
 
-**Why it has never shown, and why that is the dangerous part.** The matching
-`POP` walks off the top of the *same* frame in the *same* direction and reads
-back precisely what the `PUSH` wrote, so the guest's own round trip is intact —
-the test grades that too, and it passes either way. What is lost is the byte at
-the *neighbour's* first address: a later non-straddling access to it reads stale
-data, and the slack the push corrupted is never pushed back because nothing
-called `x86_seam_sync()`. The failure is a wrong byte somewhere else, later.
+**Why it never showed, and why that was the dangerous part.** The matching
+`POP` walked off the top of the *same* frame in the *same* direction and read
+back precisely what the `PUSH` wrote, so the guest's own round trip was intact
+— the test grades that too, and it passes either way. What was lost is the byte
+at the *neighbour's* first address: a later non-straddling access to it read
+stale data, and the slack the push corrupted was never pushed back because
+nothing called `x86_seam_sync()`. The failure was a wrong byte somewhere else,
+later.
 
-**It is REPORTED and not FAILED by default** (`--stack-seam` grades it). The
-fix is a `SEAM_CHECK` on every push and every pop, which is a **hot-path** cost
-on a machine where 29.4% of wall is ordinary opcodes and where `SEAM_CHECK`'s
-measured cost elsewhere was 0.04% — cheap, but per-push rather than per-fold-site
-and therefore a number somebody should take before the check lands, not a
-decision a red test makes by itself. `x86_seam_overflow` does not fire here
-either: the site never asks.
+### The fix
+
+One `SEAM_CHECK` in each macro, immediately after `SS.base + SP` is formed and
+before the fold. That is the *only* place it can go, and it is also why there
+is **no cheaper form**: the straddle is a property of the LINEAR address, and
+`SS.base` is paragraph-aligned in real mode and wholly arbitrary in protected
+mode, so the granule offset is not knowable from SP alone. It cannot be folded
+into `SP_WRAP` (which runs before the base is added) or into the existing
+`UBFX` (which extracts bits 12-23, not the offset). The one thing that *is*
+free is the scratch register: `\tsp` in `PUSH_V` and `\dest` in `POP_V` are
+both dead at that point and about to be overwritten by the fold, so the check
+needs no register the site did not already own.
+
+**Every stack path goes through these two macros** — `PUSHA`, `POPA`, `ENTER`,
+`LEAVE`, `CALL`/`RET`, the far `CALL`/`RETF`/`INT`/`IRET` frames and the
+protected-mode gate. `SEG_SS_BASE` is read at exactly two fold sites in the
+tree, and they are these; the only other readers are the trace block in
+`cpu_exec.S`, which folds each word separately for this very reason.
+
+### The cost, and what tier it is
+
+**A STATIC INSTRUCTION COUNT, from `scripts/asm_metrics.py`. NOT a wall-clock
+claim — gwemu does not model timing and tier 3 was not available.**
+
+| | |
+|---|---|
+| per `PUSH_V` / per `POP_V`, in line | **+3 instructions, +12 bytes** (`LSLS.W`, `CMN.W`, `BCS.W`) |
+| per site, out of line in `.itcram_hot.norslow` | ~6 instructions, never executed unless a straddle occurs |
+| `.op_push_r32`, `.op_pop_r32`, `.op_ret_C3`, `.op_pushfd_9C` | +3 each |
+| `.op_retf_CB`, `.op_iret_CF` | +6, +12 (two and four stack slots) |
+| `.op_pusha_60` / `.op_popa_61` | +24 / +21 (eight slots each) |
+| `__CORE_ITCM_CODE_END__` | 0xDE60 → **0xE930** (+2,768 B), against 64 KB |
+| `__CORE_BSS_END__` | **unchanged** |
+
+The honest reading: on a machine where ordinary opcodes are 29.4% of wall at
+~57 cyc/insn, three instructions and a branch that is not taken 2,047 times in
+2,048 is a real but small addition to the hottest primitive in the
+interpreter. The 0.04%-of-wall figure recorded for `SEAM_CHECK` elsewhere is
+**not** transferable — those sites are not the stack — and no number here is a
+cycle claim. What is not negotiable is the alternative: a fold site that moves
+more than one byte and does not check is wrong at one address in 2,048, and
+this one is the stack.
+
+### The arms
+
+`tests/test_seam.py` grades three, in the DEFAULT run (the old `--stack-seam`
+opt-in is gone), and all three were **seen to fail** with the two
+`SEAM_CHECK`s backed out:
+
+| arm | without the fix |
+|---|---|
+| 1b straddling `PUSH` | neighbour reads `0xBB`, not the pushed `0x56` |
+| 1c straddling `POP` (slot written by the host, only read by the guest) | pops `0xEE78` — the painted slack in place of the neighbour's byte |
+| 1d far `RETF` whose frame's IP word straddles | `IP = 0xEE00`, derails, exits `X86_EXIT_TIMER` at eip `0x70876` instead of the `HLT` at `0x101` |
+
+The contiguous control asserts all three positively and passes in every build,
+and `--negative` (`-DX86_SEAM_FIX=0`) inverts all three and passes there.
+
+The slack byte itself is deliberately **not** graded: the fix works by writing
+*through* the slack and pushing the change into the neighbour at the
+instruction boundary, so after a served straddle the slack holds the same value
+the defect would have left there. Only the neighbour distinguishes them.
