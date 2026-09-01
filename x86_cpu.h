@@ -721,6 +721,10 @@ extern volatile uint32_t x86_opl_status_reads;
 extern volatile uint32_t x86_opl_timer_expiry;
 extern volatile uint32_t x86_opl_t1_gap;
 extern volatile uint32_t x86_io_isa_ticks;
+/* Game port (0x200/0x201). Reads are the number that matters: WOLF3D issues
+   2.35 M of them, more than everything sound-related combined. */
+extern volatile uint32_t x86_gameport_reads;
+extern volatile uint32_t x86_gameport_writes;
 extern volatile uint32_t x86_sb_resets;
 extern volatile uint32_t x86_sb_cmds;
 extern volatile uint32_t x86_pic_imr_now;

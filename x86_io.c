@@ -165,6 +165,12 @@ uint32_t x86_pit_ticks(void)
 #endif
 volatile uint32_t x86_io_isa_ticks;     /* bus ticks charged on the FM ports */
 
+/* Game-port accesses. Reads are the interesting number -- WOLF3D issues 2.35 M
+   of them -- and writes say whether the title is calibrating axes (it will not
+   get anywhere; nothing is attached) or only reading the button bits. */
+volatile uint32_t x86_gameport_reads = 0;
+volatile uint32_t x86_gameport_writes = 0;
+
 /* Per-channel counter state. Channel 1 (DRAM refresh) is carried so the array
    indexes by channel number and nothing has to remember that 2 is really 1. */
 static uint32_t pit_ch_start[3];    /* pit_now when the count was loaded   */
@@ -1919,6 +1925,57 @@ uint32_t x86_port_read(uint32_t port, uint32_t size)
 static uint32_t port_read_inner(uint32_t port)
 {
     switch (port) {
+    /*
+     * THE GAME PORT, AND WHY IT IS THE FIRST CASE IN THIS SWITCH.
+     *
+     * WOLF3D issues 2.35 M `IN 0x201` -- more reads than everything
+     * sound-related put together, and the single most-read port in the machine
+     * after 0x3DA. Until now it was not decoded at all: every one of those
+     * reads fell through this entire switch, then through `dma_decode()` and
+     * `dma_page_decode()`, and came out of the open-bus arm at the bottom
+     * marked "unmodelled". The VALUE was right by accident; the path was the
+     * longest in the file. Decoding it here makes the hottest reads the
+     * cheapest, and stops 2.35 M reads being reported as a port we have never
+     * heard of, which was drowning the unmodelled-port report.
+     *
+     * Bit layout, and note that every bit is ACTIVE LOW:
+     *
+     *   7 6 5 4 3 2 1 0
+     *   | | | | | | | +-- A X axis one-shot still timing
+     *   | | | | | | +---- A Y axis
+     *   | | | | | +------ B X axis
+     *   | | | | +-------- B Y axis
+     *   | | | +---------- A button 1   (0 = PRESSED)
+     *   | | +------------ A button 2
+     *   | +-------------- B button 1
+     *   +---------------- B button 2
+     *
+     * We report NO JOYSTICK PRESENT, which is a constant 0xFF, and that is the
+     * correct answer for both ways of having no joystick:
+     *
+     *   - no game port card at all: the bus floats high, 0xFF.
+     *   - a card with nothing plugged in: the four axis lines are 558 one-shots
+     *     whose pulse width is set by the stick's potentiometer. With nothing
+     *     attached the resistance is infinite, so a triggering write to 0x201
+     *     starts a pulse that NEVER ends and the axis bits stay 1 forever.
+     *
+     * Both give 0xFF, so the one-shot state machine would be dead weight on a
+     * 2.35 M-read path: there is no sequence of writes and reads that could
+     * make an unattached axis bit read 0. DOSBox-X's `read_p201`
+     * (src/hardware/joystick.cpp) agrees exactly -- it starts from `ret=0xff`
+     * and only ever clears bits inside `if (stick[n].enabled)`, so with no
+     * stick enabled it returns 0xFF unconditionally.
+     *
+     * The active-low layout is why this must be 0xFF and not 0x00. A zero here
+     * would read as ALL FOUR BUTTONS HELD DOWN on both sticks, permanently --
+     * the "stuck button" failure. Detection code polls the axis bits with a
+     * bounded counter and concludes "no joystick" when it times out, which is
+     * exactly what a constant 0xFF produces.
+     */
+    case 0x200:
+    case 0x201:
+        x86_gameport_reads++;
+        return 0xFFu;
     /* The counters. Not the reload value: see the PIT clock block above. */
     case 0x40:
         return pit_read_data(0);
@@ -2178,6 +2235,14 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
     unsigned unmodelled = 0;
 #endif
     switch (port) {
+    case 0x200:
+    case 0x201:
+        /* The trigger write. On real hardware it fires the four axis one-shots;
+           with nothing attached they never time out, so there is no state to
+           keep -- see the read side. Decoded so the write is not reported as
+           unmodelled, and so a calibration loop's writes are counted. */
+        x86_gameport_writes++;
+        break;
     case 0x40:
         pit_write_ch0((uint8_t)value);
         break;
