@@ -39,3 +39,7 @@ __pycache__/
 
 # Other agents run in git worktrees under here; they are never our content.
 .claude/worktrees/
+
+# FatFs objects are built in-tree; never commit them.
+lib/FatFs/*.o
+lib/FatFs/*.d
