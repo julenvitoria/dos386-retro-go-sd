@@ -10,7 +10,7 @@ where numbers go stale.
 
 | Tier | State |
 |---|---|
-| 1. gwemu bare-metal | `test_opcodes` **295/295**; `test_video` **25/25 arms** at the shipping `EXTRA_PAGES=1`, Mode Y and EGA 0Dh **64000/64000**; `test_seam`, `test_pit`, `test_dos`, `test_paging` **205** (32 the HMA, 16 the memory policy, 24 the pagefile ring; `run_hma_controls.py` 2/2 caught), `test_nor`, `test_sysinfo`, `test_xms` **47/47**, `test_ems` **40/40**, `test_text`, `test_keyboard`, `test_osk`, `test_disk_cache`, **`test_pmode` 126/126** (protected mode; 16/16 negative controls caught by `scripts/run_pmode_controls.py`) -- and the walk is no longer theory: **two titles now run it**, see below |
+| 1. gwemu bare-metal | `test_opcodes` **295/295**; `test_video` **25/25 arms** at the shipping `EXTRA_PAGES=1`, Mode Y and EGA 0Dh **64000/64000**; `test_seam`, `test_pit`, `test_dos`, `test_paging` **205** (32 the HMA, 16 the memory policy, 24 the pagefile ring; `run_hma_controls.py` 2/2 caught), `test_nor`, `test_sysinfo`, `test_xms` **47/47**, `test_ems` **40/40**, `test_text`, `test_keyboard`, `test_osk`, `test_disk_cache`, **`test_pmode` 164/164** (protected mode; 22/22 negative controls caught by `scripts/run_pmode_controls.py`) -- and the walk is no longer theory: **two titles now run it**, see below |
 | 2. gwemu + retro-go | `core_dtcm_ok=1`, bonus pool 153,600 B, 1,000,001 insns — matches tier 1. **XMS is live and a shipped title uses it**: WOLF3D detects it, allocates and moves 430,636 B in 278 moves, `xms_opens=1`, 0 errors, at a 4% frame cost ([`docs/12`](docs/12_memory_tiers.md) §6) |
 | 3. Hardware | ~**2.8 M insn/s** stock, ~**3.8 M** overclocked, 59 fps. ABI VERIFIED on silicon. **Disk reads are NOT a live cost — they freeze at t+36 s and never move again; SylverB's CMD18/DMA work is already in the flashed firmware.** The live cost was the pagefile WRITE, now 5x cheaper (`docs/12` §1b) |
 
@@ -95,11 +95,12 @@ was plausible and each measured to nothing.
 ## Protected mode — the walk, IDT GATE DELIVERY and IRET are IN
 
 `CR0.PE` no longer traps out, and neither does `INT imm8` with PE set —
-**which is the instruction Dark Forces AND Mortal Kombat both stop on.**
+**which is the instruction Dark Forces AND Mortal Kombat both stop on** — and
+neither do `LAR`, `LSL`, `VERR`, `VERW`, `STR`, `LTR` or `CLTS`.
 `LGDT`/`LIDT`/`LLDT`, GDT/LDT fetch, type/DPL/present with the right vector and
 error code, cached per-segment descriptor, `CR0.PE` both ways, same-privilege
 far JMP, **same-privilege IDT gate dispatch and `IRET`**. `test_pmode.py`
-**126 checks**; `run_pmode_controls.py` **16/16 seen to fail** when compiled
+**164 checks**; `run_pmode_controls.py` **22/22 seen to fail** when compiled
 out. Real-mode cost proven by DISASSEMBLY DIFF (`scripts/disasm_diff.py`), not
 argued: `.fetch_decode_loop`, every `.op_*` handler **except `.op_iret_CF`**,
 the ModRM decoders and all four dispatch tables byte-identical;
@@ -108,8 +109,15 @@ the ModRM decoders and all four dispatch tables byte-identical;
 **`test_benchmark` cannot decide this**: under gwemu it spans 10.30–11.88 M
 cycles on the BASELINE alone. NOT built and REFUSED rather than approximated:
 call gates, ring changes, stack switches, the TSS, task gates, paging,
-per-access limit enforcement. **NEXT IS A MEASUREMENT, NOT A BUILD — where
-Dark Forces stops now, and whether it ever changes ring.**
+per-access limit enforcement. **"Does it ever change ring" IS ANSWERED, STATICALLY: `opcode_demand.py` over
+DOS4GW.EXE finds all 256 IDT template entries at DPL 0 and NO DPL-3 code
+descriptor — DOS/4GW RUNS ENTIRELY AT CPL 0**, so call gates, TSS stack
+switches, task switching and `IRET`-across-privilege are DELETED (~1,225
+lines), not deferred. The demand that WAS real (58 `LAR`, 28 `LSL`, 5 `CLTS`,
+5 `STR`, 2 `LTR`) is built: group 6 complete, `0F 02`/`03`/`06`, task register
+loaded and stored with NO task switch. Real mode again pays nothing (disasm
+diff: 0 hot symbols changed). ITCM **0xD978 -> 0xDE60**, `__CORE_BSS_END__`
+**+568 B**. **NEXT IS STILL A MEASUREMENT — where Dark Forces stops now.**
 [`docs/14`](docs/14_protected_mode.md).
 
 ## Retractions worth keeping

@@ -105,6 +105,33 @@ ARMS = [
      "checks only code-ness and present, so nothing else in the suite can "
      "grade it. Without it an IRET returns into a segment at the wrong "
      "privilege."),
+    # ---- the DESCRIPTOR-INSPECTION instructions --------------------------
+    (17, "LTR TYPE",
+     "LTR's descriptor must be an AVAILABLE TSS, not a busy one and not "
+     "anything else. The arm's target is a BUSY TSS -- present, S=0 and a "
+     "TSS type -- so every weaker rule admits it and only this one refuses "
+     "it. Without the check a task the guest believes is running is entered "
+     "a second time."),
+    (18, "LAR/LSL PRIVILEGE",
+     "DPL >= max(CPL, RPL) for LAR, LSL, VERR and VERW. Without it an "
+     "extender's `may I touch this` probe answers yes for a selector it may "
+     "not touch, which is the one question these instructions exist to ask."),
+    (19, "LAR TYPE LIST",
+     "an INTERRUPT or TRAP gate is NOT accessible to LAR. `any present "
+     "descriptor` is the intuitive rule and this is where it is wrong: the "
+     "arm's gate is present and well-formed."),
+    (20, "LSL TYPE LIST",
+     "a CALL GATE is accessible to LAR and NOT to LSL -- a gate has no limit "
+     "to load. This is the ONLY descriptor the two type lists disagree "
+     "about, so the arm replaces LSL's list with LAR's and nothing else in "
+     "the suite moves."),
+    (21, "VERR READABLE",
+     "VERR of EXECUTE-ONLY code must clear ZF. Without it a guest reads a "
+     "segment the chip would have faulted on."),
+    (22, "VERW WRITABLE",
+     "VERW admits ONLY writable data -- no code type, conforming or not. "
+     "Without it VERW becomes VERR, and both the read-only-data arm and the "
+     "readable-code arm move."),
 ]
 
 

@@ -220,6 +220,14 @@ struct X86CPUState {
     uint32_t ldt_base;
     uint32_t ldt_limit;      /* byte limit, G already applied */
     uint32_t ldt_sel;
+    /* The TASK REGISTER. Loaded by LTR, stored by STR, and NOTHING ELSE reads
+       it: no task switch is implemented, because DOS/4GW runs entirely at
+       CPL 0 and never asks for one (x86_pmode.c). A TSS is still needed for
+       SS0:ESP0 and the I/O permission bitmap, which is why the register
+       exists at all. */
+    uint32_t tr_base;
+    uint32_t tr_limit;       /* byte limit, G already applied */
+    uint32_t tr_sel;
     uint32_t cpl;            /* == CS.RPL; see x86_pmode.c */
     /* The last segmentation fault, recorded where a host can read it. There is
        no protected-mode IDT gate path yet, so a fault EXITS the interpreter
@@ -781,6 +789,18 @@ int x86_sb_raise_irq(X86CPUState *cpu);
 int x86_pmode_load_seg(X86CPUState *cpu, uint32_t seg, uint32_t sel);
 /* LLDT. Same return convention. */
 int x86_pmode_lldt(X86CPUState *cpu, uint32_t sel);
+/* LTR. Same return convention. LOADS THE TASK REGISTER AND DOES NOT SWITCH
+   TASKS -- see x86_pmode.c for why that is a complete implementation of what
+   any title in this tree asks for. */
+int x86_pmode_ltr(X86CPUState *cpu, uint32_t sel);
+/* LAR / LSL / VERR / VERW. These NEVER FAULT: an inaccessible selector is
+   reported by returning 0, which the caller turns into ZF=0. LAR and LSL
+   leave their output untouched in that case, which is architectural. */
+int x86_pmode_lar(X86CPUState *cpu, uint32_t sel, uint32_t *ar);
+int x86_pmode_lsl(X86CPUState *cpu, uint32_t sel, uint32_t *limit);
+int x86_pmode_verrw(X86CPUState *cpu, uint32_t sel, uint32_t write);
+extern volatile uint32_t x86_pmode_ars;        /* LAR/LSL/VERR/VERW executed */
+extern volatile uint32_t x86_pmode_ltrs;       /* task registers loaded      */
 /* Re-derive the dispatch table from CS.D after a protected-mode CS load.
    Exposed for the tier-1 harness, which sets segments up by hand. */
 void x86_pmode_sync_mode(X86CPUState *cpu);

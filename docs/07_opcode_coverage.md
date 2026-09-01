@@ -94,9 +94,9 @@ only). That leaves roughly **185 one-byte opcodes believed correct**.
 |---|---|
 | One-byte slots with a handler | **255 / 256** |
 | One-byte slots dispatching to `.exit_loop` | **1 / 256** |
-| Two-byte (0F) slots with a handler | **51 / 256** |
-| Two-byte slots dispatching to `.exit_loop` | **205 / 256** |
-| Implemented slots carrying at least one mechanical warning | **177** |
+| Two-byte (0F) slots with a handler | **54 / 256** |
+| Two-byte slots dispatching to `.exit_loop` | **202 / 256** |
+| Implemented slots carrying at least one mechanical warning | **180** |
 
 Every row below is DERIVED. `status` is `reached` or `.exit_loop`, taken from
 the dispatch table. `mode` is `OP` (dual-emitted) or `OP_AGNOSTIC`, taken from the
@@ -384,11 +384,11 @@ Warning legend:
 |---|---|---|---|---|---|
 | 0F 00 | reached | `.op_0f_00` | dual | - | no flag macro reachable |
 | 0F 01 | reached | `.op_0f_01` | dual | - | - |
-| 0F 02 | **`.exit_loop`** | `.exit_loop` | - | - | - |
-| 0F 03 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 02 | reached | `.op_0f_lar_02` | dual | - | no flag macro reachable |
+| 0F 03 | reached | `.op_0f_lsl_03` | dual | - | no flag macro reachable |
 | 0F 04 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F 05 | **`.exit_loop`** | `.exit_loop` | - | - | - |
-| 0F 06 | **`.exit_loop`** | `.exit_loop` | - | - | - |
+| 0F 06 | reached | `.op_0f_clts_06` | AGN | - | REVIEW: no width primitive, 4 bare word op(s), no flag macro reachable |
 | 0F 07 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F 08 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F 09 | **`.exit_loop`** | `.exit_loop` | - | - | - |
@@ -765,16 +765,20 @@ F6: 7 of 8 reach code, 1 of those 7 is a no-op. F7: 7 of 8 reach code and are co
 
 | /reg | Op | Status |
 |---|---|---|
-| /0 | SLDT Ew | unimplemented |
-| /1 | STR Ew | unimplemented |
-| /2 | LLDT Ew | unimplemented |
-| /3 | LTR Ew | unimplemented |
-| /4 | VERR Ew | unimplemented |
-| /5 | VERW Ew | unimplemented |
-| /6, /7 | (invalid) | unimplemented |
+| /0 | SLDT Ew | implemented |
+| /1 | STR Ew | implemented — the task register is loaded and stored; NO TASK SWITCH |
+| /2 | LLDT Ew | implemented |
+| /3 | LTR Ew | implemented — validates the descriptor as an AVAILABLE TSS and marks it busy |
+| /4 | VERR Ew | implemented — ZF only, never faults |
+| /5 | VERW Ew | implemented — ZF only, never faults |
+| /6, /7 | (invalid) | correctly `.exit_loop` |
 
-The whole `0F 00` table slot is `.exit_loop`, so none of these can be reached. Consistent
-with a real-mode-only core.
+ALL SIX members are reachable. `LTR` is here because `scripts/opcode_demand.py`
+counted two static sites in DOS4GW.EXE and `STR` five, and a TSS at DPL 0 is
+wanted for SS0:ESP0 and the I/O permission bitmap — it is **not** evidence of a
+ring change, and no task switch is built. `VERR`/`VERW` share the machinery of
+`0F 02`/`0F 03` and are refused in real mode, where they are not instructions.
+See [`docs/14`](14_protected_mode.md).
 
 ### `0F 01` — Grp7
 
@@ -854,7 +858,7 @@ Segment override coverage on the *destination* of string ops is correctly refuse
 | 386 `0F AF` IMUL Gv,Ev | 0 | Implemented. |
 | 386 `0F A0/A1/A8/A9` PUSH/POP FS,GS | 4 | Unimplemented. |
 | 386 control/debug regs `0F 20`–`0F 27` | 8 | Unimplemented — consistent with a real-mode-only core. |
-| 286 protected mode `0F 00`, `0F 02`, `0F 03`, `0F 06` | 4 | Unimplemented. |
+| 286 protected mode `0F 00`, `0F 02`, `0F 03`, `0F 06` | 0 | Implemented: all of Grp6, `LAR`, `LSL`, `CLTS`. `LAR`/`LSL`/`VERR`/`VERW` exit as unimplemented in REAL mode, where they are not instructions. |
 | 486/Pentium+ (`0F 31` RDTSC, `0F A2` CPUID, `0F C8`–`CF` BSWAP, CMPXCHG, XADD, MMX/SSE) | 158 | **Out of scope** for a 386-class target. |
 
 ## Defects, prioritised

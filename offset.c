@@ -60,6 +60,9 @@ int main(void)
     EMIT("CPU_LDT_BASE",   offsetof(X86CPUState, ldt_base));
     EMIT("CPU_LDT_LIMIT",  offsetof(X86CPUState, ldt_limit));
     EMIT("CPU_LDT_SEL",    offsetof(X86CPUState, ldt_sel));
+    EMIT("CPU_TR_BASE",    offsetof(X86CPUState, tr_base));
+    EMIT("CPU_TR_LIMIT",   offsetof(X86CPUState, tr_limit));
+    EMIT("CPU_TR_SEL",     offsetof(X86CPUState, tr_sel));
     EMIT("CPU_CPL",        offsetof(X86CPUState, cpl));
     EMIT("CPU_PMODE_EXCP", offsetof(X86CPUState, pmode_excp));
     EMIT("CPU_PMODE_ERR",  offsetof(X86CPUState, pmode_err));
