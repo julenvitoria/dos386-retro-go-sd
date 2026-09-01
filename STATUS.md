@@ -10,7 +10,7 @@ where numbers go stale.
 
 | Tier | State |
 |---|---|
-| 1. gwemu bare-metal | `test_opcodes` **295/295**; `test_video` **25/25 arms** at the shipping `EXTRA_PAGES=1`, Mode Y and EGA 0Dh **64000/64000**; `test_seam`, `test_pit`, `test_dos`, `test_paging` **205** (32 the HMA, 16 the memory policy, 24 the pagefile ring; `run_hma_controls.py` 2/2 caught), `test_nor`, `test_sysinfo`, `test_xms` **47/47**, `test_ems` **40/40**, `test_text`, `test_keyboard`, `test_osk`, `test_disk_cache`, **`test_pmode` 80/80** (protected mode; 10/10 negative controls caught by `scripts/run_pmode_controls.py`) -- and the walk is no longer theory: **two titles now run it**, see below |
+| 1. gwemu bare-metal | `test_opcodes` **295/295**; `test_video` **25/25 arms** at the shipping `EXTRA_PAGES=1`, Mode Y and EGA 0Dh **64000/64000**; `test_seam`, `test_pit`, `test_dos`, `test_paging` **205** (32 the HMA, 16 the memory policy, 24 the pagefile ring; `run_hma_controls.py` 2/2 caught), `test_nor`, `test_sysinfo`, `test_xms` **47/47**, `test_ems` **40/40**, `test_text`, `test_keyboard`, `test_osk`, `test_disk_cache`, **`test_pmode` 126/126** (protected mode; 16/16 negative controls caught by `scripts/run_pmode_controls.py`) -- and the walk is no longer theory: **two titles now run it**, see below |
 | 2. gwemu + retro-go | `core_dtcm_ok=1`, bonus pool 153,600 B, 1,000,001 insns — matches tier 1. **XMS is live and a shipped title uses it**: WOLF3D detects it, allocates and moves 430,636 B in 278 moves, `xms_opens=1`, 0 errors, at a 4% frame cost ([`docs/12`](docs/12_memory_tiers.md) §6) |
 | 3. Hardware | ~**2.8 M insn/s** stock, ~**3.8 M** overclocked, 59 fps. ABI VERIFIED on silicon. **Disk reads are NOT a live cost — they freeze at t+36 s and never move again; SylverB's CMD18/DMA work is already in the flashed firmware.** The live cost was the pagefile WRITE, now 5x cheaper (`docs/12` §1b) |
 
@@ -89,20 +89,28 @@ was plausible and each measured to nothing.
 | **EPIC_PINBALL's 64,000-read spin on `IN 0x22A` is FIXED** (6 reads). It now resets the DSP twice, issues 5 commands with **none unknown**, programs the mixer and a 22,050 Hz rate -- and dies EARLIER, at 483,354 instructions, on `guest_exit_reason=4` `exit_info=0x0F`: **an unimplemented opcode, not a sound defect.** That is the next thing in its way | [`docs/07`](docs/07_opcode_coverage.md) |
 | **WOLF3D and PRINCE OF PERSIA have sound** (digitised + FM music). Retro-go's Pause overlay is unreadable over 256-colour modes | [`docs/08`](docs/08_vga_mode13h.md) §1 |
 | **`X86_VPROF=1` DOES NOT FIT and fails SILENTLY** — adds ~1,080 B to RAM_EMU, `guest_ram` returns NULL, `core_ready` stays 0, the frame loop paints nothing. Reproduced on STOCK master (KEEN4: `core_ready`=0 at 1, =1 with 157 M insns at 0). **THIRD instance of this shape** — see the RAM_EMU row in Budgets | `Makefile.core` |
-| **THE DESCRIPTOR WALK IS EXERCISED BY A TITLE AT LAST — `CR0=1` on Dark Forces AND Mortal Kombat.** LMSW, not `MOV CR0`, is what a DOS extender issues (it must also run on a 286), which is why the walk sat unexercised for so long. It HELD: both come out with `CS=0x0070`, a real GDT selector with base `0xA900` rather than `sel<<4`, and `SS=0x0020`. Both now stop on the SAME real thing — `exit_info=0xCD`, `INT imm8` with PE set — which is protected-mode IDT gate dispatch, i.e. PLAN Queue B5, now **measured demand from two titles**. Epic Pinball is unrelated and still real mode, stopped on `PUSH FS` (`0x0FA0`). Cost: ITCM **0xD2D8 -> 0xD580**, `__CORE_BSS_END__` **unchanged** — zero RAM_EMU, zero pager frames | [`docs/13`](docs/13_title_status.md) |
+| **THE DESCRIPTOR WALK IS EXERCISED BY A TITLE AT LAST — `CR0=1` on Dark Forces AND Mortal Kombat.** LMSW, not `MOV CR0`, is what a DOS extender issues (it must also run on a 286), which is why the walk sat unexercised for so long. It HELD: both come out with `CS=0x0070`, a real GDT selector with base `0xA900` rather than `sel<<4`, and `SS=0x0020`. Both stopped on the SAME real thing — `exit_info=0xCD`, `INT imm8` with PE set — and **that is now BUILT** (gate dispatch + `IRET`, same privilege; `test_pmode` 126/126, 16/16 controls). Where they stop NEXT is UNMEASURED: tier 2 does not reach the guest in a fresh worktree, reproduced on stock master, see `docs/14` §8. Epic Pinball is unrelated and still real mode, stopped on `PUSH FS` (`0x0FA0`). Cost of the walk: ITCM **0xD2D8 -> 0xD580**, `__CORE_BSS_END__` unchanged. Cost of the gate + IRET on top: ITCM **0xD580 -> 0xD6A8** (+296 B, all cold), `__CORE_BSS_END__` **0x24067F00 -> 0x24068300 (+1,024 B)** — READ `guest_ram_pages_short` before adding more | [`docs/13`](docs/13_title_status.md) |
 | **Interpreter gaps**: seg override before `REP` survives one element; `moffs` uses operand not ADDRESS size; `MOV SS,x` does not inhibit interrupts; 5 handlers ignore `0x67`; 13 slots exit (x87, `BOUND`/`ARPL`, `XLAT`, `WAIT`, `INT1`) | [`docs/07`](docs/07_opcode_coverage.md) |
 
-## Protected mode — the descriptor walk is IN, real mode pays NOTHING
+## Protected mode — the walk, IDT GATE DELIVERY and IRET are IN
 
-`CR0.PE` no longer traps out: `LGDT`/`LIDT`/`LLDT`, GDT/LDT fetch, type/DPL/
-present with the right vector and error code, cached per-segment descriptor,
-`CR0.PE` both ways, same-privilege far JMP. `test_pmode.py` **80 checks**;
-`run_pmode_controls.py` **10/10 seen to fail** when compiled out. Zero
-real-mode cost proven by DISASSEMBLY DIFF, not argued — `.fetch_decode_loop`
-and every `.op_*` handler byte-identical. **`test_benchmark` cannot decide
-this**: under gwemu it spans 10.30–11.88 M cycles on the BASELINE alone. NOT
-built: gates, `IRET` across privilege, stack switches, paging, per-access limit
-enforcement. [`docs/14`](docs/14_protected_mode.md).
+`CR0.PE` no longer traps out, and neither does `INT imm8` with PE set —
+**which is the instruction Dark Forces AND Mortal Kombat both stop on.**
+`LGDT`/`LIDT`/`LLDT`, GDT/LDT fetch, type/DPL/present with the right vector and
+error code, cached per-segment descriptor, `CR0.PE` both ways, same-privilege
+far JMP, **same-privilege IDT gate dispatch and `IRET`**. `test_pmode.py`
+**126 checks**; `run_pmode_controls.py` **16/16 seen to fail** when compiled
+out. Real-mode cost proven by DISASSEMBLY DIFF (`scripts/disasm_diff.py`), not
+argued: `.fetch_decode_loop`, every `.op_*` handler **except `.op_iret_CF`**,
+the ModRM decoders and all four dispatch tables byte-identical;
+`L(HANDLE_INTERRUPT)`'s real-mode arm identical but for one branch TARGET.
+**The whole cost is 3 instructions at the top of `.op_iret_CF`, per IRET.**
+**`test_benchmark` cannot decide this**: under gwemu it spans 10.30–11.88 M
+cycles on the BASELINE alone. NOT built and REFUSED rather than approximated:
+call gates, ring changes, stack switches, the TSS, task gates, paging,
+per-access limit enforcement. **NEXT IS A MEASUREMENT, NOT A BUILD — where
+Dark Forces stops now, and whether it ever changes ring.**
+[`docs/14`](docs/14_protected_mode.md).
 
 ## Retractions worth keeping
 

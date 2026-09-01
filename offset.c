@@ -64,6 +64,12 @@ int main(void)
     EMIT("CPU_PMODE_EXCP", offsetof(X86CPUState, pmode_excp));
     EMIT("CPU_PMODE_ERR",  offsetof(X86CPUState, pmode_err));
     EMIT("CPU_HOST_SP",    offsetof(X86CPUState, host_sp));
+    /* Not an offset: the `type` bits x86_pmode_int_gate() takes. Emitted here
+       for the same reason every offset is -- the protected-mode arm of
+       L(HANDLE_INTERRUPT) passes it as an immediate, and a literal in the
+       assembly could drift from the header without anything noticing. */
+    EMIT("X86_INT_SOFTWARE",  X86_INT_SOFTWARE);
+    EMIT("X86_INT_HAS_ERROR", X86_INT_HAS_ERROR);
     printf("\n");
 
     EMIT("CPU_CR0", offsetof(X86CPUState, cr0));

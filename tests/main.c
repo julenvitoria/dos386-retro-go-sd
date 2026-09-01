@@ -3072,11 +3072,12 @@ static void nor_test_run(void)
  *   0x32010  0xA5  -- reached through LDT selector 0x0C (base 0x32000)
  * ========================================================================= */
 volatile uint32_t run_pmode_flag = 0;
-volatile uint32_t pmode_r[80];
+volatile uint32_t pmode_r[128];
 
 #define PM_GDT   0x2000u
 #define PM_LDT   0x2800u
 #define PM_OPND  0x1000u
+#define PM_IDT   0x4000u
 
 /* Build one 8-byte descriptor. `access` is the byte at offset 5 (P/DPL/S/type)
    and `gran` the high nibble of the byte at offset 6 (G/D/AVL) -- both written
@@ -3096,8 +3097,27 @@ static void pm_desc(uint32_t at, uint32_t base, uint32_t limit,
     d[7] = (uint8_t)((base >> 24) & 0xFF);
 }
 
-/* Reset the CPU and run a program placed at guest 0. Returns exit_reason. */
-static uint32_t pm_run(const uint8_t *prog, uint32_t len)
+/* Build one 8-byte GATE. `access` is byte 5 (P/DPL/S/type) exactly as for a
+   segment descriptor; the rest of the layout is the gate's own -- offset low
+   at 0-1, SELECTOR at 2-3, the parameter-count byte at 4, offset high at 6-7.
+   Written raw, like pm_desc, so the tables below read like the manual. */
+static void pm_gate(uint32_t at, uint16_t sel, uint32_t off, uint8_t access)
+{
+    uint8_t *d = test_ram + at;
+    d[0] = (uint8_t)(off & 0xFF);
+    d[1] = (uint8_t)((off >> 8) & 0xFF);
+    d[2] = (uint8_t)(sel & 0xFF);
+    d[3] = (uint8_t)((sel >> 8) & 0xFF);
+    d[4] = 0;
+    d[5] = access;
+    d[6] = (uint8_t)((off >> 16) & 0xFF);
+    d[7] = (uint8_t)((off >> 24) & 0xFF);
+}
+
+/* Reset the CPU and run a program placed at guest 0, with the descriptor
+   tables sized by `gdt_limit`/`idt_limit`. Returns exit_reason. */
+static uint32_t pm_run_lim(const uint8_t *prog, uint32_t len,
+                           uint32_t gdt_limit, uint32_t idt_limit)
 {
     memcpy(test_ram, prog, len);
     memset(&cpu_state_dtcm, 0, sizeof(cpu_state_dtcm));
@@ -3107,11 +3127,29 @@ static uint32_t pm_run(const uint8_t *prog, uint32_t len)
     cpu_state_dtcm.pit_counter = 0xFFFFFFFF;
     /* The GDT is normally installed by the guest's own LGDT, and one arm below
        proves LGDT does that. The rest start with it already in place so a
-       failure in a later arm cannot be an LGDT failure wearing a disguise. */
+       failure in a later arm cannot be an LGDT failure wearing a disguise.
+       The IDT is here for the same reason -- arm A proves LIDT parses its
+       operand, and no interrupt arm should be able to fail for LIDT. */
     cpu_state_dtcm.gdt_base = PM_GDT;
-    cpu_state_dtcm.gdt_limit = 0x3F;
+    cpu_state_dtcm.gdt_limit = gdt_limit;
+    cpu_state_dtcm.idtr_base = PM_IDT;
+    cpu_state_dtcm.idtr_limit = (uint16_t)idt_limit;
     x86_cpu_interp_asm();
     return cpu_state_dtcm.exit_reason;
+}
+
+static uint32_t pm_run(const uint8_t *prog, uint32_t len)
+{
+    return pm_run_lim(prog, len, 0x3F, 0x1FF);
+}
+
+/* The interrupt arms need descriptors the walk arms' 0x3F limit cannot hold,
+   and they must not disturb it: arms E and M grade that very bound. So they
+   run with a larger GDT and put everything new at 0x48 and above, past the
+   0x40 entry arm M deliberately leaves outside. */
+static uint32_t pm_run_int(const uint8_t *prog, uint32_t len)
+{
+    return pm_run_lim(prog, len, 0x7F, 0x1FF);
 }
 
 /* The three instructions that turn PE on, and the three that turn it off.
@@ -3123,7 +3161,7 @@ static uint32_t pm_run(const uint8_t *prog, uint32_t len)
 
 static void pmode_test_run(void)
 {
-    for (uint32_t i = 0; i < 80; i++)
+    for (uint32_t i = 0; i < 128; i++)
         pmode_r[i] = 0;
 
     /* Undo whatever the A20 and pager arms left behind: they unmap everything
@@ -3161,6 +3199,35 @@ static void pmode_test_run(void)
        and the arm still "passes" -- which is exactly what the first version of
        this test did, and the negative control caught it. */
     pm_desc(PM_GDT + 0x40, 0x33000, 0xFFFF, 0x92, 0x00);
+
+    /* ---- and the descriptors the INTERRUPT arms need ------------------
+       All at 0x48 and above, so the walk arms' GDT limit of 0x3F -- which
+       arms E and M grade -- is untouched and the 0x40 entry arm M puts
+       deliberately out of bounds stays out of bounds. */
+    memset(test_ram + PM_GDT + 0x48, 0, 0x38);
+    /* 0x48  READABLE code, DPL 0, base 0x30000: the gate target, and the
+       segment the IRET arms return INTO                                  */
+    pm_desc(PM_GDT + 0x48, 0x30000, 0xFFFF, 0x9A, 0x00);
+    /* 0x50  READABLE code, DPL 3, base 0x31000: reaching it makes CPL 3,
+       which is the only way to grade the software-interrupt gate DPL rule,
+       and it is also the wrong-DPL target the IRET rule must refuse       */
+    pm_desc(PM_GDT + 0x50, 0x31000, 0xFFFF, 0xFA, 0x00);
+
+    /* ---- the IDT --------------------------------------------------------
+       Limit 0x1FF: vectors 0 to 0x3F, so 0x40 is exactly one gate past the
+       end. The gate PUT there is well-formed, for the reason arm M's
+       descriptor is: with junk at that address, removing the bound would
+       merely move the fault to the type check and the arm would still
+       "pass". */
+    memset(test_ram + PM_IDT, 0, 0x208);
+    pm_gate(PM_IDT + 0x21 * 8, 0x48, 0x20, 0x8E);   /* 386 INT gate, DPL 0  */
+    pm_gate(PM_IDT + 0x22 * 8, 0x48, 0x20, 0x8F);   /* 386 TRAP gate        */
+    pm_gate(PM_IDT + 0x23 * 8, 0x48, 0x20, 0x9E);   /* S=1: not a gate      */
+    pm_gate(PM_IDT + 0x24 * 8, 0x48, 0x20, 0x0E);   /* NOT PRESENT          */
+    pm_gate(PM_IDT + 0x25 * 8, 0x48, 0x30, 0x86);   /* 286 INT gate: 16-bit */
+    pm_gate(PM_IDT + 0x26 * 8, 0x48, 0x20, 0x8E);   /* DPL 0, taken at CPL 3 */
+    pm_gate(PM_IDT + 0x27 * 8, 0x50, 0x00, 0xEE);   /* DPL 3, CS DPL 3      */
+    pm_gate(PM_IDT + 0x40 * 8, 0x48, 0x20, 0x8E);   /* valid, PAST the limit */
 
     /* A HLT at the base of the code descriptor at selector 0x30, so a far
        jump that installs it has somewhere to land. */
@@ -3554,6 +3621,299 @@ static void pmode_test_run(void)
         };
         pmode_r[78] = pm_run(bad, sizeof(bad));             /* 13 */
         pmode_r[79] = cpu_state_dtcm.pmode_err;             /* 0x08 */
+    }
+
+    /* ==================================================================
+     * PROTECTED-MODE INTERRUPT DELIVERY, arms O to U.
+     *
+     * WHY THESE EXIST NOW. The walk above shipped with no guest in the tree
+     * exercising it. That is no longer true: Dark Forces AND Mortal Kombat
+     * both reach CR0.PE=1 through LMSW, come out with CS=0x0070 and
+     * SS=0x0020, and both stop on the SAME instruction -- `INT imm8` with
+     * PE set, which L(HANDLE_INTERRUPT) refused for want of a gate walk.
+     * These arms grade the walk that answers it, and the IRET that returns
+     * from it, at the SAME PRIVILEGE only. Call gates, ring changes, stack
+     * switches, task gates and paging are NOT built and are NOT tested --
+     * a test that passes over unbuilt code is worse than no test.
+     *
+     * THE CODE THE GATES POINT AT, and where it lives. Selector 0x48 is
+     * based at 0x30000 and 0x50 at 0x31000, so an offset in a gate is a
+     * linear address 0x30000 higher. Nothing here writes 0x30000 or
+     * 0x30010 themselves: those belong to arms B and N, which have already
+     * run, and leaving them alone keeps an ordering accident from becoming
+     * a passing test.
+     *
+     *   0x48:0x0020   HLT       the delivery arms' landing site
+     *   0x48:0x0030   IRET      the round trip's handler
+     *   0x48:0x0060   HLT       where the good IRET returns to
+     *   0x48:0x0100   STI / INT 0x25 / HLT     the round trip itself
+     *   0x48:0x0200   a hand-built IRET frame naming a WRONG-DPL selector
+     *   0x48:0x0220   ... and the same frame naming a right one
+     *   0x50:0x0000   HLT       vector 0x27's target, at DPL 3
+     *   0x50:0x0010   INT 0x26 / HLT           run at CPL 3
+     * ================================================================== */
+    test_ram[0x30020] = 0xF4;                       /* HLT               */
+    test_ram[0x30030] = 0xCF;                       /* IRET              */
+    test_ram[0x30060] = 0xF4;                       /* HLT               */
+    {
+        /* STI first, so "the gate cleared IF" and "the IRET put it back"
+           are both gradeable. With IF already 0 -- which is what a zeroed
+           context gives -- neither check can fail and both look live. */
+        static const uint8_t body[] = { 0xFB, 0xCD, 0x25, 0xF4 };
+        memcpy(test_ram + 0x30100, body, sizeof(body));
+        /* PUSH imm16 x3 builds an IRET frame by hand: FLAGS, then CS, then
+           IP, because IRET pops them in the opposite order. CS 0x0050 is a
+           DPL 3 code selector loaded at RPL 0, so RPL == CPL (the return is
+           same-privilege and legal on that count) and DPL != RPL (which is
+           the rule this arm exists for). Selector 0x50 is based at 0x31000
+           where a HLT is waiting, so if the rule is removed the IRET
+           SUCCEEDS and lands on a halt -- an unambiguous survivor rather
+           than a hang that could be anything. */
+        static const uint8_t bad_iret[] = {
+            0x68, 0x00, 0x00,       /* PUSH 0x0000   FLAGS */
+            0x68, 0x50, 0x00,       /* PUSH 0x0050   CS    */
+            0x68, 0x00, 0x00,       /* PUSH 0x0000   IP    */
+            0xCF,                   /* IRET                */
+        };
+        memcpy(test_ram + 0x30200, bad_iret, sizeof(bad_iret));
+        /* The twin: the identical frame naming selector 0x48, whose DPL 0
+           does equal its RPL. It returns, so the arm above failed for the
+           DPL rule and not merely for being a hand-built frame. */
+        static const uint8_t good_iret[] = {
+            0x68, 0x00, 0x00,       /* PUSH 0x0000   FLAGS */
+            0x68, 0x48, 0x00,       /* PUSH 0x0048   CS    */
+            0x68, 0x60, 0x00,       /* PUSH 0x0060   IP    */
+            0xCF,                   /* IRET                */
+        };
+        memcpy(test_ram + 0x30220, good_iret, sizeof(good_iret));
+    }
+    test_ram[0x31000] = 0xF4;                       /* HLT, at DPL 3     */
+    {
+        static const uint8_t at_cpl3[] = { 0xCD, 0x26, 0xF4 };
+        memcpy(test_ram + 0x31010, at_cpl3, sizeof(at_cpl3));
+    }
+
+    /* ---- O. INT through a 386 INTERRUPT GATE -------------------------
+     * The frame width is the GATE's -- three 4-byte words -- and NOT the
+     * operand size, which is 16 here because CS.D is 0 throughout. That is
+     * NEGATIVE CONTROL 15, and ESP is what grades it: 12 bytes of frame
+     * leave SP at 0x7FF4, six bytes leave it at 0x7FFA.
+     *
+     *   BC 00 80   MOV SP,8000h     3 bytes
+     *   PM_ENTER                    8 bytes
+     *   CD 21      INT 21h          2 bytes, at offset 0x0B
+     *                               so the pushed IP is 0x0D
+     */
+    {
+        static const uint8_t prog[] = {
+            0xBC, 0x00, 0x80,
+            PM_ENTER,
+            0xCD, 0x21,
+        };
+        x86_pmode_gates = 0;
+        pmode_r[80] = pm_run_int(prog, sizeof(prog));       /* 6 = HLT   */
+        pmode_r[81] = cpu_state_dtcm.segs[X86_CPU_SEG_CS].sel;   /* 0x48 */
+        pmode_r[82] = cpu_state_dtcm.segs[X86_CPU_SEG_CS].base;  /* 0x30000 */
+        pmode_r[83] = cpu_state_dtcm.eip;                  /* 0x21: past HLT */
+        pmode_r[84] = cpu_state_dtcm.regs[4];              /* 0x7FF4    */
+        pmode_r[85] = *(uint32_t *)(test_ram + 0x7FF4);    /* pushed EIP */
+        pmode_r[86] = *(uint32_t *)(test_ram + 0x7FF8);    /* pushed CS  */
+        /* An INTERRUPT gate clears IF; STI is not in this program, so the
+           TRAP arm below is what makes this number mean anything. */
+        pmode_r[87] = (cpu_state_dtcm.eflags >> 9) & 1u;   /* 0         */
+        pmode_r[88] = x86_pmode_gates;                     /* 1         */
+    }
+
+    /* ---- P. a TRAP gate leaves IF alone ------------------------------
+     * The ONLY difference between vector 0x21 and 0x22 is bit 0 of the gate
+     * type. With STI in front, IF must survive 0x22 and must not survive
+     * 0x21 -- and the pair is what makes either number a check.
+     */
+    {
+        static const uint8_t trap[] = {
+            0xBC, 0x00, 0x80,
+            PM_ENTER,
+            0xFB,                       /* STI          */
+            0xCD, 0x22,                 /* INT 22h      */
+        };
+        pmode_r[89] = pm_run_int(trap, sizeof(trap));      /* 6 = HLT   */
+        pmode_r[90] = (cpu_state_dtcm.eflags >> 9) & 1u;   /* 1: kept   */
+
+        static const uint8_t intr[] = {
+            0xBC, 0x00, 0x80,
+            PM_ENTER,
+            0xFB,                       /* STI          */
+            0xCD, 0x21,                 /* INT 21h      */
+        };
+        pmode_r[91] = pm_run_int(intr, sizeof(intr));      /* 6 = HLT   */
+        pmode_r[92] = (cpu_state_dtcm.eflags >> 9) & 1u;   /* 0: cleared */
+    }
+
+    /* ---- Q. a 286 gate builds a 16-BIT frame -------------------------
+     * Same instruction, same operand size, same code segment -- only the
+     * gate's type differs, and the frame is six bytes instead of twelve.
+     * Vector 0x25's handler is the IRET at 0x48:0x0030, so this arm also
+     * says the 16-bit frame is the one arm T's IRET pops back.
+     */
+    {
+        static const uint8_t prog[] = {
+            0xBC, 0x00, 0x80,
+            PM_ENTER,
+            0xEA, 0x00, 0x01, 0x48, 0x00,   /* JMP FAR 0x48:0x0100 */
+        };
+        pmode_r[93] = pm_run_int(prog, sizeof(prog));      /* 6 = HLT   */
+        /* The IRET at the far end put SP back, so read the frame from the
+           memory it was built in rather than from ESP. */
+        pmode_r[94] = *(uint16_t *)(test_ram + 0x7FFA);    /* pushed IP: 0x103 */
+        pmode_r[95] = *(uint16_t *)(test_ram + 0x7FFC);    /* pushed CS: 0x48 */
+    }
+
+    /* ---- R. the gate's own three refusals ----------------------------
+     * NEGATIVE CONTROLS 12, 13 and 11. Each of the three gates is
+     * well-formed in every respect but the one being tested, so removing
+     * that check DELIVERS -- exit 6 rather than 13 -- instead of merely
+     * moving the fault somewhere else. That is the failure mode the walk's
+     * controls caught three of on their first run.
+     *
+     * The error code is the IDT form, `vec*8 + 2`, and NOT a selector:
+     * 0x23*8+2 = 282, 0x24*8+2 = 290, 0x40*8+2 = 514. A selector-shaped
+     * number here would send whoever read it to the wrong table.
+     */
+    {
+        static const uint8_t sysd[] = {                 /* S=1: not a gate */
+            0xBC, 0x00, 0x80, PM_ENTER, 0xCD, 0x23,
+        };
+        pmode_r[96] = pm_run_int(sysd, sizeof(sysd));      /* 13        */
+        pmode_r[97] = cpu_state_dtcm.pmode_excp;           /* 13 = #GP  */
+        pmode_r[98] = cpu_state_dtcm.pmode_err;            /* 282       */
+
+        static const uint8_t np[] = {                   /* P = 0          */
+            0xBC, 0x00, 0x80, PM_ENTER, 0xCD, 0x24,
+        };
+        pmode_r[99] = pm_run_int(np, sizeof(np));          /* 13        */
+        pmode_r[100] = cpu_state_dtcm.pmode_excp;          /* 11 = #NP  */
+        pmode_r[101] = cpu_state_dtcm.pmode_err;           /* 290       */
+
+        static const uint8_t past[] = {                 /* one gate past   */
+            0xBC, 0x00, 0x80, PM_ENTER, 0xCD, 0x40,
+        };
+        pmode_r[102] = pm_run_int(past, sizeof(past));     /* 13        */
+        pmode_r[103] = cpu_state_dtcm.pmode_excp;          /* 13 = #GP  */
+        pmode_r[104] = cpu_state_dtcm.pmode_err;           /* 514       */
+        /* Raise the IDT limit by one gate and the very same vector
+           delivers, so the arm above failed for the BOUND and not for the
+           gate. This is arm M's shape, for arm M's reason. */
+        pmode_r[105] = pm_run_lim(past, sizeof(past), 0x7F, 0x207);  /* 6 */
+    }
+
+    /* ---- S. a SOFTWARE interrupt may not reach a more privileged gate
+     * NEGATIVE CONTROL 14, and it is the only arm that needs CPL != 0.
+     *
+     * CPL is reached the way a guest reaches it: a far JMP to selector
+     * 0x53 -- index 0x50, RPL 3 -- whose descriptor is DPL 3 code. CPL
+     * becomes CS.RPL, which is the rule x86_pmode_load_seg already
+     * implements and arm N already grades.
+     *
+     * At CPL 3, INT 0x26 names a DPL 0 gate and must be refused with
+     * #GP(0x26*8+2 = 306). INT 0x27 names a DPL 3 gate whose CS is also
+     * DPL 3 and must be DELIVERED -- without that twin, "refused" cannot
+     * be told from "protected mode broke at CPL 3".
+     *
+     * NEITHER ARM IS GRADED ON ITS EXIT REASON, and the reason is worth
+     * writing down because it cost a pass here: the twin's handler cannot
+     * end in a HLT. HLT is a PRIVILEGED instruction, so at CPL 3 it is
+     * itself a #GP -- the twin delivered perfectly and then exited 13 on
+     * the halt, which reads exactly like a refusal. There is no
+     * ring-3-legal way to stop the interpreter, so what is graded instead
+     * is the DELIVERY: x86_pmode_gates, which the refused arm must leave
+     * at 0 and the delivered arm must leave at 1. That is a sharper check
+     * than the exit code anyway -- with the DPL rule compiled out, the
+     * refused arm delivers and its counter goes to 1.
+     */
+    {
+        static const uint8_t prog[] = {
+            0xBC, 0x00, 0x80,
+            PM_ENTER,
+            0xEA, 0x10, 0x00, 0x53, 0x00,   /* JMP FAR 0x53:0x0010 */
+        };
+        x86_pmode_gates = 0;
+        pmode_r[106] = pm_run_int(prog, sizeof(prog));     /* 13        */
+        pmode_r[107] = cpu_state_dtcm.cpl;                 /* 3         */
+        pmode_r[108] = cpu_state_dtcm.pmode_excp;          /* 13 = #GP  */
+        pmode_r[109] = cpu_state_dtcm.pmode_err;           /* 306       */
+        pmode_r[110] = x86_pmode_gates;                    /* 0: refused */
+
+        /* The twin: the identical program with the vector changed. */
+        test_ram[0x31011] = 0x27;
+        x86_pmode_gates = 0;
+        pm_run_int(prog, sizeof(prog));
+        pmode_r[111] = x86_pmode_gates;                    /* 1: delivered */
+        pmode_r[112] = cpu_state_dtcm.segs[X86_CPU_SEG_CS].sel;  /* 0x53 */
+        test_ram[0x31011] = 0x26;                          /* put it back */
+    }
+
+    /* ---- T. THE ROUND TRIP: gate in, IRET out ------------------------
+     * Task 1 is useless without task 2 and this is the arm that says so.
+     * A far JMP puts CS in a real selector first, because after PM_ENTER
+     * alone CS.sel is still 0 -- and a frame carrying a null CS is one an
+     * IRET must refuse, correctly, for a reason that has nothing to do
+     * with the return path.
+     *
+     * The gate is the 286 one, so the frame the interrupt PUSHES and the
+     * frame the 16-bit IRET POPS are the same width. They need not be --
+     * the gate decides one and the operand size the other -- and a guest
+     * that mismatches them is wrong on silicon too.
+     */
+    {
+        static const uint8_t prog[] = {
+            0xBC, 0x00, 0x80,
+            PM_ENTER,
+            0xEA, 0x00, 0x01, 0x48, 0x00,   /* JMP FAR 0x48:0x0100 */
+        };
+        x86_pmode_gates = 0;
+        x86_pmode_irets = 0;
+        pmode_r[113] = pm_run_int(prog, sizeof(prog));     /* 6 = HLT   */
+        /* Offset 0x100 is STI, 0x101 the INT, 0x103 the HLT: the IRET
+           returned to 0x103 and the HLT retired, so EIP is 0x104. Any
+           other number means the popped IP was not the pushed one. */
+        pmode_r[114] = cpu_state_dtcm.eip;                 /* 0x104     */
+        pmode_r[115] = cpu_state_dtcm.regs[4];             /* 0x8000    */
+        pmode_r[116] = cpu_state_dtcm.segs[X86_CPU_SEG_CS].sel;  /* 0x48 */
+        pmode_r[117] = x86_pmode_gates;                    /* 1         */
+        pmode_r[118] = x86_pmode_irets;                    /* 1         */
+        /* STI set IF, the INTERRUPT gate cleared it, the IRET restored it
+           from the frame. Three separate things have to be right for this
+           to read 1. */
+        pmode_r[119] = (cpu_state_dtcm.eflags >> 9) & 1u;  /* 1         */
+    }
+
+    /* ---- U. IRET's OWN CS rule ---------------------------------------
+     * NEGATIVE CONTROL 16. A non-conforming target must have DPL == RPL,
+     * which is stricter than the "is it code, is it present" that
+     * L(SET_SREG)'s CS arm applies -- so this cannot be graded by reusing
+     * the far-jump arms and it is not.
+     */
+    {
+        static const uint8_t bad[] = {
+            0xBC, 0x00, 0x80,
+            PM_ENTER,
+            0xEA, 0x00, 0x02, 0x48, 0x00,   /* JMP FAR 0x48:0x0200 */
+        };
+        pmode_r[120] = pm_run_int(bad, sizeof(bad));       /* 13        */
+        pmode_r[121] = cpu_state_dtcm.pmode_excp;          /* 13 = #GP  */
+        pmode_r[122] = cpu_state_dtcm.pmode_err;           /* 0x50      */
+        /* And ESP is back where it started: the three pops are
+           SPECULATIVE until the CS is known good, and a fault must not
+           leave the stack half-consumed. */
+        pmode_r[123] = cpu_state_dtcm.regs[4];             /* 0x7FFA    */
+
+        static const uint8_t good[] = {
+            0xBC, 0x00, 0x80,
+            PM_ENTER,
+            0xEA, 0x20, 0x02, 0x48, 0x00,   /* JMP FAR 0x48:0x0220 */
+        };
+        pmode_r[124] = pm_run_int(good, sizeof(good));     /* 6 = HLT   */
+        pmode_r[125] = cpu_state_dtcm.eip;                 /* 0x61      */
     }
 }
 
