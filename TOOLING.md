@@ -50,6 +50,7 @@ change**, and read what it prints even when it passes.
 | `__CORE_BSS_END__` | `core_bss_end_max` — RAM_EMU overshoot is SILENT (`guest_ram` NULL, `core_ready` 0, a black frame loop). Three instrumented builds have died of it |
 | pager frames implied by `__CORE_BSS_END__` | `frames_implied_min` |
 | `docs/07`'s generated block | `gen_opcode_coverage.py --check`, so the table cannot rot again |
+| `docs/07`/`STATUS`/`PLAN`/`CLAUDE` PROSE | same `--check`: a hand-written "`8D` is unimplemented" next to a generated "reached" now FAILS |
 
 It also prints ITCM bytes free of 65,536, RAM_EMU headroom, and how many
 **4,104**-byte frames that headroom implies (stride is 4,104, not 4,096 — the
@@ -1060,6 +1061,7 @@ hand-edited.
 python3 scripts/gen_opcode_coverage.py              # print the tables
 python3 scripts/gen_opcode_coverage.py --write      # rewrite the block in docs/07
 python3 scripts/gen_opcode_coverage.py --check      # exit 1 if docs/07 is stale
+python3 scripts/gen_opcode_coverage.py --check-prose  # prose vs the table only
 python3 scripts/gen_opcode_coverage.py --json build/artifacts/coverage.json
 ```
 
@@ -1079,6 +1081,49 @@ the thing that stops the document rotting a third time.
 
 Only the block between the `BEGIN GENERATED` / `END GENERATED` markers is
 rewritten; the hand-written analysis after it is preserved.
+
+#### `--check-prose` — the hand-written half, because the rot came back there
+
+Generating the table fixed only half the problem. Within the same session the
+PROSE around it went stale again: paragraphs twenty lines below a correct,
+green generated table still called the BCD adjusts, `6C`-`6F`, `62`, `9B`,
+`F1`, several `0F` slots, the bit set and the double shifts unimplemented.
+`--check` did not notice, because it only diffed the generated block.
+
+`--check-prose` (run automatically by `--check`, and therefore by
+`budget_gate.py`) compares hand-written REACHABILITY claims against the
+generated status column, in both directions:
+
+| prose says | table says | result |
+|---|---|---|
+| "unimplemented" / "missing" / "falls to `.exit_loop`" | reached | **FAIL** |
+| "implemented" / "reached" | `.exit_loop` | **FAIL** |
+
+It checks `docs/07_opcode_coverage.md`, `STATUS.md`, `PLAN.md` and `CLAUDE.md`
+(`--prose-file PATH`, repeatable, overrides that list; `--skip-prose` turns the
+arm off inside `--check`; `-v` lists what it skipped and why).
+
+**It judges reachability and NOTHING else.** "DEFECT", "broken", "silently
+32-bit", "no flags" are deliberately not claim words: a reached handler can be
+all of those, the status column cannot refute it, and firing on them would
+flag the whole (correct) defect taxonomy table and get the checker switched
+off. Its unit is one table row or one sentence, so a claim word must sit next
+to its opcode; only backticked opcode-shaped tokens count; and two-letter flag
+names (`CF`, `OF`, `AF`, …) are never read as opcodes, which costs recall on
+those few slots and removes a large class of false positives.
+
+Prose that is deliberately HISTORICAL — "formerly listed as unimplemented",
+the superseded list docs/07 keeps by name — is what the fence is for:
+
+```markdown
+<!-- coverage-check: historical -->
+... text whose status claims are about the past ...
+<!-- coverage-check: end -->
+```
+
+`<!-- coverage-check: ignore -->` exempts a single line. Sentences that already
+read as history ("formerly", "no longer", "now implemented", "superseded",
+"was") are skipped automatically; the fence is for when that is not enough.
 
 ### `opcode_demand.py` — what does a title's binary actually CONTAIN
 

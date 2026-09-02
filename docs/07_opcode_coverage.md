@@ -671,6 +671,11 @@ against an older tree.
 > a HYPOTHESIS to check against the generated table above and against the
 > handler body, not as a statement about today's code. It is retained for its
 > reasoning and its taxonomy, not for its status column.
+>
+> Its individual reachability claims ARE checked, in both directions, by
+> `python3 scripts/gen_opcode_coverage.py --check-prose` (which `--check` and
+> `budget_gate.py` run). A passage that is deliberately historical is fenced
+> with `<!-- coverage-check: historical -->` ... `<!-- coverage-check: end -->`.
 
 
 ## Group opcodes — every `/reg` individually (hand-written, DATED)
@@ -855,6 +860,11 @@ GENERATED TABLE WINS and this section is the thing to fix.
 | 486/Pentium+ (`0F 31` RDTSC, `0F A2` CPUID, `0F C8`-`CF` BSWAP, CMPXCHG, XADD, MMX/SSE) | 158 | **Out of scope** for a 386-class target — not gaps. |
 | `63` ARPL | 1 | **The only one-byte slot still dispatching to `.exit_loop`.** |
 
+<!-- coverage-check: historical -->
+*(The list below is deliberately HISTORICAL — it records what these slots were
+once called, which is the whole point of keeping it. It is fenced off from
+`gen_opcode_coverage.py --check-prose` for that reason.)*
+
 **Formerly listed here as unimplemented and NOW IMPLEMENTED** — do not task a
 lane from an older copy of this section: BCD adjusts `27`/`2F`/`37`/`3F`;
 `D4`/`D5` AAM/AAD; string port I/O `6C`-`6F`; `62` BOUND; `9B` WAIT; `F1` ICEBP;
@@ -864,6 +874,8 @@ FS,GS; `0F B2`/`B4`/`B5` LSS/LFS/LGS; `0F AF` IMUL Gv,Ev; the 386 bit set
 double shifts `0F A4`/`A5`/`AC`/`AD` (SHLD/SHRD); and all of group 6 plus
 `0F 02`/`03`/`06` (`LAR`/`LSL`/`CLTS`), which exit as unimplemented in REAL mode
 because they are not instructions there.
+
+<!-- coverage-check: end -->
 
 **"Implemented" is a dispatch fact, not a correctness verdict** — see "What the
 generator will NOT tell you" above, and the defect sections below.
@@ -1097,8 +1109,9 @@ prints `cpu_exit_info` alongside `cpu_cs_sel`/`cpu_eip`/`cpu_cr0` — the report
     classic `MOV SS,ax / MOV SP,imm` sequence can therefore take an interrupt on a
     half-updated stack. The PIT check only fires at counter expiry, which makes this rare
     and non-deterministic — the worst combination to debug.
-30. **`0xF4` HLT's handler exists but is unreachable**; the table entry is `.exit_loop`.
-    Net behaviour is nearly the same, minus the CR0/CPL `#GP` check.
+30. **`0xF4` HLT** dispatches to `.op_hlt_F4`. This item previously recorded the
+    slot as `.exit_loop`; that is stale -- see the generated table. What is still
+    worth a look is the CR0/CPL `#GP` check, which the handler does not perform.
 31. **`0xF0` LOCK clears a preceding segment override** and double-decrements the PIT.
 
 ## What a real DOS game or utility actually needs

@@ -47,6 +47,11 @@ Usage
     python3 scripts/gen_opcode_coverage.py --check         # is docs/07 stale?
     python3 scripts/gen_opcode_coverage.py --write         # regenerate docs/07
     python3 scripts/gen_opcode_coverage.py --json out.json
+    python3 scripts/gen_opcode_coverage.py --check-prose   # prose vs table
+
+`--check` does BOTH: the generated block must be up to date AND the
+hand-written prose must not contradict it. See `check_prose()` for why the
+second half exists and exactly which claims it is willing to judge.
 """
 
 import argparse
@@ -57,6 +62,12 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DOC = os.path.join(ROOT, "docs", "07_opcode_coverage.md")
+
+# Files whose hand-written text is checked against the generated status
+# column. docs/07 is where the rot happened twice; the other three are the
+# documents every agent reads FIRST, and CLAUDE.md is binding.
+DEFAULT_PROSE_FILES = ("docs/07_opcode_coverage.md", "STATUS.md", "PLAN.md",
+                       "CLAUDE.md")
 
 WIDTH_PRIMS = ("LD_V", "ST_V", "LDS_V", "LDREG_V", "STREG_V", "EIP_ADV_V",
                "EIP_WRAP", "PUSH_V", "POP_V", "SP_DEC", "SP_INC", "SP_WRAP",
@@ -354,6 +365,278 @@ def render(rows, chains):
     return "\n".join(out) + "\n"
 
 
+
+# ---------------------------------------------------------------------------
+# Prose consistency ("does the hand-written text still agree with the table?")
+# ---------------------------------------------------------------------------
+#
+# The generated block cannot rot. The PROSE around it can, and it did, in the
+# same file and the same session: hand-written paragraphs went on calling the
+# BCD adjusts, `6C`-`6F`, `62`, `9B`, `F1`, several `0F` slots, the bit set and
+# the double shifts UNIMPLEMENTED while the generated table twenty lines above
+# said every one of them is reached. `--check` did not notice, because it only
+# diffed the generated block.
+#
+# What this checker decides, and what it refuses to decide
+# -------------------------------------------------------
+# The generated data knows exactly ONE thing about an opcode that prose can
+# contradict: whether its dispatch slot REACHES a handler. So this checks
+# reachability claims ONLY, in both directions:
+#
+#     negative claim ("unimplemented", "missing", "falls to `.exit_loop`")
+#         about a slot the table says is REACHED            -> FAIL
+#     positive claim ("implemented", "reached")
+#         about a slot the table says is `.exit_loop`       -> FAIL
+#
+# It deliberately does NOT treat "DEFECT", "broken", "wrong" or "silently
+# 32-bit" as checkable. A reached handler can be defective; the status column
+# cannot refute that, so firing on those words would flag the entire (correct)
+# defect taxonomy table and the checker would be switched off within a day. A
+# checker that cries wolf protects nothing.
+#
+# Precision guards
+# ----------------
+#   * A claim unit is one table ROW or one SENTENCE of a re-joined paragraph --
+#     never the whole file, so a claim word must sit next to the opcode token.
+#   * Only backticked tokens count, and only in opcode shape (`8D`, `0x8D`,
+#     `0F BA`), so `#4` and `R10` are not opcodes.
+#   * Two-letter flag names (`CF`, `OF`, `AF`, ...) are never read as opcodes,
+#     even though a couple of them really are opcode numbers too. That costs
+#     recall on `CF`/`AF`/`DF`-numbered slots and buys back a large class of
+#     false positives from every flags column in the document.
+#   * A unit that reads as HISTORY ("formerly", "no longer", "now implemented",
+#     "superseded", ...) is skipped, and so is anything inside an explicit
+#     marked region. History is what the superseded lists in docs/07 are FOR.
+#
+# Explicit markers (use these when the auto-hedges are not enough):
+#     <!-- coverage-check: historical -->   ... <!-- coverage-check: end -->
+#     <!-- coverage-check: ignore -->       (rest of that line only)
+
+HIST_BEGIN = "<!-- coverage-check: historical -->"
+HIST_END = "<!-- coverage-check: end -->"
+HIST_LINE = "<!-- coverage-check: ignore -->"
+
+# Two-hex-digit tokens that are overwhelmingly flag names in this document.
+FLAG_WORDS = {"CF", "OF", "SF", "ZF", "AF", "PF", "DF", "TF", "IF", "NT"}
+
+TOK_1B = re.compile(r"^(?:0x)?([0-9A-F]{2})$")
+TOK_2B = re.compile(r"^(?:0x)?0F[ _]?([0-9A-F]{2})$")
+
+# A claim is only checkable if it is about the DISPATCH SLOT. Each pattern
+# below was added because a FALSE positive was seen on the real document -- the
+# comment on each says which, because the failure mode of this checker is not
+# missing rot, it is being switched off for crying wolf.
+#
+#   "missing"        -> "Missing FLAGS entirely", "memory ModRM form missing":
+#                       both true, both about a sub-feature of a REACHED
+#                       handler. Only a bare/emphatic "missing" counts.
+#   "unimplemented"  -> `X86_EXIT_UNIMPLEMENTED` is an identifier, and "exits
+#                       as unimplemented" describes a REACHED handler that
+#                       raises at RUN time. Neither is a slot claim.
+#   ".exit_loop"     -> "`.exit_loop` reports R0" is prose about the mechanism.
+#                       It counts only in a claiming construction ("falls to",
+#                       "the table entry is", "dispatching to").
+#   "absent"/"exits" -> dropped outright: seen only as "an absent prefix" and
+#                       "exits as unimplemented". Neither shape is worth the
+#                       recall.
+NEG_PATTERNS = (
+    re.compile(r"(?<![\w_])unimplemented(?![\w_])", re.I),
+    re.compile(r"\bnot implemented\b", re.I),
+    re.compile(r"\bmissing\b", re.I),
+    re.compile(r"\bno handler\b", re.I),
+    re.compile(r"\bunreachable\b|\bnot reached\b", re.I),
+    re.compile(r"\bstubbed out\b|\bis a stub\b|\bstub\b", re.I),
+    re.compile(r"\.exit_loop", re.I),
+)
+# (pattern index, regex over the ~48 chars BEFORE, regex over the ~48 AFTER)
+NEG_REJECT = (
+    # "Missing flags", "memory form missing", "missing a segment base" ...
+    (2, None, re.compile(r"^\s*(flags?|forms?|memory|mem\b|segment|base|"
+                         r"width|prefix|the\b)", re.I)),
+    (2, re.compile(r"(flags?|forms?|memory form|segment base|prefix)\s*(is|"
+                   r"are)?\s*$", re.I), None),
+    # "exits as unimplemented" / "exit with unimplemented": run-time, not slot.
+    (0, re.compile(r"exit\w*\s+(as|with)\s+$", re.I), None),
+)
+# `.exit_loop` only counts inside one of these constructions.
+EXIT_CLAIM_BEFORE = re.compile(
+    r"(falls?|fall through|dispatch\w*|entry is|slot is|is|to|goes|→|->|"
+    r"points at)\s*`?$", re.I)
+
+POS_PATTERNS = (
+    re.compile(r"(?<!un)(?<!not )\bimplemented\b", re.I),
+    re.compile(r"\breached\b", re.I),
+    re.compile(r"\bhas a handler\b", re.I),
+)
+
+HEDGE = re.compile(
+    r"formerly|previously|no longer|used to\b|now implemented|is fixed|"
+    r"was fixed|were fixed|has been fixed|have been fixed|are fixed|"
+    r"superseded|historical|\bwas\b|\bwere\b|\buntil\b|hypothesis|dated|"
+    r"before that|at the time",
+    re.I)
+
+WIN = 48
+
+
+def _find_claim(unit, patterns, rejects=(), exit_rule=False):
+    """First claim occurrence in `unit` that survives the context rejects."""
+    for idx, pat in enumerate(patterns):
+        for m in pat.finditer(unit):
+            before = unit[max(0, m.start() - WIN):m.start()]
+            after = unit[m.end():m.end() + WIN]
+            if any(i == idx and (b is None or b.search(before))
+                   and (a is None or a.search(after))
+                   for i, b, a in rejects):
+                continue
+            if exit_rule and pat.pattern == r"\.exit_loop":
+                if not EXIT_CLAIM_BEFORE.search(before):
+                    continue
+            return m.group(0)
+    return None
+
+
+def _expand_tokens(text, ranges=True):
+    """Backticked opcode tokens in one unit -> {('1'|'0f', op): raw}.
+
+    Handles `E0`-`E3` style ranges written as two adjacent backtick spans
+    separated by a dash of any flavour.
+    """
+    spans = [(m.start(), m.group(1).strip())
+             for m in re.finditer(r"`([^`]+)`", text)]
+    found = {}
+
+    def classify(tok):
+        tok = tok.replace("0X", "0x")
+        m = TOK_2B.match(tok)
+        if m:
+            return ("0f", int(m.group(1), 16))
+        m = TOK_1B.match(tok)
+        if m and m.group(1) not in FLAG_WORDS:
+            return ("1", int(m.group(1), 16))
+        return None
+
+    keys = []
+    for pos, tok in spans:
+        k = classify(tok)
+        keys.append((pos, tok, k))
+        if k:
+            found[k] = tok
+    # ranges: `AA`<dash>`BB` in the same table (same kind)
+    for i in range(len(keys) - 1) if ranges else ():
+        (p0, t0, k0), (p1, t1, k1) = keys[i], keys[i + 1]
+        if not (k0 and k1) or k0[0] != k1[0]:
+            continue
+        gap = text[p0 + len(t0) + 2:p1]
+        if re.fullmatch(r"\s*[-‐-―]\s*", gap) and k1[1] > k0[1]:
+            if k1[1] - k0[1] <= 32:
+                for op in range(k0[1] + 1, k1[1]):
+                    found[(k0[0], op)] = "%s%s%s" % (t0, gap.strip(), t1)
+    return found
+
+
+def _units(path, doc_skip=None):
+    """Yield (lineno, text) claim units outside generated/marked regions.
+
+    A markdown table row is its own unit; a wrapped paragraph is re-joined and
+    split into sentences so that a claim word must land near its opcode.
+    """
+    lines = open(path).read().splitlines()
+    out = []
+    in_gen = False
+    in_hist = False
+    para, para_line = [], 0
+    for i, raw in enumerate(lines, 1):
+        line = raw
+        if BEGIN in line:
+            in_gen = True
+        if END in line:
+            in_gen = False
+            continue
+        if HIST_BEGIN in line:
+            in_hist = True
+            continue
+        if HIST_END in line:
+            in_hist = False
+            continue
+        skip = in_gen or in_hist or (HIST_LINE in line)
+        stripped = line.strip()
+        if not stripped or stripped.startswith("|") or skip:
+            if para:
+                out.extend(_sentences(" ".join(para), para_line))
+                para, para_line = [], 0
+            if stripped.startswith("|") and not skip:
+                out.append((i, stripped))
+            continue
+        if not para:
+            para_line = i
+        para.append(stripped)
+    if para:
+        out.extend(_sentences(" ".join(para), para_line))
+    return out
+
+
+def _sentences(text, lineno):
+    parts = re.split(r"(?<=[.;:!?])\s+", text)
+    return [(lineno, p) for p in parts if p.strip()]
+
+
+def check_prose(rows, paths, verbose=False):
+    """Return a list of violation strings. Empty means the prose agrees."""
+    bad = []
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        rel = os.path.relpath(path, ROOT)
+        for lineno, unit in _units(path):
+            toks = _expand_tokens(unit)
+            if not toks:
+                continue
+            neg = _find_claim(unit, NEG_PATTERNS, NEG_REJECT, exit_rule=True)
+            pos = _find_claim(unit, POS_PATTERNS)
+            if not (neg or pos):
+                continue
+            if HEDGE.search(unit):
+                if verbose:
+                    print("  skip (reads as history) %s:%d: %s"
+                          % (rel, lineno, unit[:70]))
+                continue
+            if not neg:
+                # The POSITIVE direction is the weaker half: "implemented"
+                # appears in every other sentence, and a range headline such as
+                # "`0F 20`-`0F 27` control regs ... `0F 20`/`0F 22` are
+                # implemented" is true of the range's named members only. So a
+                # positive claim is judged only when the unit names exactly one
+                # opcode and no range.
+                toks = _expand_tokens(unit, ranges=False)
+                if len(toks) != 1:
+                    if verbose:
+                        print("  skip (positive claim, %d tokens) %s:%d"
+                              % (len(toks), rel, lineno))
+                    continue
+            for (kind, op), raw in sorted(toks.items()):
+                r = rows.get((kind, op))
+                if r is None:
+                    continue
+                name = ("0F %02X" % op) if kind == "0f" else "%02X" % op
+                if neg and r["reached"]:
+                    bad.append(
+                        "%s:%d: prose calls `%s` %s -- the generated table "
+                        "says `%s` is REACHED (handler `%s`).\n      %s"
+                        % (rel, lineno, raw, _q(neg), name,
+                           r["symbol"], unit[:160]))
+                elif pos and not neg and not r["reached"]:
+                    bad.append(
+                        "%s:%d: prose calls `%s` %s -- the generated table "
+                        "says `%s` dispatches to `.exit_loop`.\n      %s"
+                        % (rel, lineno, raw, _q(pos), name, unit[:160]))
+    return bad
+
+
+def _q(s):
+    return '"%s"' % s.strip()
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -363,10 +646,38 @@ def main():
     ap.add_argument("--check", action="store_true",
                     help="exit 1 if docs/07's generated block is out of date")
     ap.add_argument("--json", help="dump the derived facts here")
+    ap.add_argument("--check-prose", action="store_true",
+                    help="only check the HAND-WRITTEN reachability claims "
+                         "against the generated status column")
+    ap.add_argument("--skip-prose", action="store_true",
+                    help="with --check, do not check the hand-written prose")
+    ap.add_argument("--prose-file", action="append", default=[],
+                    metavar="PATH",
+                    help="extra file to prose-check (repeatable). Default is "
+                         "docs/07 plus STATUS.md, PLAN.md and CLAUDE.md.")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="with a prose check, also list the units skipped as "
+                         "history")
     args = ap.parse_args()
 
     rows, chains, _ana = build()
     text = render(rows, chains)
+
+    prose_paths = [os.path.join(ROOT, p) for p in
+                   (args.prose_file or DEFAULT_PROSE_FILES)]
+
+    if args.check_prose:
+        bad = check_prose(rows, prose_paths, verbose=args.verbose)
+        for b in bad:
+            print("PROSE ROT: " + b)
+        if bad:
+            print("\n%d hand-written claim(s) disagree with the generated "
+                  "table. Fix the prose, or mark it historical with "
+                  "`%s` ... `%s`." % (len(bad), HIST_BEGIN, HIST_END))
+            return 1
+        print("prose reachability claims agree with the generated table "
+              "(%d file(s) checked)." % len(prose_paths))
+        return 0
 
     if args.json:
         with open(args.json, "w") as f:
@@ -390,6 +701,17 @@ def main():
                       "Run: python3 scripts/gen_opcode_coverage.py --write")
                 return 1
             print("docs/07 generated block is up to date.")
+            if args.skip_prose:
+                return 0
+            bad = check_prose(rows, prose_paths, verbose=args.verbose)
+            for b in bad:
+                print("PROSE ROT: " + b)
+            if bad:
+                print("%d hand-written claim(s) disagree with the generated "
+                      "table. Fix the prose, or mark it historical with "
+                      "`%s` ... `%s`." % (len(bad), HIST_BEGIN, HIST_END))
+                return 1
+            print("hand-written reachability claims agree with it too.")
             return 0
         with open(DOC, "w") as f:
             f.write(new)

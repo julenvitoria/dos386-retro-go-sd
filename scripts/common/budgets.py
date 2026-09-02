@@ -237,7 +237,15 @@ def check(m, thr):
 
 
 def run_opcode_check():
-    """gen_opcode_coverage.py --check: has docs/07 rotted again?"""
+    """gen_opcode_coverage.py --check: has docs/07 rotted again?
+
+    `--check` covers BOTH halves of that question since the prose checker
+    landed: the generated block must match the dispatch tables, and the
+    hand-written reachability claims in docs/07, STATUS.md, PLAN.md and
+    CLAUDE.md must not contradict it. The second half exists because the rot
+    came back into docs/07's PROSE while the generated table twenty lines above
+    it was correct and green.
+    """
     proc = _run([sys.executable, "scripts/gen_opcode_coverage.py", "--check"])
     return proc.returncode, (proc.stdout + proc.stderr).strip()
 

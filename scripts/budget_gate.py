@@ -136,9 +136,12 @@ def main(argv=None):
         rc, out = budgets.run_opcode_check()
         if rc != 0:
             fails.append(
-                "docs/07 IS STALE: its generated block no longer matches the "
-                "dispatch tables. Regenerate with `python3 "
-                "scripts/gen_opcode_coverage.py --write`.\n    " +
+                "docs/07 IS STALE: either its generated block no longer "
+                "matches the dispatch tables (regenerate with `python3 "
+                "scripts/gen_opcode_coverage.py --write`) or a HAND-WRITTEN "
+                "reachability claim contradicts that block (fix the prose, or "
+                "fence it with `<!-- coverage-check: historical -->`). The "
+                "detail below says which.\n    " +
                 out.replace("\n", "\n    "))
         else:
             print("DOCS   " + out)
