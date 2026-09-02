@@ -87,6 +87,7 @@ def get_free_port():
         return s.getsockname()[1]
 
 def run_test(args):
+    eipw_negative = bool(getattr(args, "eip_wrap_negative", False))
     runner = build_and_create_runner(args)
     runner.start()
     
@@ -4323,6 +4324,158 @@ def run_test(args):
             },
         ])
 
+        # -------------------------------------------------------------------
+        # EIP WRAP AT A 16-BIT SEGMENT BOUNDARY (lane W).
+        #
+        # In a 16-bit code segment IP is 16 bits: a branch whose target
+        # arithmetic crosses 0xFFFF (or goes below 0) must WRAP inside the
+        # SAME segment. E8/E9/0F 8x all run `EIP_WRAP` (cpu_exec.S, the 16-bit
+        # pass) which does `R10 = CS.base + ((R10 - CS.base) & 0xFFFF)`.
+        # `.op_jcc_rel8_7X` and `L(LOOP_TAKEN)` do a bare `ADD R10, R5` with no
+        # wrap, because both are OP_AGNOSTIC (emitted once, shared by the 16-
+        # and 32-bit passes) while EIP_WRAP is pass-specific.
+        #
+        # These four arms MEASURE that, they do not fix it. Each one puts a
+        # DIFFERENT, individually identifiable instruction at BOTH candidate
+        # landing sites -- `MOV AX, imm16` with a distinct immediate -- and
+        # grades WHICH one ran, never merely that the guest stopped. Both
+        # sites are inside the identity-mapped test_ram, so the not-wrapped
+        # path is genuinely reachable and executes; a fault there would be a
+        # different, visible outcome rather than something mistakable for a
+        # working wrap.
+        #
+        #   python3 tests/test_opcodes.py                     -> arms graded
+        #       against the ARCHITECTURALLY CORRECT (wrapped) landing site and,
+        #       while the gap stands, printing REPORTED without turning the
+        #       suite red.
+        #   python3 tests/test_opcodes.py --eip-wrap-negative -> the same arms
+        #       graded against the NOT-wrapped site and REQUIRED to pass. That
+        #       is the proof the arms can express both outcomes: an arm that
+        #       cannot report failure is not evidence.
+        #
+        # CS.base is 0x1000 so that "segment offset" and "linear address"
+        # differ -- with base 0 the wrap would be unobservable by construction.
+        EIPW_CS = 0x1000
+
+        def _eipw(name, setup, wrap_off, wrap_imm, nowrap_lin, nowrap_imm,
+                  regs_initial, wrap_regs, nowrap_regs, eflags=0):
+            """One wrap arm. Landing sites are planted here, not by the caller,
+            so the two can never accidentally be the same bytes."""
+            assert EIPW_CS + wrap_off != nowrap_lin, "landing sites must differ"
+            assert wrap_imm != nowrap_imm, "landing sites must be distinguishable"
+            ram = list(setup)
+            ram.append((EIPW_CS + wrap_off,
+                        bytes([0xB8, wrap_imm & 0xFF, wrap_imm >> 8, 0xF4])))
+            ram.append((nowrap_lin,
+                        bytes([0xB8, nowrap_imm & 0xFF, nowrap_imm >> 8, 0xF4])))
+            wrap_eip = (wrap_off + 4) & 0xFFFFFFFF
+            nowrap_eip = (nowrap_lin + 4 - EIPW_CS) & 0xFFFFFFFF
+            tc = {
+                "name": name,
+                "code": bytes([0xF4]),      # linear 0, outside CS; never run
+                "mode": 16,
+                "segs_initial": {"CS": EIPW_CS},
+                "ram_setup": ram,
+                "eflags_initial": eflags,
+                "regs_initial": dict(regs_initial),
+            }
+            if eipw_negative:
+                tc["regs_expected"] = dict(nowrap_regs)
+                tc["expected_eip"] = nowrap_eip
+            else:
+                tc["regs_expected"] = dict(wrap_regs)
+                tc["expected_eip"] = wrap_eip
+                tc["reported"] = ("short branch does not wrap IP at the 16-bit "
+                                  "segment boundary (no EIP_WRAP in "
+                                  ".op_jcc_rel8_7X / L(LOOP_TAKEN))")
+            return tc
+
+        # Forward: the branch sits at offset 0xFFF0, the last 16 bytes of the
+        # segment. E9 gets us there and E9 wraps correctly, so it cannot be the
+        # thing under test. JZ +0x7F from IP 0xFFF2 targets 0x10071, which must
+        # become 0x0071 in this segment.
+        _E9_TO_FFF0 = bytes([0xE9, 0xED, 0xFF])   # IP 3 + 0xFFED = 0xFFF0
+        test_cases.extend([
+            _eipw("Jcc rel8 (74) forward across 0xFFFF wraps to the low segment",
+                  [(EIPW_CS + 0x0000, _E9_TO_FFF0),
+                   (EIPW_CS + 0xFFF0, bytes([0x74, 0x7F]))],
+                  wrap_off=0x0071, wrap_imm=0x1111,
+                  nowrap_lin=EIPW_CS + 0x10071, nowrap_imm=0x2222,
+                  regs_initial={0: 0}, wrap_regs={0: 0x1111},
+                  nowrap_regs={0: 0x2222},
+                  eflags=1 << FLAG_BITS["ZF"]),      # ZF=1 -> JZ taken
+            # Backward: the branch sits at offset 0 and reaches below it.
+            # IP 0x0002 - 0x80 = -126, which must become 0xFF82 in this
+            # segment; unwrapped it lands 126 bytes BELOW CS.base, still inside
+            # test_ram and still executable, so the wrong path really runs.
+            _eipw("Jcc rel8 (75) backward below 0 wraps to the top of segment",
+                  [(EIPW_CS + 0x0000, bytes([0x75, 0x80]))],
+                  wrap_off=0xFF82, wrap_imm=0x3333,
+                  nowrap_lin=EIPW_CS + 2 - 0x80, nowrap_imm=0x4444,
+                  regs_initial={0: 0}, wrap_regs={0: 0x3333},
+                  nowrap_regs={0: 0x4444},
+                  eflags=0),                          # ZF=0 -> JNZ taken
+            # E2 LOOP reaches the same L(LOOP_TAKEN) as E0/E1/E3.
+            _eipw("LOOP (E2) forward across 0xFFFF wraps to the low segment",
+                  [(EIPW_CS + 0x0000, _E9_TO_FFF0),
+                   (EIPW_CS + 0xFFF0, bytes([0xE2, 0x7F]))],
+                  wrap_off=0x0071, wrap_imm=0x5555,
+                  nowrap_lin=EIPW_CS + 0x10071, nowrap_imm=0x6666,
+                  regs_initial={1: 5}, wrap_regs={0: 0x5555, 1: 4},
+                  nowrap_regs={0: 0x6666, 1: 4}),
+            _eipw("LOOP (E2) backward below 0 wraps to the top of segment",
+                  [(EIPW_CS + 0x0000, bytes([0xE2, 0x80]))],
+                  wrap_off=0xFF82, wrap_imm=0x7777,
+                  nowrap_lin=EIPW_CS + 2 - 0x80, nowrap_imm=0x8888,
+                  regs_initial={1: 5}, wrap_regs={0: 0x7777, 1: 4},
+                  nowrap_regs={0: 0x8888, 1: 4}),
+        ])
+
+        # POSITIVE CONTROLS. Both of these reach `EIP_WRAP` (0F 8x and E9 are
+        # emitted per operand size), so they must land on the WRAPPED site --
+        # graded normally, never "reported". They are what makes the four arms
+        # above evidence rather than an artefact: they prove the wrap is
+        # observable in this harness at all, that CS.base=0x1000 with mode 16
+        # really selects the 16-bit pass, and that the wrapped landing site is
+        # reachable and executes. If one of these ever fails, the arms above
+        # are measuring the harness, not the core.
+        test_cases.extend([
+            {
+                "name": "CONTROL: near Jcc (0F 84) DOES wrap forward across 0xFFFF",
+                "code": bytes([0xF4]),
+                "mode": 16,
+                "segs_initial": {"CS": EIPW_CS},
+                "ram_setup": [
+                    (EIPW_CS + 0x0000, _E9_TO_FFF0),
+                    # 0F 84 cw at IP 0xFFF0, len 4 -> next IP 0xFFF4;
+                    # +0x007D = 0x10071, which must wrap to 0x0071.
+                    (EIPW_CS + 0xFFF0, bytes([0x0F, 0x84, 0x7D, 0x00])),
+                    (EIPW_CS + 0x0071, bytes([0xB8, 0x99, 0x99, 0xF4])),
+                    (EIPW_CS + 0x10071, bytes([0xB8, 0xAA, 0xAA, 0xF4])),
+                ],
+                "eflags_initial": 1 << FLAG_BITS["ZF"],
+                "regs_initial": {0: 0},
+                "regs_expected": {0: 0x9999},
+                "expected_eip": 0x0075,
+            },
+            {
+                "name": "CONTROL: near JMP (E9) DOES wrap backward below 0",
+                "code": bytes([0xF4]),
+                "mode": 16,
+                "segs_initial": {"CS": EIPW_CS},
+                "ram_setup": [
+                    # E9 cw at IP 0, len 3 -> next IP 3; -0x80 = -125, which
+                    # must wrap to 0xFF83.
+                    (EIPW_CS + 0x0000, bytes([0xE9, 0x80, 0xFF])),
+                    (EIPW_CS + 0xFF83, bytes([0xB8, 0xBB, 0xBB, 0xF4])),
+                    (EIPW_CS + 3 - 0x80, bytes([0xB8, 0xCC, 0xCC, 0xF4])),
+                ],
+                "regs_initial": {0: 0},
+                "regs_expected": {0: 0xBBBB},
+                "expected_eip": 0xFF87,
+            },
+        ])
+
         all_passed = True
 
         only = getattr(args, "only", None)
@@ -4480,7 +4633,11 @@ def run_test(args):
                   f"(Expected: {tc['expected_eip']}) eflags=0x{eflags_now:08x} "
                   f"exit={exit_reason}")
             
-            if not passed:
+            if not passed and tc.get("reported"):
+                # A known, deliberately unfixed gap: printed loudly, but it
+                # does not turn the suite red. See the EIP-wrap arms above.
+                print(f"  -> REPORTED, NOT COUNTED: {tc['reported']}")
+            elif not passed:
                 all_passed = False
                 
         print("Halting...")
@@ -4499,6 +4656,10 @@ if __name__ == "__main__":
     from scripts.common.runner import add_runner_args
     parser = argparse.ArgumentParser(description="Run opcodes tests")
     add_runner_args(parser)
+    parser.add_argument("--eip-wrap-negative", action="store_true",
+                        help="grade the EIP-wrap arms against the NOT-wrapped "
+                             "landing site and require them to pass -- the "
+                             "proof those arms can express both outcomes")
     parser.add_argument("--only", type=int, nargs="+", metavar="N",
                         help="run only these test numbers (1-based)")
     args = parser.parse_args()
