@@ -59,10 +59,9 @@
  * as memory when the gate is open; claiming to manage an HMA we do not have
  * would be answered by a guest relocating code into it.
  *
- * LOCK (AH=0Ch): refused with BL=0ADh, "lock failed". A lock's whole purpose is
- * to yield a 32-bit LINEAR address the caller may then dereference. Our bytes
- * are in a file; there is no such address, and inventing one produces a guest
- * that reads garbage instead of a guest that takes the documented failure path.
+ * LOCK (AH=0Ch): yields a linear alias in the pager's 8..16 MB window. The
+ * alias uses pagefile slots at the same byte offsets as the XMS store; unlock
+ * removes ownership once no locked block covers those pages.
  */
 #ifndef X86_XMS_H
 #define X86_XMS_H

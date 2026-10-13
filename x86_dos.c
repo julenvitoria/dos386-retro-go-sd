@@ -2667,6 +2667,7 @@ static x86_xms_rd_fn    xms_rd;
 static x86_xms_wr_fn    xms_wr;
 static uint32_t         xms_kb;         /* the whole store, in KB */
 static uint32_t         xms_a20_local;  /* AH=05h/06h nesting count */
+#define XMS_LINEAR_BASE  (8u * 1024u * 1024u)
 
 /* The ONLY buffer this interface owns, and it is 256 bytes because the two
    paths that need one are rare: an XMS->XMS move and the copy inside a growing
@@ -2691,6 +2692,10 @@ void x86_xms_set_backing(x86_xms_open_fn op, x86_xms_close_fn cl,
 
 void x86_xms_reset(void)
 {
+    for (unsigned i = 0; i < X86_XMS_HANDLES; i++)
+        if (xms_h[i].used && xms_h[i].locks)
+            x86_pager_own_aux((XMS_LINEAR_BASE + (xms_h[i].kb_off << 10))
+                                  >> X86_PG_SHIFT, 0);
     for (unsigned i = 0; i < X86_XMS_HANDLES; i++) {
         xms_h[i].used = 0;
         xms_h[i].locks = 0;
@@ -2788,6 +2793,32 @@ static xms_handle_t *xms_get(uint16_t handle)
         return NULL;
     xms_handle_t *h = &xms_h[handle - 1];
     return h->used ? h : NULL;
+}
+
+static void xms_alias_refresh(uint32_t first, uint32_t count)
+{
+    /* Locked blocks can share a 4 KB boundary page. Keep any page still
+       covered by another locked handle registered when one block unlocks. */
+    for (uint32_t p = first; p < first + count; p++) {
+        int covered = 0;
+        for (unsigned i = 0; i < X86_XMS_HANDLES; i++) {
+            xms_handle_t *h = &xms_h[i];
+            if (!h->used || !h->locks) continue;
+            uint32_t lo = (XMS_LINEAR_BASE + (h->kb_off << 10)) >> X86_PG_SHIFT;
+            uint32_t hi = (XMS_LINEAR_BASE + ((h->kb_off + h->kb) << 10)
+                           + X86_PG_SIZE - 1u) >> X86_PG_SHIFT;
+            if (p >= lo && p < hi) { covered = 1; break; }
+        }
+        if (!covered) x86_pager_own_aux(p, 0);
+    }
+    for (unsigned i = 0; i < X86_XMS_HANDLES; i++) {
+        xms_handle_t *h = &xms_h[i];
+        if (!h->used || !h->locks) continue;
+        uint32_t lo = (XMS_LINEAR_BASE + (h->kb_off << 10)) >> X86_PG_SHIFT;
+        uint32_t hi = (XMS_LINEAR_BASE + ((h->kb_off + h->kb) << 10)
+                       + X86_PG_SIZE - 1u) >> X86_PG_SHIFT;
+        x86_pager_own_aux(lo, hi - lo);
+    }
 }
 
 /* ---- results -------------------------------------------------------------
@@ -2932,6 +2963,8 @@ static int xms_move(void)
         xms_handle_t *h = xms_get(sh);
         if (!h)
             return xms_err(XMSE_BADSRCH);
+        if (h->locks)
+            return xms_err(XMSE_LOCKED);
         if (so > (h->kb << 10) || (h->kb << 10) - so < len)
             return xms_err(XMSE_BADSRCO);
         s_off = (h->kb_off << 10) + so;
@@ -2942,6 +2975,8 @@ static int xms_move(void)
         xms_handle_t *h = xms_get(dh);
         if (!h)
             return xms_err(XMSE_BADDSTH);
+        if (h->locks)
+            return xms_err(XMSE_LOCKED);
         if (dof > (h->kb << 10) || (h->kb << 10) - dof < len)
             return xms_err(XMSE_BADDSTO);
         d_off = (h->kb_off << 10) + dof;
@@ -3072,15 +3107,39 @@ int x86_xms_control(void)
         return xms_move();
 
     case 0x0C:                                  /* lock a block */
-        if (!xms_get(dx))
+        {
+        xms_handle_t *h = xms_get(dx);
+        if (!h)
             return xms_err(XMSE_BADHANDLE);
-        /* Honest refusal: a lock exists to yield a 32-bit LINEAR address, and
-           our bytes are in a file. See x86_xms.h. */
-        return xms_err(XMSE_LOCKFAIL);
+        if (h->locks == 255u)
+            return xms_err(XMSE_LOCKFAIL);
+        h->locks++;
+        uint32_t linear = XMS_LINEAR_BASE + (h->kb_off << 10);
+        uint32_t first = linear >> X86_PG_SHIFT;
+        uint32_t last = (linear + (h->kb << 10) + X86_PG_SIZE - 1u)
+                        >> X86_PG_SHIFT;
+        xms_alias_refresh(first, last - first);
+        x86_set_ax(1);
+        xms_bl_set(0);
+        x86_set_bx((uint16_t)linear);
+        x86_set_dx((uint16_t)(linear >> 16));
+        return 1;
+        }
     case 0x0D:                                  /* unlock */
-        if (!xms_get(dx))
+        {
+        xms_handle_t *h = xms_get(dx);
+        if (!h)
             return xms_err(XMSE_BADHANDLE);
-        return xms_err(XMSE_NOTLOCKED);
+        if (!h->locks)
+            return xms_err(XMSE_NOTLOCKED);
+        uint32_t linear = XMS_LINEAR_BASE + (h->kb_off << 10);
+        uint32_t first = linear >> X86_PG_SHIFT;
+        uint32_t last = (linear + (h->kb << 10) + X86_PG_SIZE - 1u)
+                        >> X86_PG_SHIFT;
+        h->locks--;
+        xms_alias_refresh(first, last - first);
+        return xms_ok();
+        }
 
     case 0x0E: {                                /* get handle information */
         xms_handle_t *h = xms_get(dx);

@@ -5476,7 +5476,7 @@ static void hma_test_run(void)
  * ===========================================================================
  */
 volatile uint32_t run_xms_flag = 0;
-volatile uint32_t xms_r[48];
+volatile uint32_t xms_r[56];
 
 /* Reuses the pagefile buffer's 32 KB -- the arms never run at the same time,
    and test_ram has no spare region (it is 752 KB and fully spoken for). */
@@ -5504,8 +5504,8 @@ static int xmsb_write(uint32_t off, const void *src, uint32_t bytes)
 
 #define XMS_CODE_A   0x3000u
 #define XMS_CODE_B   0x3100u
-#define XMS_CODE_C   0x3180u
-#define XMS_RES      0x3200u        /* 32 result words */
+#define XMS_CODE_C   0x3800u
+#define XMS_RES      0x3200u        /* guest result words */
 #define XMS_ENTRY    0x3300u        /* the far pointer the guest CALLs         */
 #define XMS_S1       0x3310u        /* move: conventional -> XMS               */
 #define XMS_S2       0x3330u        /* move: XMS -> conventional               */
@@ -5600,11 +5600,28 @@ static const uint8_t xms_code_c[] = {
     0xFF, 0x1E, 0x00, 0x33,
     0xA3, 0x2E, 0x32,             /* r23: 0                                  */
     0x88, 0x1E, 0x30, 0x32,       /* r24: A3h invalid source handle          */
-    0xB4, 0x0C,                   /* MOV AH,0Ch -- lock, which we refuse     */
+    0xB4, 0x0C,                   /* MOV AH,0Ch -- lock and get alias        */
     0x8B, 0x16, 0x10, 0x32,
     0xFF, 0x1E, 0x00, 0x33,
-    0xA3, 0x32, 0x32,             /* r25: 0                                  */
-    0x88, 0x1E, 0x34, 0x32,       /* r26: ADh lock failed                    */
+    0xA3, 0x80, 0x32,             /* r40: AX success                         */
+    0x89, 0x16, 0x82, 0x32,       /* r41: alias high                         */
+    0x89, 0x1E, 0x84, 0x32,       /* r42: alias low                          */
+    0x8B, 0x16, 0x10, 0x32,
+    0xB4, 0x0E, 0xFF, 0x1E, 0x00, 0x33,
+    0x89, 0x1E, 0x86, 0x32,       /* r43: locks/free                         */
+    0xC7, 0x06, 0x50, 0x33, 0x40, 0x00,
+    0xC7, 0x06, 0x54, 0x33, 0x01, 0x00, /* locked move source = handle 1 */
+    0xB4, 0x0B, 0xBE, 0x50, 0x33, 0xFF, 0x1E, 0x00, 0x33,
+    0xA3, 0x88, 0x32,             /* locked move AX                         */
+    0x88, 0x1E, 0x8A, 0x32,       /* locked move BL                         */
+    0x8B, 0x16, 0x10, 0x32,
+    0xB4, 0x0D, 0xFF, 0x1E, 0x00, 0x33,
+    0xA3, 0x8C, 0x32,             /* r46: unlock succeeded                 */
+    0xB4, 0x0C, 0x8B, 0x16, 0x10, 0x32,
+    0xFF, 0x1E, 0x00, 0x33,
+    0xA3, 0x8E, 0x32,             /* r47: relock succeeded                 */
+    0x8B, 0x16, 0x10, 0x32,
+    0xB4, 0x0D, 0xFF, 0x1E, 0x00, 0x33,
     0xB4, 0x0A,                   /* MOV AH,0Ah -- free                      */
     0x8B, 0x16, 0x10, 0x32,
     0xFF, 0x1E, 0x00, 0x33,
@@ -5650,7 +5667,10 @@ static void xms_test_run(void)
     };
     uint8_t pat[XMS_PAT_LEN], got[XMS_PAT_LEN];
 
-    for (uint32_t i = 0; i < 48; i++)
+    /* The bare-metal harness's identity RAM ends below 1 MB. The XMS linear
+       alias lives at 8 MB, so direct it into the same RAM-backed store used by
+       the XMS callbacks for this test arm. */
+    for (uint32_t i = 0; i < 56; i++)
         xms_r[i] = 0;
 
     /* ---- the store, and the guest pages the moves run against ---------- */
@@ -5665,6 +5685,13 @@ static void xms_test_run(void)
                                              can reach the store but XMS */
     x86_livemap_clear();
     x86_pager_own(PGT_FIRST, PGT_PAGES);
+    for (uint32_t i = 0; i < XMS_STORE_BYTES / X86_PG_SIZE; i++) {
+        uint32_t lin_page = (8u * 1024u * 1024u) / X86_PG_SIZE + i;
+        guest_page_table[lin_page] = FOLD_K((uint32_t)(test_ram + XMS_STORE_OFF)
+                                             + i * X86_PG_SIZE, lin_page);
+    }
+    x86_pager_own_aux(8u * 1024u * 1024u / X86_PG_SIZE,
+                      XMS_STORE_BYTES / X86_PG_SIZE);
     x86_pager_add_frames(test_ram + PGT_MEM_OFF, X86_PG_POOL_BYTES(4));
     for (uint32_t i = 0; i < PGT_PAGES; i++)
         guest_page_table[PGT_FIRST + i] = FOLD_INVALID;
@@ -5743,6 +5770,7 @@ static void xms_test_run(void)
         x86_guest_copy_out(got, XMS_DST_LIN, XMS_PAT_LEN);
         xms_r[34] = (memcmp(got, pat, XMS_PAT_LEN) != 0);
     }
+
     test_ram[XMS_STORE_OFF + 40] ^= 0xFF;
 
     /* ---- phase C ------------------------------------------------------- */
@@ -5774,6 +5802,15 @@ static void xms_test_run(void)
         xms_r[i] = (uint32_t)(test_ram[XMS_RES + i * 2]
                               | (test_ram[XMS_RES + i * 2 + 1] << 8));
 
+    xms_r[48] = (uint16_t)(test_ram[XMS_RES + 0x80] | (test_ram[XMS_RES + 0x81] << 8));
+    xms_r[49] = (uint16_t)(test_ram[XMS_RES + 0x82] | (test_ram[XMS_RES + 0x83] << 8));
+    xms_r[50] = (uint16_t)(test_ram[XMS_RES + 0x84] | (test_ram[XMS_RES + 0x85] << 8));
+    xms_r[51] = (uint16_t)(test_ram[XMS_RES + 0x86] | (test_ram[XMS_RES + 0x87] << 8));
+    xms_r[52] = (uint16_t)(test_ram[XMS_RES + 0x88] | (test_ram[XMS_RES + 0x89] << 8));
+    xms_r[53] = (uint16_t)(test_ram[XMS_RES + 0x8A] | (test_ram[XMS_RES + 0x8B] << 8));
+    xms_r[54] = (uint16_t)(test_ram[XMS_RES + 0x8C] | (test_ram[XMS_RES + 0x8D] << 8));
+    xms_r[55] = (uint16_t)(test_ram[XMS_RES + 0x8E] | (test_ram[XMS_RES + 0x8F] << 8));
+
     xms_r[36] = x86_xms_moves;
     xms_r[37] = x86_xms_move_up;
     xms_r[38] = x86_xms_move_down;
@@ -5782,9 +5819,9 @@ static void xms_test_run(void)
     xms_r[41] = xmsb_opens;
     xms_r[42] = x86_a20_changes - a20_0;
     xms_r[43] = x86_xms_total_kb;
-    xms_r[45] = x86_xms_handles_used;
-    xms_r[46] = x86_xms_detects;
-    xms_r[47] = x86_xms_entry_reqs;
+    xms_r[47] = x86_xms_handles_used;
+    xms_r[45] = x86_xms_detects;
+    xms_r[46] = x86_xms_entry_reqs;
 
     x86_xms_set_backing(NULL, NULL, NULL, NULL, 0);
     for (uint32_t i = 0; i < PGT_PAGES; i++)

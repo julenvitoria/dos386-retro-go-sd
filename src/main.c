@@ -1954,10 +1954,10 @@ static int pgf_read(uint32_t page, void *dst)
  * are, and the one property that has to hold is that a guest page and an XMS
  * byte cannot land on the same byte of x86page.swp.
  *
- * They cannot, by arithmetic rather than by convention. The pager's `slot` IS
- * the guest page number and guest page numbers stop at X86_PG_PAGES, so the
- * pager can never write past X86_PG_PAGES * X86_PG_SIZE. XMS starts exactly
- * there. Nothing has to be allocated, reserved or checked at run time.
+ * Ordinary pager slots stop at 8 MB. Locked XMS linear aliases use the
+ * separately-owned 8..16 MB page range, where each page offset matches the
+ * same bytes in the XMS store. Nothing has to be copied when guest code writes
+ * through an alias.
  *
  * The file is sparse in practice: a slot that was never written is never read,
  * and the same holds for the XMS range -- an unwritten region reads back as a
@@ -1969,7 +1969,7 @@ static int pgf_read(uint32_t page, void *dst)
  * pager opened and closed a third per evicted page; see the pagefile header for
  * why that was both slow and, with FF_FS_LOCK 0, unsound.
  */
-#define XMS_FILE_BASE  ((uint32_t)X86_PG_PAGES * X86_PG_SIZE)   /* 8 MB */
+#define XMS_FILE_BASE  (8u * 1024u * 1024u)   /* keep XMS at byte offset 8 MB */
 
 volatile uint32_t xms_bytes_read = 0;
 volatile uint32_t xms_bytes_written = 0;

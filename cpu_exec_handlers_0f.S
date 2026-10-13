@@ -1623,6 +1623,11 @@ OP .op_0f_lgs_B5
 .set .op_out_imm8_eax_E7, .op_out_imm8_eax_E7_32
 .set .op_insv_6D, .op_insv_6D_32
 .set .op_outsv_6F, .op_outsv_6F_32
+.set .op_jcc_rel8_7X, .op_jcc_rel8_7X_32
+.set .op_loopnz_E0, .op_loopnz_E0_32
+.set .op_loopz_E1, .op_loopz_E1_32
+.set .op_loop_E2, .op_loop_E2_32
+.set .op_jcxz_E3, .op_jcxz_E3_32
 opcode_table_32:
 #include "opcode_table.S"
 
@@ -1735,6 +1740,11 @@ opcode_table_0f_32:
 .set .op_out_imm8_eax_E7, .op_out_imm8_eax_E7_16
 .set .op_insv_6D, .op_insv_6D_16
 .set .op_outsv_6F, .op_outsv_6F_16
+.set .op_jcc_rel8_7X, .op_jcc_rel8_7X_16
+.set .op_loopnz_E0, .op_loopnz_E0_16
+.set .op_loopz_E1, .op_loopz_E1_16
+.set .op_loop_E2, .op_loop_E2_16
+.set .op_jcxz_E3, .op_jcxz_E3_16
 opcode_table_16:
 #include "opcode_table.S"
 

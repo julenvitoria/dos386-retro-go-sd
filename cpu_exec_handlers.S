@@ -2543,7 +2543,7 @@ L(GRP5_PUSH):
     PUSH_V R3, R4, R12
     B.W .fetch_decode_loop
 
-OP_AGNOSTIC .op_jcc_rel8_7X
+OP .op_jcc_rel8_7X
     CODE_PTR R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
@@ -2552,6 +2552,7 @@ OP_AGNOSTIC .op_jcc_rel8_7X
     CMP R3, #1
     BNE.W .fetch_decode_loop
     ADD R10, R5
+    EIP_WRAP
     B.W .fetch_decode_loop
 L(EVAL_COND):
     MOV.W R3, #0
@@ -3082,7 +3083,7 @@ L(X87_STORE_MASK):
     .byte 0x00, 0xCC, 0x00, 0x8C, 0x00, 0xCC, 0x00, 0xCC
     .p2align 1
 
-OP_AGNOSTIC .op_loopnz_E0
+OP .op_loopnz_E0
     CODE_PTR R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
@@ -3099,7 +3100,7 @@ OP_AGNOSTIC .op_loopnz_E0
     BEQ.N L(LOOP_TAKEN)
     B.W .fetch_decode_loop
 
-OP_AGNOSTIC .op_loopz_E1
+OP .op_loopz_E1
     CODE_PTR R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
@@ -3116,7 +3117,7 @@ OP_AGNOSTIC .op_loopz_E1
     BEQ.N L(LOOP_TAKEN)
     B.W .fetch_decode_loop
 
-OP_AGNOSTIC .op_loop_E2
+OP .op_loop_E2
     CODE_PTR R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
@@ -3130,7 +3131,7 @@ OP_AGNOSTIC .op_loop_E2
     BNE.N L(LOOP_TAKEN)
     B.W .fetch_decode_loop
 
-OP_AGNOSTIC .op_jcxz_E3
+OP .op_jcxz_E3
     CODE_PTR R5
     LDRSB.W R5, [R5]
     ADD.W R10, R10, #1
@@ -3140,6 +3141,7 @@ OP_AGNOSTIC .op_jcxz_E3
     B.W .fetch_decode_loop
 L(LOOP_TAKEN):
     ADD R10, R5
+    EIP_WRAP
     B.W .fetch_decode_loop
 
 OP_AGNOSTIC .op_lock_F0

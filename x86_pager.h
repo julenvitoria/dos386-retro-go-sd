@@ -96,10 +96,9 @@
 
 #define X86_PG_SIZE   4096u
 #define X86_PG_SHIFT  12u
-/* The guest space the pager owns, in pages. 8 MB. Sized for the space rather
-   than for the 640 KB a real-mode DOS guest can address, so the structures do
-   not have to be rebuilt when something can reach above 1 MB. */
-#define X86_PG_PAGES  2048u
+/* The guest space the pager owns, in pages. 16 MB. The upper 8 MB is used
+   only by XMS blocks while they are locked; ordinary ownership remains 8 MB. */
+#define X86_PG_PAGES  4096u
 
 /* Backing-store callbacks. The pager does not know what an SD card is: the ABI
    lives in src/main.c and keeping it there is what lets the whole mechanism be
@@ -137,7 +136,7 @@ typedef int (*x86_pg_write_fn)(uint32_t slot, const void *src);
 /* What a caller must hand x86_pager_add_frames() to get `pages` frames. */
 #define X86_PG_POOL_BYTES(pages) ((pages) * X86_PG_STRIDE)
 
-#define X86_PG_TABLE_BYTES (4u * X86_PG_PAGES)
+#define X86_PG_TABLE_BYTES (3u * X86_PG_PAGES)
 int  x86_pager_set_tables(void *block, uint32_t bytes);
 
 /* Hand the pager the AXI it may hand out, in whole pages. May be called more

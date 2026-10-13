@@ -25,8 +25,8 @@ THE THREE NEGATIVE CONTROLS, all of which must FAIL in the way stated:
     vacuous this would come back "matching".
   * `control: the naive one-pointer copy IS wrong` -- 64 bytes memcpy'd through
     a single x86_guest_ptr(), then read back granule-aware. It cannot match.
-  * the guest's own refusals: an odd length, an unissued handle, a lock we do
-    not support, and an allocation larger than the store all have to come back
+  * the guest's own refusals: an odd length, an unissued handle, a move while
+    locked, and an allocation larger than the store all have to come back
     with the documented BL code and AX=0.
 
 The store is a plain RAM buffer standing in for the pagefile, exactly as the
@@ -47,9 +47,22 @@ PAT = 64            # bytes moved each way
 
 
 def run_arm(b, syms, flag, result, count):
+    # Boot/reset takes several seconds under gwemu. A flag written before
+    # Reset_Handler reaches its command loop is cleared by BSS initialization.
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        pc = b.read_register("pc")
+        if 0x08000000 <= pc < 0x08200000 and \
+                b.read_uint32(syms["run_xms_flag"]) == 0:
+            break
+        time.sleep(0.05)
+    else:
+        return None
     b.write_uint32(syms[flag], 1)
-    for _ in range(400):
-        if b.read_uint32(syms[flag]) == 0:
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if b.read_uint32(syms[flag]) == 0 and \
+                b.read_uint32(syms["x86_xms_calls"]) >= 10:
             break
         time.sleep(0.05)
     else:
@@ -69,7 +82,7 @@ def main(args):
                 return False
 
         time.sleep(0.5)
-        r = run_arm(b, syms, "run_xms_flag", "xms_r", 48)
+        r = run_arm(b, syms, "run_xms_flag", "xms_r", 56)
         if r is None:
             print("FAIL: target never ran the XMS test")
             return False
@@ -82,8 +95,8 @@ def main(args):
             ("INT 2Fh AX=4300h returns AL=80h",         r[0], 0x4380),
             ("AX=4310h entry segment",                  r[1], 0x0060),
             ("AX=4310h entry offset",                   r[2], 0x00C0),
-            ("the driver was detected once",            r[46], 1),
-            ("the entry point was asked for once",      r[47], 1),
+            ("the driver was detected once",            r[45], 1),
+            ("the entry point was asked for once",      r[46], 1),
 
             # ---- the far call works at all, which is the RETF stub
             ("AH=00h version is 2.00",                  r[3], 0x0200),
@@ -98,9 +111,9 @@ def main(args):
 
             # ---- THE POINT OF THE ARM
             ("AH=0Bh move up succeeded",                r[9], 1),
-            ("  ... BL clear",                          r[10], 0),
+            ("  ... BL clear",                          r[10] & 0xFF, 0),
             ("AH=0Bh move down succeeded",              r[11], 1),
-            ("  ... BL clear",                          r[12], 0),
+            ("  ... BL clear",                          r[12] & 0xFF, 0),
             ("ROUND TRIP BYTE-EXACT across a granule",  r[33], 1),
             ("nothing outside the block was written",   r[44], 1),
             ("bytes moved up",                          r[37], PAT),
@@ -127,19 +140,25 @@ def main(args):
 
             # ---- the refusals, each with its documented code
             ("odd length is refused",                   r[21], 0),
-            ("  ... BL=A7h invalid length",             r[22], 0xA7),
+            ("  ... BL=A7h invalid length",             r[22] & 0xFF, 0xA7),
             ("an unissued source handle is refused",    r[23], 0),
-            ("  ... BL=A3h invalid source handle",      r[24], 0xA3),
-            ("AH=0Ch lock is refused, honestly",        r[25], 0),
-            ("  ... BL=ADh lock failed",                r[26], 0xAD),
+            ("  ... BL=A3h invalid source handle",      r[24] & 0xFF, 0xA3),
+            ("AH=0Ch lock returns an XMS alias",        r[48], 1),
+            ("  ... alias is in the 8 MB window",       r[49], 0x0080),
+            ("  ... alias starts at allocated bytes",   r[50], 0),
+            ("AH=0Eh reports one lock",                 r[51], 0x010F),
+            ("AH=0Bh refuses moves of locked handles", r[52], 0),
+            ("  ... BL=ABh locked",                    r[53] & 0xFF, 0xAB),
+            ("AH=0Dh unlock succeeds",                 r[54], 1),
+            ("AH=0Ch can relock after unlock",          r[55], 1),
             ("more memory than exists is refused",      r[30], 0),
-            ("  ... BL=A0h all extended memory in use", r[31], 0xA0),
+            ("  ... BL=A0h all extended memory in use", r[31] & 0xFF, 0xA0),
 
             # ---- and the memory comes BACK
             ("AH=0Ah freed the handle",                 r[27], 1),
             ("AH=08h largest free, after",              r[28], STORE_KB),
             ("AH=08h total free, after",                r[29], STORE_KB),
-            ("no handle left in use",                   r[45], 0),
+            ("no handle left in use",                   r[47], 0),
         ]
 
         bad = 0

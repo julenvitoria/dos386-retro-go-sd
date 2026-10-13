@@ -159,6 +159,11 @@ the per-run temp directory, so without this the pictures a timeline exists to
 take are written and then thrown away -- which reads exactly like gwemu
 ignoring the events.
 
+`--stdio-gdb` selects gwemu's GDB remote protocol over subprocess pipes. Use
+this when the host sandbox denies local sockets; it preserves probe and
+firmware log-buffer reads. QMP screenshots are unavailable on this transport,
+so use timeline screenshots instead.
+
 ```bash
 # the 768 DAC bytes behind the pointer, as r,g,b triples
 python3 scripts/probe.py --retrogo --wait-magic \

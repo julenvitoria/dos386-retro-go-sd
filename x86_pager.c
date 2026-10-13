@@ -76,7 +76,7 @@ volatile uint32_t x86_pg_policy_ratchet = 0;
  * this project keeps getting bitten by. */
 static uint8_t  *pg_flags;
 static uint8_t  *pg_hot;
-static uint16_t *pg_frame;
+static uint8_t  *pg_frame;
 
 int x86_pager_set_tables(void *block, uint32_t bytes)
 {
@@ -85,12 +85,13 @@ int x86_pager_set_tables(void *block, uint32_t bytes)
     uint8_t *b = (uint8_t *)block;
     pg_flags = b;
     pg_hot   = b + X86_PG_PAGES;
-    pg_frame = (uint16_t *)(b + 2u * X86_PG_PAGES);
+    pg_frame = b + 2u * X86_PG_PAGES;
     x86_pager_reset();
     return 0;
 }
 
 #define NO_FRAME 0xFFFFu
+#define PG_NO_FRAME 0xFFu
 
 /* ---- frames --------------------------------------------------------------
  *
@@ -121,7 +122,7 @@ static x86_pg_write_fn backing_write;
 static uint32_t own_first, own_count;
 /* The extra windows; see x86_pager.h. Two of them: EMS at linear 4 MB and the
    HMA at 1 MB, which comes and goes with the A20 gate. */
-#define AUX_WINDOWS 2
+#define AUX_WINDOWS 20
 static struct { uint32_t first, count; } aux_win[AUX_WINDOWS];
 
 /* The clock hand. One index, not a list: see the policy note in x86_pager.h. */
@@ -150,7 +151,7 @@ void x86_pager_reset(void)
         memset(pg_flags, 0, X86_PG_PAGES);
         memset(pg_hot, 0, X86_PG_PAGES);
         for (uint32_t i = 0; i < X86_PG_PAGES; i++)
-            pg_frame[i] = NO_FRAME;
+            pg_frame[i] = PG_NO_FRAME;
     }
     memset(extents, 0, sizeof(extents));
     extent_count = frame_count = free_count = 0;
@@ -331,7 +332,7 @@ void x86_pager_refold(uint32_t page)
     if (!guest_page_table_ptr || page >= X86_PG_PAGES)
         return;
     if (pg_flags && (pg_flags[page] & PG_RESIDENT)
-        && pg_frame[page] != NO_FRAME) {
+        && pg_frame[page] < MAX_FRAMES) {
         uint8_t *host = frame_addr(pg_frame[page]);
         if (host) {
             fold_install(page, host);
@@ -520,7 +521,7 @@ static void evict_frame(uint32_t f)
     }
 
     frame_page[f]  = NO_FRAME;
-    pg_frame[page] = NO_FRAME;
+    pg_frame[page] = PG_NO_FRAME;
     pg_flags[page] &= (uint8_t)~PG_RESIDENT;
     pg_hot[page] = 0;
     if (x86_pg_resident)
@@ -1101,7 +1102,7 @@ uint32_t x86_pager_fault(uint32_t lin, int write)
     }
 
     frame_page[f] = (uint16_t)page;
-    pg_frame[page] = (uint16_t)f;
+    pg_frame[page] = (uint8_t)f;
     pg_flags[page] |= PG_RESIDENT;
     x86_pg_resident++;
     /* The high-water mark IS the working set, measured rather than assumed,

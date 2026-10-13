@@ -96,7 +96,7 @@ only). That leaves roughly **185 one-byte opcodes believed correct**.
 | One-byte slots dispatching to `.exit_loop` | **1 / 256** |
 | Two-byte (0F) slots with a handler | **64 / 256** |
 | Two-byte slots dispatching to `.exit_loop` | **192 / 256** |
-| Implemented slots carrying at least one mechanical warning | **194** |
+| Implemented slots carrying at least one mechanical warning | **178** |
 
 Every row below is DERIVED. `status` is `reached` or `.exit_loop`, taken from
 the dispatch table. `mode` is `OP` (dual-emitted) or `OP_AGNOSTIC`, taken from the
@@ -233,22 +233,22 @@ Warning legend:
 | 6D | reached | `.op_insv_6D` | dual | - | no flag macro reachable |
 | 6E | reached | `.op_outsb_6E` | AGN | - | no flag macro reachable |
 | 6F | reached | `.op_outsv_6F` | dual | - | no flag macro reachable |
-| 70 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
-| 71 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
-| 72 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
-| 73 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
-| 74 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
-| 75 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
-| 76 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
-| 77 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
-| 78 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
-| 79 | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
-| 7A | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
-| 7B | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
-| 7C | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
-| 7D | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
-| 7E | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
-| 7F | reached | `.op_jcc_rel8_7X` | AGN | - | REVIEW: AGN body mixes width primitives with 34 bare word op(s) |
+| 70 | reached | `.op_jcc_rel8_7X` | dual | - | - |
+| 71 | reached | `.op_jcc_rel8_7X` | dual | - | - |
+| 72 | reached | `.op_jcc_rel8_7X` | dual | - | - |
+| 73 | reached | `.op_jcc_rel8_7X` | dual | - | - |
+| 74 | reached | `.op_jcc_rel8_7X` | dual | - | - |
+| 75 | reached | `.op_jcc_rel8_7X` | dual | - | - |
+| 76 | reached | `.op_jcc_rel8_7X` | dual | - | - |
+| 77 | reached | `.op_jcc_rel8_7X` | dual | - | - |
+| 78 | reached | `.op_jcc_rel8_7X` | dual | - | - |
+| 79 | reached | `.op_jcc_rel8_7X` | dual | - | - |
+| 7A | reached | `.op_jcc_rel8_7X` | dual | - | - |
+| 7B | reached | `.op_jcc_rel8_7X` | dual | - | - |
+| 7C | reached | `.op_jcc_rel8_7X` | dual | - | - |
+| 7D | reached | `.op_jcc_rel8_7X` | dual | - | - |
+| 7E | reached | `.op_jcc_rel8_7X` | dual | - | - |
+| 7F | reached | `.op_jcc_rel8_7X` | dual | - | - |
 | 80 | reached | `.op_alu_eb_imm8_80` | AGN | - | - |
 | 81 | reached | `.op_alu_ev_imm32_81` | dual | - | - |
 | 82 | reached | `.op_alu_eb_imm8_80` | AGN | - | - |
@@ -345,10 +345,10 @@ Warning legend:
 | DD | reached | `.op_esc_x87` | AGN | - | no flag macro reachable |
 | DE | reached | `.op_esc_x87` | AGN | - | no flag macro reachable |
 | DF | reached | `.op_esc_x87` | AGN | - | no flag macro reachable |
-| E0 | reached | `.op_loopnz_E0` | AGN | - | REVIEW: no width primitive, 4 bare word op(s), no flag macro reachable |
-| E1 | reached | `.op_loopz_E1` | AGN | - | REVIEW: no width primitive, 4 bare word op(s), no flag macro reachable |
-| E2 | reached | `.op_loop_E2` | AGN | - | REVIEW: no width primitive, 4 bare word op(s), no flag macro reachable |
-| E3 | reached | `.op_jcxz_E3` | AGN | - | REVIEW: no width primitive, 4 bare word op(s), no flag macro reachable |
+| E0 | reached | `.op_loopnz_E0` | dual | - | no flag macro reachable |
+| E1 | reached | `.op_loopz_E1` | dual | - | no flag macro reachable |
+| E2 | reached | `.op_loop_E2` | dual | - | no flag macro reachable |
+| E3 | reached | `.op_jcxz_E3` | dual | - | no flag macro reachable |
 | E4 | reached | `.op_in_al_imm8_E4` | AGN | - | no flag macro reachable |
 | E5 | reached | `.op_in_eax_imm8_E5` | dual | - | no flag macro reachable |
 | E6 | reached | `.op_out_imm8_al_E6` | AGN | - | no flag macro reachable |

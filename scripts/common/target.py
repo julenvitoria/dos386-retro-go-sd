@@ -70,6 +70,47 @@ def _free_port():
         return s.getsockname()[1]
 
 
+class _PipeSocket:
+    """Socket-shaped adapter for QEMU's GDB stdio chardev."""
+
+    def __init__(self, proc):
+        self.proc = proc
+
+    def sendall(self, data):
+        self.proc.stdin.write(data)
+        self.proc.stdin.flush()
+
+    def makefile(self, mode, buffering=-1):
+        return self.proc.stdout
+
+    def close(self):
+        for stream in (self.proc.stdin, self.proc.stdout):
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+class GDBPipeBackend(GDBBackend):
+    """GDB remote protocol over pipes, for sandboxes that deny local sockets."""
+
+    def __init__(self, proc):
+        super().__init__()
+        self.proc = proc
+
+    def open(self):
+        self._socket = _PipeSocket(self.proc)
+        self._sock_file = self._socket.makefile("rb", buffering=8192)
+        try:
+            self._send_command(b"qSupported:multiprocess+;xmlRegisters=i386;qRelocInsn+")
+        except Exception:
+            # The normal backend deliberately tolerates a stub without
+            # qSupported. Pipe transport has the same compatibility rule.
+            pass
+        self.resume()
+        return self
+
+
 @dataclass
 class Image:
     """The bytes to boot. bank1/bank2 are internal flash; the rest optional."""
@@ -231,15 +272,16 @@ class GwemuTarget(Target):
 
     def __init__(self, image, display=False, audio=False, icount=None,
                  timeline=None, record=None, port=None, qmp_port=None,
-                 keep_temp=False):
+                 keep_temp=False, stdio_gdb=False):
         super().__init__(image)
         self.display = display
         self.audio = audio
         self.icount = icount
         self.timeline = timeline
         self.record = record
-        self.port = port or _free_port()
-        self.qmp_port = qmp_port or _free_port()
+        self.stdio_gdb = stdio_gdb
+        self.port = port or (None if stdio_gdb else _free_port())
+        self.qmp_port = qmp_port or (None if stdio_gdb else _free_port())
         self.proc = None
         self.qmp = None
         self.keep_temp = keep_temp
@@ -289,13 +331,23 @@ class GwemuTarget(Target):
                 "-global", "gnw-h7b0-sai1.audiodev=snd0"]
         if os.path.exists(os.path.join(self.tmpdir, "sdcard.img")):
             cmd += ["-drive", "if=sd,format=raw,file=sdcard.img"]
-        cmd += ["-display", "gwemu" if self.display else "none",
-                "-qmp", f"tcp:localhost:{self.qmp_port},server=on,wait=off",
-                "-gdb", f"tcp::{self.port}", "-S"]
+        cmd += ["-display", "gwemu" if self.display else "none"]
+        if self.stdio_gdb:
+            cmd += ["-gdb", "stdio", "-S"]
+        else:
+            cmd += ["-qmp", f"tcp:localhost:{self.qmp_port},server=on,wait=off",
+                    "-gdb", f"tcp::{self.port}", "-S"]
         if self.icount is not None:
             # Without -icount, virtual time follows host wall-clock and DWT
             # counts vary ~14% run to run. See docs/06.
             cmd += ["-icount", f"shift={self.icount},align=off,sleep=off"]
+
+        # Pipe mode has no QMP, so use the timeline's own quit event as the
+        # process lifetime bound instead of leaving a background emulator.
+        if self.stdio_gdb and not self.timeline:
+            env_timeline = os.path.join(os.path.dirname(__file__), "..", "..",
+                                        "timelines", "probe-quit.tl")
+            self.timeline = os.path.abspath(env_timeline)
 
         env = dict(os.environ)
         if self.timeline:
@@ -316,10 +368,17 @@ class GwemuTarget(Target):
             env["GNW_TIMELINE_RECORD"] = rec
             print(f"recording timeline to {rec} -- quit gwemu cleanly to save it")
 
-        self.proc = subprocess.Popen(cmd, cwd=self.tmpdir, env=env)
+        self.proc = subprocess.Popen(
+            cmd, cwd=self.tmpdir, env=env,
+            stdin=subprocess.PIPE if self.stdio_gdb else None,
+            stdout=subprocess.PIPE if self.stdio_gdb else None)
         time.sleep(1.0)
-        self.qmp = QMP(self.qmp_port)
-        self.backend = GDBBackend(host="localhost", port=self.port)
+        if self.stdio_gdb:
+            self.qmp = None
+            self.backend = GDBPipeBackend(self.proc)
+        else:
+            self.qmp = QMP(self.qmp_port)
+            self.backend = GDBBackend(host="localhost", port=self.port)
         self.backend.open()
         self.sdcard = QemuSDCardManager(os.path.join(self.tmpdir, "sdcard.img"))
         self.backend.resume()
@@ -351,6 +410,8 @@ class GwemuTarget(Target):
         try:
             if self.qmp:
                 self.qmp.close()
+            if self.backend:
+                self.backend.close()
             if self.proc:
                 self.proc.terminate()
                 try:
@@ -578,6 +639,9 @@ def add_target_args(parser):
                         help="keep the run directory under build/run/ for "
                              "analysis (deleted by default -- each run copies "
                              "the SD image and extflash)")
+    parser.add_argument("--stdio-gdb", action="store_true",
+                        help="use gwemu GDB over subprocess pipes when local "
+                             "sockets are unavailable")
 
 
 def open_target(args, image):
@@ -595,4 +659,5 @@ def open_target(args, image):
                        icount=getattr(args, "icount", None),
                        timeline=getattr(args, "timeline", None),
                        record=getattr(args, "record", None),
-                       keep_temp=getattr(args, "keep_temp", False))
+                       keep_temp=getattr(args, "keep_temp", False),
+                       stdio_gdb=getattr(args, "stdio_gdb", False))
