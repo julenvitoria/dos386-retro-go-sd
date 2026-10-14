@@ -2092,6 +2092,21 @@ python3 tests/test_settings.py --negative
                                          # PASSES as its own failure -- a guard
                                          # that cannot be made to fail was not
                                          # being tested. 6/6 seen to fail
+python3 tests/test_pad.py                # PER-TITLE [gamepad] MAPPING and
+                                         # typematic repeat, NATIVE -- no
+                                         # target. Compiles tests/host_pad.c
+                                         # against x86_pad.c + x86_cfg.c +
+                                         # x86_settings.c: bindings, combos
+                                         # (pressed in order, released in
+                                         # reverse), aliases, `none`, refusals
+                                         # (unknown key/button, four keys,
+                                         # GAME), the repeat delay/rate and
+                                         # that x86_cfg.c does not count the
+                                         # section's keys as unknown. 22 checks
+python3 tests/test_pad.py --negative     # ONE control: X86_PAD_CTL_ALLOWGAME
+                                         # lets a .cfg rebind GAME (the OSK's
+                                         # only door); it MUST make the harness
+                                         # fail. 1/1 seen to fail
 python3 tests/test_osk.py                # the on-screen keyboard, driven by
                                          # button MASK exactly as src/main.c
                                          # drives it: the grid press, the

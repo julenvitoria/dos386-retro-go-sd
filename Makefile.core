@@ -37,6 +37,7 @@ x86_dos.c \
 x86_ems.c \
 x86_settings.c \
 x86_cfg.c \
+x86_pad.c \
 lib/FatFs/ff.c \
 lib/FatFs/ffunicode.c \
 x86_disk.c \

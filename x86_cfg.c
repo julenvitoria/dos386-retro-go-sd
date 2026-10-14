@@ -403,6 +403,8 @@ x86_cfg_status_t x86_cfg_parse(const unsigned char *buf, unsigned long len,
        truncated, which only ever affects a section this table does not name. */
     char section[X86_CFG_NAME_MAX];
     int in_autoexec = 0;
+    int in_gamepad = 0;     /* [gamepad] belongs to x86_pad.c, which reads the
+                               same bytes; its keys are not unknown here */
 
     memset(&r, 0, sizeof r);
     section[0] = 0;
@@ -471,12 +473,16 @@ x86_cfg_status_t x86_cfg_parse(const unsigned char *buf, unsigned long len,
                     section[n] = 0;
                 }
                 in_autoexec = (strcmp(section, "autoexec") == 0);
+                in_gamepad = (strcmp(section, "gamepad") == 0);
                 continue;
             }
             /* A '[' with no ']' is not a header and not a key. */
             r.malformed++;
             continue;
         }
+
+        if (in_gamepad)
+            continue;
 
         /* ---- inside [autoexec]: command lines, not key=value ------------- */
         if (in_autoexec) {

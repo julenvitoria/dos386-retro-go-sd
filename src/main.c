@@ -55,6 +55,7 @@
 #include "x86_ems.h"
 #include "x86_settings.h" /* per-title settings: the format and the policy   */
 #include "x86_cfg.h"      /* per-title settings: the DOSBox-syntax .cfg      */
+#include "x86_pad.h"      /* per-title [gamepad] mapping + typematic repeat  */
 
 /* Chrom-ART offload for the chained 13h blit. DEFAULT OFF and UNVERIFIED --
    the whole rationale, the price and what tier 2 can and cannot prove are on
@@ -653,6 +654,13 @@ volatile uint32_t input_pad_raw = 0;    /* last raw pad, bit N = values[N]  */
 volatile uint32_t input_pad_seen = 0;   /* sticky OR of the above           */
 volatile uint32_t input_keys_now = 0;   /* our 8-bit mapped key mask        */
 volatile uint32_t input_scancodes = 0;  /* codes handed to the controller   */
+
+/* One scancode from a gamepad button (x86_pad.c) into the keyboard controller. */
+static void pad_emit(uint8_t sc)
+{
+    x86_kbd_scancode(sc);
+    input_scancodes++;
+}
 volatile uint32_t input_irqs = 0;       /* IRQ 1 raises                     */
 volatile uint32_t input_kbd_ht = 0;     /* controller head | tail<<8        */
 volatile uint32_t hle_bad_vector = 0;
@@ -2536,7 +2544,9 @@ static void guest_reset(void)
 /* Indexed by the bit numbering poll_input builds below from the ODROID_INPUT_*
    enum -- the compiler resolves the enum, so this order is ours and is correct
    by construction. Do NOT "fix" it against odroid_input.h.
-   0 means the button is deliberately bound to nothing. */
+   0 means the button is deliberately bound to nothing.
+   THIS IS THE DEFAULT, not the binding: a title's .cfg can replace any entry
+   but GAME with a [gamepad] section (x86_pad.h), keys and combos alike. */
 static const uint8_t pad_scancode[10] = {
     0x48,  /* UP                      -> Up arrow    */
     0x50,  /* DOWN                    -> Down arrow  */
@@ -2713,6 +2723,8 @@ static int settings_path(char *out, size_t cap, const char *suffix)
    from a working one -- so what it did is readable over the probe. */
 volatile uint32_t settings_cfg_status  = 0xFF; /* x86_cfg_status_t             */
 volatile uint32_t settings_cfg_bytes   = 0;    /* .cfg bytes read              */
+volatile uint32_t settings_pad_applied = 0;    /* [gamepad] bindings taken     */
+volatile uint32_t settings_pad_bad     = 0;    /* [gamepad] lines refused      */
 volatile uint32_t settings_cfg_applied = 0;    /* keys it applied              */
 volatile uint32_t settings_dset_status = 0xFF; /* x86_settings_status_t        */
 volatile uint32_t settings_dset_bytes  = 0;    /* .dosset bytes read           */
@@ -2767,6 +2779,9 @@ static void settings_load(void)
            and it clears the base itself, so there is no path out of here that
            leaves a previous title's .cfg behind. */
         x86_cfg_parse(NULL, 0, &res);
+        /* The compiled-in button table, until a [gamepad] section says
+           otherwise -- so a title with no .cfg gets exactly pad_scancode[]. */
+        x86_pad_defaults(pad_scancode);
 
         if (settings_path(path, sizeof(path), ".cfg") == 0) {
             /* ONE BYTE MORE than the cap, so a file exactly one byte too long
@@ -2775,6 +2790,13 @@ static void settings_load(void)
             n = settings_slurp(path, cfgbuf, sizeof(cfgbuf));
             settings_cfg_bytes = (uint32_t)n;
             st = x86_cfg_parse(cfgbuf, (unsigned long)n, &res);
+            if (st == X86_CFG_OK) {
+                /* Same bytes, one more section: [gamepad] (x86_pad.h). */
+                x86_pad_result_t pr;
+                x86_pad_parse(cfgbuf, (unsigned long)n, &pr);
+                settings_pad_applied = pr.applied;
+                settings_pad_bad = pr.bad;
+            }
         }
         settings_cfg_status = (uint32_t)st;
         settings_cfg_applied = res.applied;
@@ -3674,18 +3696,17 @@ static void poll_input(const gw_firmware_abi_t *abi)
 
         if ((changed & game) && (keys & game)) {
             if (!was_up) {
-                for (unsigned i = 0; i < 10; i++) {
-                    uint8_t sc = pad_scancode[i];
-                    if (sc && (prev & (1u << i))) {
-                        x86_kbd_scancode((uint8_t)(sc | 0x80));
-                        input_scancodes++;
-                    }
-                }
+                for (unsigned i = 0; i < 10; i++)
+                    if (prev & (1u << i))
+                        x86_pad_button(i, 0, pad_emit);   /* breaks, combo in reverse */
             }
             x86_osk_cycle();
         }
 
         if (x86_osk_visible() || was_up) {
+            /* The OSK owns the buttons: forget every hold, so one held across
+               it does not come back already past the repeat delay. */
+            x86_pad_repeat(0, 0, pad_emit);
             if (x86_osk_visible() && was_up) {
                 /* Real host time, so held-direction repeat runs at a fixed
                    rate rather than a frame-rate-dependent one. */
@@ -3696,18 +3717,18 @@ static void poll_input(const gw_firmware_abi_t *abi)
         }
     }
 
-    if (!changed)
+    /* Typematic repeat for buttons held past the delay (x86_pad.h). Before the
+       early return: a held button is exactly the case where nothing CHANGED. */
+    unsigned repeated = x86_pad_repeat(keys, abi->HAL_GetTick(), pad_emit);
+
+    if (!changed && !repeated)
         return;
 
-    for (unsigned i = 0; i < 10; i++) {
-        if (!(changed & (1u << i)))
-            continue;
-        uint8_t sc = pad_scancode[i];
-        if (!sc)
-            continue;              /* bit deliberately unbound */
-        x86_kbd_scancode((keys & (1u << i)) ? sc : (uint8_t)(sc | 0x80));
-        input_scancodes++;
-    }
+    /* The title's [gamepad] table, or pad_scancode[] when it has none. An
+       unbound button (or GAME, which is never bound) emits nothing. */
+    for (unsigned i = 0; i < 10; i++)
+        if (changed & (1u << i))
+            x86_pad_button(i, (keys & (1u << i)) != 0, pad_emit);
 deliver:
     input_kbd_ht = (uint32_t)x86_io.kbd_head | ((uint32_t)x86_io.kbd_tail << 8);
 
