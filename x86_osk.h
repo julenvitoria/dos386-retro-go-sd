@@ -76,11 +76,11 @@ extern volatile uint32_t x86_osk_mode;      /* 0 off, 1 keyboard, 2 mouse */
 extern volatile uint32_t x86_osk_presses;   /* grid keys pressed          */
 extern volatile uint32_t x86_osk_codes;     /* scancodes injected         */
 extern volatile uint32_t x86_osk_last_key;  /* (scancode << 8) | ascii    */
-/* The widest grid row, in 8 px cells, measured at reset -- and 1 if any row is
-   past the 40 that fit. The renderer clips silently, so a row that grew loses
-   its rightmost keys (the OFF cell, in every row that has one) with no fault to
-   notice; tests/test_osk.py asserts on these rather than on a comment. */
-extern volatile uint32_t x86_osk_row_cells_max;
+/* The widest key row, in PIXELS, measured at reset -- and 1 if any row is past
+   the 320 that fit. The renderer clips silently, so a row that grew loses its
+   rightmost caps with no fault to notice; tests/test_osk.py asserts on these
+   rather than on a comment. */
+extern volatile uint32_t x86_osk_row_px_max;
 extern volatile uint32_t x86_osk_row_overflow;
 extern volatile uint32_t x86_mouse_clicks;  /* button edges the mouse UI made */
 

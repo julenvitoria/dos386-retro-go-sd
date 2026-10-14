@@ -38,16 +38,9 @@
  * buffer after the blit, never into CGA VRAM, so nothing the guest can read
  * changes -- in either text or graphics mode.
  *
- * COLOURS ARE 16 / 24 / 31, NOT 0 / 8 / 15. Both modes publish 32 CLUT entries
- * (src/main.c's CORE_CLUT_ENTRIES block). In TEXT mode 0-31 are the CGA palette
- * twice over, so either range works -- but in GRAPHICS mode entries 0-3 are the
- * mode-4 colours, and entry 0 is whatever background the guest selected through
- * 0x3D9. Drawing the bars in "colour 0" there paints them in the game's
- * background colour and the text in a game colour. 16/24/31 are cga_argb[0],
- * [8] and [15] in BOTH modes (x86_video_refresh_palette), i.e. black, dark grey
- * and white, whatever the guest has done to its palette. (Under the capture-only
- * X86_TEXT_AA build every entry is reallocated per frame and this no longer
- * holds; the OSK is not a capture-build feature.)
+ * COLOURS: see ui_map_refresh(). CGA colour n is a FIXED entry in every
+ * 32-entry-CLUT mode (x86_video_ui_colour) and the nearest palette entry in a
+ * 256-colour one -- never one the guest can repaint under us.
  */
 
 #include <stdint.h>
@@ -60,6 +53,20 @@
 
 /* ---------------------------------------------------------------------------
  * Layout
+ *
+ * FOUR QWERTY ROWS SPLIT ROUND THE PICTURE: rows 0-1 in the 20-row band ABOVE
+ * the game, rows 2-3 in the band BELOW, so the game stays where it always is
+ * (rows 20..219) and nothing is scaled or moved. The look -- blue key caps,
+ * yellow cursor, red latched modifiers -- is the gw-dos (XTulator) frontend's,
+ * which the owner asked for by name. It replaces the earlier three-layer,
+ * two-row alphabetical grid: with four rows every key is on screen at once,
+ * so there are no layers to page through and no hidden '`'.
+ *
+ * A key cap is (label chars x 8) + 4 px wide -- 2 px of cap either side of the
+ * glyphs -- with the last column of each cap left black as the gap. A row must
+ * total <= 320 px; draw_glyph() CLIPS SILENTLY, so x86_osk_reset() measures
+ * every row and publishes x86_osk_row_overflow rather than trusting the sums
+ * in the comments below.
  * ------------------------------------------------------------------------- */
 
 enum {
@@ -67,83 +74,53 @@ enum {
     A_SHIFT,        /* latch/unlatch sticky Shift */
     A_CTRL,
     A_ALT,
-    A_LAYER,        /* cycle layer */
     A_CLOSE,        /* straight to OFF, short-cutting mouse mode */
-    A_MOUSE,        /* enter mouse mode -- see K_NAV */
 };
-#define F_SHIFT 0x80u   /* this cell's character needs Shift held */
 
-/* Cell width is one 8x8 glyph per label character, so a row's labels must total
- * no more than 320/8 = 40 cells. draw_glyph() CLIPS SILENTLY, so an over-long
- * row loses its OFF key with no warning and no fault -- which is why
- * x86_osk_reset() measures every row and publishes x86_osk_row_overflow. */
 typedef struct {
     char    label[4];   /* 1..3 chars, NUL terminated */
     uint8_t sc;         /* XT scancode; 0 for action cells */
-    uint8_t flags;      /* action | F_SHIFT */
+    uint8_t flags;      /* action */
 } osk_key_t;
 
 #define KC(c, sc)      { { (c), 0, 0, 0 }, (sc), A_KEY }
-#define KX(c, sc)      { { (c), 0, 0, 0 }, (sc), A_KEY | F_SHIFT }
 #define KS(lbl, sc)    { lbl, (sc), A_KEY }
 #define KA(lbl, act)   { lbl, 0, (act) }
 
-/* Common tails, spelled out per row because C has no array splicing. */
-#define K_MODS  KA("SHF", A_SHIFT), KA("CTL", A_CTRL), KA("ALT", A_ALT)
-/* No MSE cell: GAME reaches mouse mode in one press from anywhere, so a grid
- * cell would be a strictly slower duplicate of a button that already exists,
- * and the three cells it would cost are what pay for '`' on layer 1 -- a key
- * reachable nowhere else on the device. Discoverability lives in the status
- * bar ("GAME>MSE"), which is on every layer rather than one. A_MOUSE is kept
- * because re-adding the cell is then one line. */
-#define K_NAV   KA("LYR", A_LAYER), KA("OFF", A_CLOSE)
-
-/* Layer 0 -- letters, ALPHABETICAL and not QWERTY. QWERTY places frequent
- * letters under strong fingers; with one moving cursor there are no fingers,
- * only distance, and the user is looking each letter up. */
-static const osk_key_t osk_l0r0[] = {          /* 13 + 4*3 = 25 cells */
-    KC('a', 0x1E), KC('b', 0x30), KC('c', 0x2E), KC('d', 0x20), KC('e', 0x12),
-    KC('f', 0x21), KC('g', 0x22), KC('h', 0x23), KC('i', 0x17), KC('j', 0x24),
-    KC('k', 0x25), KC('l', 0x26), KC('m', 0x32),
-    KS("SPC", 0x39), KS("ENT", 0x1C), KS("BSP", 0x0E), KS("TAB", 0x0F),
-};
-static const osk_key_t osk_l0r1[] = {          /* 13 + 9 + 3 + 6 = 31 cells */
-    KC('n', 0x31), KC('o', 0x18), KC('p', 0x19), KC('q', 0x10), KC('r', 0x13),
-    KC('s', 0x1F), KC('t', 0x14), KC('u', 0x16), KC('v', 0x2F), KC('w', 0x11),
-    KC('x', 0x2D), KC('y', 0x15), KC('z', 0x2C),
-    K_MODS, KS("ESC", 0x01), K_NAV,
-};
-
-/* Layer 1 -- digits and punctuation. */
-static const osk_key_t osk_l1r0[] = {          /* 20 + 9 = 29 cells */
-    KC('0', 0x0B), KC('1', 0x02), KC('2', 0x03), KC('3', 0x04), KC('4', 0x05),
-    KC('5', 0x06), KC('6', 0x07), KC('7', 0x08), KC('8', 0x09), KC('9', 0x0A),
-    KC('.', 0x34), KC('\\', 0x2B), KX(':', 0x27), KC('/', 0x35), KC('-', 0x0C),
-    KX('_', 0x0C), KC('=', 0x0D), KX('+', 0x0D), KX('*', 0x09), KX('?', 0x35),
-    KS("SPC", 0x39), KS("ENT", 0x1C), KS("BSP", 0x0E),
-};
-static const osk_key_t osk_l1r1[] = {          /* 20 + 9 + 3 + 6 = 38 cells */
-    KC(',', 0x33), KC(';', 0x27), KC('\'', 0x28), KX('"', 0x28), KX('(', 0x0A),
-    KX(')', 0x0B), KC('[', 0x1A), KC(']', 0x1B), KX('<', 0x33), KX('>', 0x34),
-    KX('!', 0x02), KX('@', 0x03), KX('#', 0x04), KX('$', 0x05), KX('%', 0x06),
-    KX('&', 0x08), KX('^', 0x07), KX('~', 0x29), KX('|', 0x2B), KC('`', 0x29),
-    K_MODS, KS("ESC", 0x01), K_NAV,
-};
-
-/* Layer 2 -- function and navigation keys. The arrows are the EXTENDED
- * scancodes a real BIOS delivers with ASCII zero (0x48/0x50/0x4B/0x4D), which
- * is what a menu-driven program reads. */
-static const osk_key_t osk_l2r0[] = {          /* 21 + 8 + 6 = 35 cells */
+/* The arrows are the EXTENDED scancodes a real BIOS delivers with ASCII zero
+ * (0x48/0x50/0x4B/0x4D), which is what a menu-driven program reads. Shifted
+ * symbols come from the sticky SHF cap (or TIME), exactly as on a keyboard. */
+static const osk_key_t osk_r0[] = {            /* 28+144+20+120 = 312 px */
+    KS("ESC", 0x01),
+    KC('1', 0x02), KC('2', 0x03), KC('3', 0x04), KC('4', 0x05), KC('5', 0x06),
+    KC('6', 0x07), KC('7', 0x08), KC('8', 0x09), KC('9', 0x0A), KC('0', 0x0B),
+    KC('-', 0x0C), KC('=', 0x0D), KS("<-", 0x0E),
     KS("F1", 0x3B), KS("F2", 0x3C), KS("F3", 0x3D), KS("F4", 0x3E),
-    KS("F5", 0x3F), KS("F6", 0x40), KS("F7", 0x41), KS("F8", 0x42),
-    KS("F9", 0x43), KS("F10", 0x44),
-    KS("UP", 0x48), KS("DN", 0x50), KS("LT", 0x4B), KS("RT", 0x4D),
-    KS("HOM", 0x47), KS("END", 0x4F),
+    KS("F5", 0x3F), KS("F6", 0x40),
 };
-static const osk_key_t osk_l2r1[] = {          /* 21 + 9 + 6 = 36 cells */
-    KS("ESC", 0x01), KS("TAB", 0x0F), KS("ENT", 0x1C), KS("BSP", 0x0E),
-    KS("SPC", 0x39), KS("PGU", 0x49), KS("PGD", 0x51),
-    K_MODS, K_NAV,
+static const osk_key_t osk_r1[] = {            /* 28+120+24+28+60+28+28 = 316 */
+    KS("TAB", 0x0F),
+    KC('q', 0x10), KC('w', 0x11), KC('e', 0x12), KC('r', 0x13), KC('t', 0x14),
+    KC('y', 0x15), KC('u', 0x16), KC('i', 0x17), KC('o', 0x18), KC('p', 0x19),
+    KC('[', 0x1A), KC(']', 0x1B), KS("ENT", 0x1C),
+    KS("F7", 0x41), KS("F8", 0x42), KS("F9", 0x43), KS("F10", 0x44),
+    KS("DEL", 0x53),
+};
+static const osk_key_t osk_r2[] = {            /* 28+108+48+80+28+28 = 320 */
+    KA("CTL", A_CTRL),
+    KC('a', 0x1E), KC('s', 0x1F), KC('d', 0x20), KC('f', 0x21), KC('g', 0x22),
+    KC('h', 0x23), KC('j', 0x24), KC('k', 0x25), KC('l', 0x26),
+    KC(';', 0x27), KC('\'', 0x28), KC('\\', 0x2B), KC('`', 0x29),
+    KS("UP", 0x48), KS("DN", 0x50), KS("LT", 0x4B), KS("RT", 0x4D),
+    KS("INS", 0x52), KS("PGU", 0x49),
+};
+static const osk_key_t osk_r3[] = {            /* 28+84+36+28+28+84+28 = 316 */
+    KA("SHF", A_SHIFT),
+    KC('z', 0x2C), KC('x', 0x2D), KC('c', 0x2E), KC('v', 0x2F), KC('b', 0x30),
+    KC('n', 0x31), KC('m', 0x32), KC(',', 0x33), KC('.', 0x34), KC('/', 0x35),
+    KA("ALT", A_ALT), KS("SPC", 0x39),
+    KS("HOM", 0x47), KS("END", 0x4F), KS("PGD", 0x51),
+    KA("OFF", A_CLOSE),
 };
 
 typedef struct {
@@ -153,14 +130,22 @@ typedef struct {
 
 #define ROW(a) { (a), (uint8_t)(sizeof(a) / sizeof((a)[0])) }
 
-#define OSK_LAYERS 3
-#define OSK_ROWS   2
+#define OSK_ROWS   4
 
-static const osk_row_t osk_layout[OSK_LAYERS][OSK_ROWS] = {
-    { ROW(osk_l0r0), ROW(osk_l0r1) },
-    { ROW(osk_l1r0), ROW(osk_l1r1) },
-    { ROW(osk_l2r0), ROW(osk_l2r1) },
+static const osk_row_t osk_layout[OSK_ROWS] = {
+    ROW(osk_r0), ROW(osk_r1), ROW(osk_r2), ROW(osk_r3),
 };
+
+/* Cap width in px, gap column included. */
+static int key_w(const osk_key_t *k) { return (int)strlen(k->label) * 8 + 4; }
+
+static int key_x(uint8_t r, uint8_t c)
+{
+    int x = 0;
+    for (uint8_t i = 0; i < c; i++)
+        x += key_w(&osk_layout[r].keys[i]);
+    return x;
+}
 
 /* ---------------------------------------------------------------------------
  * State
@@ -179,26 +164,23 @@ volatile uint32_t x86_osk_mode = MODE_OFF;
 volatile uint32_t x86_osk_presses = 0;
 volatile uint32_t x86_osk_codes = 0;
 volatile uint32_t x86_osk_last_key = 0;
-/* Widest row measured at reset, in cells, and 1 if any row exceeds 40. A row
+/* Widest row measured at reset, in PIXELS, and 1 if any row exceeds 320. A row
    that overflows loses its rightmost keys to draw_glyph()'s silent clip, so the
    check is published rather than trusted -- tests/test_osk.py asserts it. */
-volatile uint32_t x86_osk_row_cells_max = 0;
+volatile uint32_t x86_osk_row_px_max = 0;
 volatile uint32_t x86_osk_row_overflow = 0;
 
-static uint8_t  osk_layer;
 static uint8_t  osk_row;
 static uint8_t  osk_col;
 static uint8_t  osk_sticky;          /* STICKY_* below */
 static uint32_t osk_prev;            /* edge detection for navigation */
 
-/* Typematic repeat, LEFT/RIGHT only.
+/* Typematic repeat, all four directions (UP/DOWN step rows).
  *
  * The grid is edge-driven on purpose -- a key must not fire twice for one
  * press. Holding a direction to scan along a row is a different gesture, so it
  * gets its own level-driven path: the edge does the first step, then nothing
- * for OSK_REPEAT_DELAY_MS, then a step every OSK_REPEAT_RATE_MS. Only the
- * horizontal axis repeats; with two rows, a repeating UP/DOWN would just
- * oscillate.
+ * for OSK_REPEAT_DELAY_MS, then a step every OSK_REPEAT_RATE_MS.
  *
  * Time comes from the host via x86_osk_set_now_ms(). If a caller never sets it
  * -- the bare-metal harness does not -- now stays 0, the delay never elapses,
@@ -207,7 +189,7 @@ static uint32_t osk_prev;            /* edge detection for navigation */
 #define OSK_REPEAT_DELAY_MS 400u
 #define OSK_REPEAT_RATE_MS   90u
 static uint32_t osk_now_ms;          /* host clock, 0 if the caller has none */
-static uint32_t osk_hold_dir;        /* the LEFT/RIGHT bits currently held */
+static uint32_t osk_hold_dir;        /* the direction bits currently held */
 static uint32_t osk_repeat_at;       /* when the next repeat step is due */
 static char     osk_echo[OSK_ECHO_MAX + 1];
 static uint8_t  osk_echo_len;
@@ -231,9 +213,47 @@ static uint16_t osk_toast_frames;
 #define OSK_BOT_Y0    (OSK_BAR + OSK_PIC_ROWS + 1)   /* 221..228 */
 #define OSK_BOT_Y1    (OSK_BAR + OSK_PIC_ROWS + 10)  /* 230..237 */
 
-#define C_BLACK  16
-#define C_DIM    24
-#define C_WHITE  31
+/* UI COLOURS ARE CGA PALETTE NUMBERS, mapped to a panel index per frame by
+ * ui_map_refresh(). In every mode with a 32-entry CLUT -- text, CGA, and EGA
+ * x86_video_ui_colour() says where the fixed CGA colours are (0-15 in text
+ * and CGA, 16-31 in EGA), whatever the guest has done to its own palette. A 256-colour mode owns the whole table, so there the nearest
+ * entry of the guest's palette is used instead: a blue key stays the bluest
+ * thing the game's palette has. */
+enum { U_BLACK = 0, U_BLUE = 1, U_GREEN = 2, U_RED = 4, U_GREY = 8,
+       U_YELLOW = 14, U_WHITE = 15 };
+static const uint32_t ui_rgb[16] = {
+    0x000000, 0x0000AA, 0x00AA00, 0x00AAAA, 0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA,
+    0x555555, 0x5555FF, 0x55FF55, 0x55FFFF, 0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF,
+};
+static uint8_t ui_map[16];
+
+static void ui_map_refresh(void)
+{
+    const uint32_t *pal = (x86_video_ui_colour(0) < 0) ? x86_video_clut256() : 0;
+    for (unsigned n = 0; n < 16; n++) {
+        if (!pal) {
+            int idx = x86_video_ui_colour(n);
+            ui_map[n] = (uint8_t)(idx < 0 ? 0 : idx);
+            continue;
+        }
+        if (n != U_BLACK && n != U_BLUE && n != U_GREEN && n != U_RED
+            && n != U_GREY && n != U_YELLOW && n != U_WHITE)
+            continue;                   /* 7 x 256 compares, not 16 x 256 */
+        uint32_t best = 0xFFFFFFFFu;
+        int r = (int)(ui_rgb[n] >> 16), g = (int)((ui_rgb[n] >> 8) & 0xFF), b = (int)(ui_rgb[n] & 0xFF);
+        for (unsigned i = 0; i < 256; i++) {
+            int dr = (int)((pal[i] >> 16) & 0xFF) - r;
+            int dg = (int)((pal[i] >> 8) & 0xFF) - g;
+            int db = (int)(pal[i] & 0xFF) - b;
+            uint32_t d = (uint32_t)(dr * dr * 3 + dg * dg * 4 + db * db * 2);
+            if (d < best) { best = d; ui_map[n] = (uint8_t)i; }
+        }
+    }
+}
+
+#define C_BLACK  ui_map[U_BLACK]
+#define C_DIM    ui_map[U_GREY]
+#define C_WHITE  ui_map[U_WHITE]
 
 /* Mouse UI state. See the block above x86_mouse_input() for what is and is not
    real about it. */
@@ -311,16 +331,8 @@ static int draw_text(uint8_t *fb, uint32_t stride, int x, int y,
     return x;
 }
 
-static void fill_row(uint8_t *fb, uint32_t stride, int y, int x, uint8_t col)
-{
-    if ((uint32_t)x >= stride)
-        return;
-    for (int r = 0; r < 8; r++)
-        memset(fb + (uint32_t)(y + r) * stride + x, col, stride - (uint32_t)x);
-}
-
-/* A latched Shift uppercases the letter cells, which is the only place the
-   latch is visible where the user is actually looking. */
+/* A latched Shift uppercases the letter caps, which is the only place the
+   latch is visible where the user is actually looking (the cap goes red too). */
 static char display_char(char c)
 {
     if ((osk_sticky & STICKY_SHIFT) && c >= 'a' && c <= 'z')
@@ -328,24 +340,44 @@ static char display_char(char c)
     return c;
 }
 
+static int key_latched(const osk_key_t *k)
+{
+    switch (k->flags) {
+    case A_SHIFT: return (osk_sticky & STICKY_SHIFT) != 0;
+    case A_CTRL:  return (osk_sticky & STICKY_CTRL) != 0;
+    case A_ALT:   return (osk_sticky & STICKY_ALT) != 0;
+    default:      return 0;
+    }
+}
+
 static void draw_row(uint8_t *fb, uint32_t stride, int y, uint8_t r)
 {
-    const osk_row_t *row = &osk_layout[osk_layer][r];
+    const osk_row_t *row = &osk_layout[r];
     int x = 0;
+
+    for (int rr = 0; rr < 8; rr++)
+        memset(fb + (uint32_t)(y + rr) * stride, C_BLACK, stride);
 
     for (uint8_t i = 0; i < row->n; i++) {
         const osk_key_t *k = &row->keys[i];
-        int sel = (r == osk_row && i == osk_col);
-        /* Highlight is a foreground/background swap, not a new colour --
-           nothing extra to program into the CLUT and nothing of the guest's
-           palette disturbed. */
-        uint8_t fg = sel ? C_BLACK : C_WHITE;
-        uint8_t bg = sel ? C_WHITE : C_BLACK;
-
-        for (const char *s = k->label; *s; s++, x += OSK_CELL)
-            draw_glyph(fb, stride, x, y, (uint8_t)display_char(*s), fg, bg);
+        int w = key_w(k);
+        uint8_t bg = U_BLUE, fg = U_WHITE;
+        if (key_latched(k))
+            bg = U_RED;
+        else if (k->flags == A_CLOSE)
+            bg = U_GREEN;
+        if (r == osk_row && i == osk_col) {
+            bg = U_YELLOW;
+            fg = U_BLACK;
+        }
+        if ((uint32_t)(x + w - 1) <= stride)
+            for (int rr = 0; rr < 8; rr++)
+                memset(fb + (uint32_t)(y + rr) * stride + x, ui_map[bg], (size_t)(w - 1));
+        int gx = x + 2;
+        for (const char *c = k->label; *c; c++, gx += OSK_CELL)
+            draw_glyph(fb, stride, gx, y, (uint8_t)display_char(*c), ui_map[fg], ui_map[bg]);
+        x += w;
     }
-    fill_row(fb, stride, y, x, C_BLACK);
 }
 
 /* Three digits, right-aligned, without pulling in snprintf: the core's RAM_EMU
@@ -388,25 +420,8 @@ static void draw_status(uint8_t *fb, uint32_t stride)
         return;
     }
 
-    {
-        char lay[4] = { 'L', (char)('1' + osk_layer), 0, 0 };
-        x = draw_text(fb, stride, 0, OSK_TOP_Y0, "KBD ", C_WHITE, C_BLACK);
-        x = draw_text(fb, stride, x, OSK_TOP_Y0, lay, C_WHITE, C_BLACK);
-        x = draw_text(fb, stride, x, OSK_TOP_Y0, "  ", C_WHITE, C_BLACK);
-    }
-    x = draw_text(fb, stride, x, OSK_TOP_Y0, "SHF ",
-                  (osk_sticky & STICKY_SHIFT) ? C_WHITE : C_DIM, C_BLACK);
-    x = draw_text(fb, stride, x, OSK_TOP_Y0, "CTL ",
-                  (osk_sticky & STICKY_CTRL) ? C_WHITE : C_DIM, C_BLACK);
-    x = draw_text(fb, stride, x, OSK_TOP_Y0, "ALT",
-                  (osk_sticky & STICKY_ALT) ? C_WHITE : C_DIM, C_BLACK);
-    /* Where GAME goes from here -- on every layer, which is strictly more
-       visible than the MSE cell on one layer that this replaces. */
-    draw_text(fb, stride, x, OSK_TOP_Y0, "   GAME>MSE", C_DIM, C_BLACK);
-
-    /* Echo of what has been sent. Genuinely useful: the guest may be mid-redraw
-       or not echoing at all, and then this is the only feedback there is. */
-    draw_text(fb, stride, 0, OSK_TOP_Y1, osk_echo, C_DIM, C_BLACK);
+    /* Keyboard mode: the top band is the first two key rows (x86_osk_draw). */
+    (void)x;
 }
 
 /* An 8x8 arrow. 1 = body; the outline is drawn by testing the neighbours, so
@@ -477,6 +492,9 @@ void x86_osk_draw(uint8_t *fb, uint32_t stride)
         return;
 
     if (x86_osk_mode == MODE_OFF) {
+        /* the 256-entry search only when something will actually be drawn */
+        if (osk_toast_frames || x86_mouse_in_use())
+            ui_map_refresh();
         if (osk_toast_frames) {
             /* One 8-row band, cleared first so the text is legible against
                whatever the guest drew underneath. */
@@ -490,21 +508,24 @@ void x86_osk_draw(uint8_t *fb, uint32_t stride)
         return;                 /* the bars are the renderer's again */
     }
 
-    if (x86_osk_mode == MODE_MOUSE)
-        mouse_draw(fb, stride);
-
-    draw_status(fb, stride);
+    ui_map_refresh();
 
     if (x86_osk_mode == MODE_MOUSE) {
+        mouse_draw(fb, stride);
+        draw_status(fb, stride);
         /* The grid is not reachable in mouse mode, so drawing it would offer
            keys the buttons cannot press. */
         memset(fb + (OSK_BAR + OSK_PIC_ROWS) * stride, C_BLACK, OSK_BAR * stride);
         return;
     }
 
+    /* Two key rows in each band, the picture untouched between them. */
+    memset(fb, C_BLACK, OSK_BAR * stride);
     memset(fb + (OSK_BAR + OSK_PIC_ROWS) * stride, C_BLACK, OSK_BAR * stride);
-    draw_row(fb, stride, OSK_BOT_Y0, 0);
-    draw_row(fb, stride, OSK_BOT_Y1, 1);
+    draw_row(fb, stride, OSK_TOP_Y0, 0);
+    draw_row(fb, stride, OSK_TOP_Y1, 1);
+    draw_row(fb, stride, OSK_BOT_Y0, 2);
+    draw_row(fb, stride, OSK_BOT_Y1, 3);
 }
 
 /* ---------------------------------------------------------------------------
@@ -545,7 +566,7 @@ static void osk_code(uint8_t sc)
  */
 static void osk_send(const osk_key_t *k)
 {
-    uint8_t shift = (k->flags & F_SHIFT) || (osk_sticky & STICKY_SHIFT);
+    uint8_t shift = (osk_sticky & STICKY_SHIFT) != 0;
 
     if (osk_sticky & STICKY_CTRL) osk_code(0x1D);
     if (osk_sticky & STICKY_ALT)  osk_code(0x38);
@@ -572,16 +593,27 @@ static void osk_send(const osk_key_t *k)
  * Input
  * ------------------------------------------------------------------------- */
 
-static void osk_clamp_col(void)
+/* UP/DOWN: to the cap in the next row (wrapping) whose centre is nearest the
+   current cap's centre -- rows have different cap widths, so keeping the
+   column index would wander sideways. */
+static void osk_move_row(int dr)
 {
-    uint8_t n = osk_layout[osk_layer][osk_row].n;
-    if (osk_col >= n)
-        osk_col = (uint8_t)(n - 1);
+    int cx = key_x(osk_row, osk_col) + key_w(&osk_layout[osk_row].keys[osk_col]) / 2;
+    uint8_t best = 0;
+    int bestd = 1 << 30;
+
+    osk_row = (uint8_t)((osk_row + OSK_ROWS + dr) % OSK_ROWS);
+    for (uint8_t c = 0; c < osk_layout[osk_row].n; c++) {
+        int m = key_x(osk_row, c) + key_w(&osk_layout[osk_row].keys[c]) / 2;
+        int d = m > cx ? m - cx : cx - m;
+        if (d < bestd) { bestd = d; best = c; }
+    }
+    osk_col = best;
 }
 
 static void osk_press(void)
 {
-    const osk_row_t *row = &osk_layout[osk_layer][osk_row];
+    const osk_row_t *row = &osk_layout[osk_row];
     const osk_key_t *k   = &row->keys[osk_col];
 
     switch (k->flags & 0x0Fu) {
@@ -589,11 +621,7 @@ static void osk_press(void)
     case A_SHIFT: osk_sticky ^= STICKY_SHIFT; break;
     case A_CTRL:  osk_sticky ^= STICKY_CTRL; break;
     case A_ALT:   osk_sticky ^= STICKY_ALT; break;
-    case A_LAYER: osk_layer = (uint8_t)((osk_layer + 1) % OSK_LAYERS);
-                  osk_clamp_col();
-                  break;
     case A_CLOSE: osk_set_mode(MODE_OFF); break;
-    case A_MOUSE: osk_set_mode(MODE_MOUSE); break;
     default: break;
     }
 }
@@ -703,16 +731,18 @@ void x86_osk_input(uint32_t buttons)
        button produces no edges at all. A change of direction (including
        release) restarts the delay, so tapping never repeats. */
     {
-        uint32_t dir = buttons & (X86_OSK_LEFT | X86_OSK_RIGHT);
+        uint32_t dir = buttons & (X86_OSK_LEFT | X86_OSK_RIGHT | X86_OSK_UP | X86_OSK_DOWN);
         if (dir != osk_hold_dir) {
             osk_hold_dir = dir;
             osk_repeat_at = osk_now_ms + OSK_REPEAT_DELAY_MS;
         } else if (dir && osk_now_ms && osk_now_ms >= osk_repeat_at) {
-            uint8_t n = osk_layout[osk_layer][osk_row].n;
+            uint8_t n = osk_layout[osk_row].n;
             if (dir & X86_OSK_LEFT)
                 osk_col = (uint8_t)((osk_col + n - 1) % n);
-            else
+            else if (dir & X86_OSK_RIGHT)
                 osk_col = (uint8_t)((osk_col + 1) % n);
+            else
+                osk_move_row((dir & X86_OSK_UP) ? -1 : 1);
             osk_repeat_at = osk_now_ms + OSK_REPEAT_RATE_MS;
         }
     }
@@ -721,17 +751,17 @@ void x86_osk_input(uint32_t buttons)
         return;
 
     if (went & X86_OSK_LEFT) {
-        uint8_t n = osk_layout[osk_layer][osk_row].n;
+        uint8_t n = osk_layout[osk_row].n;
         osk_col = (uint8_t)((osk_col + n - 1) % n);
     }
     if (went & X86_OSK_RIGHT) {
-        uint8_t n = osk_layout[osk_layer][osk_row].n;
+        uint8_t n = osk_layout[osk_row].n;
         osk_col = (uint8_t)((osk_col + 1) % n);
     }
-    if (went & (X86_OSK_UP | X86_OSK_DOWN)) {
-        osk_row ^= 1u;
-        osk_clamp_col();
-    }
+    if (went & X86_OSK_UP)
+        osk_move_row(-1);
+    else if (went & X86_OSK_DOWN)
+        osk_move_row(1);
     if (went & X86_OSK_A)
         osk_press();
     if (went & X86_OSK_B) {
@@ -739,10 +769,8 @@ void x86_osk_input(uint32_t buttons)
         static const osk_key_t bsp = KS("BSP", 0x0E);
         osk_send(&bsp);
     }
-    if (went & X86_OSK_TIME) {
-        osk_layer = (uint8_t)((osk_layer + 1) % OSK_LAYERS);
-        osk_clamp_col();
-    }
+    if (went & X86_OSK_TIME)
+        osk_sticky ^= STICKY_SHIFT;     /* the second most-used: Shift, sticky */
 }
 
 /* ---------------------------------------------------------------------------
@@ -758,7 +786,8 @@ void x86_osk_reset(void)
 {
     osk_now_ms = osk_hold_dir = osk_repeat_at = 0;
     x86_osk_mode  = MODE_OFF;
-    osk_layer = osk_row = osk_col = 0;
+    osk_row = 2;                        /* home row, on 'a' */
+    osk_col = 1;
     osk_sticky = 0;
     osk_prev = 0;
     osk_echo[0] = '\0';
@@ -772,19 +801,14 @@ void x86_osk_reset(void)
     /* Measure the layout instead of trusting the arithmetic in the comments.
        draw_glyph() clips silently, so an over-long row loses its rightmost keys
        -- the OFF key, in every row that has one -- with no fault to notice. */
-    x86_osk_row_cells_max = 0;
+    x86_osk_row_px_max = 0;
     x86_osk_row_overflow = 0;
-    for (unsigned l = 0; l < OSK_LAYERS; l++) {
-        for (unsigned r = 0; r < OSK_ROWS; r++) {
-            const osk_row_t *row = &osk_layout[l][r];
-            uint32_t cells = 0;
-            for (unsigned i = 0; i < row->n; i++)
-                cells += (uint32_t)strlen(row->keys[i].label);
-            if (cells > x86_osk_row_cells_max)
-                x86_osk_row_cells_max = cells;
-        }
+    for (unsigned r = 0; r < OSK_ROWS; r++) {
+        uint32_t px = (uint32_t)key_x((uint8_t)r, osk_layout[r].n);
+        if (px > x86_osk_row_px_max)
+            x86_osk_row_px_max = px;
     }
-    if (x86_osk_row_cells_max > 320u / OSK_CELL)
+    if (x86_osk_row_px_max > 320u)
         x86_osk_row_overflow = 1;
 }
 

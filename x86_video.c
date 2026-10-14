@@ -730,6 +730,22 @@ static void vga_clut_rebuild(void)
  * is that the darken stops working while it does -- see the caveat in
  * docs/03 and in gw_lcd.h.
  */
+/*
+ * Where CGA colour n sits in the CLUT currently pushed, for host UI painted over
+ * the picture (x86_osk.c). Text and CGA keep the fixed palette at 0-15 (the CGA
+ * graphics colours live at 16-19); EGA keeps it at 16-31 (ega_sync_palette).
+ * -1 in a 256-colour mode, where the guest owns every entry and the caller has
+ * to search x86_video_clut256() for the nearest one.
+ */
+int x86_video_ui_colour(unsigned n)
+{
+    if (!cur_desc || cur_desc->kind == VM_VGA8)
+        return -1;
+    if (cur_desc->kind == VM_EGA4)
+        return (int)(16u + (n & 15u));
+    return (int)(n & 15u);
+}
+
 const uint32_t *x86_video_clut256(void)
 {
     if (cur_desc->kind != VM_VGA8 || !vga_clut256)
@@ -962,8 +978,13 @@ static void ega_sync_palette(void)
         const uint8_t *e = vga_dac + (attr[i] & 0x3Fu) * 3u;
         cga_clut[i] = dac_expand(e[0], e[1], e[2]);
     }
+    /* 16-31 are the FIXED CGA colours, not a mirror of 0-15: a 4-bit pixel
+       never reaches them, so they are free to be what host UI drawn over the
+       picture needs -- the on-screen keyboard's blue caps and yellow cursor
+       (x86_video_ui_colour). They still give lcd_pack_color() sixteen real
+       colours to search, which is all the old mirror was for. */
     for (unsigned i = 16; i < X86_TEXT_CLUT_ENTRIES; i++)
-        cga_clut[i] = cga_clut[i - 16];
+        cga_clut[i] = cga_argb[i - 16];
 
     ega_clut_valid = 1;
     cga_clut_dirty = 1;

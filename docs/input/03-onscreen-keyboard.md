@@ -25,6 +25,28 @@ had to come in properly. Original provenance and licence: the user's own code.
 
 # On-screen keyboard
 
+> **SUPERSEDED LAYOUT (2026-10-14, this tree's `x86_osk.c`).** The layered
+> two-row grid below is no longer what ships here. The owner asked for the
+> gw-dos (XTulator) look, with the game kept where it is:
+>
+> ```
+>   top band (rows 2-9, 11-18)     ESC 1..0 - = <- F1..F6
+>                                  TAB q..p [ ] ENT F7..F10 DEL
+>   picture (rows 20-219)          untouched
+>   bottom band (221-228, 230-237) CTL a..l ; ' \ ` UP DN LT RT INS PGU
+>                                  SHF z..m , . / ALT SPC HOM END PGD OFF
+> ```
+>
+> Blue caps, yellow cursor, red latched modifier, green OFF; cap width is
+> label x 8 + 4 px and every row is measured at reset (`x86_osk_row_px_max`,
+> widest = 320). UP/DOWN step to the nearest cap by x and wrap; all four
+> directions repeat when held; A presses, B is Backspace, TIME toggles a sticky
+> Shift (there are no layers left to cycle). The status line is gone in keyboard
+> mode -- the caps show the latches; mouse mode keeps its top-band readout.
+> Colours come from `x86_video_ui_colour()`: fixed CGA entries in every
+> 32-entry-CLUT mode (EGA's 16-31 are now the fixed CGA colours rather than a
+> mirror), nearest palette entry in 256-colour modes.
+
 > **SHIPPED.** `Core/Src/porting/dos/dos_osk.c` + `dos_osk.h`, wired from
 > `dos_input.c` (button routing) and `main_dos.c` (one `dos_osk_draw()` after the
 > blit). This document is now part design record, part correction: the sections

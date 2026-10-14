@@ -11,20 +11,20 @@ then INT 09h for every code the controller holds. Every expectation below is
 read out of the guest's own ring, not out of the OSK's state.
 
 Covered:
-  * The layout fits. Every row is measured in 8 px cells at reset; the renderer
-    clips silently, so a row that grew past 40 would lose its rightmost keys
-    (the OFF cell) with no fault to notice.
+  * The layout fits. Every row is measured in pixels at reset; the renderer
+    clips silently, so a row that grew past 320 would lose its rightmost caps
+    (the OFF cap) with no fault to notice.
   * GAME opens the keyboard, cycles on to mouse mode -- which still owns the
     buttons -- and closes it. Three states, not two.
-  * A on the first cell sends 'a' (scancode 0x1E, ASCII 0x61).
-  * RIGHT then A sends 'b' -- navigation moved the cursor, and the second press
+  * A on the opening cap (home row, 'a') sends 'a' (scancode 0x1E, ASCII 0x61).
+  * RIGHT then A sends 's' -- navigation moved the cursor, and the second press
     is a fresh edge.
   * B is Backspace wherever the cursor is.
-  * A SHIFTED CELL. TIME cycles the layer, DOWN flips the row, ten RIGHTs reach
-    '!' -- and the ring must show ASCII 0x21 on scancode 0x02. That can only
-    happen if a real Left-Shift MAKE reached INT 09h ahead of the key, which is
-    the half with no other witness: without it the guest receives '1' and every
-    counter still looks right.
+  * A SHIFTED KEY. TIME latches Shift, two UPs step to the nearest cap in each
+    row ('s' -> 'w' -> '2'), and the ring must show '@' (ASCII 0x40) on
+    scancode 0x03. That can only happen if a real Left-Shift MAKE reached
+    INT 09h ahead of the key, which is the half with no other witness: without
+    it the guest receives '2' and every counter still looks right.
   * The Shift does not LATCH: the BDA shift-flags byte is back to 0 afterwards,
     so the next key is not silently shifted too.
   * Drawing touches the bars and never the guest's VRAM, in either video mode.
@@ -39,11 +39,11 @@ from scripts.common.elf import get_symbols
 
 # (scancode << 8) | ascii, as the BDA ring stores a key.
 KEY_A = (0x1E << 8) | ord('a')
-KEY_B = (0x30 << 8) | ord('b')
+KEY_S = (0x1F << 8) | ord('s')
 KEY_BSP = (0x0E << 8) | 0x08
-KEY_BANG = (0x02 << 8) | ord('!')
+KEY_AT = (0x03 << 8) | ord('@')
 
-CELLS_PER_ROW = 40
+PX_PER_ROW = 320
 
 
 def main(args):
@@ -69,7 +69,7 @@ def main(args):
             return False
 
         r = [b.read_uint32(syms["osk_r"] + 4 * i) for i in range(20)]
-        (cells_max, overflow, vis0, vis1, key_a, key_b, key_bsp, key_bang,
+        (px_max, overflow, vis0, vis1, key_a, key_s, key_bsp, key_at,
          shift_flags, vram_same, top_ink, bottom_ink, picture_ink,
          mouse_mode, vis_mouse, vis_off,
          irq_armed_if0, pit_if0, irq_refused, irq_armed_if1) = r
@@ -83,14 +83,14 @@ def main(args):
 
         hexw = lambda v: f"0x{v:04x}"
 
-        print(f"widest grid row            {cells_max} cells of {CELLS_PER_ROW}")
+        print(f"widest key row             {px_max} px of {PX_PER_ROW}")
         check("no row overflows the panel", overflow, 0)
         check("closed before GAME", vis0, 0)
         check("GAME opens the keyboard", vis1, 1)
-        check("first cell sends 'a'", key_a, KEY_A, hexw)
-        check("RIGHT then A sends 'b'", key_b, KEY_B, hexw)
+        check("opening cap sends 'a'", key_a, KEY_A, hexw)
+        check("RIGHT then A sends 's'", key_s, KEY_S, hexw)
         check("B sends Backspace", key_bsp, KEY_BSP, hexw)
-        check("shifted cell sends '!'", key_bang, KEY_BANG, hexw)
+        check("TIME-shifted '2' sends '@'", key_at, KEY_AT, hexw)
         check("Shift did not latch", shift_flags, 0)
         check("guest VRAM untouched by draw", vram_same, 1)
         check("mouse mode is the second state", mouse_mode, 2)
@@ -114,8 +114,8 @@ def main(args):
         print(f"ink: top bar {top_ink}, bottom bar {bottom_ink}, "
               f"picture {picture_ink}")
         # "ink" is any non-zero index: the renderer clears the bars to 0 and the
-        # OSK paints them in 16 (see the colour block in x86_osk.c), so a full
-        # bar of non-zero is precisely "the OSK owns these rows now".
+        # OSK's blue caps are never index 0 (black is), so non-zero ink in
+        # both bands is precisely "the OSK put its key rows there".
         for label, v in (("top bar painted by the OSK", top_ink),
                          ("bottom bar painted by the OSK", bottom_ink)):
             good = v > 0

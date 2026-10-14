@@ -2113,8 +2113,9 @@ python3 tests/test_pad.py --negative     # ONE control: X86_PAD_CTL_ALLOWGAME
 python3 tests/test_osk.py                # the on-screen keyboard, driven by
                                          # button MASK exactly as src/main.c
                                          # drives it: the grid press, the
-                                         # navigation, B as Backspace, a
-                                         # SHIFTED cell (which only works if a
+                                         # navigation (nearest-cap UP), B as
+                                         # Backspace, a TIME-shifted '@'
+                                         # (which only works if a
                                          # real Left-Shift make reaches INT 09h
                                          # first), the three-state GAME cycle,
                                          # the row-width check, and that

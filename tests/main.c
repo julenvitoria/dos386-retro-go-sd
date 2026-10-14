@@ -2474,7 +2474,7 @@ static void osk_test_run(void)
 
     /* The layout's own arithmetic. draw_glyph() clips silently, so an
        over-long row loses its OFF key with no fault to notice. */
-    osk_r[0] = x86_osk_row_cells_max;
+    osk_r[0] = x86_osk_row_px_max;
     osk_r[1] = x86_osk_row_overflow;
 
     /* GAME opens it. The press is consumed by the transition -- the frame the
@@ -2483,38 +2483,34 @@ static void osk_test_run(void)
     x86_osk_cycle();
     osk_r[3] = (uint32_t)x86_osk_visible();      /* expect 1 */
 
-    /* Layer 0, row 0, column 0 is 'a'. A presses it. Two frames: the release
-       of the buttons has to be seen or the next press is not an edge. */
+    /* The cursor opens on the home row, on 'a'. A presses it. Two frames: the
+       release of the buttons has to be seen or the next press is not an edge. */
     (void)osk_frame(0);
     osk_r[4] = osk_frame(X86_OSK_A);             /* expect 0x1E1E ('a')      */
     (void)osk_frame(0);
 
-    /* RIGHT then A is 'b' -- navigation, not just the first cell. */
+    /* RIGHT then A is 's' -- navigation, not just the first cell. */
     (void)osk_frame(X86_OSK_RIGHT);
     (void)osk_frame(0);
-    osk_r[5] = osk_frame(X86_OSK_A);             /* expect 0x3062 ('b')      */
+    osk_r[5] = osk_frame(X86_OSK_A);             /* expect 0x1F73 ('s')      */
     (void)osk_frame(0);
 
     /* B is Backspace wherever the cursor is. */
     osk_r[6] = osk_frame(X86_OSK_B);             /* expect 0x0E08            */
     (void)osk_frame(0);
 
-    /* TIME cycles the layer and DOWN flips the row, neither of which moves the
-       column -- so the cursor is still on column 1 from the 'b' press above,
-       and NINE more RIGHTs reach column 10. That cell is '!', a SHIFTED one:
-       the BDA must show the shifted ASCII, which is only possible if a real
-       Left Shift make reached INT 09h ahead of the key. (Ten RIGHTs lands on
-       '@' -- also shifted, and it passed, which is exactly why the column is
-       spelled out here rather than counted from zero in a comment.) */
+    /* TIME latches a sticky Shift; two UPs walk to the cap nearest in x on
+       each row: 's' (x 40..51) -> 'w' -> '2'. Shift+2 is '@': the BDA must
+       show the shifted ASCII, which is only possible if a real Left Shift make
+       reached INT 09h ahead of the key -- and the nearest-cap row step is
+       what lands on '2' and not '1' or '3'. */
     (void)osk_frame(X86_OSK_TIME);
     (void)osk_frame(0);
-    (void)osk_frame(X86_OSK_DOWN);
+    (void)osk_frame(X86_OSK_UP);
     (void)osk_frame(0);
-    for (int i = 0; i < 9; i++) {
-        (void)osk_frame(X86_OSK_RIGHT);
-        (void)osk_frame(0);
-    }
-    osk_r[7] = osk_frame(X86_OSK_A);             /* expect 0x0221 ('!')      */
+    (void)osk_frame(X86_OSK_UP);
+    (void)osk_frame(0);
+    osk_r[7] = osk_frame(X86_OSK_A);             /* expect 0x0340 ('@')      */
     osk_r[8] = (uint32_t)test_ram[0x400 + 0x17]; /* BDA shift flags: 0 again */
     (void)osk_frame(0);
 

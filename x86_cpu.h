@@ -394,6 +394,7 @@ extern volatile uint32_t x86_vga_dac_writes;
    256-colour mode is up; the frame loop pushes it through
    lcd_set_clut_ext() instead of the 32-entry lcd_set_clut(). */
 const uint32_t *x86_video_clut256(void);
+int x86_video_ui_colour(unsigned cga_colour);   /* -1: search clut256 */
 /* VGA DAC, ports 0x3C6-0x3C9. 0x3C9 is a STREAM, not a latch: a guest sets the
    index once and writes 768 consecutive bytes, so this cannot be modelled as
    "the last value written". */

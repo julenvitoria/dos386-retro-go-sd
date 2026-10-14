@@ -4396,6 +4396,16 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                        on dma2d_blit_hook). */
                     dma2d_sync();
                     x86_osk_draw(fb, FRAME_W);
+                    /* Retro-go's in-game HUD: the volume / brightness bars that
+                       PAUSE/SET + a direction raises (common_emu_input_loop()
+                       already changes the level; this is only the picture),
+                       plus the low-battery blink and the save/load icons. It
+                       draws into the ACTIVE buffer, so it belongs right here,
+                       after everything of ours and before the swap. The Mode
+                       Y arm above paints BOTH buffers on its own schedule and
+                       does not get it: drawn into one of two buffers the bars
+                       would flicker at the panel rate. */
+                    abi->common_ingame_overlay();
                 }
             }
             fb_sample = *(volatile uint32_t *)(fb + 20 * FRAME_W);
