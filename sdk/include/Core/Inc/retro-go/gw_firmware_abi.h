@@ -38,6 +38,7 @@
 #include "common.h"
 #include "ff.h"
 #include "rg_storage.h"
+#include "bilinear.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -87,7 +88,7 @@ typedef enum {
 typedef enum {
     GW_MEM_OP_ALLOC     = 0,  /* calloc from pool; count=1 → malloc(size)+zero */
     GW_MEM_OP_INIT      = 1,  /* reset pool bump (ITC/RAM/DTCM only) */
-    GW_MEM_OP_FREE_SIZE = 2,  /* free bytes in pool (RAM only today) */
+    GW_MEM_OP_FREE_SIZE = 2,  /* largest allocatable bytes in this pool */
 } gw_mem_op_t;
 
 typedef struct {
@@ -243,9 +244,6 @@ typedef struct {
     void     (*lcd_setup_framebuffers)(int lcd_mode);
     void     (*lcd_get_bonus_pool)(uint8_t **out_ptr, size_t *out_size);
     void     (*lcd_set_clut)(const uint32_t *clut, uint16_t count);
-    /* Caller-owned palette, up to 256 entries; NULL/0 restores the cached
-     * path. For cores whose mode owns the whole table -- see gw_lcd.h. */
-    void     (*lcd_set_clut_ext)(const uint32_t *clut, uint16_t count);
 
     /* ================================================================
      * G&W hardware: audio
@@ -287,7 +285,9 @@ typedef struct {
      * gw_core_bridge.c re-exposes the historical per-pool names as thin
      * wrappers so core source is unaffected.
      *
-     * Returns: ALLOC → (uintptr_t)ptr; INIT → 0; FREE_SIZE → free bytes.
+     * Returns: ALLOC → (uintptr_t)ptr; INIT → 0; FREE_SIZE → largest
+     * allocatable bytes in that pool (bump remaining, or AHB wilderness /
+     * largest free chunk).
      * ================================================================ */
     uintptr_t (*mem_ctl)(gw_mem_op_t op, gw_mem_pool_t pool, size_t count, size_t size);
 
@@ -309,11 +309,11 @@ typedef struct {
      * retro-go: system
      * ================================================================ */
     void (*odroid_system_init)(int app_id, int sample_rate);
-    /* cheat_update_cb (7th arg) added for TGB Dual (Game Boy / Game Boy
-     * Color): every core in this repo is rebuilt from source alongside the
-     * firmware (the packaged core binaries under cores/ are gitignored,
-     * nothing is distributed as a prebuilt blob yet), so this branch has
-     * no released-ABI compatibility window to preserve — no
+    /* cheat_update_cb (7th arg) added for cores that update cheats mid-run
+     * (e.g. external GB/GBC). Every core in this repo is rebuilt from source
+     * alongside the firmware (the packaged core binaries under cores/ are
+     * gitignored, nothing is distributed as a prebuilt blob yet), so this
+     * branch has no released-ABI compatibility window to preserve — no
      * GW_FIRMWARE_ABI_VERSION bump needed for this signature change (see
      * that macro's comment above). */
     void (*odroid_system_emu_init)(state_handler_t load_cb,
@@ -405,8 +405,7 @@ typedef struct {
 
     /* ================================================================
      * v1 append: surface required to port a "classic" emulator core
-     * (e.g. Watara Supervision) to the external-core model. Identified
-     * by porting Core/Src/porting/wsv/main_wsv.c against this ABI.
+     * to the external-core model.
      * ================================================================ */
     char    *(*strcpy)(char *, const char *);
     void    *(*malloc)(size_t size);
@@ -414,7 +413,7 @@ typedef struct {
     /* ================================================================
      * v1 append: surface required to port the Mega Drive / Genesis
      * (gwenesis) core to the external-core model. Identified by porting
-     * Core/Src/porting/gwenesis/main_gwenesis.c against this ABI.
+     * Mega Drive (gwenesis) external core against this ABI.
      * DWT cycle helpers are implemented locally in the bridge via CMSIS
      * MMIO — no ABI slots.
      * ================================================================ */
@@ -439,8 +438,8 @@ typedef struct {
     /* ================================================================
      * v2 append: surface required to port PC Engine / PC Engine CD
      * (multi-system, multi-segment core) to the external-core model.
-     * Identified by porting Core/Src/porting/pce/main_pce.c (+ pce_cd.c)
-     * against this ABI. Pure append — no version bump needed.
+     * Required by the external PC Engine / PCE CD core. Pure append —
+     * no version bump needed.
      * ================================================================ */
     /* Matches Core/Inc/porting/crc32.h's exact declared signature
      * (`unsigned int`/`unsigned char const *`, not uint32_t/uint8_t*) —
@@ -465,11 +464,8 @@ typedef struct {
     uint32_t                    *common_emu_sound_dma_marker_ptr;
 
     /* ================================================================
-     * v2 append: surface required to port TGB Dual (Game Boy / Game Boy
-     * Color, C++) to the external-core model. Identified by porting
-     * Core/Src/porting/gb_tgbdual/main_gb_tgbdual.cpp (+ gw_renderer.cpp)
-     * against this ABI. (GW_GetUnixTM/mktime were dropped during
-     * external-core development — use time()+localtime() instead.)
+     * v2 append: palette settings used by external GB/GBC core (TGB Dual)
+     * and other systems. Keep for ABI compatibility.
      * ================================================================ */
     int32_t  (*odroid_settings_Palette_get)(void);
     void     (*odroid_settings_Palette_set)(int32_t value);
@@ -484,8 +480,8 @@ typedef struct {
                                                   gw_file_progress_cb_t file_progress_cb);
 
     /* ================================================================
-     * v2 append: blueMSX (MSX) porting surface. Identified by porting
-     * Core/Src/porting/msx/main_msx.c (+ msx_database.c) against this ABI.
+     * v2 append: MSX external-core surface (SHA1 helpers used by
+     * msxromdb / disk identity; keep for ABI compatibility).
      * (ahb_* → mem_ctl. calculate_sha1_file is the whole-file form of
      * calculate_sha1_file_limit.)
      * ================================================================ */
@@ -494,7 +490,7 @@ typedef struct {
     int8_t   (*calculate_sha1_hw)(const uint8_t *data, size_t len, uint8_t *output);
 
     /* ================================================================
-     * v2 append: blueMSX extras (RTC init, disk-swap UI, ROM loader).
+     * v2 append: MSX extras (RTC init, disk-swap UI, path helpers).
      * ================================================================ */
     struct tm *(*localtime)(const time_t *timer);
     int      (*gettimeofday)(struct timeval *tv, void *tz);
@@ -504,7 +500,7 @@ typedef struct {
     const char *(*rg_basename)(const char *path);
 
     /* ================================================================
-     * v2 append: LCD-Game-Emulator (Game & Watch handhelds).
+     * v2 append: LCD-Game-Emulator (external Game & Watch core).
      * GW_SetUnixTM is the only RTC write entry left after the read-side
      * getters were dropped (no portable libc setter on this firmware).
      * ================================================================ */
@@ -519,9 +515,9 @@ typedef struct {
     unsigned int (*lz4_get_file_size)(const void *src);
 
     /* ================================================================
-     * v2 append: Tamagotchi P1 (tamalib) — frame-pacing reset after
-     * save-state catch-up fast-forward (static frame_integrator lives
-     * in firmware common.c).
+     * v2 append: reset frame-pacing after save-state catch-up
+     * fast-forward (static frame_integrator lives in firmware
+     * common.c). Kept for ABI compatibility with packed cores.
      * ================================================================ */
     void     (*common_emu_frame_loop_reset)(void);
 
@@ -587,6 +583,103 @@ typedef struct {
     int      (*odroid_overlay_get_font_width)(void);
     void     (*odroid_overlay_draw_fill_rect)(int x, int y, int width, int height,
                                               uint16_t color);
+
+    /* ================================================================
+     * v2 append: DMA2D R2M solid RGB565 fill for homebrews/cores.
+     * Same HAL handle as dma2d_m2m_rgb565_start (re-Init every start).
+     * color = RGB565; dst_offset = output line offset in pixels (OOR),
+     * i.e. pitch_in_pixels - width (0 for a tightly packed rectangle).
+     * Start returns 0 on success; poll via dma2d_poll().
+     * ================================================================ */
+    uint32_t (*dma2d_r2m_rgb565_start)(uint32_t color, uint32_t dst,
+                                       uint16_t width, uint16_t height,
+                                       uint16_t dst_offset);
+
+    /* ================================================================
+     * v2 append: DMA2D M2M RGB565 with line offsets (pitch - width).
+     * src_offset / dst_offset are in pixels (FGOR / OOR). The legacy
+     * dma2d_m2m_rgb565_start is equivalent to offsets of 0.
+     * ================================================================ */
+    uint32_t (*dma2d_m2m_rgb565_start_ex)(uint32_t src, uint32_t dst,
+                                          uint16_t width, uint16_t height,
+                                          uint16_t src_offset, uint16_t dst_offset);
+
+    /* ================================================================
+     * v2 append: soft bilinear blit (OpenMV imlib_draw_image). Used by
+     * GB/WSV/Celeste soft scaling filters. Types live in bilinear.h.
+     * Append-only — no version bump; required_abi_min_size grows for
+     * cores that link this slot.
+     * ================================================================ */
+    void (*imlib_draw_image)(image_t *dst_img, image_t *src_img,
+                             int dst_x_start, int dst_y_start, int dst_stride,
+                             float x_scale, float y_scale, rectangle_t *roi,
+                             int rgb_channel, int alpha,
+                             const uint16_t *color_palette,
+                             const uint8_t *alpha_palette, image_hint_t hint,
+                             imlib_draw_row_callback_t callback,
+                             void *dst_row_override);
+
+    /* ================================================================
+     * v2 append (ours): derived-blob flash cache. A core that decodes or
+     * weaves an asset once (the arcade master's woven 68000 program, its
+     * Z80 flag tables, a tile-plane LUT) stores it in external flash
+     * under a key and gets a memory-mapped pointer back on every later
+     * launch, instead of paying the RAM and the rebuild each time.
+     *
+     * The streaming form exists because the one-shot form needs a RAM
+     * buffer the size of the blob: a 512KB ROM entry did not fit in the
+     * machine pool and the failure looked like a missing ROM.
+     *
+     * NOTE FOR UPSTREAM: nothing here is arcade-specific -- any core that
+     * caches decoded assets wants it. Until it is upstream, a core built
+     * against these slots cannot run on stock firmware, because
+     * gnw_core_probe() gates on required_abi_min_size <= sizeof(abi).
+     * ================================================================ */
+    /* Both builds provide lookup: SD probes the writable NOR cache, while
+     * SD_CARD=0 resolves a preplaced FrogFS sidecar through its LittleFS
+     * index. Store slots below remain NULL on SD_CARD=0. Keep the slots in
+     * both variants so the ABI table layout never differs. */
+    const uint8_t *(*lookup_data_in_flash)(const char *key, uint32_t *size_out);
+    const uint8_t *(*store_data_in_flash)(const char *key, const uint8_t *data,
+                                          uint32_t data_size);
+    void           (*store_data_set_progress_cb)(void (*cb)(uint32_t done, uint32_t total));
+    /* Streaming form; flash_stream_t is owned by the CALLER (gw_flash_alloc.h).
+     * The trampolines must stay RESIDENT in a core: they run while OSPI is
+     * unmapped, so a callback in flash faults. */
+    bool           (*store_data_begin)(void *st, const char *key, uint32_t total_size);
+    bool           (*store_data_append)(void *st, const uint8_t *buf, uint32_t len);
+    const uint8_t *(*store_data_finish)(void *st);
+    void           (*store_data_abort)(void *st);
+
+    /* ================================================================
+     * v2 append (ours): four small slots the arcade core needs and the
+     * bridge did not carry. lcd_pen() is static inline over lcd_get_mode()
+     * and needs no slot of its own.
+     * ================================================================ */
+    int  (*lcd_get_mode)(void);
+    void (*odroid_overlay_draw_progress_bar)(const char *header, uint8_t progress);
+    bool (*rg_storage_mkdir)(const char *dir);
+    const char *(*rg_dirname)(const char *path);
+
+    /* ================================================================
+     * v2 append: flash cache capacity (extflash − reserved OFW / layout).
+     * NULL on SD_CARD=0 builds (same as the other flash_alloc slots).
+     * ================================================================ */
+    uint32_t (*flash_cache_usable_size)(void);
+
+    /* ================================================================
+     * v2 append: cancellable progress / flash-cache helpers.
+     * Original draw_progress_bar + cache_file_in_flash stay non-cancellable.
+     * NULL on older firmware — cores must NULL-check.
+     * ================================================================ */
+    bool     (*odroid_overlay_progress_poll_cancel)(void);
+    bool     (*odroid_overlay_draw_progress_bar_cancellable)(const char *header, uint8_t progress);
+    uint8_t *(*odroid_overlay_cache_file_in_flash_cancellable)(const char *file_path,
+                                                               uint32_t *file_size_p,
+                                                               bool byte_swap);
+    uint8_t *(*odroid_overlay_cache_file_in_flash_relocate_cancellable)(
+        const char *file_path, uint32_t *file_size_p, bool byte_swap,
+        gw_flash_relocate_cb_t relocate_cb);
 
 } gw_firmware_abi_t;
 

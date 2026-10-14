@@ -4354,19 +4354,27 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
          * menu colours still resolve to a real nearest match.
          *
          * The array must stay valid until we hand the table back, which the
-         * mode change below does by pushing the 32-entry path again. */
+         * mode change below does by pushing the 32-entry path again.
+         *
+         * THIS FIRMWARE HAS NO lcd_set_clut_ext(). retro-go-sd's external_cores
+         * branch (the firmware the SDK is synced from, see SDK_VERSION) never
+         * grew that slot, and its lcd_set_clut() takes all 256 entries itself:
+         * at count > 128 there is no room for darkened twins, so it stores the
+         * table as given and the overlay falls back to a nearest-match darken.
+         * Calling the old slot index against this ABI called whatever function
+         * now sits there -- the symptom was a Hardfault in printf() on launch. */
         const uint32_t *ext = x86_video_clut256();
         if (ext != clut256_pushed) {
             /* Entering or leaving a 256-colour mode. */
             if (ext)
-                abi->lcd_set_clut_ext(ext, 256);
+                abi->lcd_set_clut(ext, 256);
             else
                 abi->lcd_set_clut(core_clut, CORE_CLUT_ENTRIES);
             clut256_pushed = ext;
             cga_clut_dirty = 0;
         } else if (cga_clut_dirty) {
             if (ext)
-                abi->lcd_set_clut_ext(ext, 256);
+                abi->lcd_set_clut(ext, 256);
             else
                 abi->lcd_set_clut(core_clut, CORE_CLUT_ENTRIES);
             cga_clut_dirty = 0;

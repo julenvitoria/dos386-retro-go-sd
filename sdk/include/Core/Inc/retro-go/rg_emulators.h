@@ -31,6 +31,15 @@ typedef enum
     IMG_STATE_COVER
 } img_state_t;
 
+/* Lazily filled by the launcher idle path (TAB_IDLE): whether this ROM's
+ * primary file is present in the external-flash cache. */
+typedef enum
+{
+    FLASH_CACHE_UNKNOWN = 0,
+    FLASH_CACHE_MISS,
+    FLASH_CACHE_HIT,
+} flash_cache_state_t;
+
 typedef struct {
     char name[256];
     const char *ext;
@@ -46,6 +55,7 @@ typedef struct {
     uint32_t cover_bin_offset;
     uint32_t cover_bin_size;
 	#endif
+    flash_cache_state_t flash_cached;
     rom_region_t region;
     const rom_system_t *system;
 #if CHEAT_CODES == 1
@@ -82,7 +92,7 @@ typedef struct {
      * longer cached here: run_dynamic_core() re-probes the file's
      * gnw_core_meta_t at launch time instead, so this struct doesn't go
      * stale if the file changes between scan and launch.
-     * Empty for the compile-time tabs (Homebrew, PICO-8). */
+     * Empty for compile-time tabs (Homebrew). */
     char core_path[64];
 
     /* GNW_PARSE_ROM (plain per-file browse, scan_folder_cb) or

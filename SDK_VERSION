@@ -1,4 +1,4 @@
 # Snapshot metadata for this SDK tree (informational).
 FIRMWARE_ABI_VERSION=2
-SOURCE=/home/doug/Nerd/git/tinyemu/references/game-and-watch-retro-go-sd
-SYNC_DATE=2026-08-13T19:44:47Z
+SOURCE=julenvitoria/game-and-watch-retro-go-sd, branch external_cores, commit b791f155
+SYNC_DATE=2026-10-14T04:30:43Z

@@ -2,32 +2,27 @@
  * core_common — reusable ABI bridge for standalone "core" binaries.
  *
  * Every classic emulator core built outside the main firmware ELF (see
- * cores/_template/ and cores/wsv/) links this bridge instead of talking to
- * firmware symbols directly. It mirrors, in generic form, the trampoline
- * pattern already used for the PICO-8 engine (Core/Src/porting/pico8/
- * p8_firmware_bridge.cpp / docs/PICO8_EXTERNAL_MODULE.md):
+ * cores/_template/) links this bridge instead of talking to
+ * firmware symbols directly:
  *
  *   1. gw_core_bridge.c defines a `core_<name>` trampoline for every libc /
  *      G&W-hardware / retro-go function a core is allowed to call.
  *   2. gw_core_bridge_redefine_syms.txt maps the *real* name (memcpy, fopen,
  *      lcd_swap, ...) to `core_<name>` via `objcopy --redefine-syms`, applied
- *      to every other object file that makes up the core (potator, bilinear,
- *      main_wsv.c, ...) — see cores/_template/Makefile.
+ *      to every other object file that makes up the core (engine sources,
+ *      main_<system>.c, ...) — see cores/_template/Makefile.
  *   3. The linker then resolves the renamed references against the
  *      trampolines defined here, so the core binary never contains a direct
  *      call to a firmware address baked in at this firmware's link time.
  *
  * Data globals (structs accessed with `.field`, not simple functions) can't
- * be redirected through a renamed function pointer. For those we go one
- * step further than PICO-8's per-build snapshot and expose them as macros
- * that dereference the ABI's data pointer on every access — this is a few
- * extra cycles per access, but stays correct regardless of the core's own
- * BSS layout (PICO-8 instead relies on its overlay's BSS landing at the
- * *same* address in both builds, which isn't a safe assumption to bake into
- * a generic multi-core SDK). Include this header AFTER the normal firmware
- * headers (common.h, rom_manager.h, gw_malloc.h) in the porting .c file so
- * their own `extern` declarations are parsed first and only later *uses* of
- * the identifiers get macro-substituted.
+ * be redirected through a renamed function pointer. For those we expose them
+ * as macros that dereference the ABI's data pointer on every access — a few
+ * extra cycles per access, but correct regardless of the core's own BSS
+ * layout. Include this header AFTER the normal firmware headers (common.h,
+ * rom_manager.h, gw_malloc.h) in the porting .c file so their own `extern`
+ * declarations are parsed first and only later *uses* of the identifiers get
+ * macro-substituted.
  */
 #pragma once
 
@@ -71,15 +66,20 @@ extern "C" {
  * right after the loaded code+data and right after BSS, respectively.
  * tools/pack_core.py reads these two (via `nm`) to compute code_size/
  * bss_size for the CORE-header metadata; a core's C code can also take
- * their address directly (e.g. to seed ram_start past its own BSS, see
- * main_wsv.c) without depending on any firmware-side symbol. */
+ * their address directly (e.g. to seed ram_start past its own BSS)
+ * without depending on any firmware-side symbol. */
 extern uint32_t __CORE_CODE_END__;
 extern uint32_t __CORE_BSS_END__;
 
-/* DMA2D M2M RGB565 (ABI). Firmware owns the HAL handle; objcopy remaps
+/* DMA2D helpers (ABI). Firmware owns the HAL handle; objcopy remaps
  * these names to core_dma2d_* trampolines. Start returns 0 on success;
- * poll returns HAL_StatusTypeDef (HAL_OK=0, HAL_TIMEOUT=3, …). */
+ * poll returns HAL_StatusTypeDef (HAL_OK=0, HAL_TIMEOUT=3, …).
+ * Offsets are line skips in pixels (pitch - width). R2M color is RGB565. */
 uint32_t dma2d_m2m_rgb565_start(uint32_t src, uint32_t dst, uint16_t width, uint16_t height);
+uint32_t dma2d_m2m_rgb565_start_ex(uint32_t src, uint32_t dst, uint16_t width, uint16_t height,
+                                   uint16_t src_offset, uint16_t dst_offset);
+uint32_t dma2d_r2m_rgb565_start(uint32_t color, uint32_t dst, uint16_t width, uint16_t height,
+                                uint16_t dst_offset);
 uint32_t dma2d_poll(uint32_t timeout_ms);
 
 /* One-time bridge setup. Currently a no-op placeholder (all state above is

@@ -2,8 +2,7 @@
  * Shared C++ runtime support for standalone "core" binaries.
  *
  * Pulled in automatically by cores/_template/Makefile whenever a core sets
- * CORE_CXX_SOURCES (see that variable's doc comment) — cores/gb_tgbdual is
- * the first (and, as of this writing, only) consumer.
+ * CORE_CXX_SOURCES (see that variable's doc comment) — e.g. external Stella.
  *
  * A C++ core builds -nostdlib, no libstdc++ (see cores/_template/Makefile's
  * CXXFLAGS comment on -fno-exceptions/-fno-rtti/-fno-threadsafe-statics/
@@ -17,12 +16,10 @@
  *     heap_alloc_mem() below, a small allocator on top of the existing
  *     ram_malloc()/itc_malloc()/ahb_calloc() core_common trampolines.
  *     Behaviorally the same allocator as the (now unused, monolithic-build-
- *     only) Core/Src/heap.cpp: cores/gb_tgbdual/main_gb_tgbdual.cpp and
- *     every .cpp file under external/tgbdual-go/gb_core call these exact names directly
+ *     only) Core/Src/heap.cpp. C++ cores call these names directly
  *     (declared in Core/Inc/heap.hpp) — heap_itc_alloc(true) temporarily
- *     routes allocations through the 64KB ITC pool (used for GB WRAM/VRAM
- *     banking when cart SRAM mapping doesn't need it), falling back to the
- *     shared RAM_EMU bump pool and then AHB SRAM when that's exhausted.
+ *     routes allocations through the 64KB ITC pool, falling back to the
+ *     shared RAM_EMU bump pool then DTC and AHB SRAM when that's exhausted.
  *   - __cxa_pure_virtual: GCC always emits a reference to this in an
  *     abstract base class's vtable (for the pure-virtual slots), even
  *     though -fno-rtti plus every pure virtual actually being overridden
@@ -38,57 +35,125 @@
  */
 #include <cstddef>
 #include <cstring>
+#include <cstdio>
+#ifndef HOST_BUILD
 #include <sys/reent.h>
+#endif
 
 extern "C" {
 #include "gw_malloc.h"
 }
 
 /* ====================================================================
- * heap_alloc_mem() family (Core/Inc/heap.hpp) — small allocator used by
- * classic C++ ports (currently: gb_tgbdual) needing a temporary
- * ITC-then-RAM-then-AHB allocation strategy on top of the plain
- * ram_malloc()/itc_malloc()/ahb_calloc() core_common trampolines.
+ * heap_alloc_mem() — ITCM only if heap_itc_alloc(true); otherwise
+ * RAM_EMU bump first, then DTCM (freeable), then AHB bump.
  * ==================================================================== */
-static bool s_heap_itc_alloc;
+static bool s_heap_itc_alloc = false;
 
 extern "C" void heap_itc_alloc(bool itc)
 {
     s_heap_itc_alloc = itc;
 }
 
+#ifdef GW_HEAP_TRACE
+static const char *heap_pool_name(const void *ptr)
+{
+    uintptr_t p = (uintptr_t)ptr;
+    if (p < 0x00010000u)
+        return "ITCM";
+    if (p >= 0x20000000u && p < 0x20020000u)
+        return "DTCM";
+    if (p >= 0x24000000u && p < 0x24100000u)
+        return "RAM_EMU";
+    if (p >= 0x30000000u && p < 0x30020000u)
+        return "AHB";
+    return "?";
+}
+#endif
+
 extern "C" void *heap_alloc_mem(size_t s)
 {
     void *ptr = NULL;
+#ifdef GW_HEAP_TRACE
+    const char *pool = NULL;
+#endif
 
     if (s_heap_itc_alloc) {
         void *p = itc_malloc(s);
         /* ITC RAM starts at 0x00000000, so itc_malloc() can't use NULL as
          * its own "allocation failed" sentinel — see gw_malloc.c. */
-        if (p != (void *)0xffffffff)
+        if (p != (void *)0xffffffff) {
             ptr = p;
+#ifdef GW_HEAP_TRACE
+            pool = "ITCM";
+#endif
+        }
     }
-    if (!ptr)
+    if (!ptr) {
         ptr = ram_malloc(s);
-    if (!ptr)
-        ptr = ahb_calloc(1, s); /* true AHB bump — ram_malloc() already just failed */
-    if (ptr)
+#ifdef GW_HEAP_TRACE
+        if (ptr)
+            pool = "RAM_EMU";
+#endif
+    }
+    if (!ptr) {
+        ptr = dtc_malloc(s);
+#ifdef GW_HEAP_TRACE
+        if (ptr)
+            pool = "DTCM";
+#endif
+    }
+    if (!ptr) {
+        ptr = ahb_malloc(s);
+#ifdef GW_HEAP_TRACE
+        if (ptr)
+            pool = "AHBM";
+#endif
+    }
+
+    if (ptr) {
         memset(ptr, 0, s);
+#ifdef GW_HEAP_TRACE
+        printf("[heap] %u B -> %s @ %p (tag %s)\n",
+               (unsigned)s, pool, ptr, heap_pool_name(ptr));
+#endif
+    } else {
+        printf("[heap] %u B -> FAIL\n", (unsigned)s);
+    }
 
     return ptr;
 }
 
+extern "C" size_t heap_get_largest_free_size(void)
+{
+    /* Mirrors heap_alloc_mem()'s pool walk: one allocation lands in one
+     * pool, so this is the max, not the sum. ITC only after
+     * heap_itc_alloc(true). */
+    size_t n = ahb_get_free_size();
+    size_t ram = ram_get_free_size();
+    size_t dtc = dtc_get_free_size();
+    if (ram > n)
+        n = ram;
+    if (dtc > n)
+        n = dtc;
+    if (s_heap_itc_alloc) {
+        size_t itc = itc_get_free_size();
+        if (itc > n)
+            n = itc;
+    }
+    return n;
+}
+
 extern "C" size_t heap_free_mem(void)
 {
-    return ram_get_free_size();
+    return heap_get_largest_free_size();
 }
 
 extern "C" void cpp_heap_init(size_t bss_end)
 {
     /* No private bump heap here (unlike the old firmware-side heap.cpp) —
-     * every allocation goes through the shared ram_malloc()/itc_malloc()/
-     * ahb_calloc() pools instead. Kept only for source compatibility with
-     * heap.hpp; bss_end is unused. */
+     * every allocation goes through the shared ram/itc/ahb/dtc pools.
+     * Kept only for source compatibility with heap.hpp; bss_end is unused. */
     (void)bss_end;
     s_heap_itc_alloc = false;
 }
@@ -96,6 +161,18 @@ extern "C" void cpp_heap_init(size_t bss_end)
 /* ====================================================================
  * operator new/delete
  * ==================================================================== */
+#ifdef HOST_BUILD
+/* Desktop build links real libc++/SDL: a freestanding no-free operator
+ * new would intercept every C++ allocation in the process (and leak).
+ * Explicit emulator buffers still go through heap_alloc_mem(). */
+#include <cstdlib>
+void *operator new(size_t s) { return std::malloc(s ? s : 1); }
+void *operator new[](size_t s) { return std::malloc(s ? s : 1); }
+void operator delete(void *p) noexcept { std::free(p); }
+void operator delete[](void *p) noexcept { std::free(p); }
+void operator delete(void *p, size_t) noexcept { std::free(p); }
+void operator delete[](void *p, size_t) noexcept { std::free(p); }
+#else
 void *operator new(size_t s) { return heap_alloc_mem(s); }
 void *operator new[](size_t s) { return heap_alloc_mem(s); }
 
@@ -110,6 +187,7 @@ void operator delete(void *p) { (void)p; }
 void operator delete[](void *p) { (void)p; }
 void operator delete(void *p, size_t s) { (void)p; (void)s; }
 void operator delete[](void *p, size_t s) { (void)p; (void)s; }
+#endif
 
 /* ====================================================================
  * Minimal C++ runtime symbols the compiler/linker require to exist even
@@ -131,7 +209,7 @@ extern "C" int __cxa_atexit(void (*)(void *), void *, void *)
 }
 
 /* ====================================================================
- * Exception / unwind stubs for cores that link -lstdc++ (Stella).
+ * Exception / unwind stubs for cores that link -lstdc++ (e.g. Stella).
  *
  * Toolchain libstdc++.a is built WITH exceptions; even with our own
  * -fno-exceptions, string/length_error paths still reference the EH

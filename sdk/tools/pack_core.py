@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Package a standalone "core" build (see cores/_template/, cores/wsv/,
-cores/pce/) into the CORE-header .bin format the launcher discovers at boot
+Package a standalone "core" build (see cores/_template/, …) into the CORE-header .bin format the launcher discovers at boot
 (emulators_scan_cores() / gnw_core_probe() in Core/Src/retro-go/rg_emulators.c).
 
 File layout produced (all integers little-endian):
@@ -44,22 +43,22 @@ Usage — image logos (template / new cores):
         --header-logo assets/header.bmp \
         --out example.bin
 
-Usage — single-system, single-segment core (see cores/wsv/Makefile):
+Usage — single-system, single-segment core (see cores/_template/Makefile):
 
     tools/pack_core.py \\
-        --elf build/wsv_core.elf --bin build/wsv_core.bin \\
-        --system-name "Watara Supervision" --dirname wsv \\
-        --extensions "wsv sv bin lzma" \\
+        --elf build/example_core.elf --bin build/example_core.bin \\
+        --system-name "Example System" --dirname example \\
+        --extensions "bin lzma" \\
         --pad-logo assets/pad.bmp \\
         --header-logo assets/header.bmp \\
         --version 1.0.0 \\
-        --out ../wsv.bin
+        --out ../example.bin
 
 `--version X.Y.Z` (optional leading `v`, default 1.0.0) and `--core-name`
 (default: --out stem) are stored in `gnw_core_meta_t` and shown in the
 in-game pause → Info dialog (name, version, path, file date).
 
-Usage — multi-system, multi-segment core (see cores/pce/Makefile):
+Usage — multi-system, multi-segment core (ITCM + multiple --system entries):
 
     tools/pack_core.py \\
         --elf build/pce_core.elf --bin build/pce_core.bin \\
@@ -70,9 +69,9 @@ pad_logo=assets/pad.bmp,header_logo=assets/header_cd.bmp,cheat_ext=pceplus \\
         --segment itcm:__ITCM_CORE_START__:__CORE_ITCM_CODE_END__:__CORE_ITCM_BSS_END__:build/pce_core_itcm.bin \\
         --out ../pce.bin
 
-Extra ITCM segments are auto-detected from ELF symbols
-(__CORE_ITCM_*, section .core_itcm) when present; pass
---no-auto-segments to disable. Explicit --segment still wins for a
+Extra ITCM / RAM_UC segments are auto-detected from ELF symbols
+(__CORE_ITCM_*, .core_itcm; __CORE_RAM_UC_*, .core_ram_uc) when present;
+pass --no-auto-segments to disable. Explicit --segment still wins for a
 given region. AHB/DTCM are not valid load targets (firmware heap /
 dtcm bump) — pack_core rejects them.
 
@@ -100,7 +99,7 @@ GNW_CORE_META_VERSION = 3
 GNW_CORE_MAX_SEGMENTS = 4
 GNW_CORE_MAX_SYSTEMS = 4
 
-REGION_NAME_TO_ID = {"ram_emu": 0, "itcm": 1}
+REGION_NAME_TO_ID = {"ram_emu": 0, "itcm": 1, "ram_uc": 2}
 PARSE_NAME_TO_ID = {"rom": 0, "cdrom": 1}
 
 # Must mirror gnw_core_segment_t exactly (Core/Inc/retro-go/gnw_core_meta.h):
@@ -127,16 +126,29 @@ CORE_NAME_MAX = 23  # stored as char[24] including NUL
 
 
 def parse_version(spec):
-    """Parse 'X.Y.Z' (optional leading 'v') into (major, minor, patch),
-    each 0..255. Used for gnw_core_meta_t.version_*. """
+    """Parse a version string into (major, minor, patch), each 0..255.
+
+    Accepts:
+      - plain X.Y.Z (optional leading 'v')
+      - git describe output: vX.Y.Z, vX.Y.Z-dirty, vX.Y.Z-N-gHEX[-dirty]
+      - NOTAG / empty → (0, 0, 0)
+
+    Only the leading X.Y.Z is stored in gnw_core_meta_t (3 bytes); the
+    full describe string is for build logs / Makefile only.
+    """
     s = spec.strip()
+    if not s or s.upper() == "NOTAG":
+        return 0, 0, 0
     if s[:1] in ("v", "V"):
         s = s[1:]
-    parts = s.split(".")
-    if len(parts) != 3:
-        sys.exit(f"error: --version expects X.Y.Z, got {spec!r}")
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)", s)
+    if not m:
+        sys.exit(
+            f"error: --version expects X.Y.Z or git describe (vX.Y.Z…), "
+            f"or NOTAG; got {spec!r}"
+        )
     try:
-        major, minor, patch = (int(p) for p in parts)
+        major, minor, patch = (int(m.group(i)) for i in (1, 2, 3))
     except ValueError:
         sys.exit(f"error: --version components must be integers, got {spec!r}")
     for name, val in (("major", major), ("minor", minor), ("patch", patch)):
@@ -302,7 +314,7 @@ def extract_logo_from_c(spec):
     able to render it is compiled into the firmware). Since a standalone
     core has no compile-time knowledge of which languages the *firmware*
     it will run against was built with (same simplification already made
-    for all of a dynamic core's own UI strings — see main_wsv.c/
+    for all of a dynamic core's own UI strings — see an external core's
     main_gwenesis.c, hardcoded English), we always take the `#else`
     (default/international) branch here."""
     path_str, _, varname = spec.rpartition(":")
@@ -402,7 +414,7 @@ def parse_segment_arg(spec):
 
 
 # Optional extra segments discovered from ELF symbols when a custom
-# linker script defines them (see cores/pce/pce_core.ld, cores/gba/…).
+# linker script defines them (see ld/gnw_itcm_core.ld for a multi-region INCLUDE).
 # If the triple is absent, packing is a no-op for that region.
 # AHB is intentionally omitted — AHB SRAM is the firmware malloc heap.
 AUTO_EXTRA_SEGMENTS = (
@@ -412,6 +424,13 @@ AUTO_EXTRA_SEGMENTS = (
         "code_end": "__CORE_ITCM_CODE_END__",
         "bss_end": "__CORE_ITCM_BSS_END__",
         "section": ".core_itcm",
+    },
+    {
+        "region": "ram_uc",
+        "start": "__RAM_UC_CORE_START__",
+        "code_end": "__CORE_RAM_UC_CODE_END__",
+        "bss_end": "__CORE_RAM_UC_BSS_END__",
+        "section": ".core_ram_uc",
     },
 )
 
@@ -499,10 +518,10 @@ def main():
     ap.add_argument("--bin", required=True, type=Path,
                      help="objcopy -O binary of --elf's segment-0 (RAM_EMU) sections — exactly segments[0].code_size bytes")
 
-    # Legacy single-system sugar (kept so cores/wsv, cores/md need no changes).
-    ap.add_argument("--system-name", help='e.g. "Watara Supervision" (single-system sugar for --system)')
-    ap.add_argument("--dirname", help='ROM subdirectory under /roms, e.g. "wsv" (single-system sugar)')
-    ap.add_argument("--extensions", help='space-separated, e.g. "wsv sv bin lzma" (single-system sugar)')
+    # Legacy single-system sugar (kept so existing core Makefiles need no changes).
+    ap.add_argument("--system-name", help='e.g. "Example System" (single-system sugar for --system)')
+    ap.add_argument("--dirname", help='ROM subdirectory under /roms, e.g. "example" (single-system sugar)')
+    ap.add_argument("--extensions", help='space-separated, e.g. "bin lzma" (single-system sugar)')
     ap.add_argument("--pad-logo",
                      help="pad (controller) logo image (.png/.bmp/...) (single-system sugar)")
     ap.add_argument("--header-logo",
@@ -530,8 +549,9 @@ def main():
 
     ap.add_argument("--flags", type=lambda s: int(s, 0), default=0)
     ap.add_argument("--version", default="1.0.0",
-                     help="core semantic version X.Y.Z (optional leading 'v'; "
-                          "stored as 3 bytes in gnw_core_meta_t, default: %(default)s)")
+                     help="X.Y.Z, git describe (vX.Y.Z…), or NOTAG → 0.0.0 "
+                          "(optional leading 'v'; stored as 3 bytes in "
+                          "gnw_core_meta_t, default: %(default)s)")
     ap.add_argument("--core-name", default=None,
                      help="short core pack name stored in gnw_core_meta_t "
                           f"(max {CORE_NAME_MAX} chars). Default: --out stem "
