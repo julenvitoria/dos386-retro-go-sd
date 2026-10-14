@@ -788,9 +788,9 @@ typedef struct {
  * OPEN on success -- mz_place() closes it, and every failure path here closes
  * it before returning.
  *
- * .COM images are NOT handled and are refused with error 0x0B, the same as any
- * other non-MZ file. Adding the .COM path is a separate, small change; saying
- * so is better than a loader that half-does it.
+ * A file without the MZ signature is refused here with error 0x0B, and
+ * dos_load_mz() then hands it to dos_load_com(): that is how real DOS tells
+ * the two apart -- by the signature, never by the extension.
  */
 static int mz_open(const char *path, mz_open_t *m)
 {
@@ -903,16 +903,125 @@ static int mz_place(mz_open_t *m, uint16_t load_seg, uint16_t reloc_factor)
 }
 
 /*
+ * Load a .COM image and build its PSP -- the other half of what EXEC loads.
+ *
+ * A .COM is a raw memory image with no header: DOS gives it ONE block (the
+ * largest free one, as for an MZ asking maxalloc 0xFFFF), copies the file to
+ * PSP:0100, points CS, DS, ES and SS all at the PSP, sets IP to 0100 and SP to
+ * the top of the segment (or of the block, when the block is smaller than
+ * 64 KB), and pushes a zero word so that a final RET lands on PSP:0000, the
+ * INT 20h every PSP starts with. The file may be at most 0xFF00 bytes.
+ *
+ * Reached from dos_load_mz() when the file has no MZ signature, so the root
+ * launch and AH=4Bh share it. Rick Dangerous (RICK.COM) is a title that needs
+ * it; before this, every .COM failed with 0x0B and the root fell back to the
+ * demo.
+ */
+static int dos_load_com(const char *path, const char *tail, unsigned tail_len,
+                        uint16_t parent, uint16_t env_seg, const uint8_t *fcbs,
+                        dos_prog_t *out)
+{
+    FIL f;
+    if (f_open(&f, path, FA_READ) != FR_OK) {
+        x86_dos_last_error = 0x02;          /* file not found */
+        return -1;
+    }
+    {
+        /* mz_open() also answers 0x0B for an MZ whose header does not add up;
+           that is a broken .EXE, not a .COM, and must stay refused. */
+        uint8_t sig[2] = {0, 0};
+        UINT got = 0;
+        f_read(&f, sig, 2, &got);
+        if (got == 2 && ((sig[0] == 'M' && sig[1] == 'Z') || (sig[0] == 'Z' && sig[1] == 'M'))) {
+            f_close(&f);
+            x86_dos_last_error = 0x0B;
+            return -1;
+        }
+        f_lseek(&f, 0);
+    }
+    uint32_t size = (uint32_t)f_size(&f);
+    if (size > 0xFF00u) {
+        f_close(&f);
+        x86_dos_last_error = 0x0B;          /* too big for one segment */
+        return -1;
+    }
+
+    /* PSP + image + a minimal stack. Everything there is, if it can be had. */
+    uint16_t need = (uint16_t)(PARA(256) + PARA(size) + PARA(256));
+    uint16_t largest = 0, granted = 0xFFFF;
+    uint16_t block = mcb_alloc(0xFFFF, MCB_OWNER_DOS, &largest);
+    if (!block && largest >= need) {
+        block = mcb_alloc(largest, MCB_OWNER_DOS, &largest);
+        granted = largest;
+    }
+    if (!block) {
+        f_close(&f);
+        x86_dos_last_error = 0x08;          /* insufficient memory */
+        return -1;
+    }
+    {
+        mcb_t hm;                           /* the block belongs to the process */
+        uint16_t hseg = (uint16_t)(block - 1u);
+        if (mcb_read(hseg, &hm)) {
+            hm.owner = block;
+            mcb_write(hseg, &hm);
+            granted = hm.size;
+        }
+    }
+    uint16_t psp = block;
+
+    /* The image, a page at a time, recorded like mz_place()'s copy. */
+    uint32_t done = 0;
+    while (done < size) {
+        uint8_t buf[512];
+        UINT n = 0;
+        UINT want = (size - done > sizeof(buf)) ? sizeof(buf) : (UINT)(size - done);
+        if (f_read(&f, buf, want, &n) != FR_OK || n == 0)
+            break;
+        if (x86_guest_copy_in(SEG(psp) + 0x100u + done, buf, n) != n)
+            break;
+        done += n;
+    }
+    f_close(&f);
+    x86_dos_load_bytes = done;
+    x86_dos_load_short = size - done;
+    if (done < size)
+        x86_dos_load_shorts++;
+
+    out->mem_top = (uint16_t)(psp + granted);
+    psp_build(psp, out->mem_top, tail, tail_len, parent, env_seg, fcbs);
+
+    uint32_t top = (uint32_t)granted * 16u;
+    uint16_t sp = (top >= 0x10000u) ? 0xFFFEu : (uint16_t)(top - 2u);
+    {
+        uint16_t *w = (uint16_t *)x86_guest_ptr(SEG(psp) + sp, 2);
+        if (w)
+            *w = 0;                         /* RET -> PSP:0000 (INT 20h) */
+    }
+    out->psp = psp;
+    out->load_seg = psp;
+    out->cs = psp;
+    out->ip = 0x100;
+    out->ss = psp;
+    out->sp = sp;
+    return 0;
+}
+
+/*
  * Load an MZ .EXE and build its PSP. Nothing else: no CPU state, no arena
- * bookkeeping beyond the block itself.
+ * bookkeeping beyond the block itself. A file without the MZ signature is a
+ * .COM image and goes to dos_load_com().
  */
 static int dos_load_mz(const char *path, const char *tail, unsigned tail_len,
                        uint16_t parent, uint16_t env_seg, const uint8_t *fcbs,
                        dos_prog_t *out)
 {
     mz_open_t m;
-    if (mz_open(path, &m) != 0)
+    if (mz_open(path, &m) != 0) {
+        if (x86_dos_last_error == 0x0B)     /* no MZ signature: a .COM image */
+            return dos_load_com(path, tail, tail_len, parent, env_seg, fcbs, out);
         return -1;
+    }
     mz_header_t h = m.h;
     uint32_t image = m.image;
 
