@@ -2193,6 +2193,37 @@ static int find_startup_program(char *out, unsigned max,
 
 static FATFS dsk_fs;
 
+/*
+ * COMMAND.COM's search order for a program named WITHOUT an extension:
+ * NAME.COM, then NAME.EXE. AUTOEXEC.BAT files written for real DOS say `CAT`,
+ * not `CAT.EXE` -- Alley Cat's own does -- and x86_dos_exec() takes the name
+ * literally, so such a disk fell back to the built-in demo with rc -1 and no
+ * other symptom. A name that already has an extension is left alone, and so is
+ * one where neither file exists (the exec then fails exactly as before).
+ */
+static void resolve_program_ext(char *full, size_t cap)
+{
+    static const char *const ext[2] = { ".COM", ".EXE" };
+    const char *base = full;
+    size_t n;
+    unsigned i;
+    for (const char *c = full; *c; c++)
+        if (*c == '/' || *c == '\\')
+            base = c + 1;
+    if (strchr(base, '.'))
+        return;
+    n = strlen(full);
+    if (n + 5 > cap)
+        return;
+    for (i = 0; i < 2; i++) {
+        FILINFO fi;
+        memcpy(full + n, ext[i], 5);
+        if (f_stat(full, &fi) == FR_OK)
+            return;
+    }
+    full[n] = 0;
+}
+
 static int mount_guest_disk(void)
 {
     if (!ACTIVE_FILE || !ACTIVE_FILE->path[0])
@@ -2439,6 +2470,7 @@ static void guest_reset(void)
         for (const char *c = startup; *c; c++)
             if (*c == '/' || *c == '\\') { rooted = 1; break; }
         path_join(full, sizeof(full), rooted ? "" : x86_dos_get_cwd(), startup);
+        resolve_program_ext(full, sizeof(full));
         dsk_exec_rc = (uint32_t)x86_dos_exec(full,
                                              guest_use_cmdtail ? cmdtail : "");
     }
