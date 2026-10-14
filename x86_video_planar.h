@@ -82,6 +82,9 @@ int  x86_vga_planar_active(void);
 #define X86_MODEY_PLANE_OFFSETS 0x4000u
 
 void x86_vga_ega_set_planes(void *planes, uint32_t plane_offsets);
+/* After a runtime re-fit has set the new planes: carry the old card's bytes
+   over and keep every register, so the guest cannot tell (x86_video.c). */
+void x86_vga_ega_reseat(const void *old, uint32_t old_offsets);
 void x86_vga_modey_set_cache(void *cache, uint32_t offsets);
 /* REAL storage for Mode Y display pages 1 and 2, each X86_MODEY_PAGE_BYTES.
    NULL leaves that page ALIASED onto page 0 -- the old behaviour, and the cause

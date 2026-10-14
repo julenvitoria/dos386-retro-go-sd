@@ -752,6 +752,43 @@ static void ega_shadow_rebuild(void)
     SHPROF_END();
 }
 
+/*
+ * RE-SEAT THE CARD UNDER A RUNNING GUEST -- the runtime refit's half.
+ *
+ * The donation policy re-fits the 0Dh card while a title is playing
+ * (x86_video.c, x86_video_policy_tick). That used to go through
+ * x86_vga_planar_arm(0) / (1), i.e. a MODE SET: planes zeroed, the GC/Sequencer
+ * state reset to the BIOS defaults, latches cleared. A title that keeps its
+ * tile set OFF-SCREEN and latch-copies it out every frame (write mode 1) lost
+ * both the tiles and its write mode mid-game. MEASURED, gwemu, Rick Dangerous
+ * in EGA: the card grew 0x8C00 -> 0xD800 offsets just after the hall of fame,
+ * and from then on only the sprites (drawn from system RAM) were visible over a
+ * black level.
+ *
+ * Nothing in the guest can observe a re-seat, so this preserves everything:
+ * the plane bytes that fit are moved (memmove -- the new block may overlap the
+ * old one, and neither the arena nor the pager writes frame contents while the
+ * claim moves), offsets the old card never had read as zero, registers and
+ * latches are untouched, and the read shadow is rebuilt because the aperture
+ * may have moved.
+ */
+void x86_vga_ega_reseat(const void *old, uint32_t old_offsets)
+{
+    uint32_t keep;
+
+    if (!ega_planes || !ega_plane_size)
+        return;
+    keep = old ? (old_offsets < ega_plane_size ? old_offsets : ega_plane_size) : 0u;
+    if (keep && (const void *)ega_planes != old)
+        memmove(ega_planes, old, 4u * keep);
+    if (ega_plane_size > keep)
+        memset(ega_planes + 4u * keep, 0, 4u * (ega_plane_size - keep));
+    if (x86_vga_ega_armed) {
+        ega_shadow_sig = ega_read_sig();
+        ega_shadow_rebuild();
+    }
+}
+
 /* ---------------------------------------------------------------------------
  * THE LATCHES.
  *

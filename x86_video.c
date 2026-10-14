@@ -1514,11 +1514,13 @@ static void planar_storage_follow(uint8_t kind)
  *    while the arena still holds a page inside the donated extent is refused
  *    (x86_pg_reclaim_busy) and the frames stay lent for the session; the Mode Y
  *    arm below gives the real pages back for exactly the same reason.
- *  - The card's CONTENTS DO NOT SURVIVE a re-fit -- the claim moves, and
- *    x86_vga_planar_arm() zeroes planes and aperture on the way back in. That
- *    is a frame of blank card until the guest redraws, and it is the price of
- *    handing frames back at all. It is paid only when the policy actually
- *    fires, which on a title that never comes under pressure is never.
+ *  - The card's CONTENTS SURVIVE a re-fit, and so do the GC/Sequencer
+ *    registers: the claim moves but x86_vga_ega_reseat() carries the bytes
+ *    across (offsets the old card never had read as zero). This used to say
+ *    "a frame of blank card until the guest redraws" -- true only of titles
+ *    that redraw everything; Rick Dangerous uploads its tiles off-screen ONCE
+ *    and latch-copies them every frame, and played on a black level for the
+ *    rest of the session.
  *
  * The GROW arm is deliberately more timid than the shrink arm: a shrink is
  * correctness (the alternative is 433 ms pagefile writes inside the frame
@@ -1573,11 +1575,22 @@ void x86_video_policy_tick(void)
        directions go through the same sequence: after the reclaim the state is
        exactly what a fresh mode set would find, and the reserve in force is
        what decides how much of it goes back out again. */
-    x86_vga_planar_arm(0);
+    /* NOT a mode set: the guest is mid-game and must not notice. The old
+       card's address and size are kept so x86_vga_ega_reseat() can carry its
+       bytes over -- releasing a claim does not touch the memory, and nothing
+       below writes frame contents (donation evicts by reading). Disarming here
+       instead, as a first version did, re-armed through the mode-set path:
+       zeroed planes and BIOS-default GC registers, which is a black level in
+       Rick Dangerous (see x86_vga_ega_reseat). */
+    const void *old_planes = x86_vga_ega_planes();
+    uint32_t old_offs = x86_vga_ega_plane_offsets();
+    /* Compact the aperture WHILE THE CARD IS STILL HELD: a moved aperture is
+       zeroed on arrival, and landing in the card's just-released bytes would
+       wipe what x86_vga_ega_reseat() is about to copy. */
+    aperture_compact();
     x86_arena_release(X86_ARENA_ID_EGA);
     x86_vga_ega_set_planes(NULL, 0);
     x86_pager_reclaim_from_arena();
-    aperture_compact();
     /* A SHRINK BORROWS NOTHING. Re-donating inside the same refit is what a
        first draft did, and MEASURED on KEEN4 it cost 9 evictions instead of 2:
        the reserve had risen, so the smaller donation was taken and then had to
@@ -1585,8 +1598,12 @@ void x86_video_policy_tick(void)
        A shrink goes straight to the arena-only card; the grow arm is the only
        thing that lends, and it needs a second of quiet first. */
     ega_card_place(act == X86_PG_POLICY_GROW);
-    if (!x86_vga_planar_arm(1))
-        x86_video_log_event(7, 0, 2);   /* no card at all: loud, not silent */
+    if (x86_vga_ega_card_offsets) {
+        x86_vga_ega_reseat(old_planes, old_offs);
+    } else {
+        x86_vga_planar_arm(0);          /* no card at all: loud, not silent */
+        x86_video_log_event(7, 0, 2);
+    }
 }
 
 static int mode_select(uint8_t mode)
