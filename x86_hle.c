@@ -21,6 +21,7 @@
 #include "x86_probe.h"
 #include "x86_xms.h"
 #include "x86_ems.h"
+#include "x86_mouse.h"
 #include "font8x8.h"
 
 /* Guest register accessors. The 8086 register file is 16-bit halves of the
@@ -292,6 +293,11 @@ int x86_hle_dispatch(uint8_t vector)
            exactly what the bare IRET this replaces did. Do not widen this arm
            without deciding what "absent" means for the subfunction you add. */
         return x86_xms_int2f();
+    case 0x33:
+        /* The mouse driver (x86_mouse.h). Opt-in per title: with the .cfg not
+           asking, it returns without touching a register -- the bare IRET this
+           stub replaced, so "no driver" reads exactly as it always did. */
+        return x86_mouse_int33();
     case 0x67:
         /* Expanded memory. Reached through the stub at 0064:0020, which the
            IVT points at only while EMS has backing -- so this arm is not

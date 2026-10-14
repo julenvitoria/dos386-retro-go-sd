@@ -38,6 +38,7 @@ x86_ems.c \
 x86_settings.c \
 x86_cfg.c \
 x86_pad.c \
+x86_mouse.c \
 lib/FatFs/ff.c \
 lib/FatFs/ffunicode.c \
 x86_disk.c \

@@ -2102,7 +2102,10 @@ python3 tests/test_pad.py                # PER-TITLE [gamepad] MAPPING and
                                          # (unknown key/button, four keys,
                                          # GAME), the repeat delay/rate and
                                          # that x86_cfg.c does not count the
-                                         # section's keys as unknown. 22 checks
+                                         # section's keys as unknown, and
+                                         # `mouse = on` (A/B become clicks,
+                                         # directions emit no key, clicks
+                                         # never repeat). 30 checks
 python3 tests/test_pad.py --negative     # ONE control: X86_PAD_CTL_ALLOWGAME
                                          # lets a .cfg rebind GAME (the OSK's
                                          # only door); it MUST make the harness

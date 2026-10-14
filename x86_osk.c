@@ -56,6 +56,7 @@
 #include "cutils.h"
 #include "x86_cpu.h"
 #include "x86_osk.h"
+#include "x86_mouse.h"
 
 /* ---------------------------------------------------------------------------
  * Layout
@@ -258,9 +259,11 @@ static void osk_set_mode(uint32_t m)
         return;
     x86_osk_mode = m;
 
-    if (m != MODE_MOUSE && mouse_buttons)
+    if (m != MODE_MOUSE && mouse_buttons) {
         mouse_buttons = 0;      /* a click let go by a mode switch, not by the
                                    user, would otherwise stay down forever */
+        x86_mouse_buttons(0);
+    }
     memset(mouse_held, 0, sizeof mouse_held);
 
     if (m != MODE_OFF) {
@@ -420,11 +423,21 @@ static void mouse_draw(uint8_t *fb, uint32_t stride)
        gone before this runs. If anyone adds dirty-rectangle tracking to the
        renderer, this leaves a trail of arrows and the fix is an 8x8 save-under,
        not a repaint here. */
-    if (!mouse_render)
-        return;
-
-    int px = mouse_x * 320 / MOUSE_VW;
-    int py = mouse_y * OSK_PIC_ROWS / MOUSE_VH + OSK_BAR;
+    int px, py;
+    if (x86_mouse_in_use()) {
+        /* A guest found the driver: ITS position is the pointer, and the arrow
+           is painted only while the guest has the driver's cursor shown --
+           a game drawing its own cursor (every SCUMM title) hides it, and two
+           arrows would be one too many. */
+        if (!x86_mouse_cursor(&px, &py))
+            return;
+        py = py * OSK_PIC_ROWS / 200 + OSK_BAR;
+    } else {
+        if (!mouse_render || x86_osk_mode != MODE_MOUSE)
+            return;
+        px = mouse_x * 320 / MOUSE_VW;
+        py = mouse_y * OSK_PIC_ROWS / MOUSE_VH + OSK_BAR;
+    }
 
     for (int r = 0; r < 8; r++) {
         int y = py + r;
@@ -471,6 +484,9 @@ void x86_osk_draw(uint8_t *fb, uint32_t stride)
             draw_text(fb, stride, 0, OSK_TOP_Y0, osk_toast, C_WHITE, C_BLACK);
             osk_toast_frames--;
         }
+        /* `mouse = on` with the keyboard closed: the driver's cursor, if a
+           guest has it shown (mouse_draw decides; nothing otherwise) */
+        mouse_draw(fb, stride);
         return;                 /* the bars are the renderer's again */
     }
 
@@ -583,14 +599,12 @@ static void osk_press(void)
 }
 
 /*
- * MOUSE MODE IS A UI SHELL AND NOTHING IS LISTENING. There is no INT 33h driver
- * on our side: the pointer moves, the status line tracks it and B/A count as
- * clicks, but no guest can ask where it is. That is stated here rather than
- * hidden because a half-built driver that answers some functions and silently
- * ignores others is WORSE than none -- INT 33h has no error channel, so an
- * unimplemented function returns with every register unchanged, which a guest
- * cannot tell from success. See docs/input/03 and STATUS.md for what a real
- * driver would take.
+ * MOUSE MODE FEEDS THE INT 33h DRIVER (x86_mouse.c) -- which answers only for a
+ * title whose .cfg says `mouse = on`. Without that the pointer still moves and
+ * B/A still count as clicks, but no guest can ask where it is, exactly as
+ * before the driver existed. The driver's scope (handlers accepted and never
+ * called) is stated in x86_mouse.h rather than hidden: INT 33h has no error
+ * channel.
  *
  * The acceleration ramp is ported unchanged, because a d-pad gives DIRECTION
  * ONLY: without a ramp the choice is between a pointer too slow to cross the
@@ -608,13 +622,14 @@ static int mouse_step(unsigned frames)
     return (int)s;
 }
 
-static void mouse_input(uint32_t now)
+/* Directions only: ramp, move our pointer and the driver's. Shared by mouse
+   mode and by `mouse = on` with the OSK closed (x86_osk_mouse_drive). */
+static void mouse_steer(uint32_t now)
 {
     static const uint32_t dir[4] = {
         X86_OSK_UP, X86_OSK_DOWN, X86_OSK_LEFT, X86_OSK_RIGHT
     };
     int dx = 0, dy = 0;
-    uint8_t btn = 0;
 
     for (int i = 0; i < 4; i++)
         mouse_held[i] = (now & dir[i]) ? (uint16_t)(mouse_held[i] + 1) : 0;
@@ -636,12 +651,27 @@ static void mouse_input(uint32_t now)
         mouse_x = (int16_t)nx;
         mouse_y = (int16_t)ny;
     }
+    if (dx || dy)
+        x86_mouse_move(dx, dy);
+}
 
+void x86_osk_mouse_drive(uint32_t buttons)
+{
+    if (x86_osk_mode == MODE_OFF)
+        mouse_steer(buttons);
+}
+
+static void mouse_input(uint32_t now)
+{
+    uint8_t btn = 0;
+
+    mouse_steer(now);
     if (now & X86_OSK_B) btn |= 1u;    /* left  */
     if (now & X86_OSK_A) btn |= 2u;    /* right */
     if (btn != mouse_buttons) {
         mouse_buttons = btn;
         x86_mouse_clicks++;
+        x86_mouse_buttons(btn);
     }
 }
 

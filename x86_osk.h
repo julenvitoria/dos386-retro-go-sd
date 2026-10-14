@@ -55,6 +55,11 @@ void x86_osk_set_now_ms(uint32_t ms);
 
 void x86_osk_input(uint32_t buttons);
 
+/* `mouse = on` (x86_pad.h) with the OSK closed: steer the pointer -- ours and
+   the INT 33h driver's -- from the d-pad bits of `buttons`, with mouse mode's
+   ramp. Level-driven: call every frame. Does nothing while the OSK is open. */
+void x86_osk_mouse_drive(uint32_t buttons);
+
 /* Paint over the rendered frame. Call once per painted frame, AFTER
    x86_video_render() and before the swap. Unlike the previous port this repaints
    unconditionally: our renderer rewrites all 240 rows every frame, so there is

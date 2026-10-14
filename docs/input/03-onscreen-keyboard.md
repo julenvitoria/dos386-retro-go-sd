@@ -14,8 +14,10 @@ port's UI, but nothing under it is shared:
                                     frame -- so this tree has no repaint counter
                                     and no BDA video-mode watch
   * mode 12h / VBE 320x240      ->  not implemented here; CGA modes 3 and 4 only
-  * INT 33h mouse driver        ->  DOES NOT EXIST here. Mouse mode is a UI
-                                    shell with nothing listening; see STATUS.md
+  * INT 33h mouse driver        ->  x86_mouse.c, OPT-IN per title (`mouse = on`
+                                    in the .cfg's [gamepad]); mouse mode and the
+                                    d-pad feed it. Without the option mouse mode
+                                    is a UI shell with nothing listening
 
 It lived in references/, which is gitignored, so anything the tree depends on
 had to come in properly. Original provenance and licence: the user's own code.

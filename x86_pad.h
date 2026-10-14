@@ -19,6 +19,8 @@
  *     start  = f5          ; Zelda START  (ODROID_INPUT_X)
  *     select = none        ; Zelda SELECT (ODROID_INPUT_Y); none = unbound
  *     repeat = on          ; typematic repeat for held buttons (default on)
+ *     mouse  = on          ; INT 33h mouse driver; the d-pad moves the pointer
+ *                          ;   and A/B are left/right click (x86_mouse.h)
  *
  * Buttons: up down left right a b time start select (Spanish: arriba abajo
  * izquierda derecha). `game` is REFUSED: GAME is the on-screen keyboard's only
@@ -28,7 +30,8 @@
  * Keys: letters, digits, f1..f12, esc, enter, space, tab, backspace, shift,
  * ctrl, alt, up, down, left, right, home, end, pgup, pgdn, ins, del, kp0..kp9,
  * the punctuation keys (- = [ ] ; ' ` \ , . /) and Spanish aliases (intro,
- * espacio, mayus, retroceso, supr ...). Anything else is a bad value: counted,
+ * espacio, mayus, retroceso, supr ...). `click` / `click2` (clic / clic2) are
+ * the left / right MOUSE buttons, meaningful with `mouse = on`. Anything else is a bad value: counted,
  * the button keeps its default, the rest of the section still applies.
  *
  * TYPEMATIC REPEAT. A real keyboard re-sends the make code of a held key after
@@ -53,6 +56,13 @@ extern "C" {
 #define X86_PAD_KEYS    3       /* keys per button (a combo)                */
 #define X86_PAD_GAME    6       /* reserved: the on-screen keyboard's door  */
 
+/* Pseudo make codes for the mouse buttons. Unused in scancode set 1, and their
+   break codes (| 0x80) stay distinct from every make code, so they travel the
+   same emit path as keys and src/main.c's emitter routes them to
+   x86_mouse_button() instead of the keyboard controller. */
+#define X86_PAD_CLICK_L 0x71
+#define X86_PAD_CLICK_R 0x72
+
 #define X86_PAD_REPEAT_DELAY_MS 500
 #define X86_PAD_REPEAT_RATE_MS  50
 
@@ -64,6 +74,9 @@ typedef struct {
 /* make codes (set 1) per button, 0-terminated; [i][0] == 0 means unbound */
 extern uint8_t x86_pad_keys[X86_PAD_BUTTONS][X86_PAD_KEYS];
 extern uint8_t x86_pad_repeat_on;
+/* `mouse = on`: directions are not keys (x86_pad_button / x86_pad_repeat skip
+   buttons 0..3) -- src/main.c steers the pointer with them instead */
+extern uint8_t x86_pad_mouse_on;
 
 /* the compiled-in table: one make code per button (0 = unbound) */
 void x86_pad_defaults(const uint8_t single[X86_PAD_BUTTONS]);

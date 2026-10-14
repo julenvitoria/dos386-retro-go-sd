@@ -95,6 +95,35 @@ int main(void)
     x86_pad_repeat(1u << 0, 2000, emit);
     check(r.applied == 1 && n_emitted == 0, "repeat = off");
 
+    /* mouse = on: A/B default to the clicks, an explicit binding wins, the
+       d-pad emits nothing (it is the pointer), and a held click never repeats */
+    parse("[gamepad]\nmouse = on\n", &r);
+    check(r.applied == 1 && x86_pad_mouse_on, "mouse = on is applied");
+    check(x86_pad_keys[4][0] == X86_PAD_CLICK_L && x86_pad_keys[5][0] == X86_PAD_CLICK_R,
+          "mouse = on: A = left click, B = right click by default");
+    parse("[gamepad]\nb = esc\nraton = si\ntime = clic\n", &r);
+    check(r.applied == 3 && r.bad == 0, "raton alias, clic alias");
+    check(x86_pad_keys[5][0] == 0x01 && x86_pad_keys[4][0] == X86_PAD_CLICK_L
+          && x86_pad_keys[7][0] == X86_PAD_CLICK_L,
+          "an explicit B keeps its key; TIME bound to the left click");
+    n_emitted = 0;
+    x86_pad_button(0, 1, emit);
+    x86_pad_button(0, 0, emit);
+    check(n_emitted == 0, "mouse = on: a direction emits no key");
+    x86_pad_button(4, 1, emit);
+    x86_pad_button(4, 0, emit);
+    check(n_emitted == 2 && emitted[0] == X86_PAD_CLICK_L && emitted[1] == (X86_PAD_CLICK_L | 0x80),
+          "a click travels the key path, make then break");
+    n_emitted = 0;
+    {
+        unsigned t;
+        for (t = 0; t <= 1000; t += 10)
+            x86_pad_repeat((1u << 4) | (1u << 0), 30000 + t, emit);
+    }
+    check(n_emitted == 0, "neither a held click nor a held direction repeats");
+    parse("[gamepad]\nmouse = off\n", &r);
+    check(!x86_pad_mouse_on && x86_pad_keys[4][0] == 0x39, "mouse = off: defaults untouched");
+
     /* x86_cfg.c skips [gamepad]: its keys are not "unknown" there */
     {
         const char *txt = "[gamepad]\na = shift\nfoo = bar\n[cpu]\ncycles = 3000\n";

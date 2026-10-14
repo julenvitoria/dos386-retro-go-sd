@@ -40,6 +40,7 @@
 #include "x86_zones.h"   /* ZONES: frame-loop phase accounting, X86_ZONES=1 */
 #include "x86_vprof.h"   /* VPROF: video-path cycle attribution, X86_VPROF=1 */
 #include "x86_osk.h"
+#include "x86_mouse.h"
 #include "x86_opl.h"   /* OPL2 FM tone generation (x86_io.c owns the ports) */
 #ifndef X86_OPL_FM
 #define X86_OPL_FM 1      /* the harness builds do not pass the core's flags */
@@ -658,6 +659,12 @@ volatile uint32_t input_scancodes = 0;  /* codes handed to the controller   */
 /* One scancode from a gamepad button (x86_pad.c) into the keyboard controller. */
 static void pad_emit(uint8_t sc)
 {
+    /* `click` / `click2` are mouse buttons travelling the key path (x86_pad.h):
+       make = down, make|0x80 = up. */
+    if ((sc & 0x7F) == X86_PAD_CLICK_L || (sc & 0x7F) == X86_PAD_CLICK_R) {
+        x86_mouse_button((sc & 0x7F) == X86_PAD_CLICK_L ? 0u : 1u, !(sc & 0x80));
+        return;
+    }
     x86_kbd_scancode(sc);
     input_scancodes++;
 }
@@ -2355,6 +2362,7 @@ static void guest_reset(void)
        successful answer -- see x86_bios.c and tests/test_sysinfo.py. */
     static const uint8_t hle_vectors[] = {
         0x08, 0x09, 0x10, 0x11, 0x12, 0x15, 0x16, 0x1A, 0x20, 0x21, 0x2F,
+        0x33,   /* answers only under `mouse = on` -- x86_mouse.h */
     };
     x86_hle_install(hle_vectors, sizeof(hle_vectors));
 
@@ -2796,6 +2804,10 @@ static void settings_load(void)
                 x86_pad_parse(cfgbuf, (unsigned long)n, &pr);
                 settings_pad_applied = pr.applied;
                 settings_pad_bad = pr.bad;
+                /* The driver answers INT 33h only for a title that asks
+                   (x86_mouse.h). Reset here, before the guest runs. */
+                x86_mouse_reset_state();
+                x86_mouse_enabled = x86_pad_mouse_on;
             }
         }
         settings_cfg_status = (uint32_t)st;
@@ -3720,6 +3732,13 @@ static void poll_input(const gw_firmware_abi_t *abi)
     /* Typematic repeat for buttons held past the delay (x86_pad.h). Before the
        early return: a held button is exactly the case where nothing CHANGED. */
     unsigned repeated = x86_pad_repeat(keys, abi->HAL_GetTick(), pad_emit);
+
+    /* `mouse = on`: the d-pad is the pointer while the OSK is closed. Level-
+       driven like the OSK's mouse mode (same ramp, same code), so it runs every
+       frame -- before the early return, because a held direction changes
+       nothing. x86_pad_button() skips buttons 0..3 for the same reason. */
+    if (x86_pad_mouse_on)
+        x86_osk_mouse_drive(keys);
 
     if (!changed && !repeated)
         return;

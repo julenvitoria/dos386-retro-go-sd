@@ -17,6 +17,7 @@
 
 uint8_t x86_pad_keys[X86_PAD_BUTTONS][X86_PAD_KEYS];
 uint8_t x86_pad_repeat_on = 1;
+uint8_t x86_pad_mouse_on;
 
 static uint32_t hold_since[X86_PAD_BUTTONS];    /* ms the button went down */
 static uint32_t last_rep[X86_PAD_BUTTONS];      /* ms of the last repeat   */
@@ -38,7 +39,9 @@ static const char key_names[] =
     "kp9\0kpminus\0kpplus\0kpmul\0semicolon\0"
     /* Spanish */
     "intro\0espacio\0mayus\0retroceso\0supr\0arriba\0abajo\0izquierda\0derecha\0"
-    "inicio\0fin\0repag\0avpag\0";
+    "inicio\0fin\0repag\0avpag\0"
+    /* mouse buttons (x86_mouse.h), not keys */
+    "click\0click2\0clic\0clic2\0";
 static const uint8_t key_codes[] = {
     0x01, 0x0C, 0x0D, 0x0E, 0x0F, 0x1A, 0x1B, 0x1C, 0x1D, 0x27, 0x28, 0x29, 0x2A, 0x2B,
     0x33, 0x34, 0x35, 0x36, 0x38, 0x39, 0x3A, 0x47, 0x48, 0x49, 0x4B, 0x4D,
@@ -46,6 +49,7 @@ static const uint8_t key_codes[] = {
     0x49, 0x4A, 0x4E, 0x37, 0x27,
     0x1C, 0x39, 0x2A, 0x0E, 0x53, 0x48, 0x50, 0x4B, 0x4D,
     0x47, 0x4F, 0x49, 0x51,
+    X86_PAD_CLICK_L, X86_PAD_CLICK_R, X86_PAD_CLICK_L, X86_PAD_CLICK_R,
 };
 
 /* button names -> poll_input() bit; aliases share a bit */
@@ -104,7 +108,13 @@ static int key_lookup(const unsigned char *s, const unsigned char *e)
     return 0;
 }
 
-static int is_modifier(uint8_t sc) { return sc == 0x1D || sc == 0x2A || sc == 0x36 || sc == 0x38; }
+/* never repeated: modifiers, as on a keyboard, and mouse buttons -- a held
+   click is a drag, not a stream of clicks */
+static int is_modifier(uint8_t sc)
+{
+    return sc == 0x1D || sc == 0x2A || sc == 0x36 || sc == 0x38
+        || sc == X86_PAD_CLICK_L || sc == X86_PAD_CLICK_R;
+}
 
 void x86_pad_defaults(const uint8_t single[X86_PAD_BUTTONS])
 {
@@ -113,6 +123,7 @@ void x86_pad_defaults(const uint8_t single[X86_PAD_BUTTONS])
     for (i = 0; i < X86_PAD_BUTTONS; i++)
         x86_pad_keys[i][0] = single[i];
     x86_pad_repeat_on = 1;
+    x86_pad_mouse_on = 0;
     held_prev = 0;
 }
 
@@ -151,6 +162,7 @@ void x86_pad_parse(const unsigned char *buf, unsigned long len, x86_pad_result_t
     x86_pad_result_t r = {0, 0};
     unsigned long i = 0;
     int in_pad = 0;
+    unsigned explicit_bits = 0;          /* buttons the section bound itself */
 
     while (buf && i < len) {
         unsigned long ls = i, le, p;
@@ -188,6 +200,11 @@ void x86_pad_parse(const unsigned char *buf, unsigned long len, x86_pad_result_t
         while (ke > k && is_space(ke[-1])) ke--;
         while (v < ve && is_space(*v)) v++;
 
+        if (eq(k, ke, "mouse") || eq(k, ke, "raton")) {
+            x86_pad_mouse_on = !(eq(v, ve, "off") || eq(v, ve, "false") || eq(v, ve, "no") || eq(v, ve, "0"));
+            r.applied++;
+            continue;
+        }
         if (eq(k, ke, "repeat") || eq(k, ke, "repetir")) {
             x86_pad_repeat_on = !(eq(v, ve, "off") || eq(v, ve, "false") || eq(v, ve, "no") || eq(v, ve, "0"));
             r.applied++;
@@ -199,9 +216,16 @@ void x86_pad_parse(const unsigned char *buf, unsigned long len, x86_pad_result_t
             for (b = 0; button_names[b].name; b++)
                 if (eq(k, ke, button_names[b].name)) { found = button_names[b].bit; break; }
             if (found < 0 || (found == X86_PAD_GAME && !X86_PAD_CTL_ALLOWGAME)) { r.bad++; continue; }
-            if (parse_keys(v, ve, x86_pad_keys[found])) r.applied++;
+            if (parse_keys(v, ve, x86_pad_keys[found])) { r.applied++; explicit_bits |= 1u << found; }
             else r.bad++;
         }
+    }
+    /* mouse = on: A and B become the two mouse buttons unless the section
+       bound them itself -- the d-pad is the pointer, so without this the
+       pointer would have nothing to click with */
+    if (x86_pad_mouse_on) {
+        if (!(explicit_bits & (1u << 4))) { memset(x86_pad_keys[4], 0, X86_PAD_KEYS); x86_pad_keys[4][0] = X86_PAD_CLICK_L; }
+        if (!(explicit_bits & (1u << 5))) { memset(x86_pad_keys[5], 0, X86_PAD_KEYS); x86_pad_keys[5][0] = X86_PAD_CLICK_R; }
     }
     if (out)
         *out = r;
@@ -212,6 +236,8 @@ void x86_pad_button(unsigned i, int down, void (*emit)(uint8_t sc))
     int n = 0, j;
     if (i >= X86_PAD_BUTTONS)
         return;
+    if (x86_pad_mouse_on && i < 4)
+        return;                                     /* the d-pad is the pointer */
     while (n < X86_PAD_KEYS && x86_pad_keys[i][n])
         n++;
     if (down)
@@ -227,6 +253,8 @@ unsigned x86_pad_repeat(uint32_t held, uint32_t now_ms, void (*emit)(uint8_t sc)
         uint32_t m = 1u << i;
         if (!(held & m))
             continue;
+        if (x86_pad_mouse_on && i < 4)
+            continue;                               /* the d-pad is the pointer */
         if (!(held_prev & m)) {                     /* went down this frame */
             hold_since[i] = now_ms;
             last_rep[i] = now_ms;
