@@ -381,7 +381,41 @@ class GwemuTarget(Target):
             self.backend = GDBBackend(host="localhost", port=self.port)
         self.backend.open()
         self.sdcard = QemuSDCardManager(os.path.join(self.tmpdir, "sdcard.img"))
+        self._check_time_pin()
         self.backend.resume()
+
+    # GPIOC input data register. TIME is PC5 on this board (retro-go main.h).
+    GPIOC_IDR = 0x58020810
+
+    def _check_time_pin(self):
+        """Refuse a gwemu that holds PC5 low.
+
+        gwemu a35a9b9acc (2026-08-19) modelled the board as TIME-on-PA2 and held
+        PC5 low as a charger PGOOD sense; our retro-go reads TIME from PC5, so it
+        saw TIME held from reset, skipped auto-launch and ate every key -- tier 2
+        was down for two months and every symptom looked like ours. gwemu has
+        since gone back to TIME=PC5 / PGOOD=PA2 (verified on its 2026-10-10
+        tree), so a run that still reads PC5 low at reset is a STALE gwemu, and
+        it is stopped here instead of producing a black screen to debug.
+        Read while halted (-S): nothing has pressed anything yet. Set
+        GWEMU_ALLOW_PC5_LOW=1 to run anyway.
+        """
+        try:
+            idr = self.backend.read_uint32(self.GPIOC_IDR)
+        except Exception as e:          # an unreadable register is not a verdict
+            print(f"warning: could not read GPIOC_IDR ({e}); TIME-pin check skipped")
+            return
+        if idr & (1 << 5):
+            return
+        msg = (f"gwemu holds PC5 (TIME) low at reset (GPIOC_IDR={idr:#06x}): this is "
+               "the stale TIME-on-PA2 gwemu (a35a9b9acc, 2026-08-19). retro-go will "
+               "see TIME held and launch nothing. Update gwemu (TOOLING.md, 'gwemu "
+               "version'), or set GWEMU_ALLOW_PC5_LOW=1.")
+        if os.environ.get("GWEMU_ALLOW_PC5_LOW") == "1":
+            print("warning: " + msg)
+            return
+        self.stop()
+        raise RuntimeError(msg)
 
     def press(self, *names, delay=0.5):
         for n in names:

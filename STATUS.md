@@ -4,26 +4,20 @@ Last truth-pass 2026-09-02 against `f0594d1`. Running: [`TOOLING.md`](TOOLING.md
 
 **This file is state, not history.** Under 100 lines — a status doc nobody reads is where numbers go stale.
 
-## TIER 2 IS DOWN — A BOARD-VARIANT DISAGREEMENT, NOT A BUG IN EITHER PROJECT
+## TIER 2 IS BACK (2026-10-16) — it was a stale gwemu, not us
 
-**gwemu and our retro-go disagree about which pin is the TIME button, and that disagreement is the whole failure.**
-
-- **The evidence, which is what makes this checkable.** `GPIOC_IDR` (0x58020810) reads `0xFFDF` — bit 5 clear, every other bit high — identically at t+0.3 s and t+26 s; `GPIOA_IDR` reads `0xFFFF`; `boot_buttons` = 64 = `B_TIME` on every run. Reproduced by `probe_report.py` and `screenshot.py`, on current master and on pre-sprint `e539d31`.
-- **gwemu holds PC5 low deliberately**, since `a35a9b9acc` (**2026-08-19**), "gpio: TIME is PA2 only; hold PC5 (PGOOD) low" — the version our runs report (`0.0.21-1-ga35a9b9acc`). Its reasoning: stock Zelda picks between PA2 and PC5 at runtime from a `.bss` byte at `0x2000ab92` (the matrix at `0x08016808` reads TIME from PC5 when that byte is 1 and from PA2 otherwise; the charger's active-low PGOOD sense at `0x0800f004` takes the other pin of the pair). The byte is never written and reads 0, so gwemu models this board as **TIME on PA2, PGOOD on PC5**, and holds PC5 low so the unit always reads as plugged in — it models no battery and exposes no charger UI.
-- **Our firmware reads TIME from PC5**: `references/game-and-watch-retro-go-sd/Core/Inc/main.h:155-156` defines `BTN_TIME_Pin GPIO_PIN_5` / `BTN_TIME_GPIO_Port GPIOC`. So we read gwemu's permanently-low PGOOD sense as a held TIME button.
-- **Two consequences**: `force_launcher = ((GW_GetBootButtons() & B_TIME) != 0)` (`Core/Src/retro-go/rg_main.c:1056`) skips auto-launch; and `B_TIME` maps to `ODROID_INPUT_SELECT`, which latches `last_key` in a dialog that never re-opens, killing a timeline's fallback A-presses (A held 15 s at the pin: no response).
-- **EXONERATED**: `/CONFIG` (magic `0xcafef00d`, version 9, `startup_file` set, CRC valid — correct and deliberately ignored), our core, the linker script, RAM_EMU, `x86_io.c`. `core_magic=0` is honest: `dos.bin` never loads. **Retired red herrings, do not re-chase**: RAM_EMU starvation / `core_ready`; "stale shared firmware" (it WAS rebuilt, symptom unchanged); the `lcd_sleep_while_swap_pending` PC pinning (a `__WFI` idle loop the firmware sits in ~always); SD image / LFN case; "a fresh worktree does not reach the guest" (`docs/14` §8's old cause); and **"a stuck pin / a gwemu GPIO quirk"**, which was this lane's own first guess and is also wrong.
-
-**THE FIX IS AN OPEN QUESTION AND IT IS THE USER'S TO SETTLE — not a bug with a known owner.** Three candidate resolutions: **(a)** gwemu is right and our retro-go's PC5 mapping is wrong for this board; **(b)** our device is the other variant and gwemu should not hardcode one; **(c)** both variants exist and something must select between them, as the stock firmware itself does. **The one fact that pulls against (a): retro-go with PC5-as-TIME demonstrably works on the user's real hardware.** Do not change either project's pin mapping on your own initiative, and do not touch the gwemu repo.
-
-**Tier-2 claims dated ON OR AFTER 2026-08-19 are suspect until re-run** — no game can have launched under gwemu since that commit. **Checked, and nothing dated is lost**: every dated tier-2 measurement in [`docs/13`](docs/13_title_status.md) is 2026-08-14/15, and all of the pre-sprint work (`e539d31` and everything under it) is 2026-08-15 — all of it BEFORE the break, and therefore VALID. What falls after the boundary is this sprint's own work (2026-09-01/02), and every item of it that needed a tier-2 number is already marked UNMEASURED below.
+- **Cause, now settled**: gwemu `a35a9b9acc` (2026-08-19) modelled TIME on PA2 and held PC5 low as a PGOOD sense; our retro-go reads TIME from PC5 (`main.h:155-156`), saw `B_TIME` held from reset, skipped auto-launch and ate every key. gwemu itself has reverted to **TIME=PC5, PGOOD=PA2** (its `gnw_h7b0_gpio.c`, 2026-10-10 tree: "TIME must never drive PA2"). No pin mapping changed on either side.
+- **Re-verified at tier 2**, gwemu 2026-10-10 + the external_cores firmware (`b791f155`): ALLEYCAT launches, `core_magic`='TINY', `core_ready`=1, frames advancing, 0 evictions in 55 s.
+- **The frame-count conflict is SETTLED by measurement**: `guest_ram_pages` = **151**, `_pages_short` = **9** (neither 160 nor the static 154). The pool IS short: the NOR snapshot stays disabled (`nor_snap_result=2`) and the pagefile is reached sooner.
+- **Guard**: `GwemuTarget` reads `GPIOC_IDR` while halted and refuses a gwemu holding PC5 low (`GWEMU_ALLOW_PC5_LOW=1` overrides), positive and negative control checked.
+- Tier-2 items marked UNMEASURED below can now be measured; nothing dated before 2026-08-19 changed.
 
 ## Verification state
 
 | Tier | State |
 |---|---|
 | 1. gwemu bare-metal | **Re-derived statically this pass**: `tests/test_opcodes.py` **351 cases**, `tests/test_pmode.py` **164 checks**, `run_pmode_controls.py` **22 negative controls**. **NOT re-run this pass, unverified today**: `test_video` 25 arms with Mode Y and EGA 0Dh 64000/64000, `test_paging` 205, `test_xms` 47, `test_ems` 40, `test_seam`, `test_pit`, `test_dos`, `test_sysinfo`, `test_text`, `test_keyboard`, `test_osk`, `test_disk_cache`. `test_alu_fuzz` defaults to 4,000 cases; any larger figure is a run result, not a property of the tree |
-| 2. gwemu + retro-go | **DOWN — see above; nothing can be measured here until the pin question is settled.** Its last results (`core_dtcm_ok=1`, bonus pool 153,600 B, 1,000,001 insns; WOLF3D detecting XMS and moving 430,636 B in 278 moves, `xms_opens=1`, 0 errors) are dated 2026-08-15, BEFORE the break, and stand |
+| 2. gwemu + retro-go | **UP again (2026-10-16)** with a current gwemu — see above. Previous results (`core_dtcm_ok=1`, bonus pool 153,600 B, 1,000,001 insns; WOLF3D detecting XMS and moving 430,636 B in 278 moves, `xms_opens=1`, 0 errors) are dated 2026-08-15, BEFORE the break, and stand |
 | 3. Hardware | ~**2.8 M insn/s** stock, ~**3.8 M** overclocked, 59 fps. ABI verified on silicon. **Disk reads are NOT a live cost** — they freeze at t+36 s. The live cost was the pagefile WRITE, now 5x cheaper ([`docs/12`](docs/12_memory_tiers.md) §1b) |
 
 Golden gate (tier 1): **WOLF3D 0.000%**, ALLEYCAT 0.874% = the moving cat, KEEN4 known-bad. `run_planar_controls.py`: 6 negative controls + the LEARN positive.
@@ -64,10 +58,9 @@ It forces a real re-link, refuses a stale ELF, and exits non-zero when ITCM, `__
 
 | | where |
 |---|---|
-| **TIER 2 (top of this file)** — it blocks the next measurement on nearly every item below | gwemu, not ours |
 | **KEEN4 has no music, and it is NOT the synthesiser** — `x86_opl_writes`=264, `keyons`=**0**: its driver never writes a note. Config right (`CONFIG.CK4`), detection works (`opl_timer_expiry=1`), WOLF3D drives the identical path and sounds. **Lead: `INT 08h` reaches our stub ~16/s = the 18.2 Hz chained BIOS rate, not the 140 Hz music tick.** | [`docs/13`](docs/13_title_status.md) |
 | **Sound costs 6 pager frames.** Judged payable only because `x86_pg_evictions` stayed 0 across a full WOLF3D run. `X86_OPL_FM=0` returns every byte with detection intact. Silicon: ~5.9% of wall for Wolf3D's music, 10.4-13.8% worst case | `Makefile.core` |
-| **The game port is now modelled as "no joystick present" (`9cb3e90`)** — WOLF3D's 2.35 M `IN 0x201` reads are answered; the frame-cost effect is UNMEASURED, because tier 2 is down | `x86_io.c` |
+| **The game port is now modelled as "no joystick present" (`9cb3e90`)** — WOLF3D's 2.35 M `IN 0x201` reads are answered; the frame-cost effect is UNMEASURED (tier 2 is back: measurable now) | `x86_io.c` |
 | Wolf3D's cached pictures render as noise (off-screen VRAM cache too small); Wolf3D paints mid-draw frames in gameplay (`x86_modey_mid_draw`); its **WEAPON SPRITE is corrupt** — deterministic, so gradeable | [`docs/13`](docs/13_title_status.md), [`docs/08`](docs/08_vga_mode13h.md) §4 |
 | **ONE 4 KB PAGEFILE WRITEBACK COSTS UP TO 433 ms ON SILICON** (`x86_pg_wb_us_worst`) vs 23 ms for a sector read, and grows over a session. The per-page `fopen`/`fclose` is fixed; `pgf_us_seek` vs `_us_write` says what the rest is. **`FF_USE_FASTSEEK` is NOT the suspect — `docs/12` §1b measured and ruled it out on silicon** | `src/main.c` |
 | **The NOR snapshot's watchdog BSOD**: both un-kicked stretches were ours — the snapshot is a menu callback outside the frame loop across a 640 KB XIP readback, and the first slice after attach serves every fetch from OCTOSPI while `max_slice` is still tuned for AXI. FIXED in code; `nor_snap_wdog_gap_ms` settles it in ONE tier-3 run against the ~472 ms WWDG window. **NOT YET MEASURED ON SILICON**, and unreachable meanwhile because the pool is short (`nor_snap_result=2`) | `x86_nor.c`, `src/main.c` |
@@ -79,7 +72,7 @@ It forces a real re-link, refuses a stale ELF, and exits non-zero when ITCM, `__
 
 `CR0.PE` no longer traps out, nor does `INT imm8` with PE set — the instruction Dark Forces and Mortal Kombat both stopped on — nor `LAR`, `LSL`, `VERR`, `VERW`, `STR`, `LTR`, `CLTS`. Built: `LGDT`/`LIDT`/`LLDT`, GDT/LDT fetch, type/DPL/present with the right vector and error code, cached per-segment descriptors, `CR0.PE` both ways, same-privilege far JMP, same-privilege IDT gate dispatch and `IRET`, group 6 complete, task register loaded and stored with NO task switch. Real-mode cost proven by DISASSEMBLY DIFF (`scripts/disasm_diff.py`), not argued: every hot symbol byte-identical, and the whole cost is 3 instructions at the top of `.op_iret_CF`, per IRET. `test_benchmark` cannot decide this — under gwemu it spans 10.30–11.88 M cycles on the baseline alone.
 
-**DELETED, not deferred (~1,225 lines), on a STATIC measurement:** `opcode_demand.py` over DOS4GW.EXE finds all 256 IDT template entries at DPL 0 and NO DPL-3 code descriptor — **DOS/4GW runs entirely at CPL 0**. Call gates, TSS stack switches, task switching and `IRET`-across-privilege are gone. Still refused rather than approximated: paging and per-access limit enforcement. **NEXT IS A MEASUREMENT — where Dark Forces stops now — and it is blocked on tier 2.** [`docs/14`](docs/14_protected_mode.md).
+**DELETED, not deferred (~1,225 lines), on a STATIC measurement:** `opcode_demand.py` over DOS4GW.EXE finds all 256 IDT template entries at DPL 0 and NO DPL-3 code descriptor — **DOS/4GW runs entirely at CPL 0**. Call gates, TSS stack switches, task switching and `IRET`-across-privilege are gone. Still refused rather than approximated: paging and per-access limit enforcement. **NEXT IS A MEASUREMENT — where Dark Forces stops now — unblocked since tier 2 is back.** [`docs/14`](docs/14_protected_mode.md).
 
 ## Retractions worth keeping
 

@@ -13,6 +13,16 @@ gwemu is the basis throughout; plain QEMU adds nothing it does not already do.
 
 Guest titles are **`.dsk` floppy images** (FAT12), not bare executables.
 
+## gwemu version
+
+Tier 2 needs a gwemu that models **TIME on PC5** (and the charger PGOOD on
+PA2): the 2026-10-10 tree or later. gwemu `a35a9b9acc` (2026-08-19) held PC5
+low, so retro-go saw TIME pressed from reset, skipped auto-launch and ate every
+key -- no game launched, and nothing pointed at gwemu. `GwemuTarget.start()`
+reads `GPIOC_IDR` while gwemu is still halted and raises if PC5 reads low
+(`GWEMU_ALLOW_PC5_LOW=1` turns that into a warning). The scripts run whatever
+`gwemu` is first on `PATH`.
+
 ## Scripts (`scripts/`)
 
 Run these directly. All take `--help`.

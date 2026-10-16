@@ -20,7 +20,7 @@ Strictly in this order — `TOOLING.md`, and `CLAUDE.md` on never skipping a tie
 + Retro-Go (ABI, DTCM, SD, video, input, audio) · **3.** hardware — the only
 tier that sees the pipeline, peripheral init or real memory ordering.
 
-**TIER 2 IS CURRENTLY DOWN, AND IT IS A BOARD-VARIANT DISAGREEMENT, NOT A BUG IN EITHER PROJECT** — gwemu holds GPIOC pin 5 low as the charger's PGOOD sense (`a35a9b9acc`, 2026-08-19) while our retro-go reads TIME from PC5, so `boot_buttons` = `B_TIME`, retro-go skips auto-launch and every fallback keypress is eaten. Evidence, the three candidate resolutions and the retired red herrings: [`STATUS.md`](STATUS.md), first section. **Which project is right is an open question for the user; do not change either pin mapping on your own initiative.** Every backlog item whose next step is "measure where it stops now" is blocked on it. **Measurements dated before 2026-08-19 — which is all of `docs/13` — are VALID and were checked; nothing is lost.**
+**Tier 2 is UP again (2026-10-16)** — the two-month outage was a stale gwemu holding PC5 (TIME) low; a current gwemu models TIME=PC5 and `GwemuTarget` refuses an old one. Items whose next step was "measure where it stops now" are unblocked. [`STATUS.md`](STATUS.md), first section.
 
 ## Backlog
 
@@ -33,10 +33,10 @@ Everything that is not Dark Forces. **Done this session:**
 3. ~~**Sound**~~ — SB16 (8237 DMA, IRQ 5 via the 8259, DSP 4.05, CT1745 mixer, `BLASTER`) **and** OPL2 FM via **emu8950**, vendored from the owner's gnw-doom with its tuned `-D` set and its 16.16 linear resample. **Prince of Persia plays digitised sound; Wolf3D plays BOTH.** Cost: **6 pager frames** and ~5.9% of wall for Wolf3D's music, 10.4-13.8% worst case. `X86_OPL_FM=0` returns every byte. ADPCM still emits silence.
 4. ~~**Epic Pinball's `0F A0` PUSH FS wall**~~ — PUSH/POP FS,GS and LSS/LFS/LGS
    are in (`e70db05`). It is past its EXEC wall, reaches mode 13h, programs the
-   mixer and 22,050 Hz. **Where it stops NOW is unmeasured — blocked on tier 2.**
+   mixer and 22,050 Hz. **Where it stops NOW is unmeasured — measurable again (tier 2 is back).**
 5. ~~**The game port**~~ — `0x200`/`0x201` modelled as "no joystick present"
    (`9cb3e90`). Wolf3D's 2.35 M `IN 0x201` reads are answered; the frame-cost
-   effect is unmeasured, because tier 2 is down.
+   effect is unmeasured (tier 2 is back: measurable now).
 
 **Open, measured, sized:**
 
@@ -68,10 +68,10 @@ predicted.
    privilege**~~ — **DELETED, ~1,225 lines, not deferred.** `opcode_demand.py`
    over DOS4GW.EXE finds all 256 IDT template entries at DPL 0 and NO DPL-3 code
    descriptor: **DOS/4GW runs entirely at CPL 0.** A static measurement, so it
-   stands while tier 2 is down. Do not re-open it without a title that changes
+   stands without tier 2. Do not re-open it without a title that changes
    ring.
 10. **NEXT IS A MEASUREMENT, NOT A BUILD: where does Dark Forces stop now?**
-   Blocked on tier 2. Nothing below it starts first.
+   Unblocked (tier 2 is back). Nothing below it starts first.
 11. Then, and only on measured demand: paging, and per-access segment limit
    enforcement (the predicate is written and tested; making it free needs a
    protected-mode mode-record axis — the same trick `66`/`67` already uses).
