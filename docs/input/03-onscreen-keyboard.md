@@ -25,19 +25,23 @@ had to come in properly. Original provenance and licence: the user's own code.
 
 # On-screen keyboard
 
-> **SUPERSEDED LAYOUT (2026-10-14, this tree's `x86_osk.c`).** The layered
-> two-row grid below is no longer what ships here. The owner asked for the
-> gw-dos (XTulator) look, with the game kept where it is:
+> **SUPERSEDED LAYOUT (2026-10-14, this tree's `x86_osk.c`; labels 2026-10-16).**
+> The layered two-row grid below is no longer what ships here. The owner asked
+> for the gw-dos (XTulator) look, with the game kept where it is -- and on
+> 2026-10-16 for the SAME keys in the same places as that core's keyboard:
 >
 > ```
->   top band (rows 2-9, 11-18)     ESC 1..0 - = <- F1..F6
->                                  TAB q..p [ ] ENT F7..F10 DEL
+>   top band (rows 2-9, 11-18)     Esc 1..0 - = <- F1..F6        (<- is CP437 0x1B '-')
+>                                  Tab Q..P [ ] Ent F7..F10 Del
 >   picture (rows 20-219)          untouched
->   bottom band (221-228, 230-237) CTL a..l ; ' \ ` UP DN LT RT INS PGU
->                                  SHF z..m , . / ALT SPC HOM END PGD OFF
+>   bottom band (221-228, 230-237) Ctl A..L ; : ' \ ` Ins PgU PgD Off
+>                                  Shf Z..M , . / Alt Spc ^ v < > Hom End   (arrows: CP437 18/19/1B/1A)
 > ```
 >
-> Blue caps, yellow cursor, red latched modifier, green OFF; cap width is
+> The ':' cap sends ';' with Shift held for that one key (`A_KEY_SHIFT`). XTulator's
+> 80c / CPU / A: caps have no counterpart in this core; PgU / PgD / Off take
+> their slots.
+> Blue caps, yellow cursor, red latched modifier, green Off; cap width is
 > label x 8 + 4 px and every row is measured at reset (`x86_osk_row_px_max`,
 > widest = 320). UP/DOWN step to the nearest cap by x and wrap; all four
 > directions repeat when held; A presses, B is Backspace, TIME toggles a sticky

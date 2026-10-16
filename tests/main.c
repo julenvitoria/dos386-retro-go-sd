@@ -103,7 +103,7 @@ volatile uint32_t kbd_r[20];
    into the right SCANCODES and that the BIOS decodes them into the right BDA
    entry -- shift included, which is the part with no other witness. */
 volatile uint32_t run_osk_flag = 0;
-volatile uint32_t osk_r[20];
+volatile uint32_t osk_r[22];
 
 /* DOS file I/O self-test: INT 21h 3Dh/3Fh/42h/3Eh/43h/4Eh/4Fh, driven from
    GUEST code against a FAT12 volume the HOST built in dosfile_img.
@@ -2513,6 +2513,27 @@ static void osk_test_run(void)
     osk_r[7] = osk_frame(X86_OSK_A);             /* expect 0x0340 ('@')      */
     osk_r[8] = (uint32_t)test_ram[0x400 + 0x17]; /* BDA shift flags: 0 again */
     (void)osk_frame(0);
+
+    /* The ':' cap (same layout as the XTulator core's keyboard): Shift+';' in
+       ONE press, with no sticky Shift latched first. From '2' two DOWNs land on
+       'S' again ('2' -> 'W' -> 'S'), and ':' is nine caps to its right
+       (D F G H J K L ; :). The BDA must show ':' on scancode 0x27 -- a ';' there
+       means the cap sent its scancode without the Shift make -- and the shift
+       flags must be clear again afterwards. */
+    {
+        int i;
+        (void)osk_frame(X86_OSK_DOWN);
+        (void)osk_frame(0);
+        (void)osk_frame(X86_OSK_DOWN);
+        (void)osk_frame(0);
+        for (i = 0; i < 9; i++) {
+            (void)osk_frame(X86_OSK_RIGHT);
+            (void)osk_frame(0);
+        }
+        osk_r[20] = osk_frame(X86_OSK_A);        /* expect 0x273A (':')      */
+        osk_r[21] = (uint32_t)test_ram[0x400 + 0x17];   /* 0 again          */
+        (void)osk_frame(0);
+    }
 
     /* Drawing must not touch the guest's framebuffer, in either mode, and must
        put ink in the bars. Rendered into the harness's own output buffer. */

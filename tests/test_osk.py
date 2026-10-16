@@ -27,6 +27,8 @@ Covered:
     it the guest receives '2' and every counter still looks right.
   * The Shift does not LATCH: the BDA shift-flags byte is back to 0 afterwards,
     so the next key is not silently shifted too.
+  * The ':' cap (the XTulator core's layout) sends ':' -- Shift+';' -- in one
+    press and leaves the shift flags clear.
   * Drawing touches the bars and never the guest's VRAM, in either video mode.
 """
 import argparse
@@ -42,6 +44,7 @@ KEY_A = (0x1E << 8) | ord('a')
 KEY_S = (0x1F << 8) | ord('s')
 KEY_BSP = (0x0E << 8) | 0x08
 KEY_AT = (0x03 << 8) | ord('@')
+KEY_COLON = (0x27 << 8) | ord(':')
 
 PX_PER_ROW = 320
 
@@ -68,11 +71,12 @@ def main(args):
             print("FAIL: the OSK arm never completed")
             return False
 
-        r = [b.read_uint32(syms["osk_r"] + 4 * i) for i in range(20)]
+        r = [b.read_uint32(syms["osk_r"] + 4 * i) for i in range(22)]
         (px_max, overflow, vis0, vis1, key_a, key_s, key_bsp, key_at,
          shift_flags, vram_same, top_ink, bottom_ink, picture_ink,
          mouse_mode, vis_mouse, vis_off,
-         irq_armed_if0, pit_if0, irq_refused, irq_armed_if1) = r
+         irq_armed_if0, pit_if0, irq_refused, irq_armed_if1,
+         key_colon, colon_shift_flags) = r
 
         def check(label, got, want, fmt=str):
             nonlocal ok
@@ -92,6 +96,8 @@ def main(args):
         check("B sends Backspace", key_bsp, KEY_BSP, hexw)
         check("TIME-shifted '2' sends '@'", key_at, KEY_AT, hexw)
         check("Shift did not latch", shift_flags, 0)
+        check("':' cap sends ':' in one press", key_colon, KEY_COLON, hexw)
+        check("':' cap leaves no Shift behind", colon_shift_flags, 0)
         check("guest VRAM untouched by draw", vram_same, 1)
         check("mouse mode is the second state", mouse_mode, 2)
         check("mouse mode owns the buttons", vis_mouse, 1)

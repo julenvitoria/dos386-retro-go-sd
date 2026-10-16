@@ -75,6 +75,7 @@ enum {
     A_CTRL,
     A_ALT,
     A_CLOSE,        /* straight to OFF, short-cutting mouse mode */
+    A_KEY_SHIFT,    /* the scancode with Shift held for this one key (':') */
 };
 
 typedef struct {
@@ -87,40 +88,50 @@ typedef struct {
 #define KS(lbl, sc)    { lbl, (sc), A_KEY }
 #define KA(lbl, act)   { lbl, 0, (act) }
 
-/* The arrows are the EXTENDED scancodes a real BIOS delivers with ASCII zero
+/* The SAME LAYOUT AS THE XTulator CORE'S (dos.bin) on-screen keyboard, so a
+ * player moving between the two cores finds every key where it was: mixed-case
+ * labels, capital letters, the arrows as glyphs after Spc, and a ':' cap of its
+ * own (Shift+';' in one press -- typing "a:" without hunting for the sticky
+ * Shift). That core's 80c / CPU / A: caps have no counterpart here; PgU / PgD and
+ * the green Off cap take their place.
+ * The arrows are the EXTENDED scancodes a real BIOS delivers with ASCII zero
  * (0x48/0x50/0x4B/0x4D), which is what a menu-driven program reads. Shifted
- * symbols come from the sticky SHF cap (or TIME), exactly as on a keyboard. */
+ * symbols come from the sticky Shf cap (or TIME), exactly as on a keyboard.
+ * Labels are drawn through display_char(), which only ever upper-cases a-z, so
+ * capital letters and the CP437 arrow glyphs (0x18/0x19/0x1B/0x1A, all in
+ * font8x8.h) draw as written. */
 static const osk_key_t osk_r0[] = {            /* 28+144+20+120 = 312 px */
-    KS("ESC", 0x01),
+    KS("Esc", 0x01),
     KC('1', 0x02), KC('2', 0x03), KC('3', 0x04), KC('4', 0x05), KC('5', 0x06),
     KC('6', 0x07), KC('7', 0x08), KC('8', 0x09), KC('9', 0x0A), KC('0', 0x0B),
-    KC('-', 0x0C), KC('=', 0x0D), KS("<-", 0x0E),
+    KC('-', 0x0C), KC('=', 0x0D), KS("\x1B-", 0x0E),
     KS("F1", 0x3B), KS("F2", 0x3C), KS("F3", 0x3D), KS("F4", 0x3E),
     KS("F5", 0x3F), KS("F6", 0x40),
 };
-static const osk_key_t osk_r1[] = {            /* 28+120+24+28+60+28+28 = 316 */
-    KS("TAB", 0x0F),
-    KC('q', 0x10), KC('w', 0x11), KC('e', 0x12), KC('r', 0x13), KC('t', 0x14),
-    KC('y', 0x15), KC('u', 0x16), KC('i', 0x17), KC('o', 0x18), KC('p', 0x19),
-    KC('[', 0x1A), KC(']', 0x1B), KS("ENT", 0x1C),
+static const osk_key_t osk_r1[] = {            /* 28+144+28+60+28+28 = 316 */
+    KS("Tab", 0x0F),
+    KC('Q', 0x10), KC('W', 0x11), KC('E', 0x12), KC('R', 0x13), KC('T', 0x14),
+    KC('Y', 0x15), KC('U', 0x16), KC('I', 0x17), KC('O', 0x18), KC('P', 0x19),
+    KC('[', 0x1A), KC(']', 0x1B), KS("Ent", 0x1C),
     KS("F7", 0x41), KS("F8", 0x42), KS("F9", 0x43), KS("F10", 0x44),
-    KS("DEL", 0x53),
+    KS("Del", 0x53),
 };
-static const osk_key_t osk_r2[] = {            /* 28+108+48+80+28+28 = 320 */
-    KA("CTL", A_CTRL),
-    KC('a', 0x1E), KC('s', 0x1F), KC('d', 0x20), KC('f', 0x21), KC('g', 0x22),
-    KC('h', 0x23), KC('j', 0x24), KC('k', 0x25), KC('l', 0x26),
-    KC(';', 0x27), KC('\'', 0x28), KC('\\', 0x2B), KC('`', 0x29),
-    KS("UP", 0x48), KS("DN", 0x50), KS("LT", 0x4B), KS("RT", 0x4D),
-    KS("INS", 0x52), KS("PGU", 0x49),
+static const osk_key_t osk_r2[] = {            /* 28+168+28+28+28+28 = 308 */
+    KA("Ctl", A_CTRL),
+    KC('A', 0x1E), KC('S', 0x1F), KC('D', 0x20), KC('F', 0x21), KC('G', 0x22),
+    KC('H', 0x23), KC('J', 0x24), KC('K', 0x25), KC('L', 0x26),
+    KC(';', 0x27), { { ':', 0, 0, 0 }, 0x27, A_KEY_SHIFT },
+    KC('\'', 0x28), KC('\\', 0x2B), KC('`', 0x29),
+    KS("Ins", 0x52), KS("PgU", 0x49), KS("PgD", 0x51),
+    KA("Off", A_CLOSE),
 };
-static const osk_key_t osk_r3[] = {            /* 28+84+36+28+28+84+28 = 316 */
-    KA("SHF", A_SHIFT),
-    KC('z', 0x2C), KC('x', 0x2D), KC('c', 0x2E), KC('v', 0x2F), KC('b', 0x30),
-    KC('n', 0x31), KC('m', 0x32), KC(',', 0x33), KC('.', 0x34), KC('/', 0x35),
-    KA("ALT", A_ALT), KS("SPC", 0x39),
-    KS("HOM", 0x47), KS("END", 0x4F), KS("PGD", 0x51),
-    KA("OFF", A_CLOSE),
+static const osk_key_t osk_r3[] = {            /* 28+120+28+28+48+28+28 = 308 */
+    KA("Shf", A_SHIFT),
+    KC('Z', 0x2C), KC('X', 0x2D), KC('C', 0x2E), KC('V', 0x2F), KC('B', 0x30),
+    KC('N', 0x31), KC('M', 0x32), KC(',', 0x33), KC('.', 0x34), KC('/', 0x35),
+    KA("Alt", A_ALT), KS("Spc", 0x39),
+    KC('\x18', 0x48), KC('\x19', 0x50), KC('\x1B', 0x4B), KC('\x1A', 0x4D),
+    KS("Hom", 0x47), KS("End", 0x4F),
 };
 
 typedef struct {
@@ -618,6 +629,7 @@ static void osk_press(void)
 
     switch (k->flags & 0x0Fu) {
     case A_KEY:   osk_send(k); break;
+    case A_KEY_SHIFT: osk_sticky |= STICKY_SHIFT; osk_send(k); break;
     case A_SHIFT: osk_sticky ^= STICKY_SHIFT; break;
     case A_CTRL:  osk_sticky ^= STICKY_CTRL; break;
     case A_ALT:   osk_sticky ^= STICKY_ALT; break;
