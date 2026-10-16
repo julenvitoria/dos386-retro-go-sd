@@ -103,7 +103,7 @@ volatile uint32_t kbd_r[20];
    into the right SCANCODES and that the BIOS decodes them into the right BDA
    entry -- shift included, which is the part with no other witness. */
 volatile uint32_t run_osk_flag = 0;
-volatile uint32_t osk_r[22];
+volatile uint32_t osk_r[28];
 
 /* DOS file I/O self-test: INT 21h 3Dh/3Fh/42h/3Eh/43h/4Eh/4Fh, driven from
    GUEST code against a FAT12 volume the HOST built in dosfile_img.
@@ -2532,6 +2532,43 @@ static void osk_test_run(void)
         }
         osk_r[20] = osk_frame(X86_OSK_A);        /* expect 0x273A (':')      */
         osk_r[21] = (uint32_t)test_ram[0x400 + 0x17];   /* 0 again          */
+        (void)osk_frame(0);
+    }
+
+    /* Shift's three states, from TIME (the Shf cap shares the code): one press
+       latches it for the next key, a second LOCKS it (caps lock: every key
+       shifted until a third press), a third lets go. From ':' one LEFT is ';',
+       which shows the Shift as ':' -- so ':' twice while locked, ';' after. */
+    {
+        int i;
+        (void)osk_frame(X86_OSK_LEFT);
+        (void)osk_frame(0);
+        (void)osk_frame(X86_OSK_TIME);
+        (void)osk_frame(0);
+        (void)osk_frame(X86_OSK_TIME);
+        (void)osk_frame(0);
+        osk_r[22] = osk_frame(X86_OSK_A);        /* expect 0x273A (':')      */
+        (void)osk_frame(0);
+        osk_r[23] = osk_frame(X86_OSK_A);        /* expect 0x273A, still on  */
+        (void)osk_frame(0);
+        (void)osk_frame(X86_OSK_TIME);
+        (void)osk_frame(0);
+        osk_r[24] = osk_frame(X86_OSK_A);        /* expect 0x273B (';')      */
+        osk_r[25] = (uint32_t)test_ram[0x400 + 0x17];   /* 0 again          */
+        (void)osk_frame(0);
+
+        /* The A: cap opens the disk menu (mode 3) -- empty here, the harness
+           has no frontend list -- and B goes back to the keyboard without
+           sending a Backspace. ';' -> A: is eight caps right. */
+        for (i = 0; i < 8; i++) {
+            (void)osk_frame(X86_OSK_RIGHT);
+            (void)osk_frame(0);
+        }
+        (void)osk_frame(X86_OSK_A);
+        osk_r[26] = x86_osk_mode;                /* expect 3 (disk menu)     */
+        (void)osk_frame(0);
+        osk_r[27] = (uint32_t)((osk_frame(X86_OSK_B) == 0xFFFF) << 8 | x86_osk_mode);
+                                                 /* expect 0x101: kbd, no key */
         (void)osk_frame(0);
     }
 

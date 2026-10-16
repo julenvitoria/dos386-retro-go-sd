@@ -648,6 +648,7 @@ int x86_dos_exec(const char *path, const char *cmdline);
    separator). FF_FS_RPATH is 0, so FatFs cannot hold this for us; every
    relative path the guest opens is resolved against it in x86_dos.c. */
 void x86_dos_set_cwd(const char *dir);
+void x86_dos_disk_changed(void);   /* the OSK swapped the .dsk: drop handles, CWD */
 const char *x86_dos_get_cwd(void);
 uint16_t x86_dos_psp(void);
 extern uint32_t x86_dos_last_error;

@@ -70,9 +70,21 @@ void x86_osk_draw(uint8_t *fb, uint32_t stride);
    any mode including OFF. */
 void x86_osk_toast(const char *s);
 
+/* The disk menu (the "A:" cap). The FRONTEND owns the list -- it is the one
+   that can see the SD card -- and src/main.c defines these; x86_osk.c carries
+   weak empty versions so the bare-metal harness links without a menu.
+     scan     (re)list the images, return how many (called when the menu opens)
+     name     the i-th entry's label, at most 38 chars
+     current  the index of the mounted image, or -1
+     insert   mount entry i as the guest disk; 0 on success */
+int         x86_osk_disk_scan(void);
+const char *x86_osk_disk_name(int i);
+int         x86_osk_disk_current(void);
+int         x86_osk_disk_insert(int i);
+
 /* Host-readable, for the same reason every other stage of the input chain is:
    "the OSK did nothing" has several causes and only counters separate them. */
-extern volatile uint32_t x86_osk_mode;      /* 0 off, 1 keyboard, 2 mouse */
+extern volatile uint32_t x86_osk_mode;      /* 0 off, 1 keyboard, 2 mouse, 3 disk menu */
 extern volatile uint32_t x86_osk_presses;   /* grid keys pressed          */
 extern volatile uint32_t x86_osk_codes;     /* scancodes injected         */
 extern volatile uint32_t x86_osk_last_key;  /* (scancode << 8) | ascii    */

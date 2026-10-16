@@ -45,6 +45,7 @@ KEY_S = (0x1F << 8) | ord('s')
 KEY_BSP = (0x0E << 8) | 0x08
 KEY_AT = (0x03 << 8) | ord('@')
 KEY_COLON = (0x27 << 8) | ord(':')
+KEY_SEMI = (0x27 << 8) | ord(";")
 
 PX_PER_ROW = 320
 
@@ -71,12 +72,13 @@ def main(args):
             print("FAIL: the OSK arm never completed")
             return False
 
-        r = [b.read_uint32(syms["osk_r"] + 4 * i) for i in range(22)]
+        r = [b.read_uint32(syms["osk_r"] + 4 * i) for i in range(28)]
         (px_max, overflow, vis0, vis1, key_a, key_s, key_bsp, key_at,
          shift_flags, vram_same, top_ink, bottom_ink, picture_ink,
          mouse_mode, vis_mouse, vis_off,
          irq_armed_if0, pit_if0, irq_refused, irq_armed_if1,
-         key_colon, colon_shift_flags) = r
+         key_colon, colon_shift_flags,
+         lock_1, lock_2, unlock, lock_flags, disk_mode, disk_back) = r
 
         def check(label, got, want, fmt=str):
             nonlocal ok
@@ -98,6 +100,12 @@ def main(args):
         check("Shift did not latch", shift_flags, 0)
         check("':' cap sends ':' in one press", key_colon, KEY_COLON, hexw)
         check("':' cap leaves no Shift behind", colon_shift_flags, 0)
+        check("Shift x2 locks: ';' -> ':'", lock_1, KEY_COLON, hexw)
+        check("still locked on the next key", lock_2, KEY_COLON, hexw)
+        check("Shift x3 releases: ';' again", unlock, KEY_SEMI, hexw)
+        check("no Shift left behind the lock", lock_flags, 0)
+        check("A: cap opens the disk menu", disk_mode, 3)
+        check("B leaves it, sends nothing", disk_back, 0x101, hexw)
         check("guest VRAM untouched by draw", vram_same, 1)
         check("mouse mode is the second state", mouse_mode, 2)
         check("mouse mode owns the buttons", vis_mouse, 1)

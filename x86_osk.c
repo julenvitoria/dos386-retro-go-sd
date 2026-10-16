@@ -76,6 +76,7 @@ enum {
     A_ALT,
     A_CLOSE,        /* straight to OFF, short-cutting mouse mode */
     A_KEY_SHIFT,    /* the scancode with Shift held for this one key (':') */
+    A_DISK,         /* the disk menu: swap the mounted .dsk (x86_osk_disk_*) */
 };
 
 typedef struct {
@@ -92,8 +93,11 @@ typedef struct {
  * player moving between the two cores finds every key where it was: mixed-case
  * labels, capital letters, the arrows as glyphs after Spc, and a ':' cap of its
  * own (Shift+';' in one press -- typing "a:" without hunting for the sticky
- * Shift). That core's 80c / CPU / A: caps have no counterpart here; PgU / PgD and
- * the green Off cap take their place.
+ * Shift), and an "A:" cap at the end of the third row that opens the disk menu
+ * (here it swaps the whole mounted .dsk -- this core has one drive). That
+ * core's 80c / CPU caps have no counterpart; PgU / PgD and the green X cap
+ * (close, short-cutting mouse mode -- "Off" until the A: cap needed its room)
+ * take their place.
  * The arrows are the EXTENDED scancodes a real BIOS delivers with ASCII zero
  * (0x48/0x50/0x4B/0x4D), which is what a menu-driven program reads. Shifted
  * symbols come from the sticky Shf cap (or TIME), exactly as on a keyboard.
@@ -116,14 +120,14 @@ static const osk_key_t osk_r1[] = {            /* 28+144+28+60+28+28 = 316 */
     KS("F7", 0x41), KS("F8", 0x42), KS("F9", 0x43), KS("F10", 0x44),
     KS("Del", 0x53),
 };
-static const osk_key_t osk_r2[] = {            /* 28+168+28+28+28+28 = 308 */
+static const osk_key_t osk_r2[] = {            /* 28+168+28+28+28+20+12 = 312 */
     KA("Ctl", A_CTRL),
     KC('A', 0x1E), KC('S', 0x1F), KC('D', 0x20), KC('F', 0x21), KC('G', 0x22),
     KC('H', 0x23), KC('J', 0x24), KC('K', 0x25), KC('L', 0x26),
     KC(';', 0x27), { { ':', 0, 0, 0 }, 0x27, A_KEY_SHIFT },
     KC('\'', 0x28), KC('\\', 0x2B), KC('`', 0x29),
     KS("Ins", 0x52), KS("PgU", 0x49), KS("PgD", 0x51),
-    KA("Off", A_CLOSE),
+    KA("A:", A_DISK), KA("X", A_CLOSE),
 };
 static const osk_key_t osk_r3[] = {            /* 28+120+28+28+48+28+28 = 308 */
     KA("Shf", A_SHIFT),
@@ -166,7 +170,8 @@ enum {
     MODE_OFF = 0,   /* buttons belong to the guest (src/main.c's table) */
     MODE_KBD,       /* the key grid owns the d-pad */
     MODE_MOUSE,     /* the pointer owns the d-pad */
-    MODE_COUNT,
+    MODE_COUNT,     /* the GAME cycle is the three above */
+    MODE_DISK = MODE_COUNT,   /* the disk list, opened by the A: cap only */
 };
 
 #define OSK_ECHO_MAX 38
@@ -208,6 +213,12 @@ static uint8_t  osk_echo_len;
 #define STICKY_SHIFT 1u
 #define STICKY_CTRL  2u
 #define STICKY_ALT   4u
+#define STICKY_LOCK  8u     /* with STICKY_SHIFT: Shift stays on (caps lock) */
+
+/* Disk menu state: the list is the frontend's (x86_osk_disk_*), only the
+   cursor lives here. */
+static uint8_t  disk_n;
+static uint8_t  disk_sel;
 
 #define OSK_TOAST_FRAMES 90
 #define OSK_TOAST_MAX    40
@@ -351,10 +362,11 @@ static char display_char(char c)
     return c;
 }
 
+/* 0 = not latched, 1 = for the next key only (green), 2 = locked (red). */
 static int key_latched(const osk_key_t *k)
 {
     switch (k->flags) {
-    case A_SHIFT: return (osk_sticky & STICKY_SHIFT) != 0;
+    case A_SHIFT: return (osk_sticky & STICKY_SHIFT) ? 1 + ((osk_sticky & STICKY_LOCK) != 0) : 0;
     case A_CTRL:  return (osk_sticky & STICKY_CTRL) != 0;
     case A_ALT:   return (osk_sticky & STICKY_ALT) != 0;
     default:      return 0;
@@ -373,9 +385,10 @@ static void draw_row(uint8_t *fb, uint32_t stride, int y, uint8_t r)
         const osk_key_t *k = &row->keys[i];
         int w = key_w(k);
         uint8_t bg = U_BLUE, fg = U_WHITE;
-        if (key_latched(k))
-            bg = U_RED;
-        else if (k->flags == A_CLOSE)
+        int lt = key_latched(k);
+        if (lt)
+            bg = (lt == 2) ? U_RED : U_GREEN;
+        else if (k->flags == A_CLOSE || k->flags == A_DISK)
             bg = U_GREEN;
         if (r == osk_row && i == osk_col) {
             bg = U_YELLOW;
@@ -530,6 +543,24 @@ void x86_osk_draw(uint8_t *fb, uint32_t stride)
         return;
     }
 
+    if (x86_osk_mode == MODE_DISK) {
+        /* XTulator's disk menu: the list over the picture, the help above,
+           the mounted image below. */
+        enum { VIS = 19 };
+        int first = (int)disk_sel - VIS / 2;
+        memset(fb, C_BLACK, (OSK_BAR + OSK_PIC_ROWS + OSK_BAR) * stride);
+        draw_text(fb, stride, 0, OSK_TOP_Y0, "Disco (A=cargar  B=volver)", ui_map[U_YELLOW], C_BLACK);
+        if (first > (int)disk_n - VIS) first = (int)disk_n - VIS;
+        if (first < 0) first = 0;
+        for (int i = 0; i < VIS && first + i < (int)disk_n; i++) {
+            int sel = (first + i == disk_sel), y = OSK_BAR + 6 + i * 10;
+            uint8_t bg = sel ? ui_map[U_BLUE] : C_BLACK;
+            draw_text(fb, stride, 8, y, x86_osk_disk_name(first + i),
+                      (first + i == x86_osk_disk_current()) ? ui_map[U_YELLOW] : C_WHITE, bg);
+        }
+        return;
+    }
+
     /* Two key rows in each band, the picture untouched between them. */
     memset(fb, C_BLACK, OSK_BAR * stride);
     memset(fb + (OSK_BAR + OSK_PIC_ROWS) * stride, C_BLACK, OSK_BAR * stride);
@@ -596,8 +627,8 @@ static void osk_send(const osk_key_t *k)
         osk_echo_push((char)a);
     }
     x86_osk_presses++;
-    /* Sticky, not locking: one keypress consumes the latch. */
-    osk_sticky = 0;
+    /* Sticky: one keypress consumes the latch -- except a LOCKED Shift. */
+    osk_sticky &= (osk_sticky & STICKY_LOCK) ? (STICKY_SHIFT | STICKY_LOCK) : 0u;
 }
 
 /* ---------------------------------------------------------------------------
@@ -622,6 +653,17 @@ static void osk_move_row(int dr)
     osk_col = best;
 }
 
+/* Shift, from the Shf cap or TIME: off -> next key only -> locked -> off. */
+static void shift_step(void)
+{
+    if (!(osk_sticky & STICKY_SHIFT))
+        osk_sticky |= STICKY_SHIFT;
+    else if (!(osk_sticky & STICKY_LOCK))
+        osk_sticky |= STICKY_LOCK;
+    else
+        osk_sticky &= (uint8_t)~(STICKY_SHIFT | STICKY_LOCK);
+}
+
 static void osk_press(void)
 {
     const osk_row_t *row = &osk_layout[osk_row];
@@ -630,10 +672,19 @@ static void osk_press(void)
     switch (k->flags & 0x0Fu) {
     case A_KEY:   osk_send(k); break;
     case A_KEY_SHIFT: osk_sticky |= STICKY_SHIFT; osk_send(k); break;
-    case A_SHIFT: osk_sticky ^= STICKY_SHIFT; break;
+    case A_SHIFT: shift_step(); break;
     case A_CTRL:  osk_sticky ^= STICKY_CTRL; break;
     case A_ALT:   osk_sticky ^= STICKY_ALT; break;
     case A_CLOSE: osk_set_mode(MODE_OFF); break;
+    case A_DISK:
+        disk_n = (uint8_t)x86_osk_disk_scan();
+        disk_sel = 0;
+        {
+            int cur = x86_osk_disk_current();
+            if (cur > 0 && cur < disk_n) disk_sel = (uint8_t)cur;
+        }
+        osk_set_mode(MODE_DISK);
+        break;
     default: break;
     }
 }
@@ -724,6 +775,23 @@ void x86_osk_input(uint32_t buttons)
        the grid is edge-driven because a key must not repeat, but a pointer is
        LEVEL-driven -- a held direction has to produce motion every frame or
        there is nothing for the ramp to ramp. */
+    if (x86_osk_mode == MODE_DISK) {
+        /* Edge-driven, like XTulator's: UP/DOWN pick, A inserts, B (or TIME)
+           goes back to the keyboard. GAME closes, through x86_osk_cycle(). */
+        if (went & (X86_OSK_B | X86_OSK_TIME))
+            osk_set_mode(MODE_KBD);
+        else if ((went & X86_OSK_UP) && disk_n)
+            disk_sel = (uint8_t)((disk_sel + disk_n - 1) % disk_n);
+        else if ((went & X86_OSK_DOWN) && disk_n)
+            disk_sel = (uint8_t)((disk_sel + 1) % disk_n);
+        else if ((went & X86_OSK_A) && disk_n) {
+            int rc = x86_osk_disk_insert(disk_sel);
+            x86_osk_toast(rc == 0 ? "Disco cambiado" : "Error de disco");
+            osk_set_mode(MODE_OFF);
+        }
+        return;
+    }
+
     if (x86_osk_mode == MODE_MOUSE) {
         if (went & X86_OSK_TIME) {
             /* TIME steps BACK to the key grid. GAME only goes forwards, so
@@ -782,7 +850,7 @@ void x86_osk_input(uint32_t buttons)
         osk_send(&bsp);
     }
     if (went & X86_OSK_TIME)
-        osk_sticky ^= STICKY_SHIFT;     /* the second most-used: Shift, sticky */
+        shift_step();                   /* the second most-used: Shift, sticky */
 }
 
 /* ---------------------------------------------------------------------------
@@ -828,5 +896,14 @@ int x86_osk_visible(void) { return x86_osk_mode != MODE_OFF; }
 
 void x86_osk_cycle(void)
 {
-    osk_set_mode((x86_osk_mode + 1u) % MODE_COUNT);
+    if (x86_osk_mode == MODE_DISK)
+        osk_set_mode(MODE_OFF);         /* GAME leaves the list straight away */
+    else
+        osk_set_mode((x86_osk_mode + 1u) % MODE_COUNT);
 }
+
+/* The harness (and any frontend without a disk menu) gets an empty list. */
+__attribute__((weak)) int x86_osk_disk_scan(void) { return 0; }
+__attribute__((weak)) const char *x86_osk_disk_name(int i) { (void)i; return ""; }
+__attribute__((weak)) int x86_osk_disk_current(void) { return -1; }
+__attribute__((weak)) int x86_osk_disk_insert(int i) { (void)i; return -1; }

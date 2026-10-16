@@ -1315,6 +1315,15 @@ static uint16_t dos_file_mask(void)
 }
 #endif
 
+static void dos_close_all(void)
+{
+    for (int i = 0; i < DOS_MAX_FILES; i++)
+        if (dos_file_used[i]) {
+            f_close(&dos_files[i]);
+            dos_file_used[i] = 0;
+        }
+}
+
 int x86_dos_terminate_code(uint16_t code)
 {
     if (dos_exec_depth) {
@@ -1366,17 +1375,29 @@ int x86_dos_terminate_code(uint16_t code)
     /* Real DOS closes the process's handles on exit, and it matters here:
        FatFs is built FF_FS_TINY, so the last sector of a file the guest wrote
        is still sitting in the filesystem window until something flushes it. */
-    for (int i = 0; i < DOS_MAX_FILES; i++)
-        if (dos_file_used[i]) {
-            f_close(&dos_files[i]);
-            dos_file_used[i] = 0;
-        }
+    dos_close_all();
     dos_ret_code = code;
     cpu_state_ptr->exit_reason = X86_EXIT_TERMINATE;
     return 1;
 }
 
 int x86_dos_terminate(void) { return x86_dos_terminate_code(0); }
+
+/*
+ * The OSK's disk menu swapped the mounted .dsk (src/main.c). Everything this
+ * file holds that points INTO the old volume goes: open handles are closed
+ * while the old image is still the one behind the reader -- f_close is what
+ * writes a written file's last sector back, FF_FS_TINY -- a FindFirst
+ * enumeration is dropped and the CWD returns to the root, which is where a
+ * disk change leaves real DOS too. A guest still holding one of those handles
+ * gets "invalid handle" on its next use, not the other disk's bytes.
+ */
+void x86_dos_disk_changed(void)
+{
+    dos_close_all();
+    if (dos_find_open) { f_closedir(&dos_find_dir); dos_find_open = 0; }
+    dos_cwd[0] = 0;
+}
 
 /*
  * Build the child's environment block when the caller did not supply one.

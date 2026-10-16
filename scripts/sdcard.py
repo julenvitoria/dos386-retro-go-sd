@@ -74,6 +74,11 @@ def main():
                         "level set through the launcher UI")
     p.add_argument("--menu-timeout", type=int, default=0,
                    help="idle standby seconds; 0 disables (default)")
+    p.add_argument("--preselect", metavar="NAME.dsk",
+                   help="with several --rom, write a /CONFIG that preselects "
+                        "this one (its basename) anyway -- a card that "
+                        "auto-launches one title but carries others, which is "
+                        "what testing the OSK's disk menu needs")
     p.add_argument("--no-config", action="store_true",
                    help="do not write /CONFIG (leaves the launcher showing)")
     args = p.parse_args()
@@ -94,10 +99,17 @@ def main():
 
     config = None
     if not args.no_config:
-        if len(args.rom) != 1:
-            sys.exit("--no-config is required when more than one ROM is on "
-                     "the card: /CONFIG preselects exactly one title")
-        startup = rom_path(args.rom_dir, os.path.basename(args.rom[0]))
+        names = [os.path.basename(r) for r in args.rom]
+        if args.preselect:
+            if os.path.basename(args.preselect) not in names:
+                sys.exit(f"--preselect {args.preselect} is not one of the --rom files")
+            pick = os.path.basename(args.preselect)
+        elif len(args.rom) != 1:
+            sys.exit("--no-config (or --preselect) is required when more than "
+                     "one ROM is on the card: /CONFIG preselects exactly one title")
+        else:
+            pick = names[0]
+        startup = rom_path(args.rom_dir, pick)
         os.makedirs(os.path.dirname(args.config_out) or ".", exist_ok=True)
         with open(args.config_out, "wb") as fh:
             fh.write(build_config(startup_file=startup,

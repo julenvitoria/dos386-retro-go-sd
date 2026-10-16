@@ -1715,7 +1715,14 @@ python3 scripts/sdcard.py --image existing.img --keep --no-config \
 `--rom` is repeatable and `--all-roms DIR` takes every `.dsk` in a directory,
 with `.cfg`/`.dosmeta`/`.jpg` sidecars. More than one ROM REFUSES to write a
 `/CONFIG` rather than picking one arbitrarily — `/CONFIG` preselects exactly
-one title.
+one title. `--preselect NAME.dsk` names it explicitly: a card that
+auto-launches that title and still carries the others, which is what the OSK's
+disk menu ("A:" cap) needs to have something to list:
+
+```bash
+python3 scripts/sdcard.py --image build/run/sd-swap.img --core dos.bin \
+    --rom .../ALLEYCAT.dsk --rom .../PRINCE.dsk --preselect ALLEYCAT.dsk
+```
 
 **`--no-config` DELETES an existing `/CONFIG`, it does not merely skip writing
 one.** Composing onto an existing card is not composing onto a fresh one: a
@@ -2650,6 +2657,10 @@ written for the "keys only arrive once the OSK is closed" report:
   the OSK closes ARE the defect, and nothing else in the tree shows it.
   `input_irqs` is the second witness -- 60/s means IRQ 1 is being re-armed
   every frame at a guest that cannot take it.
+- `timelines/osk-disk-swap.tl` -- the "A:" cap's disk menu: open it, pick the
+  next image, insert it. Needs a card with two images and one preselected
+  (`sdcard.py --preselect`); watch `x86_osk_mode` (3 = menu), `dsk_swaps` and
+  `dsk_mounted`.
 - `timelines/osk-held-across.tl` -- LEFT held for 12 s while GAME cycles the
   OSK all the way round underneath it, then ordinary taps after the release.
   This is the "a button held across the transition" case; the release code goes

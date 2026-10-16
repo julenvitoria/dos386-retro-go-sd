@@ -25,7 +25,7 @@ had to come in properly. Original provenance and licence: the user's own code.
 
 # On-screen keyboard
 
-> **SUPERSEDED LAYOUT (2026-10-14, this tree's `x86_osk.c`; labels 2026-10-16).**
+> **SUPERSEDED LAYOUT (2026-10-14, this tree's `x86_osk.c`; labels 2026-10-16; A: cap and Shift lock 2026-10-17).**
 > The layered two-row grid below is no longer what ships here. The owner asked
 > for the gw-dos (XTulator) look, with the game kept where it is -- and on
 > 2026-10-16 for the SAME keys in the same places as that core's keyboard:
@@ -34,18 +34,26 @@ had to come in properly. Original provenance and licence: the user's own code.
 >   top band (rows 2-9, 11-18)     Esc 1..0 - = <- F1..F6        (<- is CP437 0x1B '-')
 >                                  Tab Q..P [ ] Ent F7..F10 Del
 >   picture (rows 20-219)          untouched
->   bottom band (221-228, 230-237) Ctl A..L ; : ' \ ` Ins PgU PgD Off
+>   bottom band (221-228, 230-237) Ctl A..L ; : ' \ ` Ins PgU PgD A: X
 >                                  Shf Z..M , . / Alt Spc ^ v < > Hom End   (arrows: CP437 18/19/1B/1A)
 > ```
 >
 > The ':' cap sends ';' with Shift held for that one key (`A_KEY_SHIFT`). XTulator's
-> 80c / CPU / A: caps have no counterpart in this core; PgU / PgD / Off take
-> their slots.
-> Blue caps, yellow cursor, red latched modifier, green Off; cap width is
+> 80c / CPU caps have no counterpart in this core; PgU / PgD take their slots.
+> **A:** (`A_DISK`) opens the DISK MENU, XTulator's: the other `.dsk` images in
+> the title's folder over the picture, UP/DOWN pick, A mounts the pick in place
+> of the running disk, B/TIME go back to the keys, GAME closes (`x86_osk_mode`
+> 3). The list belongs to the frontend (`x86_osk_disk_*` in `src/main.c`, weak
+> empty stubs in `x86_osk.c` for the harness); the swap closes the guest's open
+> handles on the OLD volume first (`x86_dos_disk_changed()`), and the title's
+> `.cfg`/pagefile/NOR snapshot stay named after the title, not the inserted disk.
+> **X** (`A_CLOSE`, was "Off") closes straight to OFF; it shrank to make room.
+> Blue caps, yellow cursor, green A:/X; a modifier latched for the next key is
+> GREEN, a LOCKED Shift is RED; cap width is
 > label x 8 + 4 px and every row is measured at reset (`x86_osk_row_px_max`,
 > widest = 320). UP/DOWN step to the nearest cap by x and wrap; all four
-> directions repeat when held; A presses, B is Backspace, TIME toggles a sticky
-> Shift (there are no layers left to cycle). The status line is gone in keyboard
+> directions repeat when held; A presses, B is Backspace, TIME steps Shift
+> exactly like its cap (there are no layers left to cycle). The status line is gone in keyboard
 > mode -- the caps show the latches; mouse mode keeps its top-band readout.
 > Colours come from `x86_video_ui_colour()`: fixed CGA entries in every
 > 32-entry-CLUT mode (EGA's 16-31 are now the fixed CGA colours rather than a
@@ -206,10 +214,11 @@ then clears. This is standard for on-screen keyboards and avoids needing chords
 on a device that cannot express them. Latched state must be visible in the top
 bar or it is baffling.
 
-> **OPEN, unchanged:** Should modifiers also support a locked state (double-tap to
-> hold)? Ctrl+C is common enough in DOS that sticky-once may be fine, but Ctrl-held
-> is occasionally needed. Not implemented. Selecting a latched modifier again
-> *clears* it, so the gesture space for a lock is still free.
+> **SHIPPED for Shift (2026-10-17), the owner's design:** Shf (or TIME) steps
+> off -> next key only (green) -> LOCKED (red, caps lock: every key shifted) ->
+> off. `STICKY_LOCK` keeps Shift across keys in `osk_send()`. Ctrl and Alt stay
+> two-state (next key only, now green too); a locked Ctrl was never asked for.
+> `tests/test_osk.py` checks lock, lock-held, release and no Shift left behind.
 
 > **TRAP, and it is not optional: the key-UP must not carry the modifier bits.**
 > `INT 7h` zeroes `keyflags1`/`keyflags2` on every SDL event and then re-adds

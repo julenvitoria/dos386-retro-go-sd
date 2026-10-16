@@ -2106,8 +2106,12 @@ static int parse_batch(const char *batpath, char *out, unsigned max,
         return -1;
 
     /* Read it whole and split by hand: f_gets needs FF_USE_STRFUNC, which this
-       FatFs build does not enable, and AUTOEXEC.BAT is never large. */
-    static char buf[1024];
+       FatFs build does not enable, and AUTOEXEC.BAT is never large.
+       ON THE STACK, not static: this runs once at launch (two levels at most,
+       depth < 1), and as .bss these 1,024 B were RAM_EMU -- the guest's pager
+       pool, claimed in 4 KB steps, so a kilobyte there is what decides whether
+       the OSK disk menu costs the guest a frame (it did: 151 -> 150). */
+    char buf[1024];
     UINT got = 0;
     FRESULT rc = f_read(&f, buf, sizeof(buf) - 1, &got);
     f_close(&f);
@@ -2239,6 +2243,15 @@ static void resolve_program_ext(char *full, size_t cap)
     full[n] = 0;
 }
 
+/*
+ * THE IMAGE BEHIND THE READER, which the OSK's disk menu can change. dsk_path
+ * stays the TITLE's .dsk for the whole run: the .cfg, the pagefile and the NOR
+ * snapshot are all named after it, and a swapped-in disk must not move them.
+ * dsk_cur_path is the reader's ctx: dsk_path until a swap, then the menu
+ * block's own path buffer.
+ */
+static const char *dsk_cur_path = dsk_path;
+
 static int mount_guest_disk(void)
 {
     if (!ACTIVE_FILE || !ACTIVE_FILE->path[0])
@@ -2246,12 +2259,132 @@ static int mount_guest_disk(void)
     /* A different title means a different image: the held handle goes first. */
     dsk_close_file();
     strncpy(dsk_path, ACTIVE_FILE->path, sizeof(dsk_path) - 1);
+    dsk_cur_path = dsk_path;
     x86_disk_set_reader(sd_sector_read, dsk_path, ACTIVE_FILE->size);
     x86_disk_set_writer(sd_sector_write);
     if (f_mount(&dsk_fs, "", 1) != FR_OK)
         return -1;
     dsk_mounted = 1;
     return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * The OSK's disk menu (x86_osk.h): the other .dsk images in the title's folder.
+ *
+ * Listed through the FIRMWARE's FatFs (the ABI's f_opendir/f_readdir; this
+ * file sees the firmware's ff.h, so DIR and FILINFO are its layout), in
+ * directory order. Names are kept truncated for display only; inserting
+ * re-reads the directory for the full name.
+ *
+ * THE TABLE LIVES IN THE AHB HEAP, allocated the first time the menu opens,
+ * NOT in .bss: RAM_EMU is the guest's pager pool, and as .bss this table and
+ * its path buffer measured one 4 KB guest frame at tier 2 (150 instead of 151).
+ * A refused allocation just shows an empty list.
+ * ------------------------------------------------------------------------- */
+#define DSK_MENU_MAX  24
+#define DSK_MENU_NAME 24      /* 23 chars shown; the insert re-reads the full name */
+typedef struct {
+    char path[160];           /* the mounted image after a swap; longer refuses */
+    char name[DSK_MENU_MAX][DSK_MENU_NAME];
+} dsk_menu_t;
+static dsk_menu_t *dsk_menu;
+static uint8_t dsk_menu_n;
+static int8_t  dsk_menu_cur = -1;
+volatile uint32_t dsk_swaps = 0;              /* host-readable: menu inserts done */
+
+/* Walk the title's folder. want < 0: fill the table and return the count;
+   want >= 0: stop at that image, its FILINFO in *out, and return the folder
+   prefix length (-1 if it is not there any more). */
+static int dsk_walk(int want, FILINFO *out)
+{
+    const gw_firmware_abi_t *abi = gw_firmware_abi();
+    DIR dir;                  /* on the stack: .bss is guest frames */
+    char path[sizeof(dsk_path)];
+    unsigned dl = 0, n;
+    int seen = 0, rc = -1;
+
+    for (unsigned i = 0; dsk_path[i]; i++)
+        if (dsk_path[i] == '/')
+            dl = i;
+    memcpy(path, dsk_path, dl);
+    path[dl] = 0;
+    if (abi->f_opendir(&dir, dl ? path : "/") != FR_OK)
+        return -1;
+    while (abi->f_readdir(&dir, out) == FR_OK && out->fname[0]) {
+        n = strlen(out->fname);
+        if ((out->fattrib & (AM_DIR | AM_HID | AM_SYS)) || n < 5 ||
+            out->fname[0] == '.' || strncasecmp(out->fname + n - 4, ".dsk", 4))
+            continue;
+        if (want >= 0) {
+            if (seen++ == want) { rc = (int)dl; break; }
+            continue;
+        }
+        if (seen >= DSK_MENU_MAX)
+            break;
+        strncpy(dsk_menu->name[seen], out->fname, DSK_MENU_NAME - 1);
+        if (!strcmp(out->fname, dsk_cur_path + dl + 1))
+            dsk_menu_cur = (int8_t)seen;
+        seen++;
+    }
+    abi->f_closedir(&dir);
+    return want >= 0 ? rc : seen;
+}
+
+int x86_osk_disk_scan(void)
+{
+    FILINFO fi;
+    int n;
+    if (!dsk_menu)
+        dsk_menu = (dsk_menu_t *)gw_firmware_abi()->mem_ctl(GW_MEM_OP_ALLOC,
+                                                    GW_MEM_AHB, 1, sizeof(dsk_menu_t));
+    dsk_menu_cur = -1;
+    n = (dsk_menu && dsk_mounted) ? dsk_walk(-1, &fi) : 0;
+    dsk_menu_n = (uint8_t)(n < 0 ? 0 : n);
+    return dsk_menu_n;
+}
+
+const char *x86_osk_disk_name(int i)
+{
+    return (i >= 0 && i < dsk_menu_n) ? dsk_menu->name[i] : "";
+}
+
+int x86_osk_disk_current(void) { return dsk_menu_cur; }
+
+int x86_osk_disk_insert(int i)
+{
+    FILINFO fi;
+    char *p;
+    int dl;
+
+    if (i == dsk_menu_cur)
+        return 0;                                /* already in */
+    if (i < 0 || i >= dsk_menu_n)
+        return -1;
+    dl = dsk_walk(i, &fi);
+    if (dl < 0 || dl + 2 + strlen(fi.fname) > sizeof(dsk_menu->path) || fi.fsize < 512)
+        return -1;
+
+    /* Everything open on the OLD volume is flushed through the OLD reader,
+       then the reader is pointed at the new image. A new image that will not
+       mount puts the title's own disk back rather than leave no disk at all. */
+    x86_dos_disk_changed();
+    dsk_close_file();
+    p = dsk_menu->path;
+    memcpy(p, dsk_path, (size_t)dl);
+    p[dl] = '/';
+    strcpy(p + dl + 1, fi.fname);
+    dsk_cur_path = p;
+    x86_disk_set_reader(sd_sector_read, p, (uint32_t)fi.fsize);
+    if (f_mount(&dsk_fs, "", 1) == FR_OK) {
+        dsk_menu_cur = (int8_t)i;
+        dsk_swaps++;
+        return 0;
+    }
+    dsk_close_file();
+    dsk_cur_path = dsk_path;
+    x86_disk_set_reader(sd_sector_read, dsk_path, ACTIVE_FILE->size);
+    f_mount(&dsk_fs, "", 1);
+    return -1;
 }
 
 static void guest_reset(void)
