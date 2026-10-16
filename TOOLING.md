@@ -1637,6 +1637,11 @@ a full-screen UI into an unrelated letter.
 
 ### `sdcard.py` — compose the SD card
 
+`create_image()` formats the partition with plain `mformat -F` and, only if that
+fails (mtools 4.0.17: "Unknown geometry", then "Too few clusters" for FAT32 at
+127 MB), retries with the partition's sector count, a 64x32 geometry and one
+sector per cluster.
+
 ```bash
 python3 scripts/sdcard.py --image sdcard_retrogo.img   # gwemu image
 python3 scripts/sdcard.py --mount /media/you/RETROGO   # card in a reader

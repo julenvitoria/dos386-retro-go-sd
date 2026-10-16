@@ -128,8 +128,18 @@ def create_image(path, size_mb=128, label="RETROGO", script=None):
                                     "make_sdcard_image.py")
     subprocess.run(["python3", script, path, "--size-mb", str(size_mb)],
                    check=True)
-    subprocess.run(["mformat", "-i", f"{path}{MTOOLS_PARTITION_OFFSET}",
-                    "-F", "-v", label, "::"], check=True)
+    target = f"{path}{MTOOLS_PARTITION_OFFSET}"
+    if subprocess.run(["mformat", "-i", target, "-F", "-v", label, "::"]).returncode == 0:
+        return path
+    # Some mtools builds (seen: 4.0.17) refuse an image partition without its
+    # geometry ("Unknown geometry"), then refuse FAT32 on a 127 MB partition
+    # with the default cluster size ("Too few clusters"). Give both: the
+    # partition runs from sector 2048 to the end of the image, one sector per
+    # cluster. Only tried when the plain command fails, so a working mtools
+    # formats exactly as before.
+    sectors = os.path.getsize(path) // 512 - 2048
+    subprocess.run(["mformat", "-i", target, "-T", str(sectors), "-h", "64",
+                    "-s", "32", "-c", "1", "-F", "-v", label, "::"], check=True)
     return path
 
 
