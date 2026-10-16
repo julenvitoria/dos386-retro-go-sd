@@ -266,6 +266,10 @@ uint32_t x86_mode_table(int op32, int addr32)
  * since all of them install CS through the same path. */
 uint32_t x86_cs_log[64];   /* 16 entries of 4 words */
 uint32_t x86_cs_log_idx;
+#if X86_CS_LOG
+/* [0] linear EIP of the last divide error, [1] how many. */
+uint32_t x86_div_error_eip[2];
+#endif
 
 /* Diagnostic: the last 16 interrupt VECTORS dispatched through the real-mode
  * IVT, paired one-for-one with the CS loads x86_cs_log records for them.

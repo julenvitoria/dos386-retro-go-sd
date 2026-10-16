@@ -625,8 +625,12 @@ static uint32_t   rate_window_frames;
 /* IRQ 0s one frame may deliver. Each costs a sub-slice boundary and a guest
    ISR entry, so a frame that owes hundreds (a debugger halt) must not try to
    run them all back to back -- the arrears cap above is the time bound and
-   this is the per-frame one. Eight covers 140 Hz down to 17 fps. */
-#define TICK_IRQ_MAX            8u
+   this is the per-frame one. It was 8, which covered 140 Hz down to 17 fps
+   and NOTHING faster: Monkey Island's 473 Hz needs 8 per frame at a full
+   60 fps, so every slower frame threw ticks away -- measured as ~351 of 473
+   per second, with guest_ticks_dropped climbing ~100/s. 24 covers 473 Hz
+   down to 20 fps and 560 Hz down to 24. */
+#define TICK_IRQ_MAX           24u
 #define TICK_STALL_MS        1000u    /* longer than this is a stall, not lag */
 static uint32_t tick_acc;             /* ms * TICK_NUM, below one IRQ 0      */
 static uint32_t bda_acc;              /* the same, for the 18.2 Hz BDA count */
@@ -636,6 +640,7 @@ volatile uint32_t guest_ticks = 0;          /* ticks handed to the guest     */
 volatile uint32_t guest_ticks_dropped = 0;  /* owed but refused (see above)  */
 volatile uint32_t guest_tick_irq_lost = 0;  /* tick IRQ the 1-deep slot ate  */
 volatile uint32_t guest_tick_divisor = 65536; /* PIT ch0 divisor in force    */
+volatile uint32_t guest_tick_replans = 0;   /* mid-frame divisor re-plans   */
 volatile uint32_t guest_uptime_ms = 0;      /* host ms since the loop started */
 
 volatile uint32_t guest_exit_reason = 0;
@@ -4112,6 +4117,8 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
          * in so it lands now instead of at the end of the slice.
          */
         uint32_t slice;
+        uint32_t plan_ms = 16u;          /* the frame time the plan covers... */
+        uint32_t plan_div = 65536u;      /* ...and the divisor it assumed     */
         {
             uint32_t now = abi->HAL_GetTick();
             uint32_t dt  = now - tick_last_ms;      /* wraps correctly */
@@ -4274,6 +4281,8 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
              * game reprogrammed the timer for itself. */
             uint32_t div = x86_pit0_divisor();
             guest_tick_divisor = div;
+            plan_div = div;
+            plan_ms = dt ? dt : 1u;
 
             bda_acc += dt * TICK_NUM;
             uint32_t bda_owed = bda_acc / TICK_DEN_MS;
@@ -4428,6 +4437,43 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                 /* The budget was spent, so that much of the debt is paid. */
                 guest_insn_debt -= (guest_insn_debt < sub_slice)
                                  ? guest_insn_debt : sub_slice;
+                /*
+                 * THE GUEST REPROGRAMMED THE SYSTEM TIMER MID-FRAME (the port
+                 * 0x40 write ended this sub-slice early, x86_io.c). The rest of
+                 * the frame was planned at the OLD rate -- at the boot divisor
+                 * that is zero or one tick for a whole frame -- so re-plan what
+                 * is left at the new one, evenly spaced. Without this the first
+                 * gap after a speed-up was up to a frame of instructions, and a
+                 * title that calibrates on exactly that gap counts too far:
+                 * Monkey Island (EGA) divides its count by 12 into a byte, and
+                 * died of "integer divide by 0" (a #DE overflow) on roughly
+                 * half its boots, depending only on where in the frame its
+                 * `OUT 40h` landed.
+                 */
+                {
+                    uint32_t nd = x86_pit0_divisor();
+                    if (nd != plan_div) {
+                        uint32_t left = sub_slice * subs;   /* this one too */
+                        /* instructions per tick at the new rate: this
+                           frame's instructions per ms, times the divisor, over
+                           the 1,193 PIT counts in a ms. 32-bit on purpose --
+                           a 64-bit divide links __aeabi_uldivmod into RAM_EMU,
+                           which is guest frames. */
+                        uint32_t per = (slice / plan_ms) * nd / 1193u;
+                        uint32_t n = per ? left / per : TICK_IRQ_MAX;
+                        if (n < 1u) n = 1u;
+                        if (n > TICK_IRQ_MAX) n = TICK_IRQ_MAX;
+                        plan_div = nd;
+                        guest_tick_divisor = nd;
+                        guest_tick_replans++;
+                        tick_irqs_owed = n;
+                        subs = n + 1u;              /* the -- below eats one */
+                        sub_slice = left / n;
+                        if (sub_slice < MAX_SLICE_FLOOR)
+                            sub_slice = MAX_SLICE_FLOOR;
+                        cpu_state_ptr->pit_reload = sub_slice;
+                    }
+                }
                 if (--subs == 0)
                     break;
                 /* Another sub-slice: arm the next timer interrupt and go back

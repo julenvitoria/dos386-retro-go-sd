@@ -558,6 +558,7 @@ static void pit_write_control(uint8_t v)
 /* Channel 0's data port. Same three access modes as channel 2 and for the same
    reasons; the divisor it leaves behind is read by the frame loop, which is
    where the guest's tick rate actually comes from. */
+static uint32_t x86_pit0_divisor_planned = 65536u;
 static void pit_write_ch0(uint8_t v)
 {
     int loaded = 1;                  /* the count is complete after this byte */
@@ -579,8 +580,18 @@ static void pit_write_ch0(uint8_t v)
         }
         break;
     }
-    if (loaded)
+    if (loaded) {
+        uint32_t before = x86_pit0_divisor_planned;
         pit_ch_loaded(0);
+        /* A NEW system-timer rate ends the sub-slice at the next boundary, so
+           the frame loop can re-plan the rest of the frame's ticks at it
+           (src/main.c, guest_tick_replans). Waiting for the next frame left
+           up to a frame of instructions before the first fast tick. */
+        if (x86_pit0_divisor() != before) {
+            x86_pit0_divisor_planned = x86_pit0_divisor();
+            x86_pit_counter_forced(1);
+        }
+    }
     x86_pit0_writes++;
 }
 

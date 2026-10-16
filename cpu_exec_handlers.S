@@ -3414,6 +3414,18 @@ L(GRP3_F6_IDIV):
 /* Vector 0. A divide error is an exception, not an exit: DOS installs a
    handler for it and programs rely on that. */
 L(DIVIDE_ERROR):
+#if X86_CS_LOG
+    /* Where the last #DE came from (linear EIP, already past the opcode/ModRM)
+       and how many there were. Behind the trace flag like the CS ring: a
+       title that dies of "run-time error R6003" says only THAT it divided by
+       zero, never where. */
+    MOVW R3, #:lower16:x86_div_error_eip
+    MOVT R3, #:upper16:x86_div_error_eip
+    STR R10, [R3]
+    LDR R12, [R3, #4]
+    ADD R12, R12, #1
+    STR R12, [R3, #4]
+#endif
     MOV.W R4, #0
     B.W L(HANDLE_INTERRUPT)
 
@@ -3706,6 +3718,24 @@ L(SET_SREG_NOLOG):
     STR.W R12, [R3, #(SEG_ES_SEL + 4)]     @ base
     MOV.W R12, #0xFFFF
     STR.W R12, [R3, #(SEG_ES_SEL + 8)]     @ limit
+    /* THE SS INTERRUPT SHADOW. A load of SS holds off interrupts until the
+       NEXT instruction has also executed, so `MOV SS,AX / MOV SP,BX` can never
+       be interrupted with SS new and SP old -- the CPU guarantees it and real
+       DOS code relies on it without a CLI. Interrupts are only taken where
+       pit_counter reaches zero at a boundary, so if THIS instruction would be
+       the last before that check (counter == 1), move the check one
+       instruction on. Monkey Island (EGA) died nondeterministically at startup
+       -- an IRQ 0 pushing onto a half-switched stack, then a jump into 0xFF
+       filler -- and whether it died depended only on where the timer landed.
+       Covers MOV SS, POP SS and LSS: all of them arrive here with R4 = 2. */
+    CMP.W R4, #2
+    BNE.N L(SET_SREG_DONE)
+    LDR.W R12, [R8, #CPU_PIT_COUNTER]
+    CMP.W R12, #1
+    IT EQ
+    MOVEQ.W R12, #2
+    STR.W R12, [R8, #CPU_PIT_COUNTER]
+L(SET_SREG_DONE):
     BX LR
 
 /* The protected-mode arm of the above. COLD, and out of line so the real-mode

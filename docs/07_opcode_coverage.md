@@ -224,7 +224,7 @@ Warning legend:
 | 64 | reached | `.op_seg_fs_64` | AGN | - | no flag macro reachable |
 | 65 | reached | `.op_seg_gs_65` | AGN | - | no flag macro reachable |
 | 66 | reached | `.op_pfx_66` | AGN | - | no flag macro reachable |
-| 67 | reached | `.op_pfx_67` | AGN | - | REVIEW: AGN body mixes width primitives with 26 bare word op(s), no flag macro reachable |
+| 67 | reached | `.op_pfx_67` | AGN | - | REVIEW: AGN body mixes width primitives with 30 bare word op(s), no flag macro reachable |
 | 68 | reached | `.op_push_imm32_68` | dual | - | no flag macro reachable |
 | 69 | reached | `.op_imul_imm32_69` | dual | - | - |
 | 6A | reached | `.op_push_imm8_6A` | dual | - | no flag macro reachable |
@@ -261,9 +261,9 @@ Warning legend:
 | 89 | reached | `.op_mov_ev_gv_89` | dual | ARITH, LOGIC | - |
 | 8A | reached | `.op_mov_gb_eb_8A` | AGN | ARITH, LOGIC | REVIEW: AGN body mixes width primitives with 10 bare word op(s) |
 | 8B | reached | `.op_mov_gv_ev_8B` | dual | ARITH, LOGIC | - |
-| 8C | reached | `.op_mov_Ew_seg_8C` | AGN | - | REVIEW: AGN body mixes width primitives with 13 bare word op(s), no flag macro reachable |
+| 8C | reached | `.op_mov_Ew_seg_8C` | AGN | - | REVIEW: AGN body mixes width primitives with 15 bare word op(s), no flag macro reachable |
 | 8D | reached | `.op_lea_8D` | dual | - | no flag macro reachable |
-| 8E | reached | `.op_mov_seg_Ew_8E` | AGN | - | REVIEW: AGN body mixes width primitives with 13 bare word op(s), no flag macro reachable |
+| 8E | reached | `.op_mov_seg_Ew_8E` | AGN | - | REVIEW: AGN body mixes width primitives with 15 bare word op(s), no flag macro reachable |
 | 8F | reached | `.op_pop_ev_8F` | dual | ARITH, LOGIC | - |
 | 90 | reached | `.op_nop` | AGN | - | no flag macro reachable |
 | 91 | reached | `.op_xchg_eax_r32` | dual | - | no flag macro reachable |
@@ -367,7 +367,7 @@ Warning legend:
 | F3 | reached | `.op_rep_F3` | AGN | - | REVIEW: no width primitive, 8 bare word op(s), no flag macro reachable |
 | F4 | reached | `.op_hlt_F4` | AGN | - | REVIEW: no width primitive, 5 bare word op(s), no flag macro reachable |
 | F5 | reached | `.op_cmc_F5` | AGN | - | no flag macro reachable |
-| F6 | reached | `.op_grp3_eb_F6` | AGN | ARITH, LOGIC | REVIEW: AGN body mixes width primitives with 66 bare word op(s) |
+| F6 | reached | `.op_grp3_eb_F6` | AGN | ARITH, LOGIC | REVIEW: AGN body mixes width primitives with 74 bare word op(s) |
 | F7 | reached | `.op_grp3_ev_F7` | dual | ARITH, LOGIC | - |
 | F8 | reached | `.op_clc_F8` | AGN | - | no flag macro reachable |
 | F9 | reached | `.op_stc_F9` | AGN | - | no flag macro reachable |
@@ -393,7 +393,7 @@ Warning legend:
 | 0F 08 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F 09 | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F 0A | **`.exit_loop`** | `.exit_loop` | - | - | - |
-| 0F 0B | reached | `.op_hypercall_0F0B` | AGN | - | REVIEW: AGN body mixes width primitives with 60 bare word op(s) |
+| 0F 0B | reached | `.op_hypercall_0F0B` | AGN | - | REVIEW: AGN body mixes width primitives with 62 bare word op(s) |
 | 0F 0C | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F 0D | **`.exit_loop`** | `.exit_loop` | - | - | - |
 | 0F 0E | **`.exit_loop`** | `.exit_loop` | - | - | - |
@@ -1104,11 +1104,14 @@ prints `cpu_exit_info` alongside `cpu_cs_sel`/`cpu_eip`/`cpu_cr0` — the report
     VM directly.
 28. **`0xCF` IRET still contains debug instrumentation**, writing four words to
     `x86_iret_log` on every single execution.
-29. **`0xFB` STI does not implement the one-instruction interrupt shadow**, and
-    **`0x17` POP SS does not inhibit interrupts** for the following instruction. The
-    classic `MOV SS,ax / MOV SP,imm` sequence can therefore take an interrupt on a
-    half-updated stack. The PIT check only fires at counter expiry, which makes this rare
-    and non-deterministic — the worst combination to debug.
+29. **`0xFB` STI does not implement the one-instruction interrupt shadow.** The SS
+    half is FIXED (2026-10-17): every real-mode SS load (`MOV SS`, `POP SS`, `LSS`)
+    goes through `L(SET_SREG)`, which moves the boundary check one instruction on
+    when it would otherwise land straight after the load (`pit_counter == 1 -> 2`),
+    so `MOV SS,ax / MOV SP,imm` can no longer take an interrupt on a half-switched
+    stack. It was found chasing Monkey Island's nondeterministic boot death; that
+    turned out to be the tick-gap #DE (src/main.c, `guest_tick_replans`), but the
+    shadow is the hardware's guarantee and costs two instructions on non-SS loads.
 30. **`0xF4` HLT** dispatches to `.op_hlt_F4`. This item previously recorded the
     slot as `.exit_loop`; that is stale -- see the generated table. What is still
     worth a look is the CR0/CPL `#GP` check, which the handler does not perform.
