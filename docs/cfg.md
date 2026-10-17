@@ -28,7 +28,7 @@ igual.
 | Clave | Valores | Qué hace |
 |---|---|---|
 | `cycles` | `max`, o un número | Velocidad de la CPU en miles de instrucciones por segundo, como en DOSBox. Se redondea al perfil más cercano de la tabla de abajo. |
-| `cpu_profile` | `0` … `8` | El perfil por su número, directamente. |
+| `cpu_profile` | `0` … `5` | El perfil por su número, directamente. |
 
 Perfiles (los mismos que el menú de retro-go, PAUSE/SET → CPU Speed):
 
@@ -40,9 +40,10 @@ Perfiles (los mismos que el menú de retro-go, PAUSE/SET → CPU Speed):
 | 3 | 286 a 12 MHz | 1200 |
 | 4 | 386SX a 16 MHz | 2500 |
 | 5 | 386DX a 33 MHz | 6000 |
-| 6 | 486SX a 25 MHz | 9000 |
-| 7 | 486DX2 a 66 MHz | 24000 |
-| 8 | 486DX4 a 100 MHz | 40000 |
+
+No hay perfiles 486: la consola da unas 5.500 k, así que 386DX 33 ya va a
+tope (como Max) y un 486 no podría ir más rápido. Un `cycles` por encima de
+6000 se queda en 386DX 33, y un `cpu_profile` antiguo de 6 a 8 pasa a Max.
 
 Algunos juegos de la época fallan o van demasiado rápidos con una CPU rápida;
 para esos, un perfil lento.
