@@ -12,6 +12,10 @@ Last truth-pass 2026-09-02 against `f0594d1`. Running: [`TOOLING.md`](TOOLING.md
 - **Guard**: `GwemuTarget` reads `GPIOC_IDR` while halted and refuses a gwemu holding PC5 low (`GWEMU_ALLOW_PC5_LOW=1` overrides), positive and negative control checked.
 - Tier-2 items marked UNMEASURED below can now be measured; nothing dated before 2026-08-19 changed.
 
+## MONKEY ISLAND (EGA) PLAYS (2026-10-17, tier 2 only)
+
+- Died on ~half its boots: its speed calibration (loop passes over one 473 Hz tick, `DIV BL` by 12) overflowed because the frame after its `OUT 40h` was still planned at 18.2 Hz. Fixed by re-planning the frame's ticks on a divisor change (`guest_tick_replans`) and `TICK_IRQ_MAX` 8 -> 24 (ticks 351/s -> ~470/s of 473). 0 crashes in 12 boots; exam, LucasFilm logo, title, intro and the lookout render correctly. Silicon UNMEASURED.
+
 ## Verification state
 
 | Tier | State |
