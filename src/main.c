@@ -361,27 +361,15 @@ volatile uint32_t x86_audio_volume = 0;    /* the launcher's own 0..255      */
 #define KIPS_386SX_16      2500u   /* 386SX @ 16 MHz                  */
 #define KIPS_386_33        6000u   /* 386DX @ 33 MHz                  */
 /*
- * The 486 rungs are STRESS TARGETS, not period-correct emulation, and the
- * distinction matters when reading a score off them.
- *
- * Measured on silicon: ~5.54 MIPS, i.e. ~5500 kips. So KIPS_386_33 (6000) is
- * ALREADY above what the machine delivers, and every rung at or above it is
- * requesting more than exists. A paced profile only throttles when its target
- * is BELOW the achievable rate; above it, the budget is never met, the guest
- * runs flat out and the rung is indistinguishable from Max. That -- not a
- * broken profile table -- is why 386SX 16 / 386DX 33 / Max were reported
- * scoring the same, and guest_insn_deficit is the witness: it stays 0 in Max
- * and climbs on any rung the silicon cannot satisfy.
- *
- * They earn their place anyway. A rung the CPU cannot satisfy still changes
- * how the frame is SHAPED -- bigger per-frame budgets, longer slices, less
- * idle handed back -- so a workload that keeps up at one rung and stutters at
- * the next names the subsystem that could not follow (blit, audio refill,
- * input poll), which is the thing a single "Max" cannot tell apart.
+ * THE TABLE STOPS AT 386DX 33, ON PURPOSE. Measured on silicon the core runs
+ * ~5.54 MIPS (~5500 kips), so 386DX 33 (6000) is already at the ceiling and
+ * plays as Max. The 486 rungs (9k/24k/40k) that used to follow it asked for
+ * 1.6-7x what exists: they never throttled, scored identically to Max and only
+ * misled users into picking a "faster" machine that was not there. Removed
+ * 2026-10-17. A .dosset / app-store index from that era (6..8) is out of range
+ * now and cpu_profile_apply() clamps it to 0 = Max -- which is exactly how
+ * those rungs already ran, so nobody's game changes speed.
  */
-#define KIPS_486SX_25      9000u   /* 486SX @ 25 MHz  -- above the ceiling */
-#define KIPS_486DX2_66    24000u   /* 486DX2 @ 66 MHz -- stress target     */
-#define KIPS_486DX4_100   40000u   /* 486DX4 @ 100 MHz -- stress target    */
 /*
  * DEFAULT: unthrottled. The emulated machine runs as fast as the silicon
  * delivers, and the number that describes it is guest_ips_achieved, not a
@@ -2753,12 +2741,10 @@ static const uint8_t pad_scancode[10] = {
  */
 static const uint16_t cpu_profile_kips[] = {
     KIPS_MAX, KIPS_8088_477, KIPS_286_8, KIPS_286_12, KIPS_386SX_16, KIPS_386_33,
-    KIPS_486SX_25, KIPS_486DX2_66, KIPS_486DX4_100,
 };
 static const char *const cpu_profile_name[] = {
     "Max", "8088 4.77 (330)", "286 8MHz (800)", "286 12MHz (1.2k)",
     "386SX 16 (2.5k)", "386DX 33 (6k)",
-    "486SX 25 (9k)", "486DX2 66 (24k)", "486DX4 100 (40k)",
 };
 #define CPU_PROFILE_COUNT ((int)(sizeof(cpu_profile_kips) / sizeof(cpu_profile_kips[0])))
 /* The two arrays are indexed by the same variable; a mismatch reads off the
@@ -3024,7 +3010,7 @@ volatile uint32_t cpu_profile_last_event = 0xFF; /* last odroid_dialog_event_t *
 static int  cpu_profile_idx;
 /* Sized for the LONGEST name plus its NUL, and asserted rather than eyeballed:
    cpu_profile_apply() strcpy()s into this, so a name that outgrows it is a
-   silent stack smash in the menu path. "486DX4 100 (40000k)" is 19 + NUL. */
+   silent stack smash in the menu path. "286 12MHz (1.2k)" is 16 + NUL. */
 #define CPU_PROFILE_VALUE_MAX 24
 static char cpu_profile_value[CPU_PROFILE_VALUE_MAX];
 
@@ -3069,7 +3055,7 @@ static bool cpu_profile_cb(odroid_dialog_choice_t *option,
          * PER TITLE, and this is the change the whole feature exists for. The
          * app-scoped store below keys on "%.12s.%d" % (key, app->id) -- the
          * APP, not the ROM -- so it held ONE CPU speed shared by every DOS
-         * title on the card. Setting Wolf3D to 486DX2 set it for Alley Cat
+         * title on the card. Setting Wolf3D to 386SX 16 set it for Alley Cat
          * too. The .dosset is keyed on the title's path and does not.
          *
          * PERSIST IMMEDIATELY, in the callback, rather than at exit. There is

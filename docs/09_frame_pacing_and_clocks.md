@@ -99,15 +99,15 @@ slot is per-app so the name is ours alone.
 |---|---:|---|---:|
 | Max | unthrottled | 386SX 16 | 2,500 |
 | 8088 4.77 | 330 | 386DX 33 | 6,000 |
-| 286 8 MHz | 800 | 486SX 25 | 9,000 |
-| 286 12 MHz | 1,200 | 486DX2 66 | 24,000 |
-| | | 486DX4 100 | 40,000 |
+| 286 8 MHz | 800 | | |
+| 286 12 MHz | 1,200 | | |
 
-The 486 rungs are **stress targets, not period-correct emulation** — they are
-above what the silicon delivers, so they never throttle and are
-indistinguishable from Max in score. They earn their place by changing how the
-frame is *shaped*, so a workload that keeps up at one rung and stutters at the
-next names the subsystem that could not follow.
+**The table stops at 386DX 33** (removed 2026-10-17: 486SX 25 / 486DX2 66 /
+486DX4 100 = 9k/24k/40k). The silicon delivers ~5,500 kips, so 386DX 33 is
+already at the ceiling and the 486 rungs never throttled — they scored
+identically to Max and only invited users to pick a machine that was not
+there. A stored index 6..8 is out of range and clamps to Max, which is how
+those rungs already ran.
 
 **A rung below the achievable rate is the only one that throttles.** Before the
 pacing fixes the effective rate was ~3,000 cycles, which sits between the 2,500
