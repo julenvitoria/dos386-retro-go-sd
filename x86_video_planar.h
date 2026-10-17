@@ -96,6 +96,12 @@ void x86_vga_modey_set_pages(void *p1, void *p2);
 const uint8_t *x86_vga_ega_planes(void);
 const uint8_t *x86_vga_modey_cache_ptr(void);
 uint32_t       x86_vga_ega_plane_offsets(void);
+/* The card's SECOND piece (frames lent by the pager), appended after the first
+   at plane offset x86_vga_ega_split(). NULL drops it. x86_vga_ega_plane_offsets()
+   is always the TOTAL. */
+void           x86_vga_ega_set_planes2(void *planes, uint32_t plane_offsets);
+const uint8_t *x86_vga_ega_planes2(void);
+uint32_t       x86_vga_ega_split(void);
 
 /* ---- the blit's half of the address model -------------------------------
  *

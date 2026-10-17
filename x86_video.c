@@ -994,6 +994,10 @@ static void blit_ega16(uint8_t *dst, uint32_t stride)
 {
     const uint8_t *planes = x86_vga_ega_planes();
     const uint32_t vram   = x86_vga_ega_plane_offsets();
+    /* Offsets from `split` on live in the card's second piece (frames lent
+       by the pager); see x86_video_planar.c. */
+    const uint8_t *planes2 = x86_vga_ega_planes2();
+    const uint32_t split   = x86_vga_ega_split();
     /* The display is a WINDOW onto plane memory, not the bottom of it. A game
        that scrolls moves the CRTC start address and widens the row pitch; both
        have to be honoured or the picture is a sheared crop. */
@@ -1021,7 +1025,8 @@ static void blit_ega16(uint8_t *dst, uint32_t stride)
             if (a < vram) {
                 /* One 32-bit load, four planes. Bit 7 is the leftmost pixel. */
                 uint32_t q;
-                memcpy(&q, planes + 4u * a, 4);
+                memcpy(&q, a < split ? planes + 4u * a
+                                     : planes2 + 4u * (a - split), 4);
                 p0 = q & 0xFFu;         p1 = (q >> 8) & 0xFFu;
                 p2 = (q >> 16) & 0xFFu; p3 = (q >> 24) & 0xFFu;
             } else {
@@ -1317,21 +1322,64 @@ static uint32_t modey_fit_offsets(void)
  * is x86_pager_policy_reserve()'s answer and it changes as the guest runs; see
  * x86_pager.h.
  */
+/*
+ * THE CARD'S SECOND PIECE: borrow what the arena's own block is short of.
+ *
+ * The first piece is the arena's (EGA claim); this lends frames from the pager
+ * for the rest, up to the 64 KB/plane the mode can address, and claims them
+ * as EGA2. It used to be ONE piece: donate enough for the WHOLE card and claim
+ * it in the donated extent, because a claim cannot span regions -- 64 frames
+ * for Keen 4's full card, which its working set could not spare, so the card
+ * fell back to the arena's 35,840 offsets as soon as the game started and the
+ * bottom of every level was lost. In two pieces the full card costs ~29.
+ *
+ * Returns 1 if a second piece was added. Nothing already in the card moves.
+ */
+static int ega_card_extend(void)
+{
+    uint32_t have = x86_vga_ega_split();
+    void *blk = NULL;
+
+    if (!have || have >= X86_EGA_PLANE_MAX || x86_vga_ega_planes2())
+        return 0;
+    uint32_t want = X86_EGA_PLANE_MAX - have;
+    if (!x86_pager_donate_upto(4u * want, X86_ARENA_PAGE))
+        return 0;
+    for (uint32_t o = want; o >= EGA_OFFS_PER_PAGE; o -= EGA_OFFS_PER_PAGE) {
+        if (x86_arena_claim(X86_ARENA_ID_EGA2, 1, 4u * o, &blk) == 0) {
+            x86_vga_ega_set_planes2(blk, o);
+            x86_vga_ega_card_offsets = have + o;
+            x86_video_log_event(8, (have + o) >> 8, 2);
+            return 1;
+        }
+    }
+    x86_pager_reclaim_from_arena();     /* lent for nothing: give it back */
+    return 0;
+}
+
+/* Drop the second piece and give its frames back. The first piece stays. */
+static void ega_card_trim(void)
+{
+    x86_arena_release(X86_ARENA_ID_EGA2);
+    x86_vga_ega_set_planes2(NULL, 0);
+    x86_vga_ega_card_offsets = x86_vga_ega_split();
+    x86_pager_reclaim_from_arena();
+}
+
 static void ega_card_place(int may_borrow)
 {
     void *blk = NULL;
-    uint32_t floor = x86_arena_largest + X86_ARENA_PAGE;
 
-    if (floor < 4u * X86_EGA_PLANE_OFFSETS)
-        floor = 4u * X86_EGA_PLANE_OFFSETS;
-    if (may_borrow && floor <= 4u * X86_EGA_PLANE_MAX)
-        x86_pager_donate_upto(4u * X86_EGA_PLANE_MAX, floor);
-
+    /* The arena's own piece first, WITHOUT borrowing: if a donation came
+       first, the fit below would happily put the first piece in the lent
+       extent and the card would be back to costing every frame it spans. */
     uint32_t offs = ega_fit_offsets();
     if (offs && x86_arena_claim(X86_ARENA_ID_EGA, 1, 4u * offs, &blk) == 0) {
         x86_vga_ega_set_planes(blk, offs);
         x86_vga_ega_card_offsets = offs;
         x86_video_log_event(8, offs >> 8, 0);
+        if (may_borrow)
+            (void)ega_card_extend();
     } else {
         /* Loud: the mode is about to be refused, and the counter plus the
            arena deficit are what say why. */
@@ -1353,6 +1401,7 @@ static void planar_storage_follow(uint8_t kind)
         x86_vga_modey_set_pages(NULL, NULL);
         /* Release BEFORE measuring: x86_arena_largest cannot know that a
            re-claim would free the card we are replacing. */
+        ega_card_trim();
         x86_arena_release(X86_ARENA_ID_EGA);
         x86_vga_ega_set_planes(NULL, 0);
         cga_storage_lend();
@@ -1361,6 +1410,7 @@ static void planar_storage_follow(uint8_t kind)
         return;
     }
 
+    ega_card_trim();
     x86_arena_release(X86_ARENA_ID_EGA);
     x86_vga_ega_set_planes(NULL, 0);
     x86_vga_ega_card_offsets = 0;
@@ -1577,54 +1627,25 @@ void x86_video_policy_tick(void)
     if (cur_desc->kind != VM_EGA4)
         return;
 
+    /* TWO PIECES, and only the second one ever moves. A shrink drops it and
+       gives its frames back; a grow adds it. The arena's piece is never
+       re-fitted under a running guest, so nothing has to be carried over and
+       nothing the guest drew there can be lost. */
     if (act == X86_PG_POLICY_SHRINK) {
-        if (!x86_pg_donated)
+        if (!x86_pg_donated || !x86_vga_ega_planes2())
             return;                     /* nothing lent: nothing to give back */
-    } else {
-        /* GROW is permission, not an instruction: only spend the card's
-           contents when a bigger one demonstrably fits. x86_arena_largest is
-           already counted by ega_fit_offsets(); what is new is the headroom. */
-        uint32_t head = x86_pager_policy_headroom();
-        uint32_t have = 4u * x86_vga_ega_card_offsets;
-        if (have >= 4u * X86_EGA_PLANE_MAX)
-            return;                     /* the mode cannot address more */
-        if (head < have + X86_ARENA_PAGE)
-            return;                     /* no gain worth a blank frame for */
+        ega_card_trim();
+        return;
     }
-
-    /* Disarm, release, hand the frames back, re-fit from scratch. Both
-       directions go through the same sequence: after the reclaim the state is
-       exactly what a fresh mode set would find, and the reserve in force is
-       what decides how much of it goes back out again. */
-    /* NOT a mode set: the guest is mid-game and must not notice. The old
-       card's address and size are kept so x86_vga_ega_reseat() can carry its
-       bytes over -- releasing a claim does not touch the memory, and nothing
-       below writes frame contents (donation evicts by reading). Disarming here
-       instead, as a first version did, re-armed through the mode-set path:
-       zeroed planes and BIOS-default GC registers, which is a black level in
-       Rick Dangerous (see x86_vga_ega_reseat). */
-    const void *old_planes = x86_vga_ega_planes();
-    uint32_t old_offs = x86_vga_ega_plane_offsets();
-    /* Compact the aperture WHILE THE CARD IS STILL HELD: a moved aperture is
-       zeroed on arrival, and landing in the card's just-released bytes would
-       wipe what x86_vga_ega_reseat() is about to copy. */
-    aperture_compact();
-    x86_arena_release(X86_ARENA_ID_EGA);
-    x86_vga_ega_set_planes(NULL, 0);
-    x86_pager_reclaim_from_arena();
-    /* A SHRINK BORROWS NOTHING. Re-donating inside the same refit is what a
-       first draft did, and MEASURED on KEEN4 it cost 9 evictions instead of 2:
-       the reserve had risen, so the smaller donation was taken and then had to
-       be recalled again one tick later, and every hop paid its own writebacks.
-       A shrink goes straight to the arena-only card; the grow arm is the only
-       thing that lends, and it needs a second of quiet first. */
-    ega_card_place(act == X86_PG_POLICY_GROW);
-    if (x86_vga_ega_card_offsets) {
-        x86_vga_ega_reseat(old_planes, old_offs);
-    } else {
-        x86_vga_planar_arm(0);          /* no card at all: loud, not silent */
-        x86_video_log_event(7, 0, 2);
-    }
+    /* GROW is permission, not an instruction: only when the headroom funds at
+       least one arena page of second piece. */
+    if (x86_vga_ega_planes2() || x86_pg_donated)
+        return;
+    if (x86_vga_ega_card_offsets >= X86_EGA_PLANE_MAX)
+        return;                         /* the mode cannot address more */
+    if (x86_pager_policy_headroom() < X86_ARENA_PAGE + X86_ARENA_PAGE)
+        return;
+    (void)ega_card_extend();
 }
 
 static int mode_select(uint8_t mode)

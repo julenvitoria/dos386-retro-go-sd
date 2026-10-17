@@ -380,4 +380,8 @@ extern volatile uint32_t x86_pg_shrink_signals; /* times frames were recalled */
 extern volatile uint32_t x86_pg_grow_signals;   /* times lending was permitted */
 extern volatile uint32_t x86_pg_policy_ratchet; /* what pressure has taught it */
 
+/* X86_PG_WSS=1 only: count the pages touched since the last call, then
+   unmap them so the next touch is seen (x86_pager.c). Frame boundary only. */
+void x86_pager_wss_sample(void);
+
 #endif /* X86_PAGER_H */

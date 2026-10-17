@@ -323,6 +323,52 @@ it are visible in `x86_vga_ega_card_offsets` and `x86_pg_frames_total`.
 `X86_PG_POLICY_NO_GROW=1` (nothing is ever borrowed). `tests/test_paging.py`
 grades the loop at tier 1, 149 checks.
 
+### 5c. The working set is not the peak (branch `ega-full-card`, 2026-10-17)
+
+The policy reserves `x86_pg_resident_peak + margin`, and the peak counts every
+page EVER made resident -- a page touched once while a title unpacked itself
+costs the card as much as one touched every frame. `X86_PG_WSS=1` (diagnostic
+build, `X86_PG_WSS_FRAMES` = window in frames) measures the other number: each
+window it counts the resident pages the guest touched, then unmaps every
+resident unpinned page so the next touch takes the cheap reinstall fault and is
+seen again -- an access bit made of minor faults. Probe `x86_pg_wss_last`,
+`_max`, `_min`, `_resident`.
+
+MEASURED, KEEN4, gwemu tier 2, map screen with movement (pool 150):
+
+| window | touched per window | resident |
+|---|---|---:|
+| 1 s | 10-77 in play, 98 at level entry | 134-137 |
+| 5 s | 57-77 in play, 114 at level entry | 134-137 |
+
+So 20-80 of the 137 resident pages are COLD in play. The full 65,536-offset
+card needs ~29 frames more than the 35,840 one.
+
+**BUILT on the branch, two pieces:**
+
+1. **The card is two claims.** `X86_ARENA_ID_EGA` in the arena (35,840 offsets)
+   and `X86_ARENA_ID_EGA2` in frames the pager lends, for the rest up to
+   65,536. `vga_cell()` and `blit_ega16()` split at `x86_vga_ega_split()`. A
+   one-piece full card had to come out of donated frames alone -- 64 of them --
+   because a claim cannot span regions; two pieces cost ~31. Grow and shrink
+   only ever add or drop the second piece, so the arena's piece is never
+   re-fitted under a running guest and nothing in it can be lost.
+2. **The policy reserves the working set, not the peak.** `X86_PG_WSS` is on by
+   default with 5 s windows (`X86_PG_WSS_FRAMES=300`); the reserve is
+   `max(FLOOR, ws_est + MARGIN, ratchet)` with `ws_est` the larger of the last
+   two windows, and pressure is the working set not fitting OR more than
+   `X86_PG_THRASH_EV` (32) evictions in a window. Evicting cold pages once is
+   the point, so an eviction alone is no longer the warning. `X86_PG_WSS=0`
+   restores the peak policy.
+
+MEASURED, KEEN4, gwemu tier 2 (pool 151): the card is **65,536 offsets in
+play** (35,840 before), the world map renders whole where its lower half used
+to be lost, 57 pagefile writes in the first minute (46 of them as the level
+loads), one shrink-and-regrow at level entry, `guest_ram_pages` 151.
+**Silicon UNMEASURED**: the open question is what those ~50 one-off writebacks
+cost on the device (§1b: ~11 ms each), and whether level entry -- 114 pages in
+5 s against 120 left to the guest at tier 2, 127 on hardware -- thrashes.
+
 ## 6. XMS — a tier with NO fast path at all
 
 `x86_xms.h` / the XMS block at the end of `x86_dos.c`. It is listed here because

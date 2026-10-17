@@ -61,7 +61,7 @@
 
 #define X86_ARENA_PAGE     4096u
 #define X86_ARENA_REGIONS  4u     /* disjoint AXI extents the arena may use */
-#define X86_ARENA_CLAIMS   5u     /* one per consumer; see the ids below */
+#define X86_ARENA_CLAIMS   6u     /* one per consumer; see the ids below */
 #define X86_ARENA_BLOCKS   8u     /* blocks in a single claim (EGA needs 4) */
 
 /* Claim ids. One per consumer, fixed rather than allocated, so a leaked claim
@@ -75,6 +75,10 @@
    sized by a fitting walk and these are fixed -- one claim that could be
    partially satisfied is exactly what the all-or-nothing rule forbids. */
 #define X86_ARENA_ID_MODEYP 4u
+/* The 0Dh card's SECOND piece: what the arena's own block is short of, out of
+   frames the pager lent. A claim cannot span regions, so the card is two
+   claims -- EGA in the arena, EGA2 in the donated extent (x86_video.c). */
+#define X86_ARENA_ID_EGA2   5u
 
 /* Give the arena an extent of AXI. Both ends are rounded INWARD to a page --
    an arena that hands out a partial page at either end is an arena that hands

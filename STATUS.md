@@ -12,9 +12,10 @@ Last truth-pass 2026-09-02 against `f0594d1`. Running: [`TOOLING.md`](TOOLING.md
 - **Guard**: `GwemuTarget` reads `GPIOC_IDR` while halted and refuses a gwemu holding PC5 low (`GWEMU_ALLOW_PC5_LOW=1` overrides), positive and negative control checked.
 - Tier-2 items marked UNMEASURED below can now be measured; nothing dated before 2026-08-19 changed.
 
-## MONKEY ISLAND (EGA) PLAYS (2026-10-17, tier 2 only)
+## 2026-10-17: Monkey, Keen 4 card, audio clock (silicon-checked by the owner)
 
-- Died on ~half its boots: its speed calibration (loop passes over one 473 Hz tick, `DIV BL` by 12) overflowed because the frame after its `OUT 40h` was still planned at 18.2 Hz. Fixed by re-planning the frame's ticks on a divisor change (`guest_tick_replans`) and `TICK_IRQ_MAX` 8 -> 24 (ticks 351/s -> ~470/s of 473). 0 crashes in 12 boots; exam, LucasFilm logo, title, intro and the lookout render correctly. Silicon UNMEASURED.
+- **Monkey Island EGA** boots (tick re-plan on a divisor change, `TICK_IRQ_MAX` 24); **VGA** finds its AdLib (INT 15h AH=86h). **Clicks** at 386SX were DMA halves replayed by overrun frames (17-20% of windows at 1598-sample lag on console recordings); `audio_pump()` now refills on `dma_counter` at every sub-slice boundary -- owner: "va genial" in both.
+- **Keen 4 full EGA card** (two-piece card + working-set donation, docs/12 §5c) merged from `ega-full-card`; world map whole on silicon. Level entry is black ~7 s on the old core, ~9 s with the card -- OPEN. **Prince of Persia** freezes in room 1 with no prince at tier 2 back to `4776be0` -- OPEN.
 
 ## Verification state
 

@@ -4717,6 +4717,18 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         }
 
         guest_exec_ms = abi->HAL_GetTick() - exec_start_ms;
+#if X86_PG_WSS
+        /* Working-set sampler (diagnostic build only): every X86_PG_WSS_FRAMES
+           frames, count the pages touched and unmap them again. Here, after
+           the guest has stopped and its seam slack is flushed. */
+        {
+            static uint32_t wss_frames;
+            if (++wss_frames >= X86_PG_WSS_FRAMES) {
+                wss_frames = 0;
+                x86_pager_wss_sample();
+            }
+        }
+#endif
 
         /* Video. The beam fraction drives the CGA status register, so a guest
            polling for vertical retrace sees it arrive about once per frame. */

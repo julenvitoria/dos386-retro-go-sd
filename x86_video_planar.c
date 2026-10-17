@@ -252,7 +252,15 @@ volatile uint32_t x86_vga_modey_lost_lo = 0xFFFFFFFFu;
 volatile uint32_t x86_vga_latch_miss;
 
 static uint8_t  *ega_planes;        /* 0Dh interleaved plane storage (arena) */
-static uint32_t  ega_plane_size;    /* plane OFFSETS the card has fitted     */
+static uint32_t  ega_plane_size;    /* plane OFFSETS the card has fitted, total */
+/* THE CARD MAY BE IN TWO PIECES. Offsets [0, ega_size1) live at ega_planes
+   (the arena's own block), [ega_size1, ega_plane_size) at ega_planes2 (a
+   block in frames the pager lent). An arena claim cannot span regions, so a
+   one-piece 64 KB card had to come entirely out of donated frames -- 64 of
+   them, more than a Galaxy-engine title's working set can spare -- while two
+   pieces need only what the arena is short of (~29). */
+static uint8_t  *ega_planes2;
+static uint32_t  ega_size1;
 static uint8_t  *modey_cache;       /* Mode Y off-screen store (arena)       */
 static uint32_t  modey_cache_offs;  /* plane offsets it holds                */
 /* Real storage for Mode Y display pages 1 and 2. Page 0 is always the aperture.
@@ -385,7 +393,28 @@ void x86_vga_ega_set_planes(void *p, uint32_t plane_offsets)
 {
     ega_planes = (uint8_t *)p;
     ega_plane_size = p ? plane_offsets : 0u;
+    ega_size1 = ega_plane_size;
+    ega_planes2 = NULL;                 /* a new first piece drops the second */
 }
+
+/* Append the second piece (or drop it with p == NULL). Its bytes are ZEROED:
+   nothing ever stored there, the offsets were past the card until now. */
+void x86_vga_ega_set_planes2(void *p, uint32_t plane_offsets)
+{
+    if (!ega_planes)
+        return;
+    if (p && plane_offsets) {
+        ega_planes2 = (uint8_t *)p;
+        memset(ega_planes2, 0, 4u * plane_offsets);
+        ega_plane_size = ega_size1 + plane_offsets;
+    } else {
+        ega_planes2 = NULL;
+        ega_plane_size = ega_size1;
+    }
+}
+
+const uint8_t *x86_vga_ega_planes2(void)  { return ega_planes2; }
+uint32_t       x86_vga_ega_split(void)    { return ega_size1; }
 
 void x86_vga_modey_set_cache(void *p, uint32_t offsets)
 {
@@ -499,8 +528,10 @@ PLANAR_HOT static uint8_t *vga_cell(uint32_t a)
     uint32_t pg, off;
 
     if (!x86_vga_modey_armed) {
-        if (a < ega_plane_size)
+        if (a < ega_size1)
             return ega_planes + 4u * a;
+        if (a < ega_plane_size)         /* the second piece, if any */
+            return ega_planes2 + 4u * (a - ega_size1);
         return 0;                       /* past the fitted card: discarded */
     }
 
@@ -778,11 +809,14 @@ void x86_vga_ega_reseat(const void *old, uint32_t old_offsets)
 
     if (!ega_planes || !ega_plane_size)
         return;
-    keep = old ? (old_offsets < ega_plane_size ? old_offsets : ega_plane_size) : 0u;
+    /* The FIRST piece only: a re-seat moves the arena's block, and a second
+       piece is added or dropped on its own (x86_vga_ega_set_planes2) with the
+       first left exactly where it is. */
+    keep = old ? (old_offsets < ega_size1 ? old_offsets : ega_size1) : 0u;
     if (keep && (const void *)ega_planes != old)
         memmove(ega_planes, old, 4u * keep);
-    if (ega_plane_size > keep)
-        memset(ega_planes + 4u * keep, 0, 4u * (ega_plane_size - keep));
+    if (ega_size1 > keep)
+        memset(ega_planes + 4u * keep, 0, 4u * (ega_size1 - keep));
     if (x86_vga_ega_armed) {
         ega_shadow_sig = ega_read_sig();
         ega_shadow_rebuild();
@@ -1274,7 +1308,9 @@ int x86_vga_planar_arm(int on)
     GC_COLOR_DC = 0x0F;
     map_mask = 0x0F;
     latch[0] = latch[1] = latch[2] = latch[3] = 0;
-    memset(ega_planes, 0, 4u * ega_plane_size);
+    memset(ega_planes, 0, 4u * ega_size1);
+    if (ega_planes2)
+        memset(ega_planes2, 0, 4u * (ega_plane_size - ega_size1));
     /* The WHOLE aperture, not just the shadow. An EGA in a planar mode decodes
        all 64 KB at A000:0000 and software uses it -- Keen 4's first act after
        the mode set is a `rep stosw` with CX=8000h over the lot. Only the bottom

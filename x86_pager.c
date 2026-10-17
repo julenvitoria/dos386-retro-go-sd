@@ -93,6 +93,41 @@ int x86_pager_set_tables(void *block, uint32_t bytes)
 #define NO_FRAME 0xFFFFu
 #define PG_NO_FRAME 0xFFu
 
+/*
+ * WORKING-SET SAMPLER (X86_PG_WSS=1, diagnostic, OFF in every shipping build).
+ *
+ * x86_pg_resident_peak counts every page EVER made resident, and that is what
+ * the donation policy reserves -- so a page touched once while a title
+ * unpacked itself costs the EGA card as much as one touched every frame. This
+ * measures the other number: how many resident pages the guest actually
+ * TOUCHES in a window. Each sample counts the pages marked accessed since the
+ * last one, then unmaps every resident, unpinned page (the frame stays theirs)
+ * so the next touch takes the cheap reinstall fault below and marks it again.
+ * An access bit made out of minor faults; the cost is one reinstall per live
+ * page per window. Called at a frame boundary, after the seam flush.
+ */
+#ifndef X86_PG_WSS
+#define X86_PG_WSS 1
+#endif
+/* Evictions in one window above which the working set is said NOT to fit,
+   whatever the sampler counted: the guest is paying SD writes for pages it is
+   still using. Cold pages going out once is the point of the policy; this is
+   the line between that and thrash. */
+#ifndef X86_PG_THRASH_EV
+#define X86_PG_THRASH_EV 32u
+#endif
+#if X86_PG_WSS
+#define PG_ACCESSED 0x08u
+volatile uint32_t x86_pg_wss_last = 0;      /* pages touched in the last window */
+volatile uint32_t x86_pg_wss_max = 0;
+volatile uint32_t x86_pg_wss_min = 0xFFFFFFFFu;
+volatile uint32_t x86_pg_wss_samples = 0;
+volatile uint32_t x86_pg_wss_resident = 0;  /* resident at that sample          */
+volatile uint32_t x86_pg_ws_est = 0;        /* what the policy reserves for     */
+volatile uint32_t x86_pg_ws_ev_window = 0;  /* evictions in the last window     */
+static uint32_t ws_prev, ws_ev_mark;
+#endif
+
 /* ---- frames --------------------------------------------------------------
  *
  * A frame is one 4 KB page of AXI. They come from up to four extents, because
@@ -326,6 +361,38 @@ static void fold_clear(uint32_t page)
             guest_page_table_ptr[a] = FOLD_INVALID;
     }
 }
+
+#if X86_PG_WSS
+void x86_pager_wss_sample(void)
+{
+    uint32_t n = 0, res = 0;
+    if (!pg_flags || !guest_page_table_ptr)
+        return;
+    for (uint32_t page = 0; page < X86_PG_PAGES; page++) {
+        if (!(pg_flags[page] & PG_RESIDENT))
+            continue;
+        res++;
+        if (pg_flags[page] & PG_ACCESSED)
+            n++;
+        pg_flags[page] &= (uint8_t)~PG_ACCESSED;
+        if (!x86_page_is_pinned(page))
+            fold_clear(page);
+    }
+    x86_pg_wss_samples++;
+    /* The estimate is the larger of the last two windows: one window can end
+       halfway through a burst, two cannot both miss it. */
+    x86_pg_ws_est = (n > ws_prev) ? n : ws_prev;
+    ws_prev = n;
+    x86_pg_ws_ev_window = x86_pg_evictions - ws_ev_mark;
+    ws_ev_mark = x86_pg_evictions;
+    x86_pg_wss_last = n;
+    x86_pg_wss_resident = res;
+    if (x86_pg_wss_samples > 2) {          /* the first windows are the boot */
+        if (n > x86_pg_wss_max) x86_pg_wss_max = n;
+        if (n < x86_pg_wss_min) x86_pg_wss_min = n;
+    }
+}
+#endif
 
 void x86_pager_refold(uint32_t page)
 {
@@ -936,13 +1003,33 @@ void x86_pager_policy_reset(void)
     x86_pg_shrink_signals = x86_pg_grow_signals = 0;
 }
 
+/*
+ * WHAT THE RESERVE IS BUILT ON. With the sampler (X86_PG_WSS, the default) it
+ * is the WORKING SET: pages the guest touched in the last two windows. Without
+ * it, the resident peak -- every page ever made resident, which charges a page
+ * touched once at load time as much as one touched every frame, and is why a
+ * Galaxy-engine title's EGA card could never stay full in play (docs/12 §5c).
+ * Until two windows have been seen there is no measurement, and the honest
+ * stand-in is everything resident.
+ */
+static uint32_t ws_basis(void)
+{
+#if X86_PG_WSS
+    if (x86_pg_wss_samples >= 2u)
+        return x86_pg_ws_est;
+    return x86_pg_resident;
+#else
+    return x86_pg_resident_peak;
+#endif
+}
+
 uint32_t x86_pager_policy_reserve(void)
 {
     uint32_t r;
 
     if (!policy_on)
         return donate_reserve;
-    r = x86_pg_resident_peak + pol_margin;
+    r = ws_basis() + pol_margin;
     if (r < pol_floor)
         r = pol_floor;
     if (r < x86_pg_policy_ratchet)
@@ -985,14 +1072,24 @@ int x86_pager_policy_tick(void)
     /* The watermark first (it fires BEFORE a write), the eviction counter
        second (it fires after one, and only catches what the watermark could
        not see inside a single tick). */
+#if X86_PG_WSS
+    /* With a measured working set, an eviction is no longer the warning: the
+       cold pages are SUPPOSED to go out (once). Pressure is the working set
+       not fitting what the guest has, or the window's evictions saying it is
+       paying SD writes for pages it still uses. */
+    pressure = (ws_basis() + pol_margin > live)
+               || (x86_pg_ws_ev_window > X86_PG_THRASH_EV);
+    (void)ev;
+#else
     pressure = (x86_pg_frames_free < pol_margin)
                || (ev != pol_ev_seen);
+#endif
     pol_ev_seen = ev;
 
     if (pressure) {
         pol_quiet = 0;
         /* Learn. The set is at least this big, so never lend into it again. */
-        want = x86_pg_resident_peak + pol_margin;
+        want = ws_basis() + pol_margin;
         if (want > x86_pg_policy_ratchet)
             x86_pg_policy_ratchet = want;
         (void)x86_pager_policy_reserve();
@@ -1059,6 +1156,9 @@ uint32_t x86_pager_fault(uint32_t lin, int write)
            allocate a second frame for the same page. */
         uint8_t *host = frame_addr(pg_frame[page]);
         if (host) {
+#if X86_PG_WSS
+            pg_flags[page] |= PG_ACCESSED;
+#endif
             fold_install(page, host);
             return (uint32_t)(uintptr_t)host + (lin & (X86_PG_SIZE - 1u));
         }
@@ -1110,6 +1210,9 @@ uint32_t x86_pager_fault(uint32_t lin, int write)
        that has just done a 4 KB fill. */
     if (x86_pg_resident > x86_pg_resident_peak)
         x86_pg_resident_peak = x86_pg_resident;
+#if X86_PG_WSS
+    pg_flags[page] |= PG_ACCESSED;
+#endif
     fold_install(page, host);
 
     return (uint32_t)(uintptr_t)host + (lin & (X86_PG_SIZE - 1u));
