@@ -241,19 +241,29 @@ uint32_t x86_hle_log_idx;
 uint32_t x86_hle_unhandled_func;
 
 /*
- * Rewind the stacked return address by two bytes so the stub's IRET lands back
- * on the INT that reached us, re-executing it next slice. Used by a blocking
- * service with nothing to return yet -- INT 16h AH=00 with an empty buffer.
- * Spinning inside the service instead would stop the frame loop, and with it
- * the input that would have satisfied the call.
+ * Make a blocking service with nothing to return yet -- INT 16h AH=00 with an
+ * empty buffer -- run again on the next re-entry. Spinning inside the service
+ * instead would stop the frame loop, and with it the input that would have
+ * satisfied the call.
+ *
+ * NOT BY REWINDING THE CALLER. This used to subtract 2 from the stacked return
+ * IP, which is right only when the stub was reached by a two-byte `INT nn`. A
+ * guest that hooks INT 16h and chains to us with `pushf; call far [old]` --
+ * Prince of Persia's INT 16h hook does exactly that -- has a FOUR-byte call in
+ * front of that IP, so the rewind landed in the middle of it and the
+ * guest executed the far pointer as code.
+ *
+ * Instead the guest stays IN THE STUB: EIP goes back over the 0F 0B nn it just
+ * executed, so the same hypercall runs again on re-entry whatever frame
+ * brought it here, and IF is set the way the real BIOS's wait loop sets it
+ * (it STIs and spins) -- without that the keyboard IRQ that would fill the
+ * buffer could never be taken inside the stub, since the INT that entered it
+ * cleared IF.
  */
 static void hle_retry(void)
 {
-    uint32_t sp = cpu_state_ptr->regs[4] & 0xFFFFu;
-    uint32_t lin = cpu_state_ptr->segs[2].base + sp;
-    uint16_t *ip = (uint16_t *)x86_guest_ptr(lin, 2);
-    if (ip)
-        *ip = (uint16_t)(*ip - 2u);
+    cpu_state_ptr->eip = (cpu_state_ptr->eip - 3u) & 0xFFFFu;
+    cpu_state_ptr->eflags |= 0x200u;
 }
 
 int x86_hle_dispatch(uint8_t vector)
