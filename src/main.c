@@ -288,6 +288,17 @@ volatile uint32_t frames_rendered = 0;
    loop for why each exists; between them they say whether a buffer was
    submitted, whether it had anything in it, and at what volume. */
 volatile uint32_t x86_audio_submits = 0;   /* buffers handed to the SAI DMA  */
+/* DMA halves the refill did not line up with, read off the firmware's own
+   dma_counter (one tick per half played). The loop is paced by the PANEL and
+   the DMA by the SAI, so nothing forces exactly one refill per half: a frame
+   that overruns 16.7 ms lets the DMA replay a half we never rewrote (heard as
+   a click -- a block repeated at exactly two halves' lag, which is what a
+   console recording of Monkey Island EGA showed at 386SX 16), and two refills
+   inside one half overwrite each other (a block dropped). _missed counts the
+   halves played without a refill, _doubled the refills that landed in a half
+   already refilled. Both 0 = the audio clock and the frame loop agree. */
+volatile uint32_t x86_audio_blocks_missed  = 0;
+volatile uint32_t x86_audio_blocks_doubled = 0;
 volatile uint32_t x86_audio_peak_last = 0; /* loudest sample, newest buffer  */
 volatile uint32_t x86_audio_peak_max = 0;  /* loudest sample, whole session  */
 volatile uint32_t x86_audio_volume = 0;    /* the launcher's own 0..255      */
@@ -359,16 +370,20 @@ volatile uint32_t x86_audio_volume = 0;    /* the launcher's own 0..255      */
 #define KIPS_286_8          800u   /* 286 @ 8 MHz                     */
 #define KIPS_286_12        1200u   /* 286 @ 12 MHz                    */
 #define KIPS_386SX_16      2500u   /* 386SX @ 16 MHz                  */
-#define KIPS_386_33        6000u   /* 386DX @ 33 MHz                  */
+#define KIPS_386DX_25      4500u   /* 386DX @ 25 MHz (33 MHz x 25/33) */
+/* Requests at or above this are unservable: the silicon tops out at ~5500
+   kips, so a `cycles` this high resolves to Max rather than to a rung that
+   would throttle BELOW what was asked. */
+#define KIPS_CEILING       5500u
 /*
- * THE TABLE STOPS AT 386DX 33, ON PURPOSE. Measured on silicon the core runs
- * ~5.54 MIPS (~5500 kips), so 386DX 33 (6000) is already at the ceiling and
- * plays as Max. The 486 rungs (9k/24k/40k) that used to follow it asked for
- * 1.6-7x what exists: they never throttled, scored identically to Max and only
- * misled users into picking a "faster" machine that was not there. Removed
- * 2026-10-17. A .dosset / app-store index from that era (6..8) is out of range
- * now and cpu_profile_apply() clamps it to 0 = Max -- which is exactly how
- * those rungs already ran, so nobody's game changes speed.
+ * THE TABLE STOPS AT 386DX 25, ON PURPOSE. Measured on silicon the core runs
+ * ~5.54 MIPS (~5500 kips). Every rung at or above that never throttled and
+ * played exactly as Max: the 486 rungs (9k/24k/40k) went first and 386DX 33
+ * (6000) followed, both 2026-10-17. 386DX 25 (4500) is the fastest rung that
+ * is genuinely BELOW the ceiling, so it is a different machine from Max. An
+ * index stored by the old table keeps its slot: 5 was 386DX 33 and is now
+ * 386DX 25 (the nearest real machine), 6..8 are out of range and clamp to Max
+ * in cpu_profile_apply(), which is how those rungs already ran.
  */
 /*
  * DEFAULT: unthrottled. The emulated machine runs as fast as the silicon
@@ -2734,17 +2749,17 @@ static const uint8_t pad_scancode[10] = {
 
 /*
  * The label carries the rung's OWN kips number, because the name alone cannot
- * be compared against anything. "386DX 33" says nothing about whether the
- * silicon can serve it; "386DX 33 (6000k)" sits next to a measured
+ * be compared against anything. "386DX 25" says nothing about whether the
+ * silicon can serve it; "386DX 25 (4.5k)" sits next to a measured
  * guest_ips_achieved of ~5500k and the answer is immediate. Max has no number
  * because it has no target -- that is the whole meaning of unthrottled.
  */
 static const uint16_t cpu_profile_kips[] = {
-    KIPS_MAX, KIPS_8088_477, KIPS_286_8, KIPS_286_12, KIPS_386SX_16, KIPS_386_33,
+    KIPS_MAX, KIPS_8088_477, KIPS_286_8, KIPS_286_12, KIPS_386SX_16, KIPS_386DX_25,
 };
 static const char *const cpu_profile_name[] = {
     "Max", "8088 4.77 (330)", "286 8MHz (800)", "286 12MHz (1.2k)",
-    "386SX 16 (2.5k)", "386DX 33 (6k)",
+    "386SX 16 (2.5k)", "386DX 25 (4.5k)",
 };
 #define CPU_PROFILE_COUNT ((int)(sizeof(cpu_profile_kips) / sizeof(cpu_profile_kips[0])))
 /* The two arrays are indexed by the same variable; a mismatch reads off the
@@ -3105,6 +3120,8 @@ static bool cpu_profile_cb(odroid_dialog_choice_t *option,
  */
 static int cpu_profile_from_kips(int kips)
 {
+    if (kips >= (int)KIPS_CEILING)
+        return 0;                   /* unservable: Max is what it would get */
     int best = 1;
     uint32_t best_d = 0xFFFFFFFFu;
 
@@ -4657,6 +4674,18 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         FRAME_PHASE(X86_PHASE_AUDIO);
         X86_ZONE_ENTER(X86_ZONE_AUDIO);             /* ZONES */
         int16_t *abuf = abi->audio_get_active_buffer();
+        if (abi->dma_counter_ptr) {
+            static uint32_t dma_last;
+            static int dma_seen;
+            uint32_t now = *(volatile uint32_t *)abi->dma_counter_ptr;
+            uint32_t d = now - dma_last;
+            if (dma_seen && d == 0u)
+                x86_audio_blocks_doubled++;
+            else if (dma_seen && d > 1u && d < 64u)  /* a pause is not a miss */
+                x86_audio_blocks_missed += d - 1u;
+            dma_last = now;
+            dma_seen = 1;
+        }
         if (abuf && audio_frames) {
             int16_t amp = (int16_t)(((int32_t)abi->common_emu_sound_get_volume()
                                      * INT16_MAX) >> 10);
