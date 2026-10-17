@@ -281,9 +281,12 @@ typedef struct {
      * The renderer used to run once a frame and point-sample the CURRENT
      * state, so a tone that started and stopped between two calls was never
      * heard at all -- which is what "half the beeps are missing" was. Every
-     * change to the audible frequency is timestamped in HOST milliseconds
-     * (x86_io_time_ms) as the guest makes it, and the render then walks the
-     * window and lays each segment down where it belongs.
+     * change to the audible frequency is timestamped as the guest makes it
+     * (x86_io_time_ms -- despite the name, src/main.c points it at the GUEST's
+     * PIT clock, x86_pit_ticks: host ms squashed a frame's notes into the
+     * burst the guest ran in), and the render then walks the window and lays
+     * each segment down where it belongs. Only the RATIO of offsets matters,
+     * so the unit is free.
      *
      * X86_SPK_EVENTS is small on purpose: a guest sweeping a siren changes the
      * divisor far faster than the output rate can show, and the overflow is
@@ -299,7 +302,7 @@ typedef struct {
     uint8_t  spk_ev_head, spk_ev_tail;
     uint32_t spk_last_div;    /* divisor at the last logged event            */
     uint32_t spk_render_div;  /* divisor the renderer left off at            */
-    uint32_t spk_window_ms;   /* host ms the next render's window starts at  */
+    uint32_t spk_window_ms;   /* clock value the next render's window starts at */
     uint8_t  spk_was_on;      /* last rendered run was audible -> edge detect */
     uint8_t  cga_mode;        /* 0x3D8 mode control */
     uint8_t  cga_color_select;/* 0x3D9 background + palette + intensity */

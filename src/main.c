@@ -3994,10 +3994,18 @@ static void arm_tick_irq(void)
 
 static void emulator_loop(const gw_firmware_abi_t *abi)
 {
-    /* Give the I/O layer the host clock BEFORE the guest runs: it is what
-       timestamps speaker events, and without it every beep collapses onto the
-       start of its buffer (the old point-sampled behaviour). */
-    x86_io_time_ms = abi->HAL_GetTick;
+    /* Give the I/O layer the clock that timestamps speaker events BEFORE the
+       guest runs -- without one every beep collapses onto the start of its
+       buffer (the old point-sampled behaviour).
+       IT IS THE GUEST'S CLOCK (PIT ticks, 1.193182 MHz, x86_pit_ticks), NOT
+       HAL_GetTick. The guest runs a frame's instructions in one burst and then
+       waits for the panel; under a CPU profile that burst is a few ms of a
+       16.7 ms frame. Stamped in host ms, every note of the frame landed in the
+       first few ms of the buffer and the last one droned on for the rest:
+       Alley Cat's tunes came out chopped into per-frame chirps at 286 and XT
+       speed (owner's videos, 2026-10-17). In guest time a note lasts what the
+       guest timed it to last, whatever the burst looked like on the host. */
+    x86_io_time_ms = x86_pit_ticks;
 
     cpu_profile_init(abi);
 
@@ -4007,7 +4015,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
     tick_acc = 0;
     bda_acc = 0;
     tick_irqs_owed = 0;
-    x86_io.spk_window_ms = tick_last_ms;
+    x86_io.spk_window_ms = x86_pit_ticks();
     rate_window_ms = tick_last_ms;
     rate_window_insns = guest_insns_total;
     rate_window_frames = frames_rendered;
