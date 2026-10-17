@@ -2177,6 +2177,33 @@ static void dos_log_path(const char *p)
 
 static int dos_int21_dispatch(uint8_t func);
 
+/*
+ * THE DOS CONSOLE HANDS AN EXTENDED KEY OVER IN TWO READS. AH=01/06/07/08
+ * return one byte; for a key with no ASCII (F1-F12, arrows, Home/End...) real
+ * DOS returns 0 and keeps the scan code for the NEXT call. These returned only
+ * the low byte, so the scan code was dropped and the program saw a bare 0 --
+ * Monkey Island (EGA) reads its keys with AH=08, so F5 (save/load) did nothing.
+ */
+static uint8_t con_pending;
+
+static int con_getc(uint8_t *ch)
+{
+    uint16_t key;
+    if (con_pending) {
+        *ch = con_pending;
+        con_pending = 0;
+        return 1;
+    }
+    if (!x86_kb_get(&key))
+        return 0;
+    *ch = (uint8_t)key;
+    if (*ch == 0 || *ch == 0xE0) {              /* extended: scan code next */
+        *ch = 0;
+        con_pending = (uint8_t)(key >> 8);
+    }
+    return 1;
+}
+
 int x86_dos_int21(uint8_t func)
 {
     int is_mem = dos_func_is_mem(func);
@@ -2253,13 +2280,13 @@ static int dos_int21_dispatch(uint8_t func)
      * would satisfy it.
      */
     case 0x06: {                                /* direct console I/O */
-        uint16_t key;
+        uint8_t ch;
         if ((dx & 0xFFu) != 0xFFu) {
             x86_video_teletype((uint8_t)dx);
             return 1;
         }
-        if (x86_kb_get(&key)) {
-            x86_set_al((uint8_t)key);
+        if (con_getc(&ch)) {
+            x86_set_al(ch);
             x86_hle_set_zf(0);
         } else {
             x86_set_al(0);
@@ -2270,20 +2297,21 @@ static int dos_int21_dispatch(uint8_t func)
     case 0x01:                                  /* input, echoed */
     case 0x07:                                  /* direct input, no echo */
     case 0x08: {                                /* input, no echo */
-        uint16_t key;
-        if (!x86_kb_get(&key))
+        uint8_t ch;
+        if (!con_getc(&ch))
             return 2;                           /* nothing yet: retry */
-        x86_set_al((uint8_t)key);
-        if (func == 0x01)
-            x86_video_teletype((uint8_t)key);
+        x86_set_al(ch);
+        if (func == 0x01 && ch)
+            x86_video_teletype(ch);
         return 1;
     }
     case 0x0B: {                                /* input status */
         uint16_t key;
-        x86_set_al(x86_kb_peek(&key) ? 0xFF : 0x00);
+        x86_set_al((con_pending || x86_kb_peek(&key)) ? 0xFF : 0x00);
         return 1;
     }
     case 0x0C:                                  /* flush, then input */
+        con_pending = 0;
         return 1;
 
     case 0x09: {                                /* $-terminated string */
