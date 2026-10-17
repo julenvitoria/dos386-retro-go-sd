@@ -77,9 +77,10 @@ def main(args):
             print("FAIL: the sysinfo arm never completed")
             return False
 
-        r = [b.read_uint32(syms["sys_r"] + 4 * i) for i in range(15)]
+        r = [b.read_uint32(syms["sys_r"] + 4 * i) for i in range(16)]
         (equip, conv, ext_ax, ext_fl, cfg_ax, cfg_fl, spk, dcc_ax, exit_reason,
-         bda_equip, bda_conv, bda_crtc, bda_kb_lo, bda_kb_hi, dcc_bx) = r
+         bda_equip, bda_conv, bda_crtc, bda_kb_lo, bda_kb_hi, dcc_bx,
+         wait_r) = r
 
         def check(label, got, want, fmt="0x{:04x}"):
             nonlocal ok
@@ -106,6 +107,12 @@ def main(args):
         check("INT 15h AH=88h CF (IRET frame)", ext_fl & CF, 0, "{}")
         check("INT 15h AH=C0h CF (IRET frame)", cfg_fl & CF, CF, "{}")
         check("INT 15h AH=C0h AH", (cfg_ax >> 8) & 0xFF, 0x86)
+        # AH=86h, used as an AdLib detection's delay (Monkey Island VGA):
+        # answered with CF clear, and the 976 us must pass in guest time so
+        # timer 1 (80 us) has expired by the status read.
+        check("INT 15h AH=86h CF (wait answered)", (wait_r >> 8) & CF, 0, "{}")
+        check("AdLib timer 1 expired across the wait", wait_r & 0xE0, 0xC0,
+              "0x{:02x}")
 
         # INT 10h AH=1Ah, the display combination code. This is not a nicety:
         # it is the FIRST of the four probes in Wolf3D's VW_VideoID, and a

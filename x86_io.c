@@ -117,6 +117,22 @@ void x86_pit_counter_forced(uint32_t v)
     pit_last_counter = v;
 }
 
+/*
+ * A BIOS WAIT (INT 15h AH=86h) that the HLE answers at once: advance the guest
+ * clock by the time the guest asked to wait, so everything that reads time off
+ * it -- the PIT counter, the OPL timers, the speaker's event stamps -- sees the
+ * wait as having happened. Monkey Island (VGA) times its AdLib detection with
+ * three of these (976 us each); answered "unsupported" with no time passing,
+ * timer 1 never expired, the card was "absent" and the game ran silent.
+ */
+void x86_pit_advance_us(uint32_t us)
+{
+    if (us > 1000000u)
+        us = 1000000u;                /* a second; nobody waits longer here */
+    x86_pit_sync();
+    pit_now += (uint32_t)(((uint64_t)us * PIT_HZ) / 1000000u);
+}
+
 uint32_t x86_pit_ticks(void)
 {
     x86_pit_sync();

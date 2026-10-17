@@ -1418,6 +1418,30 @@ static const uint8_t sys_guest_code[] = {
     0xA3, 0x0E, 0x4C,                   /* MOV [4C0E],AX                   */
     0x89, 0x1E, 0x10, 0x4C,             /* MOV [4C10],BX                   */
 
+    /* INT 15h AH=86h -- WAIT CX:DX us, used as the DELAY in an AdLib
+       detection, which is exactly how Monkey Island (VGA) uses it: reset the
+       timers, preset timer 1 to FFh (80 us), start it, wait 976 us, read the
+       status. A card is "present" when it reads C0h in the top three bits.
+       The wait must ANSWER (CF clear, poisoned SET) and must let guest time
+       pass; answered "unsupported" with no time passing, the flag never came
+       up and the game decided there was no card. */
+    0xBA, 0x88, 0x03,                   /* MOV DX,0388                     */
+    0xB0, 0x04, 0xEE, 0x42, 0xB0, 0x60, 0xEE, 0x4A, /* reg 4 = 60h (reset) */
+    0xB0, 0x04, 0xEE, 0x42, 0xB0, 0x80, 0xEE, 0x4A, /* reg 4 = 80h (IRQ)   */
+    0xB0, 0x02, 0xEE, 0x42, 0xB0, 0xFF, 0xEE, 0x4A, /* reg 2 = FFh         */
+    0xB0, 0x04, 0xEE, 0x42, 0xB0, 0x21, 0xEE, 0x4A, /* reg 4 = 21h (start) */
+    0xB8, 0x00, 0x86,                   /* MOV AX,8600                     */
+    0x31, 0xC9,                         /* XOR CX,CX                       */
+    0xBA, 0xD0, 0x03,                   /* MOV DX,03D0  (976 us)           */
+    0xF9,                               /* STC                             */
+    0xCD, 0x15,                         /* INT 15h                         */
+    0x9C,                               /* PUSHF                           */
+    0xBA, 0x88, 0x03,                   /* MOV DX,0388                     */
+    0xEC,                               /* IN AL,DX   (status)             */
+    0xA2, 0x12, 0x4C,                   /* MOV [4C12],AL                   */
+    0x58,                               /* POP AX     (flags)              */
+    0xA2, 0x13, 0x4C,                   /* MOV [4C13],AL                   */
+
     0xF4,                               /* HLT                             */
 };
 
@@ -1426,7 +1450,7 @@ static void sysinfo_test_run(void)
     static const uint8_t hle_vectors[] = {
         0x08, 0x09, 0x10, 0x11, 0x12, 0x15, 0x16, 0x1A, 0x20, 0x21,
     };
-    memset(&test_ram[SYS_RES_BASE], 0, 20);
+    memset(&test_ram[SYS_RES_BASE], 0, 20);   /* 4C00..4C13 */
     x86_video_init(cga_test_vram, cga_test_palette);
     x86_video_set_aperture(vga_test_aperture, vga_test_pal);
     x86_bios_init();
@@ -1442,6 +1466,9 @@ static void sysinfo_test_run(void)
     /* sys_r[8] is the exit reason, so the AH=1Ah BX lands at the top. */
     sys_r[14] = (uint16_t)(test_ram[SYS_RES_BASE + 16] |
                            (test_ram[SYS_RES_BASE + 17] << 8));
+    /* AH=86h as an AdLib delay: low byte the OPL status, high byte FLAGS. */
+    sys_r[15] = (uint16_t)(test_ram[SYS_RES_BASE + 18] |
+                           (test_ram[SYS_RES_BASE + 19] << 8));
 
     /* The same facts as MEMORY, which is the other half of the contract: a
        program is free to peek the BDA instead of calling, and the two must not

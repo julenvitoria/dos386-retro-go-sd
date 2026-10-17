@@ -697,11 +697,20 @@ int x86_bios_system(uint8_t func)
         x86_set_ax(EXT_MEM_KB);
         x86_hle_set_cf(0);
         return 1;
+    case 0x86:                      /* wait CX:DX microseconds */
+        /* ANSWERED, as an AT BIOS does: the wait is a jump of the guest clock
+           (x86_pit_advance_us), not a host stall. "Unsupported" was honest
+           for an XT, but this machine is a 386 and Monkey Island (VGA) does not
+           check CF -- it times its AdLib detection with three of these, saw
+           no time pass, and concluded there was no card. */
+        x86_pit_advance_us(((uint32_t)(cpu_state_ptr->regs[1] & 0xFFFF) << 16)
+                           | (cpu_state_ptr->regs[2] & 0xFFFF));
+        x86_hle_set_cf(0);
+        return 1;
     case 0xC0:                      /* get system configuration table */
     case 0x87:                      /* move block to extended memory */
     case 0x89:                      /* switch to protected mode */
     case 0x24:                      /* A20 gate control */
-    case 0x86:                      /* wait, microseconds */
     case 0x83:                      /* event wait */
         /* A PC/XT-class BIOS does not have these, and it says so the way the
            interface provides for: CF set, AH=86h. That is an ANSWER. Leaving

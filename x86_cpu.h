@@ -696,6 +696,7 @@ extern volatile uint32_t x86_pit0_writes;
 extern uint32_t x86_pit_kips;         /* main.c publishes guest_kips here */
 void     x86_pit_sync(void);          /* accrue what the guest has just run */
 void     x86_pit_counter_forced(uint32_t v);  /* host write to pit_counter  */
+void     x86_pit_advance_us(uint32_t us); /* INT 15h AH=86h: the wait passes */
 uint32_t x86_pit_ticks(void);         /* reporting and tier-1 assertions    */
 uint32_t x86_speaker_divisor(void);   /* the signal path's pitch source */
 uint32_t x86_speaker_hz(void);        /* reporting only */
