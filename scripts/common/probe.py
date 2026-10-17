@@ -356,8 +356,8 @@ def dump_dos_log(target, syms, out=print):
         out(f"    [{i:3d}] {func:02X}h/{al:02X} {name:<14} {args}  -> {res}")
     if "x86_dos_path_log" in syms:
         pbase = syms["x86_dos_path_log"]
-        out("  paths (ring of 16, oldest position unknown):")
-        for i in range(16):
+        out("  paths (ring of 8, oldest position unknown):")
+        for i in range(8):
             raw = b.read_memory(pbase + 32 * i, 32)
             s = raw.split(b"\0")[0].decode("latin-1")
             if s:

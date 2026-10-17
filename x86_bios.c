@@ -395,6 +395,50 @@ int x86_bios_video(uint8_t func)
             (uint8_t)((cpu_state_ptr->regs[3] >> 8) & 0xFF),
             (uint8_t)(cpu_state_ptr->regs[3] & 0xFF));
         return 1;
+    case 0x13: {                    /* write string (AT BIOS) */
+        /* ES:BP string, CX length, DH/DL row/col, BL attribute, AL bit 0 =
+           leave the cursor after the string, bit 1 = the string carries its
+           own attribute byte after every character. Rick Dangerous 2 prints
+           with it at start-up; unanswered, its text never appeared. Control
+           characters go through the teletype, as the BIOS does. */
+        uint8_t  mode = (uint8_t)(cpu_state_ptr->regs[0] & 0xFF);
+        uint8_t  attr = (uint8_t)(cpu_state_ptr->regs[3] & 0xFF);
+        uint16_t n    = (uint16_t)(cpu_state_ptr->regs[1] & 0xFFFF);
+        uint16_t bp   = (uint16_t)(cpu_state_ptr->regs[5] & 0xFFFF);
+        uint32_t es   = cpu_state_ptr->segs[0].base;
+        uint16_t saved = x86_video_get_cursor();
+        uint8_t  col  = (uint8_t)(cpu_state_ptr->regs[2] & 0xFF);
+        uint8_t  row  = (uint8_t)((cpu_state_ptr->regs[2] >> 8) & 0xFF);
+        uint8_t  cols = (uint8_t)x86_video_text_cols();
+        x86_video_set_cursor(col, row);
+        for (uint16_t i = 0; i < n; i++) {
+            const uint8_t *p = x86_guest_ptr(es + (uint16_t)(bp++), 1);
+            uint8_t ch = p ? *p : ' ';
+            if (mode & 2) {
+                const uint8_t *a = x86_guest_ptr(es + (uint16_t)(bp++), 1);
+                attr = a ? *a : attr;
+            }
+            if (ch == 7 || ch == 8 || ch == 10 || ch == 13) {
+                x86_video_teletype(ch);
+                uint16_t c = x86_video_get_cursor();
+                col = (uint8_t)(c & 0xFF);
+                row = (uint8_t)(c >> 8);
+                continue;
+            }
+            x86_video_putc_attr(ch, attr, 1);
+            if (++col >= cols) {
+                col = 0;
+                if (++row > 24) {
+                    x86_video_scroll(1, attr);
+                    row = 24;
+                }
+            }
+            x86_video_set_cursor(col, row);
+        }
+        if (!(mode & 1))
+            x86_video_set_cursor((uint8_t)(saved & 0xFF), (uint8_t)(saved >> 8));
+        return 1;
+    }
     case 0x01:                      /* set cursor shape: nothing to model */
     case 0x05:                      /* set active page: single page only */
         return 1;
