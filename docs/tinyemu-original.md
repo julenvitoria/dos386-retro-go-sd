@@ -1,3 +1,8 @@
+# TinyEMU original (Fabrice Bellard)
+
+*El README del emulador del que parte este proyecto, tal cual. Describe el TinyEMU de escritorio (RISC-V / x86 con KVM), no el núcleo para Game & Watch: para eso, el [README](../README.md).*
+
+```text
 TinyEMU System Emulator by Fabrice Bellard
 ==========================================
 
@@ -199,3 +204,4 @@ TinyEMU is released under the MIT license. If there is no explicit
 license in a file, the license from MIT-LICENSE.txt applies.
 
 The SLIRP library has its own license (two clause BSD license).
+```
