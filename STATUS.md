@@ -15,7 +15,7 @@ Last truth-pass 2026-09-02 against `f0594d1`. Running: [`TOOLING.md`](TOOLING.md
 ## 2026-10-17: Monkey, Keen 4 card, audio clock (silicon-checked by the owner)
 
 - **Monkey Island EGA** boots (tick re-plan on a divisor change, `TICK_IRQ_MAX` 24); **VGA** finds its AdLib (INT 15h AH=86h). **Clicks** at 386SX were DMA halves replayed by overrun frames (17-20% of windows at 1598-sample lag on console recordings); `audio_pump()` now refills on `dma_counter` at every sub-slice boundary -- owner: "va genial" in both.
-- **Keen 4 full EGA card** (two-piece card + working-set donation, docs/12 §5c) merged from `ega-full-card`; world map whole on silicon. Level entry is black ~7 s on the old core, ~9 s with the card -- OPEN. **Prince of Persia** freezes in room 1 with no prince at tier 2 back to `4776be0` -- OPEN.
+- **Keen 4 full EGA card** (two-piece card + working-set donation, docs/12 §5c) merged from `ega-full-card`; world map whole on silicon. Level entry is black ~7 s on the old core, ~9 s with the card -- OPEN. **Prince of Persia** (VGA 13h) shows room 1 with no prince and frozen torches, at tier 2 back to `4776be0` -- OPEN. Measured: NOT hung -- its INT 08h ISR (0D00:79C5) runs at 60 Hz, the main loop (0506:0555, waits on `[DS:31EE]`) turns ~12 fps, Space draws "60 MINUTES LEFT"; but A000 is byte-identical over 5 s, so the per-frame object draw (kid, flames) never runs. Not SB/AdLib polling (`--io-log` shows only EOIs). Next: find why play_frame skips drawing.
 
 ## Verification state
 
