@@ -27,6 +27,10 @@
  * door on every unit (x86_osk.c), and a .cfg must not be able to lock a user
  * out of it.
  *
+ * THE USER-FACING LIST (Spanish, every accepted name, the differences from
+ * dos.bin, and how to find which keys a game uses): docs/input/06-gamepad-keys.md.
+ * Keep it in step with key_names[] in x86_pad.c.
+ *
  * Keys: letters, digits, f1..f12, esc, enter, space, tab, backspace, shift,
  * ctrl, alt, up, down, left, right, home, end, pgup, pgdn, ins, del, kp0..kp9,
  * the punctuation keys (- = [ ] ; ' ` \ , . /) and Spanish aliases (intro,
