@@ -323,6 +323,30 @@ it are visible in `x86_vga_ega_card_offsets` and `x86_pg_frames_total`.
 `X86_PG_POLICY_NO_GROW=1` (nothing is ever borrowed). `tests/test_paging.py`
 grades the loop at tier 1, 149 checks.
 
+### 5c. The working set is not the peak (branch `ega-full-card`, 2026-10-17)
+
+The policy reserves `x86_pg_resident_peak + margin`, and the peak counts every
+page EVER made resident -- a page touched once while a title unpacked itself
+costs the card as much as one touched every frame. `X86_PG_WSS=1` (diagnostic
+build, `X86_PG_WSS_FRAMES` = window in frames) measures the other number: each
+window it counts the resident pages the guest touched, then unmaps every
+resident unpinned page so the next touch takes the cheap reinstall fault and is
+seen again -- an access bit made of minor faults. Probe `x86_pg_wss_last`,
+`_max`, `_min`, `_resident`.
+
+MEASURED, KEEN4, gwemu tier 2, map screen with movement (pool 150):
+
+| window | touched per window | resident |
+|---|---|---:|
+| 1 s | 10-77 in play, 98 at level entry | 134-137 |
+| 5 s | 57-77 in play, 114 at level entry | 134-137 |
+
+So 20-80 of the 137 resident pages are COLD in play. The full 65,536-offset
+card needs ~29 frames more than the 35,840 one; a policy on the measured working
+set instead of the peak could fund it by evicting cold pages once. Open: the
+cost of those one-off writebacks on silicon (§1b), and level entry (114 in 5 s)
+leaving ~7 frames of margin.
+
 ## 6. XMS — a tier with NO fast path at all
 
 `x86_xms.h` / the XMS block at the end of `x86_dos.c`. It is listed here because

@@ -143,6 +143,10 @@ X86_EGA_SHPROF ?= 0
 # and per-PORT-ACCESS, never per guest instruction. scripts/probe_report.py
 # builds with it and prints the measured link delta in every report.
 X86_PROBE ?= 0
+# Working-set sampler (x86_pager.c): diagnostic, unmaps resident pages each
+# window to see which ones the guest really touches. Never in a shipping build.
+X86_PG_WSS ?= 0
+X86_PG_WSS_FRAMES ?= 60
 
 # How many distinct (kind, id, AH, sub) keys the accumulator holds. 128 keys is
 # 2,848 B of RAM_EMU .bss all in; the busiest title measured here claimed 60.
@@ -283,6 +287,8 @@ $(if $(X86_PG_DONATE_RESERVE),-DX86_PG_DONATE_RESERVE=$(X86_PG_DONATE_RESERVE)u)
 -DX86_VPROF=$(X86_VPROF) \
 -DX86_EGA_SHPROF=$(X86_EGA_SHPROF) \
 -DX86_PROBE=$(X86_PROBE) \
+-DX86_PG_WSS=$(X86_PG_WSS) \
+-DX86_PG_WSS_FRAMES=$(X86_PG_WSS_FRAMES) \
 -DX86_PROBE_ENTS=$(X86_PROBE_ENTS) \
 -DX86_CS_LOG=$(X86_CS_LOG) \
 -DX86_TEXT_AA=$(X86_TEXT_AA) \

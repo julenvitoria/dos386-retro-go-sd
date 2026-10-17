@@ -93,6 +93,31 @@ int x86_pager_set_tables(void *block, uint32_t bytes)
 #define NO_FRAME 0xFFFFu
 #define PG_NO_FRAME 0xFFu
 
+/*
+ * WORKING-SET SAMPLER (X86_PG_WSS=1, diagnostic, OFF in every shipping build).
+ *
+ * x86_pg_resident_peak counts every page EVER made resident, and that is what
+ * the donation policy reserves -- so a page touched once while a title
+ * unpacked itself costs the EGA card as much as one touched every frame. This
+ * measures the other number: how many resident pages the guest actually
+ * TOUCHES in a window. Each sample counts the pages marked accessed since the
+ * last one, then unmaps every resident, unpinned page (the frame stays theirs)
+ * so the next touch takes the cheap reinstall fault below and marks it again.
+ * An access bit made out of minor faults; the cost is one reinstall per live
+ * page per window. Called at a frame boundary, after the seam flush.
+ */
+#ifndef X86_PG_WSS
+#define X86_PG_WSS 0
+#endif
+#if X86_PG_WSS
+#define PG_ACCESSED 0x08u
+volatile uint32_t x86_pg_wss_last = 0;      /* pages touched in the last window */
+volatile uint32_t x86_pg_wss_max = 0;
+volatile uint32_t x86_pg_wss_min = 0xFFFFFFFFu;
+volatile uint32_t x86_pg_wss_samples = 0;
+volatile uint32_t x86_pg_wss_resident = 0;  /* resident at that sample          */
+#endif
+
 /* ---- frames --------------------------------------------------------------
  *
  * A frame is one 4 KB page of AXI. They come from up to four extents, because
@@ -326,6 +351,32 @@ static void fold_clear(uint32_t page)
             guest_page_table_ptr[a] = FOLD_INVALID;
     }
 }
+
+#if X86_PG_WSS
+void x86_pager_wss_sample(void)
+{
+    uint32_t n = 0, res = 0;
+    if (!pg_flags || !guest_page_table_ptr)
+        return;
+    for (uint32_t page = 0; page < X86_PG_PAGES; page++) {
+        if (!(pg_flags[page] & PG_RESIDENT))
+            continue;
+        res++;
+        if (pg_flags[page] & PG_ACCESSED)
+            n++;
+        pg_flags[page] &= (uint8_t)~PG_ACCESSED;
+        if (!x86_page_is_pinned(page))
+            fold_clear(page);
+    }
+    x86_pg_wss_samples++;
+    x86_pg_wss_last = n;
+    x86_pg_wss_resident = res;
+    if (x86_pg_wss_samples > 2) {          /* the first windows are the boot */
+        if (n > x86_pg_wss_max) x86_pg_wss_max = n;
+        if (n < x86_pg_wss_min) x86_pg_wss_min = n;
+    }
+}
+#endif
 
 void x86_pager_refold(uint32_t page)
 {
@@ -1059,6 +1110,9 @@ uint32_t x86_pager_fault(uint32_t lin, int write)
            allocate a second frame for the same page. */
         uint8_t *host = frame_addr(pg_frame[page]);
         if (host) {
+#if X86_PG_WSS
+            pg_flags[page] |= PG_ACCESSED;
+#endif
             fold_install(page, host);
             return (uint32_t)(uintptr_t)host + (lin & (X86_PG_SIZE - 1u));
         }
@@ -1110,6 +1164,9 @@ uint32_t x86_pager_fault(uint32_t lin, int write)
        that has just done a 4 KB fill. */
     if (x86_pg_resident > x86_pg_resident_peak)
         x86_pg_resident_peak = x86_pg_resident;
+#if X86_PG_WSS
+    pg_flags[page] |= PG_ACCESSED;
+#endif
     fold_install(page, host);
 
     return (uint32_t)(uintptr_t)host + (lin & (X86_PG_SIZE - 1u));
