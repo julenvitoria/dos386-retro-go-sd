@@ -1371,6 +1371,13 @@ with the firmware's own `dma_counter`: submits climbing with peak 0 means the
 chain runs and the sources are silent; submits stuck at 0 means the frame loop
 never reaches the audio phase.
 
+`x86_audio_blocks_missed` / `x86_audio_blocks_doubled` say whether the refill
+kept step with the DMA (one `dma_counter` tick per 800-sample half): _missed
+is halves the DMA played twice because a frame overran (a click), _doubled is
+two refills inside one half (a dropped block). Timing, so **tier 3 only** --
+gwemu does not model it. Paced title, compare rungs: if _missed climbs at
+386SX 16 and not at 8088, the clicks are frame overruns, not the synthesiser.
+
 #### Sound Blaster: which commands, and did the guest unmask its IRQ?
 
 `x86_sb_cmd_hist_lo` / `_hi` are the last EIGHT DSP command bytes, newest in

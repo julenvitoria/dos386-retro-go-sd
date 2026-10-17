@@ -98,16 +98,16 @@ slot is per-app so the name is ours alone.
 | rung | cycles | rung | cycles |
 |---|---:|---|---:|
 | Max | unthrottled | 386SX 16 | 2,500 |
-| 8088 4.77 | 330 | 386DX 33 | 6,000 |
+| 8088 4.77 | 330 | 386DX 25 | 4,500 |
 | 286 8 MHz | 800 | | |
 | 286 12 MHz | 1,200 | | |
 
-**The table stops at 386DX 33** (removed 2026-10-17: 486SX 25 / 486DX2 66 /
-486DX4 100 = 9k/24k/40k). The silicon delivers ~5,500 kips, so 386DX 33 is
-already at the ceiling and the 486 rungs never throttled — they scored
-identically to Max and only invited users to pick a machine that was not
-there. A stored index 6..8 is out of range and clamps to Max, which is how
-those rungs already ran.
+**The table stops at 386DX 25** (2026-10-17: 486SX 25 / 486DX2 66 /
+486DX4 100 = 9k/24k/40k removed, then 386DX 33 = 6k replaced by 386DX 25).
+The silicon delivers ~5,500 kips, so any rung at or above that never
+throttled and scored identically to Max. 386DX 25 is the fastest rung that is
+really below the ceiling. `cycles` >= 5,500 (`KIPS_CEILING`) resolves to Max;
+a stored index 6..8 clamps to Max; index 5 now means 386DX 25.
 
 **A rung below the achievable rate is the only one that throttles.** Before the
 pacing fixes the effective rate was ~3,000 cycles, which sits between the 2,500
