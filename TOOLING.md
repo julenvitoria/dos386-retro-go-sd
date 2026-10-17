@@ -1371,12 +1371,15 @@ with the firmware's own `dma_counter`: submits climbing with peak 0 means the
 chain runs and the sources are silent; submits stuck at 0 means the frame loop
 never reaches the audio phase.
 
-`x86_audio_blocks_missed` / `x86_audio_blocks_doubled` say whether the refill
-kept step with the DMA (one `dma_counter` tick per 800-sample half): _missed
-is halves the DMA played twice because a frame overran (a click), _doubled is
-two refills inside one half (a dropped block). Timing, so **tier 3 only** --
-gwemu does not model it. Paced title, compare rungs: if _missed climbs at
-386SX 16 and not at 8088, the clicks are frame overruns, not the synthesiser.
+`x86_audio_blocks_missed` counts DMA halves (one `dma_counter` tick per
+800-sample half) played without a refill -- each one a click. The refill is
+`audio_pump()` in `src/main.c`: it runs at every guest sub-slice boundary
+(the frame is cut into `AUDIO_CHUNK_DIV` runs for it) and at the audio phase,
+and renders only when `dma_counter` moved, so it is exactly one block per
+half however long frames are. Timing, so **tier 3 only** -- under gwemu the
+number means nothing. On silicon it should stay near 0 at every CPU rung;
+climbing means something blocks for >16.7 ms with no boundary (a long HLE
+disk read, an interpreter call over `GUEST_ASM_MS_MAX`).
 
 #### Sound Blaster: which commands, and did the guest unmask its IRQ?
 

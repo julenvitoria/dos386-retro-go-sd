@@ -288,17 +288,11 @@ volatile uint32_t frames_rendered = 0;
    loop for why each exists; between them they say whether a buffer was
    submitted, whether it had anything in it, and at what volume. */
 volatile uint32_t x86_audio_submits = 0;   /* buffers handed to the SAI DMA  */
-/* DMA halves the refill did not line up with, read off the firmware's own
-   dma_counter (one tick per half played). The loop is paced by the PANEL and
-   the DMA by the SAI, so nothing forces exactly one refill per half: a frame
-   that overruns 16.7 ms lets the DMA replay a half we never rewrote (heard as
-   a click -- a block repeated at exactly two halves' lag, which is what a
-   console recording of Monkey Island EGA showed at 386SX 16), and two refills
-   inside one half overwrite each other (a block dropped). _missed counts the
-   halves played without a refill, _doubled the refills that landed in a half
-   already refilled. Both 0 = the audio clock and the frame loop agree. */
+/* DMA halves played without a refill, read off the firmware's own dma_counter
+   (one tick per half played): a half the DMA had to play TWICE because no
+   sub-slice boundary or audio phase came round within its 16.7 ms -- heard as
+   a click. 0 = the refill kept step with the audio clock. See audio_pump(). */
 volatile uint32_t x86_audio_blocks_missed  = 0;
-volatile uint32_t x86_audio_blocks_doubled = 0;
 volatile uint32_t x86_audio_peak_last = 0; /* loudest sample, newest buffer  */
 volatile uint32_t x86_audio_peak_max = 0;  /* loudest sample, whole session  */
 volatile uint32_t x86_audio_volume = 0;    /* the launcher's own 0..255      */
@@ -3991,9 +3985,143 @@ static void arm_tick_irq(void)
 /* Wall-clock ceiling on ONE uninterruptible interpreter call. Well under the
    ~472 ms watchdog window, and above the 65-100 ms whole FRAMES a healthy
    title produces, so it fires on the pathological mix and nothing else. */
+/* Audio chunks per regulated slice: max_slice targets GUEST_EXEC_PCT of a
+   frame, so 4 puts an audio_pump() boundary every ~3.5 ms of guest work. */
+#ifndef AUDIO_CHUNK_DIV
+#define AUDIO_CHUNK_DIV 4u
+#endif
+
 #ifndef GUEST_ASM_MS_MAX
 #define GUEST_ASM_MS_MAX 60u
 #endif
+
+
+/*
+ * THE AUDIO REFILL RUNS ON THE DMA'S CLOCK, NOT THE FRAME'S.
+ *
+ * The SAI DMA plays two 800-sample halves at exactly 60 Hz and bumps the
+ * firmware's dma_counter as each one finishes; audio_get_active_buffer() is
+ * the half it just let go of. This used to be refilled once per FRAME, at the
+ * audio phase -- and the frame loop is paced by the PANEL and stretched by the
+ * guest, so nothing tied the two together. Measured on two console recordings
+ * of Monkey Island (EGA and VGA, AdLib): at 386SX 16, 17-20% of 8 ms windows
+ * repeated at exactly two halves' lag (1598 samples) -- a half the DMA played
+ * again because the frame that should have rewritten it ran long, heard as a
+ * click -- falling to under 1% at 286 8 MHz. The owner also heard the music
+ * SPEED UP with the CPU: a short frame after a long one refilled the same
+ * half twice, so a block was overwritten unheard and the tune skipped ahead.
+ *
+ * So the refill is called from every guest sub-slice boundary as well as from
+ * the audio phase, and it renders ONLY when dma_counter has moved since the
+ * last refill: exactly one block per half played, whatever the frames do, and
+ * a block written within a sub-slice (AUDIO_CHUNK_DIV) of the half freeing up
+ * instead of up to a frame later. XTulator met the same defect on the same
+ * game (its a8dcb4e / 3e55a17) and paced its whole loop off the DMA; this
+ * core keeps the panel pacing and moves only the refill.
+ *
+ * A firmware without dma_counter_ptr gets the old once-per-frame refill.
+ */
+static uint32_t audio_frames;       /* samples per half, set at audio start */
+static uint32_t audio_dma_last;
+static int      audio_dma_seen;
+
+static void audio_pump(const gw_firmware_abi_t *abi, int frame_end)
+{
+    if (abi->dma_counter_ptr) {
+        uint32_t now = *(volatile uint32_t *)abi->dma_counter_ptr;
+        uint32_t d = now - audio_dma_last;
+        if (audio_dma_seen && d == 0u)
+            return;                             /* this half is written */
+        if (audio_dma_seen && d > 1u && d < 64u) /* a pause is not a miss */
+            x86_audio_blocks_missed += d - 1u;
+        audio_dma_last = now;
+        audio_dma_seen = 1;
+    } else if (!frame_end) {
+        return;
+    }
+    int16_t *abuf = abi->audio_get_active_buffer();
+    if (abuf && audio_frames) {
+        int16_t amp = (int16_t)(((int32_t)abi->common_emu_sound_get_volume()
+                                 * INT16_MAX) >> 10);
+#if X86_AUDIO_TONE
+        /* THE PARTITION TEST. Every emulated source is bypassed: a 440 Hz
+           square at the launcher's own volume, written straight into the
+           half-buffer the SAI DMA is reading. Nothing downstream of here
+           is ours, so this separates "the guest never played anything"
+           from "nothing we write is ever heard". */
+        {
+            static uint32_t phase;              /* 16.16, survives frames */
+            uint32_t step = (uint32_t)(((uint64_t)440u << 16) / SAMPLE_RATE);
+            for (unsigned i = 0; i < audio_frames; i++) {
+                abuf[i] = (phase & 0x8000u) ? amp : (int16_t)-amp;
+                phase = (phase + step) & 0xFFFFu;
+            }
+        }
+#else
+        x86_speaker_render(abuf, audio_frames, SAMPLE_RATE, amp);
+        /* THE SOUND BLASTER IS MIXED ON TOP, AND THIS CALL IS ALSO WHAT
+           ADVANCES THE DMA TRANSFER -- there is no per-instruction engine
+           anywhere (x86_io.c's engine block says why). It pulls exactly the
+           guest bytes this frame's samples needed, so the transfer runs at
+           the sample clock, which is what the hardware does. A card at half
+           amplitude against the speaker keeps a beep audible under music
+           rather than being swamped by it.
+
+           THE >> 1 THAT WAS HERE IS GONE, and the reason it was here is
+           the reason it had to go: it ducked the card under the music, and
+           at the time THERE WAS NO MUSIC. There is now -- x86_opl.c --
+           so the collision it guarded against is real again; it is still
+           not reinstated, because the measurement that removed it stands
+           (silicon, PRINCE OF PERSIA: x86_audio_peak_max 495 -> 991 for
+           the same 18 transfers) and the FM gain below was chosen against
+           THIS card level rather than against the ducked one. The mix
+           clamps either way. */
+        x86_sb_render_mix(abuf, audio_frames, SAMPLE_RATE, amp);
+#endif
+        /* AND THE FM SYNTHESISER ON TOP OF BOTH, on the same clock and for
+           the same reason: a title can play a digitised effect over its
+           AdLib music and the three must SUM, not replace one another.
+           It early-outs to nothing when no voice is sounding, so a title
+           with no music pays one load and a test. Placed BEFORE the peak
+           scan below on purpose -- x86_audio_peak_max is meant to answer
+           "did anything reach the DMA", and FM is now one of the things
+           that can. */
+#if X86_OPL_FM
+#if X86_OPL_BENCH
+        /* MEASUREMENT ONLY. The cost of the synthesis in the REAL core --
+           its code in RAM_EMU, the caches on, the frame loop around it --
+           which is the only environment whose cycle count describes what
+           the owner will feel. x86_opl_bench_all_on() holds all nine
+           channels sounding so this is the chip's worst case. */
+        {
+            uint32_t t0 = DWT_CYCCNT;
+            x86_opl_render_mix(abuf, audio_frames, SAMPLE_RATE, amp);
+            x86_opl_frame_cycles = DWT_CYCCNT - t0;
+        }
+#else
+        x86_opl_render_mix(abuf, audio_frames, SAMPLE_RATE, amp);
+#endif
+#endif
+        /* WHAT WE ACTUALLY SUBMITTED, on every tier and every build. One
+           pass over the buffer we just wrote: how many frames were handed
+           to the DMA, and the loudest sample in the newest of them. A peak
+           of 0 with submits climbing says the chain runs and the sources
+           are silent; submits stuck at 0 says the frame loop never reaches
+           the audio phase at all. Neither is inferable from the SB
+           counters, and the difference is the whole question. */
+        x86_audio_submits++;
+        int32_t pk = 0;
+        for (unsigned i = 0; i < audio_frames; i++) {
+            int32_t s = abuf[i];
+            if (s < 0) s = -s;
+            if (s > pk) pk = s;
+        }
+        x86_audio_peak_last = (uint32_t)pk;
+        if ((uint32_t)pk > x86_audio_peak_max)
+            x86_audio_peak_max = (uint32_t)pk;
+        x86_audio_volume = (uint32_t)abi->common_emu_sound_get_volume();
+    }
+}
 
 static void emulator_loop(const gw_firmware_abi_t *abi)
 {
@@ -4029,7 +4157,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
        answer is how the mismatch above stayed invisible. Start with the length
        we want, then read it back so the number we render is the firmware's. */
     abi->audio_start_playing(SPEAKER_FRAMES);
-    uint32_t audio_frames = (uint32_t)abi->audio_get_buffer_length();
+    audio_frames = (uint32_t)abi->audio_get_buffer_length();
     if (audio_frames > SPEAKER_FRAMES)
         audio_frames = SPEAKER_FRAMES;
 
@@ -4354,8 +4482,21 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
            before the new one lands, and the emulated CPU's declared speed is
            what converts instructions into 1.193182 MHz ticks. */
         x86_pit_sync();
-        cpu_state_ptr->pit_reload = sub_slice;
+        /* AUDIO CHUNKS. A sub-slice is the unit of the guest's timer plan and
+           at the boot divisor it is the whole frame, so it is cut further into
+           runs of at most chunk instructions purely to give audio_pump() a
+           boundary every few ms. A run that ends inside its sub-slice changes
+           nothing about the tick plan: no interrupt is armed and subs does not
+           move. */
+        uint32_t chunk = max_slice / AUDIO_CHUNK_DIV;
+        if (chunk < MAX_SLICE_FLOOR)
+            chunk = MAX_SLICE_FLOOR;
+        uint32_t sub_left = sub_slice;
+        uint32_t run = sub_left < chunk ? sub_left : chunk;
+        cpu_state_ptr->pit_reload = run;
         arm_tick_irq();
+        if (cpu_state_ptr->pit_counter != 1u)
+            x86_pit_counter_forced(run);
 
         FRAME_PHASE(X86_PHASE_GUEST);
         uint32_t exec_start_ms = abi->HAL_GetTick();
@@ -4381,6 +4522,8 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
              * pending tick keeps priority -- the one-deep slot is the emulated
              * 8259A's whole model of one.
              */
+            /* The audio half the DMA just freed, if it freed one. */
+            audio_pump(abi, 0);
             input_irqs += (uint32_t)x86_kbd_raise_irq(cpu_state_ptr);
             /* IRQ 5, on the same terms and in the same place. A sound driver
                that starts a transfer and waits for the completion interrupt is
@@ -4431,8 +4574,17 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                     sub_slice /= 2u;
                     if (sub_slice < MAX_SLICE_FLOOR)
                         sub_slice = MAX_SLICE_FLOOR;
-                    cpu_state_ptr->pit_reload = sub_slice;
                 }
+                if (chunk > MAX_SLICE_FLOOR) {
+                    chunk /= 2u;
+                    if (chunk < MAX_SLICE_FLOOR)
+                        chunk = MAX_SLICE_FLOOR;
+                }
+                if (sub_left > sub_slice)
+                    sub_left = sub_slice;
+                if (run > chunk)
+                    run = chunk;
+                cpu_state_ptr->pit_reload = run;
             }
             /* Bank the slice's guest time while pit_counter still holds what
                the guest left it at -- every host store to it below is a
@@ -4446,8 +4598,9 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
             if (reason == X86_EXIT_TIMER) {
                 cpu_state_ptr->exit_reason = 0;
                 /* The budget was spent, so that much of the debt is paid. */
-                guest_insn_debt -= (guest_insn_debt < sub_slice)
-                                 ? guest_insn_debt : sub_slice;
+                guest_insn_debt -= (guest_insn_debt < run)
+                                 ? guest_insn_debt : run;
+                sub_left = sub_left > run ? sub_left - run : 0u;
                 /*
                  * THE GUEST REPROGRAMMED THE SYSTEM TIMER MID-FRAME (the port
                  * 0x40 write ended this sub-slice early, x86_io.c). The rest of
@@ -4464,7 +4617,8 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                 {
                     uint32_t nd = x86_pit0_divisor();
                     if (nd != plan_div) {
-                        uint32_t left = sub_slice * subs;   /* this one too */
+                        /* what is left of this sub-slice, and the rest */
+                        uint32_t left = sub_left + sub_slice * (subs - 1u);
                         /* instructions per tick at the new rate: this
                            frame's instructions per ms, times the divisor, over
                            the 1,193 PIT counts in a ms. 32-bit on purpose --
@@ -4482,14 +4636,27 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                         sub_slice = left / n;
                         if (sub_slice < MAX_SLICE_FLOOR)
                             sub_slice = MAX_SLICE_FLOOR;
-                        cpu_state_ptr->pit_reload = sub_slice;
+                        sub_left = 0;   /* start the re-planned sub-slices */
                     }
+                }
+                /* An audio chunk inside the sub-slice: go straight back in,
+                   with no interrupt and no change to the tick plan. */
+                if (sub_left) {
+                    run = sub_left < chunk ? sub_left : chunk;
+                    cpu_state_ptr->pit_reload = run;
+                    x86_pit_counter_forced(run);
+                    continue;
                 }
                 if (--subs == 0)
                     break;
                 /* Another sub-slice: arm the next timer interrupt and go back
                    in. Nothing else about the frame changes. */
+                sub_left = sub_slice;
+                run = sub_left < chunk ? sub_left : chunk;
+                cpu_state_ptr->pit_reload = run;
                 arm_tick_irq();
+                if (cpu_state_ptr->pit_counter != 1u)
+                    x86_pit_counter_forced(run);
                 continue;
             }
             if (reason == X86_EXIT_HLE_INT) {
@@ -4685,100 +4852,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
          * at >> 10 for the same PRINCE OF PERSIA speaker workload. */
         FRAME_PHASE(X86_PHASE_AUDIO);
         X86_ZONE_ENTER(X86_ZONE_AUDIO);             /* ZONES */
-        int16_t *abuf = abi->audio_get_active_buffer();
-        if (abi->dma_counter_ptr) {
-            static uint32_t dma_last;
-            static int dma_seen;
-            uint32_t now = *(volatile uint32_t *)abi->dma_counter_ptr;
-            uint32_t d = now - dma_last;
-            if (dma_seen && d == 0u)
-                x86_audio_blocks_doubled++;
-            else if (dma_seen && d > 1u && d < 64u)  /* a pause is not a miss */
-                x86_audio_blocks_missed += d - 1u;
-            dma_last = now;
-            dma_seen = 1;
-        }
-        if (abuf && audio_frames) {
-            int16_t amp = (int16_t)(((int32_t)abi->common_emu_sound_get_volume()
-                                     * INT16_MAX) >> 10);
-#if X86_AUDIO_TONE
-            /* THE PARTITION TEST. Every emulated source is bypassed: a 440 Hz
-               square at the launcher's own volume, written straight into the
-               half-buffer the SAI DMA is reading. Nothing downstream of here
-               is ours, so this separates "the guest never played anything"
-               from "nothing we write is ever heard". */
-            {
-                static uint32_t phase;              /* 16.16, survives frames */
-                uint32_t step = (uint32_t)(((uint64_t)440u << 16) / SAMPLE_RATE);
-                for (unsigned i = 0; i < audio_frames; i++) {
-                    abuf[i] = (phase & 0x8000u) ? amp : (int16_t)-amp;
-                    phase = (phase + step) & 0xFFFFu;
-                }
-            }
-#else
-            x86_speaker_render(abuf, audio_frames, SAMPLE_RATE, amp);
-            /* THE SOUND BLASTER IS MIXED ON TOP, AND THIS CALL IS ALSO WHAT
-               ADVANCES THE DMA TRANSFER -- there is no per-instruction engine
-               anywhere (x86_io.c's engine block says why). It pulls exactly the
-               guest bytes this frame's samples needed, so the transfer runs at
-               the sample clock, which is what the hardware does. A card at half
-               amplitude against the speaker keeps a beep audible under music
-               rather than being swamped by it.
-
-               THE >> 1 THAT WAS HERE IS GONE, and the reason it was here is
-               the reason it had to go: it ducked the card under the music, and
-               at the time THERE WAS NO MUSIC. There is now -- x86_opl.c --
-               so the collision it guarded against is real again; it is still
-               not reinstated, because the measurement that removed it stands
-               (silicon, PRINCE OF PERSIA: x86_audio_peak_max 495 -> 991 for
-               the same 18 transfers) and the FM gain below was chosen against
-               THIS card level rather than against the ducked one. The mix
-               clamps either way. */
-            x86_sb_render_mix(abuf, audio_frames, SAMPLE_RATE, amp);
-#endif
-            /* AND THE FM SYNTHESISER ON TOP OF BOTH, on the same clock and for
-               the same reason: a title can play a digitised effect over its
-               AdLib music and the three must SUM, not replace one another.
-               It early-outs to nothing when no voice is sounding, so a title
-               with no music pays one load and a test. Placed BEFORE the peak
-               scan below on purpose -- x86_audio_peak_max is meant to answer
-               "did anything reach the DMA", and FM is now one of the things
-               that can. */
-#if X86_OPL_FM
-#if X86_OPL_BENCH
-            /* MEASUREMENT ONLY. The cost of the synthesis in the REAL core --
-               its code in RAM_EMU, the caches on, the frame loop around it --
-               which is the only environment whose cycle count describes what
-               the owner will feel. x86_opl_bench_all_on() holds all nine
-               channels sounding so this is the chip's worst case. */
-            {
-                uint32_t t0 = DWT_CYCCNT;
-                x86_opl_render_mix(abuf, audio_frames, SAMPLE_RATE, amp);
-                x86_opl_frame_cycles = DWT_CYCCNT - t0;
-            }
-#else
-            x86_opl_render_mix(abuf, audio_frames, SAMPLE_RATE, amp);
-#endif
-#endif
-            /* WHAT WE ACTUALLY SUBMITTED, on every tier and every build. One
-               pass over the buffer we just wrote: how many frames were handed
-               to the DMA, and the loudest sample in the newest of them. A peak
-               of 0 with submits climbing says the chain runs and the sources
-               are silent; submits stuck at 0 says the frame loop never reaches
-               the audio phase at all. Neither is inferable from the SB
-               counters, and the difference is the whole question. */
-            x86_audio_submits++;
-            int32_t pk = 0;
-            for (unsigned i = 0; i < audio_frames; i++) {
-                int32_t s = abuf[i];
-                if (s < 0) s = -s;
-                if (s > pk) pk = s;
-            }
-            x86_audio_peak_last = (uint32_t)pk;
-            if ((uint32_t)pk > x86_audio_peak_max)
-                x86_audio_peak_max = (uint32_t)pk;
-            x86_audio_volume = (uint32_t)abi->common_emu_sound_get_volume();
-        }
+        audio_pump(abi, 1);
         X86_ZONE_EXIT();                            /* ZONES: end AUDIO */
 
         /* Pace the loop. lcd_wait_for_vblank() is NOT usable here: gwemu does
