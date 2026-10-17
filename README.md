@@ -42,40 +42,28 @@ con el nombre del ejecutable (por ejemplo `MONKEY`).
 
 ## Configuración por juego (`.cfg`)
 
-Usa el formato de DOSBox, así que se puede copiar casi tal cual un
-`dosbox.conf`. Todo es opcional:
+Al lado de cada juego puede ir un `.cfg` con su mismo nombre (`MONKEY.dsk` →
+`MONKEY.cfg`), en el formato de DOSBox. Un ejemplo:
 
 ```ini
 [cpu]
-cycles = 2500        ; miles de instrucciones por segundo (como en DOSBox); max = lo que dé
-
-[dos]
-xms = true           ; o false, o un tamaño: xms_kb = 2048
-ems = true           ; o false, o ems_kb = 1024 (múltiplos de 16)
+cycles = 2500        ; velocidad (como en DOSBox); max = lo que dé la consola
 
 [autoexec]
-; directorio de trabajo y programa a ejecutar (con sus parámetros si los lleva)
 cd \MONKEY
-monkey
+monkey a
 
 [gamepad]
 a      = enter       ; qué tecla del PC manda cada botón
-b      = esc
-start  = f5
-select = none
-repeat = on          ; repetición al mantener pulsado
-mouse  = on          ; ratón: la cruceta mueve el puntero, A/B son los botones
+mouse  = on          ; ratón con la cruceta
 ```
 
-- `;` o `#` empiezan un comentario (al principio de la línea, o detrás de un espacio). En `[autoexec]` solo a principio de línea, porque una orden de DOS puede llevarlos.
-- En `[autoexec]` las líneas típicas de DOSBox (`mount`, `imgmount`, `echo`,
-  `cls`, `c:`…) se ignoran sin dar error; cuenta el `cd` y el último programa.
-- **Teclas de los botones**: la lista completa de nombres (y cómo saber qué
-  teclas usa un juego) está en
+- **Todas las opciones** (`[cpu]`, `[dos]`, `[autoexec]`, `[gamepad]`), los
+  perfiles de CPU, las opciones de sonido de los propios juegos (como el `a`
+  de `monkey a`, que elige AdLib) y qué tarjetas se emulan:
+  [`docs/cfg.md`](docs/cfg.md).
+- **Nombres de teclas** para los botones, y cómo saber qué teclas usa un juego:
   [`docs/input/06-gamepad-keys.md`](docs/input/06-gamepad-keys.md).
-- **Velocidad de la CPU**: también se cambia desde el menú de retro-go
-  (PAUSE/SET → CPU Speed), con perfiles de 8088 a 486. Algunos juegos de la
-  época fallan si la CPU va demasiado rápida.
 
 ## Controles
 
