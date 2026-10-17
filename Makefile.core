@@ -143,10 +143,11 @@ X86_EGA_SHPROF ?= 0
 # and per-PORT-ACCESS, never per guest instruction. scripts/probe_report.py
 # builds with it and prints the measured link delta in every report.
 X86_PROBE ?= 0
-# Working-set sampler (x86_pager.c): diagnostic, unmaps resident pages each
-# window to see which ones the guest really touches. Never in a shipping build.
-X86_PG_WSS ?= 0
-X86_PG_WSS_FRAMES ?= 60
+# Working-set sampler (x86_pager.c): unmaps resident pages each window (5 s) to
+# see which ones the guest really touches; the donation policy reserves THAT,
+# not the resident peak (docs/12 5c). 0 restores the peak-based policy.
+X86_PG_WSS ?= 1
+X86_PG_WSS_FRAMES ?= 300
 
 # How many distinct (kind, id, AH, sub) keys the accumulator holds. 128 keys is
 # 2,848 B of RAM_EMU .bss all in; the busiest title measured here claimed 60.

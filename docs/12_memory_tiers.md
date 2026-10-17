@@ -342,10 +342,32 @@ MEASURED, KEEN4, gwemu tier 2, map screen with movement (pool 150):
 | 5 s | 57-77 in play, 114 at level entry | 134-137 |
 
 So 20-80 of the 137 resident pages are COLD in play. The full 65,536-offset
-card needs ~29 frames more than the 35,840 one; a policy on the measured working
-set instead of the peak could fund it by evicting cold pages once. Open: the
-cost of those one-off writebacks on silicon (§1b), and level entry (114 in 5 s)
-leaving ~7 frames of margin.
+card needs ~29 frames more than the 35,840 one.
+
+**BUILT on the branch, two pieces:**
+
+1. **The card is two claims.** `X86_ARENA_ID_EGA` in the arena (35,840 offsets)
+   and `X86_ARENA_ID_EGA2` in frames the pager lends, for the rest up to
+   65,536. `vga_cell()` and `blit_ega16()` split at `x86_vga_ega_split()`. A
+   one-piece full card had to come out of donated frames alone -- 64 of them --
+   because a claim cannot span regions; two pieces cost ~31. Grow and shrink
+   only ever add or drop the second piece, so the arena's piece is never
+   re-fitted under a running guest and nothing in it can be lost.
+2. **The policy reserves the working set, not the peak.** `X86_PG_WSS` is on by
+   default with 5 s windows (`X86_PG_WSS_FRAMES=300`); the reserve is
+   `max(FLOOR, ws_est + MARGIN, ratchet)` with `ws_est` the larger of the last
+   two windows, and pressure is the working set not fitting OR more than
+   `X86_PG_THRASH_EV` (32) evictions in a window. Evicting cold pages once is
+   the point, so an eviction alone is no longer the warning. `X86_PG_WSS=0`
+   restores the peak policy.
+
+MEASURED, KEEN4, gwemu tier 2 (pool 151): the card is **65,536 offsets in
+play** (35,840 before), the world map renders whole where its lower half used
+to be lost, 57 pagefile writes in the first minute (46 of them as the level
+loads), one shrink-and-regrow at level entry, `guest_ram_pages` 151.
+**Silicon UNMEASURED**: the open question is what those ~50 one-off writebacks
+cost on the device (§1b: ~11 ms each), and whether level entry -- 114 pages in
+5 s against 120 left to the guest at tier 2, 127 on hardware -- thrashes.
 
 ## 6. XMS — a tier with NO fast path at all
 

@@ -107,7 +107,14 @@ int x86_pager_set_tables(void *block, uint32_t bytes)
  * page per window. Called at a frame boundary, after the seam flush.
  */
 #ifndef X86_PG_WSS
-#define X86_PG_WSS 0
+#define X86_PG_WSS 1
+#endif
+/* Evictions in one window above which the working set is said NOT to fit,
+   whatever the sampler counted: the guest is paying SD writes for pages it is
+   still using. Cold pages going out once is the point of the policy; this is
+   the line between that and thrash. */
+#ifndef X86_PG_THRASH_EV
+#define X86_PG_THRASH_EV 32u
 #endif
 #if X86_PG_WSS
 #define PG_ACCESSED 0x08u
@@ -116,6 +123,9 @@ volatile uint32_t x86_pg_wss_max = 0;
 volatile uint32_t x86_pg_wss_min = 0xFFFFFFFFu;
 volatile uint32_t x86_pg_wss_samples = 0;
 volatile uint32_t x86_pg_wss_resident = 0;  /* resident at that sample          */
+volatile uint32_t x86_pg_ws_est = 0;        /* what the policy reserves for     */
+volatile uint32_t x86_pg_ws_ev_window = 0;  /* evictions in the last window     */
+static uint32_t ws_prev, ws_ev_mark;
 #endif
 
 /* ---- frames --------------------------------------------------------------
@@ -369,6 +379,12 @@ void x86_pager_wss_sample(void)
             fold_clear(page);
     }
     x86_pg_wss_samples++;
+    /* The estimate is the larger of the last two windows: one window can end
+       halfway through a burst, two cannot both miss it. */
+    x86_pg_ws_est = (n > ws_prev) ? n : ws_prev;
+    ws_prev = n;
+    x86_pg_ws_ev_window = x86_pg_evictions - ws_ev_mark;
+    ws_ev_mark = x86_pg_evictions;
     x86_pg_wss_last = n;
     x86_pg_wss_resident = res;
     if (x86_pg_wss_samples > 2) {          /* the first windows are the boot */
@@ -987,13 +1003,33 @@ void x86_pager_policy_reset(void)
     x86_pg_shrink_signals = x86_pg_grow_signals = 0;
 }
 
+/*
+ * WHAT THE RESERVE IS BUILT ON. With the sampler (X86_PG_WSS, the default) it
+ * is the WORKING SET: pages the guest touched in the last two windows. Without
+ * it, the resident peak -- every page ever made resident, which charges a page
+ * touched once at load time as much as one touched every frame, and is why a
+ * Galaxy-engine title's EGA card could never stay full in play (docs/12 §5c).
+ * Until two windows have been seen there is no measurement, and the honest
+ * stand-in is everything resident.
+ */
+static uint32_t ws_basis(void)
+{
+#if X86_PG_WSS
+    if (x86_pg_wss_samples >= 2u)
+        return x86_pg_ws_est;
+    return x86_pg_resident;
+#else
+    return x86_pg_resident_peak;
+#endif
+}
+
 uint32_t x86_pager_policy_reserve(void)
 {
     uint32_t r;
 
     if (!policy_on)
         return donate_reserve;
-    r = x86_pg_resident_peak + pol_margin;
+    r = ws_basis() + pol_margin;
     if (r < pol_floor)
         r = pol_floor;
     if (r < x86_pg_policy_ratchet)
@@ -1036,14 +1072,24 @@ int x86_pager_policy_tick(void)
     /* The watermark first (it fires BEFORE a write), the eviction counter
        second (it fires after one, and only catches what the watermark could
        not see inside a single tick). */
+#if X86_PG_WSS
+    /* With a measured working set, an eviction is no longer the warning: the
+       cold pages are SUPPOSED to go out (once). Pressure is the working set
+       not fitting what the guest has, or the window's evictions saying it is
+       paying SD writes for pages it still uses. */
+    pressure = (ws_basis() + pol_margin > live)
+               || (x86_pg_ws_ev_window > X86_PG_THRASH_EV);
+    (void)ev;
+#else
     pressure = (x86_pg_frames_free < pol_margin)
                || (ev != pol_ev_seen);
+#endif
     pol_ev_seen = ev;
 
     if (pressure) {
         pol_quiet = 0;
         /* Learn. The set is at least this big, so never lend into it again. */
-        want = x86_pg_resident_peak + pol_margin;
+        want = ws_basis() + pol_margin;
         if (want > x86_pg_policy_ratchet)
             x86_pg_policy_ratchet = want;
         (void)x86_pager_policy_reserve();
