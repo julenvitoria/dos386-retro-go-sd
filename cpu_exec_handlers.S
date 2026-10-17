@@ -232,12 +232,21 @@
        size -- not at the operand size, and not a linear address. A0-A3 read a
        fixed 32 bits and used the result raw: at 16-bit address size that
        mis-decoded the instruction length AND indexed the fold table far past
-       its end, so the handler dereferenced whatever lay beyond it. */
+       its end, so the handler dereferenced whatever lay beyond it.
+
+       THE OFFSET IS AN IN-STREAM FETCH, SO IT GOES THROUGH CODE_PTR. It used
+       to re-fold R10 on its own, which is wrong at exactly one place: an A0-A3
+       whose opcode sits in the last bytes of a 4 KB page, with its moffs
+       straddling into the next one. The dispatch had already staged that
+       instruction into DTCM (x86_code_reloc) and threaded code_k at the
+       staging buffer, but the private fold read the offset out of the LOW
+       granule's frame and ran into its seam slack -- so the high byte of the
+       address came from whatever the slack held at that moment. Prince of
+       Persia's `mov ax,[409Eh]` (drawn_room) sits at lin 0xBFFE: it read
+       0xFFFF while the variable held 1, so the kid and the torch flames were
+       never drawn, and only on the timings that left the slack stale. */
     .macro MOFFS_ADDR out, tmp
-        UBFX \tmp, R10, #12, #12
-        LDR.W \tmp, [R9, \tmp, LSL #2]
-        ADDS \tmp, \tmp, R10
-        MEM_TRAP_R \tmp                @ instruction stream: always a read
+        CODE_PTR \tmp
         TST.W R2, #ADDRSIZE_XOR
         BNE 9f
         LDRH \out, [\tmp]             @ 16-bit addressing: moffs16

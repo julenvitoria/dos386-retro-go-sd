@@ -6617,6 +6617,11 @@ static void seam_test_run(void)
  *   2  OPCODE.        89 06 40 00  mov [0040h],ax   at 0FFFh
  *                     the opcode is the granule's last byte; ModRM and disp16
  *                     are all in the neighbour.
+ *   3  MOFFS.         A1 20 00     mov ax,[0020h]   at 0FFEh
+ *                     A0-A3 fetch their offset through MOFFS_ADDR, which
+ *                     re-folded R10 privately instead of using CODE_PTR, so the
+ *                     offset's high byte came out of the slack. Prince of
+ *                     Persia's `mov ax,[409Eh]` at lin 0xBFFE read 0xFFFF.
  *
  * Each stores its answer at 0040h, well inside the low granule, so reading it
  * back cannot itself straddle. Run tests/test_seam.py --code-negative for the
@@ -6652,6 +6657,15 @@ static void code_seam_poke_prog(void)
         seam_poke(lo + 0x1003, 0x00);
         seam_poke(lo + 0x1004, 0xF4);
         break;
+    case 3:                                  /* moffs across        */
+        seam_poke(lo + 0x0FFE, 0xA1);        /* mov ax,[moffs16]    */
+        seam_poke(lo + 0x0FFF, 0x20);        /* moffs low  -- last byte */
+        seam_poke(lo + 0x1000, 0x00);        /* moffs high -- NEIGHBOUR */
+        seam_poke(lo + 0x1001, 0xA3);
+        seam_poke(lo + 0x1002, 0x40);
+        seam_poke(lo + 0x1003, 0x00);
+        seam_poke(lo + 0x1004, 0xF4);
+        break;
     default:                                 /* opcode is the last byte */
         seam_poke(lo + 0x0FFF, 0x89);        /* mov [disp16],ax        */
         seam_poke(lo + 0x1000, 0x06);        /* ModRM    -- NEIGHBOUR  */
@@ -6664,9 +6678,9 @@ static void code_seam_poke_prog(void)
 
 static void code_seam_test_run(void)
 {
-    static const uint16_t start_ip[3] = { 0x0FFD, 0x0FFE, 0x0FFF };
-    static const uint16_t expect[3]   = { 0x5678, 0x1234, 0xABCD };
-    uint32_t c = code_seam_case < 3 ? code_seam_case : 2;
+    static const uint16_t start_ip[4] = { 0x0FFD, 0x0FFE, 0x0FFF, 0x0FFE };
+    static const uint16_t expect[4]   = { 0x5678, 0x1234, 0xABCD, 0x5678 };
+    uint32_t c = code_seam_case < 4 ? code_seam_case : 2;
 
     for (uint32_t i = 0; i < 16; i++)
         code_seam_r[i] = 0;

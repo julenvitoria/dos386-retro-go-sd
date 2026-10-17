@@ -81,6 +81,7 @@ CODE_CASES = (
     (0, "DISPLACEMENT across the boundary  (8B 06 20 00 at 0FFDh)"),
     (1, "IMMEDIATE across the boundary     (B8 34 12 at 0FFEh)"),
     (2, "OPCODE is the granule's last byte (89 06 40 00 at 0FFFh)"),
+    (3, "MOFFS across the boundary         (A1 20 00 at 0FFEh)"),
 )
 
 
