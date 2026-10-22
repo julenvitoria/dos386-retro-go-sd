@@ -95,7 +95,7 @@ def check_input(runner, syms, out=print):
 
 
 ODROID_INPUT_START = 5        # odroid_input.h; the firmware maps B_GAME here
-PAD_SCANCODE_ENTER = 0x1C     # src/main.c pad_scancode[8] -- the X button now
+PAD_SCANCODE_ENTER = 0x1C     # src/main.c pad_scancode[5] -- the B button since 2026-10-22
 OSK_KEY_A = 0x1E              # layer 0, cell 0: the letter 'a'
 
 

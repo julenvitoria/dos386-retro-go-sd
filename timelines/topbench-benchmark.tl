@@ -12,8 +12,8 @@
 4.0  press a
 5.0  press a
 14.0 press down
-16.0 press start
-18.0 press start
+16.0 press b
+18.0 press b
 
 
 58.0 quit

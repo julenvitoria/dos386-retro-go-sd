@@ -68,7 +68,7 @@ mouse  = on          ; ratón con la cruceta
 ## Controles
 
 **Botones por defecto** (sin `[gamepad]`): cruceta = flechas, A = Espacio,
-B = Esc, TIME = Y, START = Intro, SELECT = N (START y SELECT solo en las
+B = Intro, TIME = Esc, START = Y, SELECT = N (START y SELECT solo en las
 consolas que los tienen).
 
 **GAME** abre el teclado en pantalla y va pasando por teclado → ratón → cerrar.

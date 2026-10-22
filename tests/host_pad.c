@@ -19,7 +19,7 @@ static uint8_t emitted[256];
 static unsigned n_emitted;
 static void emit(uint8_t sc) { if (n_emitted < sizeof emitted) emitted[n_emitted++] = sc; }
 
-static const uint8_t defaults[X86_PAD_BUTTONS] = { 0x48, 0x50, 0x4B, 0x4D, 0x39, 0x01, 0x00, 0x15, 0x1C, 0x31 };
+static const uint8_t defaults[X86_PAD_BUTTONS] = { 0x48, 0x50, 0x4B, 0x4D, 0x39, 0x1C, 0x00, 0x01, 0x15, 0x31 };
 
 static void parse(const char *txt, x86_pad_result_t *r)
 {
@@ -57,7 +57,7 @@ int main(void)
 
     /* a later section ends [gamepad] */
     parse("[gamepad]\na = z\n[dos]\nb = x\n", &r);
-    check(x86_pad_keys[4][0] == 0x2C && x86_pad_keys[5][0] == 0x01, "[gamepad] ends at the next header");
+    check(x86_pad_keys[4][0] == 0x2C && x86_pad_keys[5][0] == 0x1C, "[gamepad] ends at the next header");
 
     /* press / release order for a combo */
     parse("[gamepad]\nb = ctrl+c\n", &r);

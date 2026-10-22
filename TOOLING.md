@@ -2601,7 +2601,7 @@ the key goes to a program that ignores it. Capture with
 `timelines/profile-alleycat.tl` gets Alley Cat actually RUNNING and then stops
 touching it, which is what a profile window needs and what no other timeline
 did. Alley Cat has **two** gates: the joystick prompt (answer N, which is
-gwemu's `press select` -- `press time` sends Y and lands on "Game Control
+gwemu's `press select` -- `press start` sends Y and lands on "Game Control
 Adapter is not present") and then a skill-level menu wanting K/H/T/A, a LETTER
 **no button can send**. The on-screen keyboard is the only door: GAME opens it
 on layer 0 cell 0, which is `a`, and two more GAME presses close it again.
@@ -2641,9 +2641,10 @@ all 0, and 55,760 counter reads over 11 distinct low-5-bit values.
 
 **GAME NO LONGER SENDS RETURN**, and a timeline written against that is testing
 something that was deliberately removed. It is the on-screen keyboard's only
-door (`docs/input/02-button-mapping.md`), so `pad_scancode[6]` is 0 and Return
-moved to the physical START button -- which IS gwemu's `press start`, the key
-this document used to warn was inert. Three timelines drive the keyboard:
+door (`docs/input/02-button-mapping.md`), so `pad_scancode[6]` is 0. Return
+went to the physical START button (gwemu's `press start`) and, since
+2026-10-22, to B (`press b`): the owner's default is A Space, B Return, START
+Y, SELECT N, TIME Esc. Three timelines drive the keyboard:
 
 - `timelines/osk-open.tl` -- open with GAME, move the cursor, press a key,
   cycle the layer, step into mouse mode, move the pointer, close. One

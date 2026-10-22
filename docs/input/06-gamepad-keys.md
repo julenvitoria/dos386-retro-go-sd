@@ -22,8 +22,8 @@ mouse  = on             ; ratón: la cruceta mueve el puntero, A/B son los boton
 `select` son los botones físicos que solo tienen algunas consolas (la de
 Zelda). `game` **no se puede cambiar**: es la puerta del teclado en pantalla.
 
-**Por defecto**, sin `[gamepad]`: flechas en la cruceta, A = Espacio, B = Esc,
-TIME = Y, START = Intro, SELECT = N.
+**Por defecto**, sin `[gamepad]`: flechas en la cruceta, A = Espacio, B = Intro,
+TIME = Esc, START = Y, SELECT = N.
 
 ## Nombres de teclas
 

@@ -2696,12 +2696,13 @@ static const uint8_t pad_scancode[10] = {
     0x4B,  /* LEFT                    -> Left arrow  */
     0x4D,  /* RIGHT                   -> Right arrow */
     0x39,  /* A                       -> Space       */
-    0x01,  /* B                       -> Esc         */
+    0x1C,  /* B                       -> Return (owner's layout, 2026-10-22:
+              A Space, B Return, START Y, SELECT N, TIME Esc) */
     0x00,  /* ODROID_INPUT_START = GAME button: reserved for the on-screen
               keyboard toggle (8086tiny docs/input/02 decided this deliberately:
               PAUSE belongs to retro-go, so GAME is the only usable door) */
-    0x15,  /* ODROID_INPUT_SELECT = TIME button -> Y  */
-    0x1C,  /* ODROID_INPUT_X = physical START   -> Return. Zelda-only in
+    0x01,  /* ODROID_INPUT_SELECT = TIME button -> Esc */
+    0x15,  /* ODROID_INPUT_X = physical START   -> Y. Zelda-only in
               8086tiny's notes, but THIS unit reports it (raw pad bit 11). */
     0x31,  /* ODROID_INPUT_Y = physical SELECT  -> N   */
 };

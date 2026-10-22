@@ -13,10 +13,10 @@
 4.0  press a
 5.0  press a
 12.0 screenshot 01-startup.png
-14.0 press b
+14.0 press time
 16.0 press a
 18.0 screenshot 02-after-keys.png
-20.0 press time
+20.0 press start
 22.0 press select
 24.0 screenshot 03-after-more-keys.png
 26.0 press a

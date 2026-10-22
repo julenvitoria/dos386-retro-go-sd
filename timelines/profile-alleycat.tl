@@ -9,7 +9,7 @@
 #   "Do you want to use a joystick (Y/N)?"
 # and reads port 0x60. pad_scancode[9] = ODROID_INPUT_Y = the physical SELECT
 # button = gwemu `press select` = 0x31 = N, which is what puts the game on the
-# keyboard we emulate. `press time` sends Y (pad_scancode[7], 0x15), and the
+# keyboard we emulate. `press start` sends Y (pad_scancode[8], 0x15), and the
 # game then reports "Game Control Adapter is not present" and waits -- MEASURED
 # with screenshot.py, after a profile run of that state came back as 56%
 # `CMP Gv,Ev` + 44% `JZ Jb`. A two-instruction spin loop is what profiling a

@@ -16,23 +16,23 @@
 # number from the run is then about menus.
 
 3.0 press a
-4.5 press start
+4.5 press b
 6.0 press a
-7.5 press start
+7.5 press b
 9.0 press a
-10.5 press start
+10.5 press b
 12.0 press a
-13.5 press start
+13.5 press b
 15.0 press a
-16.5 press start
+16.5 press b
 18.0 press a
-19.5 press start
+19.5 press b
 21.0 press a
-22.5 press start
+22.5 press b
 24.0 press a
-25.5 press start
+25.5 press b
 27.0 press a
-28.5 press start
+28.5 press b
 30.0 screenshot 01-entered.png
 
 # ---- sustained gameplay: walk and turn, every frame a full redraw -------

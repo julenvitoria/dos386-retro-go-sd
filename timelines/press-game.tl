@@ -8,12 +8,12 @@
 # how "START sends Return" came to be believed working while the device said
 # otherwise. Press GAME to test GAME.
 #
-# TIME first: Alley Cat opens on "use a joystick (Y/N)?" and TIME sends N,
+# SELECT first: Alley Cat opens on "use a joystick (Y/N)?" and SELECT sends N,
 # which is what puts the game on the keyboard we emulate. Pressing Return at
 # that prompt is not observable, so the answer has to come first.
 4.0  press a
 5.0  press a
-10.0 press time
+10.0 press select
 12.0 screenshot 01-after-time.png
 14.0 press game
 16.0 screenshot 02-after-game.png
