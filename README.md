@@ -1,5 +1,7 @@
 # TinyEMU x86 para Game & Watch (retro-go SD)
 
+*[Read in English](README.en.md)*
+
 Un PC con MS-DOS para la Game & Watch, como núcleo externo del firmware
 **retro-go SD** (rama `external_cores`, ABI v2). Parte del
 [TinyEMU de Fabrice Bellard](docs/tinyemu-original.md), con la CPU x86

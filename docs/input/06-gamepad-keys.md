@@ -1,5 +1,7 @@
 # Teclas para los botones (`[gamepad]` del `.cfg`)
 
+*[Read in English](06-gamepad-keys.en.md)*
+
 *Guía para quien escribe el `.cfg` de un juego. El formato y el parser están en
 [`x86_pad.h`](../../x86_pad.h) / `x86_pad.c`; esta página es la lista que se
 consulta al escribirlo.*
@@ -78,5 +80,5 @@ No hay forma automática: cada juego de DOS eligió las suyas. Por orden:
 
 Cuidado con los juegos en los que una tecla tiene un efecto inesperado: en
 Monkey Island (y los demás SCUMM) **Espacio es pausa**, así que con la A por
-defecto el juego se pausa; Intro (START) avanza los textos y Esc (B) salta
+defecto el juego se pausa; Intro (B) avanza los textos y Esc (TIME) salta
 escenas.
