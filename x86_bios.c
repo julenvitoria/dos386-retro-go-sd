@@ -231,6 +231,14 @@ void x86_bios_init(void)
 void x86_bios_tick(void)
 {
     bda_w32(BDA_TICKS, bda_r32(BDA_TICKS) + 1u);
+    /* The diskette motor-off countdown at 0040:0040. The real INT 08h
+       decrements it every tick and stops the motors (0040:003F) at zero, and
+       programs use it as a one-tick delay: Ironman Super Off Road writes 1 and
+       spins until it reads 0 -- forever here, with the speaker on. */
+    uint8_t m = bda_r8(BDA + 0x40);
+    if (m && --m == 0)
+        bda_w8(BDA + 0x3F, (uint8_t)(bda_r8(BDA + 0x3F) & 0xF0u));
+    bda_w8(BDA + 0x40, m);
 }
 
 /* --------------------------------------------------------------------------
