@@ -514,7 +514,7 @@ volatile uint32_t guest_slice_halted = 0;
 /* Where the guest was when it executed HLT: (CS << 16) | IP, 16 deep, plus the
    last linear EIP. See the capture site for why the LOCATION is the question
    and the count is not. */
-volatile uint32_t x86_hlt_log[16];
+volatile uint32_t x86_hlt_log[4];   /* 16 -> 4, 2026-10-22: RAM_EMU */
 volatile uint32_t x86_hlt_log_idx = 0;
 volatile uint32_t x86_hlt_last_eip = 0;
 volatile uint32_t guest_grow_blocked = 0;
@@ -3918,6 +3918,7 @@ static void arm_tick_irq(void)
         return;
     }
     cpu_state_ptr->hard_int_pending = 0x08;
+    x86_pic_mark_in_service(0);
     x86_pit_counter_forced(1);       /* NOT a raw store: see x86_pit_sync() */
     tick_irqs_owed--;
     guest_ticks++;
@@ -4682,7 +4683,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                    first is work we cannot have, the second is the guest
                    sitting at a prompt and nothing to do with throughput.
                    One ring of (CS<<16 | IP), plus a linear EIP, answers it. */
-                x86_hlt_log[x86_hlt_log_idx & 15u] =
+                x86_hlt_log[x86_hlt_log_idx & 3u] =
                     ((uint32_t)cpu_state_ptr->segs[1].sel << 16)
                     | (cpu_state_ptr->eip & 0xFFFFu);
                 x86_hlt_log_idx++;

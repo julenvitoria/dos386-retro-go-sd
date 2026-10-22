@@ -2409,6 +2409,7 @@ static void kbd_test_run(void)
     /* Inject a key exactly as INT 09h does: a scancode on the controller,
        then the BIOS keyboard interrupt handler. 0x1C is Enter. */
     x86_kbd_scancode(0x1C);
+    x86_kbd_latch_next();
     kbd_r[10] = (uint32_t)x86_bios_kbd_irq();
     kbd_r[11] = kbd_bda_r16(0x1A);
     kbd_r[12] = kbd_bda_r16(0x1C);
@@ -2420,6 +2421,7 @@ static void kbd_test_run(void)
     /* Drain the break code the controller still holds, so it cannot leak into
        a later phase. */
     x86_kbd_scancode(0x9C);
+    x86_kbd_latch_next();
     x86_bios_kbd_irq();
 
     /* Phase B: peek, peek again, read, peek empty. */
@@ -2432,11 +2434,13 @@ static void kbd_test_run(void)
     kbd_bda_w16(0x1A, 0x3C);
     kbd_bda_w16(0x1C, 0x3C);
     x86_kbd_scancode(0x39);          /* Space */
+    x86_kbd_latch_next();
     x86_bios_kbd_irq();
     kbd_r[14] = kbd_bda_r16(0x1C);   /* tail must have wrapped to 0x1E */
     kbd_r[15] = (uint16_t)(test_ram[0x400 + 0x3C] |
                            (test_ram[0x401 + 0x3C] << 8));
     x86_kbd_scancode(0xB9);
+    x86_kbd_latch_next();
     x86_bios_kbd_irq();
     kbd_test_reset_cpu(KBD_PHASE_C);
     kbd_r[19] = 0xC0DE0005;
@@ -2462,8 +2466,10 @@ static void kbd_test_run(void)
 static void osk_drain_irqs(void)
 {
     /* Bounded: a controller that never empties must fail, not hang. */
-    for (int guard = 0; guard < 32 && x86_kbd_pending(); guard++)
+    for (int guard = 0; guard < 32 && x86_kbd_pending(); guard++) {
+        x86_kbd_latch_next();
         x86_bios_kbd_irq();
+    }
 }
 
 static uint16_t osk_ring_pop(void)
@@ -2648,7 +2654,7 @@ static void osk_test_run(void)
      * one instruction per frame and the OSK's codes piled up in the queue
      * until the keyboard was closed. */
     while (x86_kbd_pending())
-        (void)x86_bios_kbd_irq();
+        { x86_kbd_latch_next(); (void)x86_bios_kbd_irq(); }
 
     cpu_state_dtcm.hard_int_pending = 0;
     cpu_state_dtcm.pit_counter = 0x5A5A;
@@ -2667,6 +2673,11 @@ static void osk_test_run(void)
     /* With IF set the boundary CAN deliver, so it is pulled in -- the property
        that makes a keypress land this frame rather than at the end of a slice. */
     cpu_state_dtcm.hard_int_pending = 0;
+    /* The controller loads a code when it RAISES, and will not raise again
+       until the last one is EOI'd (x86_kbd_raise_irq): give it a fresh code
+       and the EOI a handler would have sent. */
+    x86_kbd_scancode(0x9E);
+    x86_pic_eoi_level(1);
     cpu_state_dtcm.pit_counter = 0x5A5A;
     cpu_state_dtcm.eflags = 0x0202;              /* IF SET */
     osk_r[19] = (uint32_t)((x86_kbd_raise_irq(&cpu_state_dtcm) << 16) |
@@ -2674,7 +2685,7 @@ static void osk_test_run(void)
                            (cpu_state_dtcm.pit_counter == 1u));  /* 0x10901 */
 
     while (x86_kbd_pending())
-        (void)x86_bios_kbd_irq();
+        { x86_kbd_latch_next(); (void)x86_bios_kbd_irq(); }
 }
 
 /* --------------------------------------------------------------------------

@@ -289,6 +289,7 @@ int x86_hle_dispatch(uint8_t vector)
     case 0x1A:
         return x86_bios_time(AH);
     case 0x08:
+        x86_pic_eoi_level(0);            /* the BIOS handler's EOI */
         /* Nothing to do. The BDA tick count is advanced by the frame loop,
            not here: a guest that hooks INT 08h never reaches this stub, and
            the count has to keep moving anyway. */

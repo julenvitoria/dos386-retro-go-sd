@@ -424,7 +424,7 @@ unsigned x86_video_text_cols(void);
 int x86_bios_bda_video(uint8_t *mode, uint16_t *cols);
 /* Ordered trace of everything that can change the active renderer; layout in
    x86_video.c. probe.py --dump x86_video_mode_log:16x4 */
-extern volatile uint32_t x86_video_mode_log[16];
+extern volatile uint32_t x86_video_mode_log[8];
 extern volatile uint32_t x86_video_mode_log_idx;
 void x86_video_log_event(uint32_t tag, uint32_t aux, uint32_t value);
 void x86_video_set_cursor(uint8_t col, uint8_t row);
@@ -455,6 +455,9 @@ int x86_kbd_pending(void);
    taken and pulling the instruction boundary in only when IF allows delivery.
    See the comment on the definition -- both guards are measured defects. */
 int x86_kbd_raise_irq(X86CPUState *cpu);
+void x86_kbd_latch_next(void);              /* host harness: load the next code */
+void x86_pic_mark_in_service(unsigned level);
+void x86_pic_eoi_level(unsigned level);      /* a BIOS HLE handler's own EOI */
 int x86_bios_kbd_irq(void);
 /* Scancode -> ASCII, the same decode INT 09h uses. Shared with the on-screen
    keyboard, whose echo line must show what the guest was actually sent. */
@@ -709,7 +712,7 @@ void x86_speaker_render(int16_t *dst, unsigned frames, unsigned sample_rate,
 extern uint32_t (*x86_io_time_ms)(void);
 extern volatile uint32_t x86_spk_events;          /* frequency changes logged */
 extern volatile uint32_t x86_spk_events_dropped;  /* ring overflows           */
-extern volatile uint32_t x86_spk_log[32];         /* (port<<24)|value, last 32 */
+extern volatile uint32_t x86_spk_log[8];          /* (port<<24)|value, last 8 */
 extern volatile uint32_t x86_spk_log_idx;
 /* Port 0x60: how often the guest asked, and the last 32 bytes it was given. */
 extern volatile uint32_t x86_kb_pushes;

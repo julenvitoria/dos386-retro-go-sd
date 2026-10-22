@@ -271,13 +271,17 @@ def mode_switch_checks(b, syms):
     return ok
 
 
+MODE_LOG_N = 8   # x86_video.c x86_video_mode_log[]
+
+
 def read_mode_log(b, syms):
     """The mode ring, oldest-to-newest, as (tag, aux, value) triples."""
     idx = b.read_uint32(syms["x86_video_mode_log_idx"])
-    raw = b.read_memory(syms["x86_video_mode_log"], 16 * 4)
-    words = [int.from_bytes(raw[i * 4:i * 4 + 4], "little") for i in range(16)]
-    n = min(idx, 16)
-    order = [(idx - n + i) & 15 for i in range(n)]
+    raw = b.read_memory(syms["x86_video_mode_log"], MODE_LOG_N * 4)
+    words = [int.from_bytes(raw[i * 4:i * 4 + 4], "little")
+             for i in range(MODE_LOG_N)]
+    n = min(idx, MODE_LOG_N)
+    order = [(idx - n + i) & (MODE_LOG_N - 1) for i in range(n)]
     return [((words[o] >> 24) & 0xFF, (words[o] >> 8) & 0xFFFF, words[o] & 0xFF)
             for o in order]
 

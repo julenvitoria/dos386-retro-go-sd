@@ -319,6 +319,16 @@ static void pit_ch2_gate(unsigned on)
 static uint8_t pic_ocw3_read = 2;   /* 2 = IRR, 3 = ISR */
 static uint8_t pic_imr = 0xB8;      /* the mask a booted PC/AT BIOS leaves  */
 static uint8_t pic_imr2 = 0xFF;     /* the SLAVE's, stored and read back    */
+/* The 8259's in-service register. Levels 0 (timer), 1 (keyboard) and 5 (Sound
+   Blaster) are tracked. A non-specific EOI clears the HIGHEST-PRIORITY set bit
+   -- the lowest-numbered one -- exactly as the chip does, so a timer handler's
+   EOI cannot release the keyboard. Levels 0 and 1 are set when the frame loop
+   arms the interrupt (x86_pic_mark_in_service / x86_kbd_raise_irq) and the
+   BIOS HLE stubs clear their own level, because a real BIOS handler EOIs. */
+static uint8_t pic_isr;
+
+void x86_pic_mark_in_service(unsigned level) { pic_isr |= (uint8_t)(1u << level); }
+void x86_pic_eoi_level(unsigned level)       { pic_isr &= (uint8_t)~(1u << level); }
 
 static uint8_t sb_irq_pending_line(void);   /* the SB's line; see the sound block */
 static uint8_t pic_isr_bits(void);
@@ -338,8 +348,8 @@ static uint32_t pic_read_irr(void)
 
 /* The last 32 writes that can move the tone, as (port << 24) | value, so a
    guest whose beeps come out at the wrong pitch can be read rather than
-   guessed at. scripts/probe.py --dump x86_spk_log:32x4 */
-volatile uint32_t x86_spk_log[32];
+   guessed at. scripts/probe.py --dump x86_spk_log:8x4 (32 -> 8, 2026-10-22: RAM_EMU) */
+volatile uint32_t x86_spk_log[8];
 volatile uint32_t x86_spk_log_idx = 0;
 
 /*
@@ -684,7 +694,7 @@ volatile uint32_t x86_spk_events_dropped = 0;
  */
 static void spk_event(uint32_t port, uint32_t value)
 {
-    x86_spk_log[x86_spk_log_idx & 31] = (port << 24) | (value & 0xFFu);
+    x86_spk_log[x86_spk_log_idx & 7] = (port << 24) | (value & 0xFFu);
     x86_spk_log_idx++;
 
     uint32_t div = x86_speaker_divisor();
@@ -838,10 +848,56 @@ int x86_kbd_pending(void)
  *
  * Returns 1 if the IRQ was armed.
  */
+static uint8_t  kbd_obf;          /* output buffer holds a byte not yet read */
+static uint16_t kbd_isr_stuck;    /* raise attempts refused by an un-EOI'd IRQ 1 */
+
+volatile uint32_t x86_kbd_port60_reads = 0;
+volatile uint32_t x86_kbd_read_log[32];
+volatile uint32_t x86_kbd_read_log_idx = 0;
+
+/* Move the next queued code into the output buffer. The log records what the
+   controller HANDED OUT, once per code, however many times the guest reads it. */
+static void kbd_load(void)
+{
+    x86_io.kbd_last = x86_io.kbd_queue[x86_io.kbd_head];
+    x86_io.kbd_head = (uint8_t)((x86_io.kbd_head + 1u) & 15u);
+    kbd_obf = 1;
+    x86_kbd_read_log[x86_kbd_read_log_idx & 31] = x86_io.kbd_last;
+    x86_kbd_read_log_idx++;
+}
+
+void x86_kbd_latch_next(void)
+{
+    if (x86_kbd_pending())
+        kbd_load();
+}
+
 int x86_kbd_raise_irq(X86CPUState *cpu)
 {
-    if (!x86_kbd_pending() || cpu->hard_int_pending)
+    if (!x86_kbd_pending())
         return 0;
+    /* IRQ 1 masked: the guest polls 0x64/0x60 itself. Hand it the next code
+       once it has read the last one, and raise nothing. */
+    if (pic_imr & 0x02u) {
+        if (!kbd_obf)
+            kbd_load();
+        return 0;
+    }
+    /* Not until the last keyboard interrupt was EOI'd -- a real 8259 will not
+       deliver a level again while it is in service. Without this the next
+       code was loaded INSIDE the guest's own INT 09h handler, between its
+       read of 0x60 and the BIOS's. Bounded, so a guest that never EOIs costs
+       a short stall and not a dead keyboard. */
+    if (pic_isr & 0x02u) {
+        if (++kbd_isr_stuck < 400u)
+            return 0;
+        pic_isr &= (uint8_t)~0x02u;
+    }
+    if (cpu->hard_int_pending)
+        return 0;
+    kbd_isr_stuck = 0;
+    kbd_load();
+    pic_isr |= 0x02u;
     cpu->hard_int_pending = 0x09;
     if (cpu->eflags & 0x200u)
         x86_pit_counter_forced(1);   /* NOT a raw store: see x86_pit_sync() */
@@ -860,19 +916,22 @@ int x86_kbd_raise_irq(X86CPUState *cpu)
  *   python3 scripts/probe.py --retrogo --wait-magic \
  *       --watch x86_kbd_port60_reads --dump x86_kbd_read_log:32x8
  */
-volatile uint32_t x86_kbd_port60_reads = 0;
-volatile uint32_t x86_kbd_read_log[32];
-volatile uint32_t x86_kbd_read_log_idx = 0;
-
+/*
+ * PORT 0x60 HOLDS ITS BYTE. Reading it does not advance the queue: on the
+ * 8042 the output buffer keeps its value until the controller loads the next
+ * code, which it does only after the byte was read and the interrupt
+ * serviced. This used to pop on every read, and that broke the most common
+ * handler shape there is -- a game's INT 09h reads 0x60, decides the key is
+ * not its business and chains to the BIOS, which reads 0x60 AGAIN. With the
+ * on-screen keyboard's make and break queued back to back, the game got the
+ * make and the BIOS the break, so no character was ever buffered: Monkey
+ * Island's save-name field stayed empty. The next code is loaded by
+ * x86_kbd_raise_irq() instead.
+ */
 static uint8_t kbd_read_data(void)
 {
     x86_kbd_port60_reads++;
-    if (x86_io.kbd_head == x86_io.kbd_tail)
-        return x86_io.kbd_last;      /* re-reading holds the last code */
-    x86_io.kbd_last = x86_io.kbd_queue[x86_io.kbd_head];
-    x86_io.kbd_head = (uint8_t)((x86_io.kbd_head + 1u) & 15u);
-    x86_kbd_read_log[x86_kbd_read_log_idx & 31] = x86_io.kbd_last;
-    x86_kbd_read_log_idx++;
+    kbd_obf = 0;
     return x86_io.kbd_last;
 }
 
@@ -1293,10 +1352,6 @@ static struct {
 static uint8_t sb_irq_line;       /* the DSP's interrupt output            */
 static uint8_t sb_irq_kind;       /* mixer 0x82: b0 = 8-bit, b1 = 16-bit   */
 
-/* The 8259's in-service latch, for IRQ 5 only. IRQ 0 and IRQ 1 keep the older
-   one-deep hard_int_pending arrangement untouched -- they are proven and this
-   change has no business perturbing them. */
-static uint8_t pic_isr;
 
 static uint8_t sb_irq_pending_line(void) { return sb_irq_line; }
 static uint8_t pic_isr_bits(void)        { return pic_isr; }
@@ -2271,7 +2326,7 @@ static uint32_t port_read_inner(uint32_t port)
     case 0x64:
         /* Status: bit 0 = output buffer full, bit 2 = self-test passed. Polled
            by code that reads the port without using the interrupt. */
-        return (uint32_t)((x86_kbd_pending() ? 1u : 0u) | 4u);
+        return (uint32_t)((kbd_obf ? 1u : 0u) | 4u);
     case 0x61: {
         /*
          * The two bits of 0x61 that a real machine DRIVES rather than stores.
@@ -2520,11 +2575,10 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
         if ((value & 0x18u) == 0x08u) {
             pic_ocw3_read = (uint8_t)(value & 3u);
         } else if (value & 0x20u) {
-            if ((value & 0xF8u) == 0x60u) {
-                if ((value & 7u) == 5u) pic_isr &= (uint8_t)~0x20u;
-            } else {
-                pic_isr = 0;
-            }
+            if ((value & 0xF8u) == 0x60u)
+                pic_isr &= (uint8_t)~(1u << (value & 7u));   /* specific */
+            else
+                pic_isr &= (uint8_t)(pic_isr - 1u);  /* highest priority only */
             x86_sb_eois++;
         }
         break;

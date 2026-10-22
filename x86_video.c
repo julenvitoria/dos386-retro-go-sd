@@ -1078,12 +1078,12 @@ static void blit_ega16(uint8_t *dst, uint32_t stride)
  * otherwise indistinguishable from a guest that draws nothing.
  * scripts/probe.py --dump x86_video_mode_log:16x4
  */
-volatile uint32_t x86_video_mode_log[16];
+volatile uint32_t x86_video_mode_log[8];   /* 16 -> 8, 2026-10-22: RAM_EMU */
 volatile uint32_t x86_video_mode_log_idx = 0;
 
 void x86_video_log_event(uint32_t tag, uint32_t aux, uint32_t value)
 {
-    x86_video_mode_log[x86_video_mode_log_idx & 15] =
+    x86_video_mode_log[x86_video_mode_log_idx & 7] =
         (tag << 24) | ((aux & 0xFFFFu) << 8) | (value & 0xFFu);
     x86_video_mode_log_idx++;
 }

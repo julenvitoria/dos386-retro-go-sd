@@ -284,6 +284,9 @@ volatile uint32_t x86_bios_int16_calls = 0;  /* guest polls of INT 16h */
 int x86_bios_kbd_irq(void)
 {
     x86_bios_kbd_irqs++;
+    /* The BIOS handler EOIs its level -- the in-service bit is what keeps the
+       controller from loading the next code under a handler still reading. */
+    x86_pic_eoi_level(1);
     /* Read the controller exactly as a real handler does, so the queue drains
        through the same path whichever handler is installed. */
     uint8_t sc = (uint8_t)x86_port_read(0x60, 1);
