@@ -23,6 +23,7 @@ to observe something, that is a bug to find, not a wait to sit through.
 import argparse
 import os
 import sys
+import time
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from scripts.common.probe import (                       # noqa: E402
@@ -144,6 +145,10 @@ def main():
     p.add_argument("--set", action="append", default=[], metavar="SYM=VALUE",
                    help="write a uint32 before sampling, e.g. to trigger work "
                         "on the target; repeatable")
+    p.add_argument("--set-at", type=float, default=0.0, metavar="SECONDS",
+                   help="apply --set this many seconds after start instead of "
+                        "at once, e.g. to re-arm a saturating log just before "
+                        "a timeline event")
     p.add_argument("--zero", action="append", default=[], metavar="ADDR:BYTES",
                    help="write zeros over a memory range before sampling, e.g. "
                         "--zero 0x30000000:0x48000. Repeatable. For clearing "
@@ -245,6 +250,8 @@ def main():
             target.backend.resume()
             print(f"zeroed 0x{addr:08x}..0x{addr + nbytes:08x} ({nbytes} bytes)")
 
+        if args.set and args.set_at > 0:
+            time.sleep(args.set_at)
         for spec in args.set:
             name, _, val = spec.partition("=")
             name = name.strip()

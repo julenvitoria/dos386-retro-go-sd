@@ -1685,6 +1685,32 @@ static int mode_select(uint8_t mode)
 }
 
 /*
+ * Mode 0Dh's DAC, as a VGA BIOS loads it on the mode set: the first 64 entries
+ * get the CGA-COMPATIBLE table a 200-line mode uses, where attribute bit 4 is
+ * INTENSITY (an EGA driving a CGA monitor). Titles written for the EGA rely on
+ * it: Loom's F5 screen programs the attribute palette as 00-07,10-17 and draws
+ * its text in colours 8-15, so with the power-on table (16+ = a near-black grey
+ * ramp) the save/load screen was a bare blue box -- no slot names, no buttons.
+ * Bit 3 counts as intensity too because our mode set leaves an IDENTITY
+ * attribute palette (x86_vga_crtc_preset), so 08-0F must stay the bright
+ * colours; entries 0-15 come out exactly the CGA colours they were before.
+ */
+static void dac_load_ega200(void)
+{
+    if (!vga_dac)
+        return;
+    for (unsigned i = 0; i < 64; i++) {
+        const unsigned hi = (i & 0x18u) ? 0x15u : 0u;
+        uint8_t *e = vga_dac + i * 3u;
+        e[0] = (uint8_t)(((i & 4u) ? 0x2Au : 0u) + hi);
+        e[1] = (uint8_t)(((i & 2u) ? 0x2Au : 0u) + hi);
+        e[2] = (uint8_t)(((i & 1u) ? 0x2Au : 0u) + hi);
+        if ((i & 0x1Fu) == 6u)
+            e[1] = 0x15u;               /* brown, as on a CGA monitor */
+    }
+}
+
+/*
  * INT 10h AH=00. The mode set half: adopt the mode AND clear the display, which
  * is what the call promises and what mode_select() deliberately does not do.
  */
@@ -1700,6 +1726,8 @@ void x86_video_set_mode(uint8_t mode)
     x86_video_log_event(6, mode, video_mode);
     if (!mode_select(mode))
         return;
+    if (cur_desc->kind == VM_EGA4)
+        dac_load_ega200();              /* the BIOS reloads it; see above */
     cur_row = cur_col = 0;
     text_scroll_col = 0;
     if (!cga_storage_ok()) {

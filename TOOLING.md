@@ -162,6 +162,13 @@ is exactly how the palette stream was cleared of a channel rotation.
 `--bytes-save SYM[:N]:FILE` writes the range out for a byte compare against a
 reference. **For GUEST memory use `--guest`, never `--bytes`.**
 
+`--set-at SECONDS` delays the `--set` writes by that many seconds instead of
+applying them at once. Its use is re-arming a SATURATING log just before the
+event you care about: `--set x86_dos_file_log_idx=0 --set-at 40` records the
+file calls an F5 menu makes rather than the boot's. The probe clock runs ahead
+of the timeline clock by the firmware's boot time, so check with
+`x86_dos_file_calls` that the write landed before the event.
+
 `--artifacts [DIR]` (default `build/artifacts`) copies the `.png`/`.ppm` that a
 timeline's `screenshot` events produced out of the run directory **before**
 `stop()` deletes it. gwemu resolves those paths against its own cwd, which is
