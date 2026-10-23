@@ -511,6 +511,11 @@ static uint32_t   last_slice_halted = 0;
 volatile uint32_t guest_max_slice    = 20000u;
 volatile uint32_t guest_panel_ms_used = 0;  /* the period the budget is 90% OF */
 volatile uint32_t guest_slice_halted = 0;
+/* Runs cut short so a keyboard code waiting behind a timer tick gets the
+   interrupt slot (see the retry in the guest loop). */
+#define KBD_RETRY_RUN 256u
+#define KBD_RETRY_MAX 8u
+volatile uint32_t guest_kbd_retries = 0;
 /* Where the guest was when it executed HLT: (CS << 16) | IP, 16 deep, plus the
    last linear EIP. See the capture site for why the LOCATION is the question
    and the count is not. */
@@ -4498,6 +4503,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
             chunk = MAX_SLICE_FLOOR;
         uint32_t sub_left = sub_slice;
         uint32_t run = sub_left < chunk ? sub_left : chunk;
+        uint32_t kbd_retries = 0;           /* see KBD_RETRY_RUN */
         cpu_state_ptr->pit_reload = run;
         arm_tick_irq();
         if (cpu_state_ptr->pit_counter != 1u)
@@ -4529,7 +4535,32 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
              */
             /* The audio half the DMA just freed, if it freed one. */
             audio_pump(abi, 0);
-            input_irqs += (uint32_t)x86_kbd_raise_irq(cpu_state_ptr);
+            {
+                int got = x86_kbd_raise_irq(cpu_state_ptr);
+                input_irqs += (uint32_t)got;
+                /*
+                 * THE TICK MUST NOT STARVE THE KEYBOARD. The slot is one deep
+                 * and every sub-slice boundary arms the next tick BEFORE this
+                 * retry runs, so with a fast guest timer the keyboard found it
+                 * taken almost every time: Ironman reprograms IRQ 0 to ~1.6
+                 * kHz, the frame is all sub-slices, and a press needed many
+                 * tries to land while a lost-in-the-queue break left the key
+                 * "held" for seconds. So when a code is waiting behind a tick,
+                 * this run is cut short: the tick is delivered at once, the run
+                 * ends KBD_RETRY_RUN instructions later INSIDE the same
+                 * sub-slice (no new tick is armed on that path), and the
+                 * keyboard gets the slot at the top of the loop.
+                 */
+                if (!got && cpu_state_ptr->hard_int_pending && x86_kbd_pending()
+                    && kbd_retries < KBD_RETRY_MAX && run > KBD_RETRY_RUN) {
+                    kbd_retries++;
+                    guest_kbd_retries++;
+                    run = KBD_RETRY_RUN;
+                    cpu_state_ptr->pit_reload = run;
+                    if (cpu_state_ptr->pit_counter != 1u)
+                        x86_pit_counter_forced(run);
+                }
+            }
             /* IRQ 5, on the same terms and in the same place. A sound driver
                that starts a transfer and waits for the completion interrupt is
                the failure mode this whole path exists to remove, and the wait

@@ -33,7 +33,7 @@ from scripts.common.probe import (                       # noqa: E402
     load_symbol_maps,
     parse_bytes, parse_deref, parse_dump, parse_guest,
     parse_watch,
-    sample, wait_for_value,
+    sample, wait_for_value, guest_read,
 )
 from scripts.common.rglog import LogDrainer                # noqa: E402
 from scripts.common.target import Image, add_target_args, open_target  # noqa: E402
@@ -163,6 +163,11 @@ def main():
                         "e.g. --guest 0x10eac:64=CSIP. This is the only correct "
                         "way to read guest RAM: under demand paging it is a "
                         "frame pool, so *guest_ram+OFF is NOT linear memory")
+    p.add_argument("--guest-watch", action="append", default=[],
+                   metavar="LINADDR[=LABEL]",
+                   help="read a uint32 of guest LINEAR memory at every sample, "
+                        "e.g. a game's own frame counter: --guest-watch "
+                        "0x5f827=FRAMES")
     p.add_argument("--guest-save", action="append", default=[],
                    metavar="LINADDR:BYTES:FILE",
                    help="write a guest LINEAR range to a file, for byte-"
@@ -264,9 +269,21 @@ def main():
         if drainer and not drainer.available:
             drainer = None
 
+        gwatch = [parse_guest(g)[::2] for g in args.guest_watch]
+
+        def on_sample(backend):
+            if drainer:
+                drainer.drain(backend)
+            if gwatch:
+                vals = []
+                for lin, label in gwatch:
+                    b = guest_read(backend, syms, lin, 4)
+                    vals.append(f"{label}={int.from_bytes(b, 'little')}")
+                print("    guest: " + " ".join(vals))
+
         sample(target, syms, watches=watches, derefs=derefs,
                count=args.samples, interval=args.interval, symbol_maps=maps,
-               on_sample=(drainer.drain if drainer else None))
+               on_sample=on_sample)
 
         # After sampling, not before: an array read at t=0 shows the state
         # before the target has done anything, which is how a full log reads

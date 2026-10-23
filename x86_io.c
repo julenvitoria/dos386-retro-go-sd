@@ -413,6 +413,13 @@ static void io_log(unsigned dir, uint32_t port, uint32_t value)
  * on a real card the Misc Output register's bit 0 selects which address the
  * CRTC decodes, and a program that probes both must see one of them answer.
  */
+/* The 0x3DA beam, in 1.193182 MHz PIT ticks: a 70 Hz frame, a 31.47 kHz line,
+   vertical retrace over the last sixteenth of the frame (~0.9 ms) and the
+   horizontal blank over the last ~5 us of each line. */
+#define VGA_FRAME_TICKS     17045u
+#define VGA_VRETRACE_TICKS  (VGA_FRAME_TICKS / 16u)
+#define VGA_LINE_TICKS      38u
+#define VGA_HBLANK_TICKS    6u
 #define VGA_CRTC_REGS  32
 #define VGA_SEQ_REGS    8
 #define VGA_GC_REGS    16
@@ -2432,12 +2439,24 @@ static uint32_t port_read_inner(uint32_t port)
     case 0x3DA: {
         unsigned v = 0;
         vga_regs.attr_flipflop = 0;      /* the documented re-sync */
-        uint32_t reload = cpu_state_ptr->pit_reload;
-        if (reload) {
-            uint32_t elapsed = reload - cpu_state_ptr->pit_counter;
-            if (elapsed >= reload - (reload >> 4))
+        /*
+         * THE BEAM RUNS ON GUEST TIME, AT 70 Hz. It used to be the position
+         * inside the current PIT run, on the reasoning that the run IS the
+         * frame -- true at the boot divisor, false the moment a guest speeds
+         * the timer up and the frame is cut into sub-slices. Ironman
+         * reprograms IRQ 0 every tick and its handler waits for vertical
+         * retrace before reloading the PIT (a raster-synced timer): with the
+         * retrace at the end of EVERY ~0.6 ms run, the handler spun on 0x3DA
+         * for ~94% of each run (2,604 reads in one io-log run) and the race
+         * crawled at any CPU speed. A VGA scans every 200/400-line mode at
+         * 70 Hz; the PIT clock (x86_pit_ticks, synced mid-run) is guest time,
+         * so the retrace now comes when a real card's would.
+         */
+        if (cpu_state_ptr->pit_reload) {
+            uint32_t t = x86_pit_ticks();
+            if (t % VGA_FRAME_TICKS >= VGA_FRAME_TICKS - VGA_VRETRACE_TICKS)
                 return 0x08u | 0x01u;           /* vertical retrace */
-            if ((elapsed >> 6) & 1u)
+            if (t % VGA_LINE_TICKS >= VGA_LINE_TICKS - VGA_HBLANK_TICKS)
                 v |= 0x01u;                     /* horizontal retrace */
             return v;
         }

@@ -559,6 +559,21 @@ static void video_render_body(uint8_t *dst, uint32_t stride)
         clear = aa_letterbox;
     }
 #endif
+    /* THE BANDS ARE BLACK, whatever colour 0 is. Index 0 is the GAME's
+       colour 0 in the 16- and 256-colour modes, and a title that makes it
+       light blue (Ironman) got two light bands that read as white on the
+       panel. EGA: entry 16 is the fixed CGA black (ega_sync_palette()).
+       Mode 13h: every entry is the game's, so take the darkest one it has. */
+    if (!aa && cur_desc && cur_desc->kind == VM_EGA4) {
+        clear = 16u;
+    } else if (!aa && cur_desc && cur_desc->kind == VM_VGA8 && vga_dac) {
+        unsigned best = 0xFFFFu;
+        for (unsigned i = 0; i < 256u; i++) {
+            const uint8_t *e = vga_dac + i * 3u;
+            unsigned l = 2u * e[0] + 5u * e[1] + e[2];
+            if (l < best) { best = l; clear = (uint8_t)i; }
+        }
+    }
     memset(dst, clear, band * stride);
     memset(dst + (band + CGA_HEIGHT) * stride, clear, band * stride);
 
