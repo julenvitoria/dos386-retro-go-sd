@@ -15,7 +15,7 @@ reescrita en ensamblador para el STM32H7B0.
   pagina en un archivo de la tarjeta SD.
 
 Para juegos de PC XT (8088, CGA) existe el otro núcleo,
-[gw-dos-xtulator](https://github.com/julenvitoria/gw-dos-xtulator) (`dos.bin`).
+[dos-retro-go-sd](https://github.com/julenvitoria/dos-retro-go-sd) (`dos.bin`).
 Los dos conviven en la misma tarjeta.
 
 ## Instalación en la tarjeta SD
@@ -88,6 +88,12 @@ consolas que los tienen).
   derecho, TIME vuelve al teclado.
 
 Más detalle: [`docs/input/03-onscreen-keyboard.md`](docs/input/03-onscreen-keyboard.md).
+
+## Ramas
+
+- **`main`**: la versión de uso, la que se compila y se reparte como `dos386.bin`.
+- **`overlays`**: pruebas de memoria (partes del núcleo cargadas en la memoria libre de la
+  pantalla para dar más páginas al juego). Pasa a `main` cuando está probada en la consola.
 
 ## Para desarrolladores
 

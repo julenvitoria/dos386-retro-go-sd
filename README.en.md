@@ -15,7 +15,7 @@ rewritten in assembly for the STM32H7B0.
   paged to a file on the SD card.
 
 For PC XT games (8088, CGA) there is the other core,
-[gw-dos-xtulator](https://github.com/julenvitoria/gw-dos-xtulator) (`dos.bin`).
+[dos-retro-go-sd](https://github.com/julenvitoria/dos-retro-go-sd) (`dos.bin`).
 Both live on the same card.
 
 ## Installing on the SD card
@@ -88,6 +88,12 @@ closed.
   TIME goes back to the keyboard.
 
 More detail: [`docs/input/03-onscreen-keyboard.md`](docs/input/03-onscreen-keyboard.md).
+
+## Branches
+
+- **`main`**: the version to use, the one built and shipped as `dos386.bin`.
+- **`overlays`**: memory experiments (parts of the core loaded into the screen's spare memory to
+  give the game more pages). Moves to `main` once it is tested on the console.
 
 ## For developers
 
