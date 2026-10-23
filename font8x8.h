@@ -18,7 +18,16 @@
 #ifndef X86_FONT8X8_H
 #define X86_FONT8X8_H
 
-static const unsigned char font8x8_basic[256][8] = {
+/* In the core it lives in ITCM: RAM_EMU is guest frames, and the 64 KB ITCM
+   segment had ~3.7 KB unused past the interpreter. The CPU reads ITCM as data
+   at zero wait states; nothing DMAs from this table. */
+#if defined(X86_CORE_BUILD) && X86_CORE_BUILD
+#define FONT8X8_PLACE __attribute__((section(".itcram_hot.font8x8"), aligned(4)))
+#else
+#define FONT8X8_PLACE
+#endif
+
+static const unsigned char font8x8_basic[256][8] FONT8X8_PLACE = {
     {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},   /* 0x00 U+0000 */
     {0x7E, 0x81, 0xA5, 0x81, 0xBD, 0x99, 0x81, 0x7E},   /* 0x01 U+263A */
     {0x7E, 0xFF, 0xDB, 0xFF, 0xC3, 0xE7, 0xFF, 0x7E},   /* 0x02 U+263B */

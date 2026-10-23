@@ -3292,18 +3292,21 @@ static void nor_snap_wdog(void)
     nor_snap_kick();
 }
 
-/* A file of the right length and nothing else. 512 bytes of zeros pushed
-   1280 times: the contents are irrelevant (the callback replaces every byte on
-   the way to flash) and this needs no allocation, which matters in a region
-   with single-digit kilobytes of headroom. */
+/* A file of the right length and nothing else, pushed 512 bytes at a time:
+   the contents are irrelevant (the callback replaces every byte on the way to
+   flash), so the source is whatever the guest pool holds. It used to be a
+   static 512-byte block of zeros, which in RAM_EMU is an eighth of a guest
+   frame spent on nothing. */
 static int nor_snap_make_placeholder(const gw_firmware_abi_t *abi,
                                      const char *path)
 {
-    static const uint8_t zeros[512];
+    const uint8_t *zeros = guest_ram;
+    if (!zeros)
+        return -1;
     FILE *f = abi->fopen(path, "wb");
     if (!f)
         return -1;
-    for (uint32_t off = 0; off < GUEST_RAM_SIZE; off += sizeof(zeros)) {
+    for (uint32_t off = 0; off < GUEST_RAM_SIZE; off += 512u) {
         /* 1,280 writes, and the frame loop -- the only thing that normally
            kicks the watchdog -- is not running: this is a menu callback. The
            SD driver does refresh inside its own busy-waits, so this loop is
@@ -3311,7 +3314,7 @@ static int nor_snap_make_placeholder(const gw_firmware_abi_t *abi,
            rest a reset on and the kick costs nothing on a path that already
            writes 640 KB. */
         nor_snap_kick();
-        if (abi->fwrite(zeros, 1, sizeof(zeros), f) != sizeof(zeros)) {
+        if (abi->fwrite(zeros, 1, 512u, f) != 512u) {
             abi->fclose(f);
             abi->remove(path);
             return -1;

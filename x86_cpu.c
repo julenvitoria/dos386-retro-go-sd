@@ -37,11 +37,19 @@
 // DTCM is a firmware bump pool (mem_ctl(GW_MEM_DTC, ...)), not a load target,
 // so the core allocates at runtime and repoints cpu_state_ptr. The assembly
 // reaches both through the pointer, never the symbol.
+//
+// So the CORE has no static instance at all: the initializer below used to
+// keep a 2,316-byte copy alive in RAM_EMU (guest frames) that nothing ever
+// touched once dtcm_state_init() repointed cpu_state_ptr.
+#if X86_CORE_BUILD
+X86CPUState *cpu_state_ptr;
+#else
 X86CPUState cpu_state_dtcm __attribute__((section(".dtcm_bss.cpu_state_dtcm")));
 
 // What the interpreter actually dereferences. Kept in normal .bss so it is
 // writable in every build.
 X86CPUState *cpu_state_ptr = &cpu_state_dtcm;
+#endif
 uint32_t *guest_page_table_ptr;
 
 // The assembly now gets its offsets from generated x86_offsets.inc, so it cannot
@@ -58,12 +66,14 @@ _Static_assert(offsetof(X86CPUState, pit_counter) == 2184, "pit_counter offset")
 _Static_assert(offsetof(X86CPUState, exit_reason) == 2196, "exit_reason offset");
 _Static_assert(offsetof(X86CPUState, opcode_table_base) == 2204, "TABLE_BASE_OFFSET");
 
+#if !X86_CORE_BUILD
 X86CPUState *x86_cpu_init(PhysMemoryMap *mem_map)
 {
     // Return the statically allocated DTCM instance instead of dynamic allocation or KVM
     memset(&cpu_state_dtcm, 0, sizeof(X86CPUState));
     return &cpu_state_dtcm;
 }
+#endif
 
 void x86_cpu_end(X86CPUState *s)
 {
