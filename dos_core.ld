@@ -31,11 +31,13 @@
 
 INCLUDE gnw_ram_emu.ld
 INCLUDE gnw_itcm_core.ld
+INCLUDE gnw_ram_uc_core.ld
 
 MEMORY
 {
   RAM_EMU (xrw) : ORIGIN = __RAM_EMU_START__,  LENGTH = __RAM_EMU_LENGTH__
   ITCM    (xrw) : ORIGIN = __ITCM_CORE_START__, LENGTH = __ITCM_CORE_LENGTH__
+  RAM_UC  (xrw) : ORIGIN = __RAM_UC_CORE_START__, LENGTH = __RAM_UC_CORE_LENGTH__
 }
 
 PHDRS
@@ -43,6 +45,8 @@ PHDRS
   text PT_LOAD FLAGS(5); /* PF_R | PF_X */
   data PT_LOAD FLAGS(6); /* PF_R | PF_W */
   itcm PT_LOAD FLAGS(5); /* PF_R | PF_X */
+  ramuc PT_LOAD FLAGS(5); /* PF_R | PF_X */
+  ramucbss PT_LOAD FLAGS(6); /* PF_R | PF_W */
 }
 
 SECTIONS
@@ -53,8 +57,8 @@ SECTIONS
     KEEP(*(.gw_core_bridge_probe))
 
     . = ALIGN(4);
-    *(.text*)
-    *(.rodata*)
+    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o) .text*)
+    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o) .rodata*)
     *(.glue_7)
     *(.glue_7t)
 
@@ -77,8 +81,8 @@ SECTIONS
   .bss (NOLOAD) :
   {
     . = ALIGN(8);
-    *(.bss*)
-    *(COMMON)
+    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o) .bss*)
+    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o) COMMON)
     . = ALIGN(8);
 
     /* `.dtcm_bss` is a TEST.ld section name: in the bare-metal harness it
@@ -120,6 +124,49 @@ SECTIONS
     . = ALIGN(4);
     __CORE_ITCM_CODE_END__ = .;
   } >ITCM :itcm
+
+  /* ------------------------------------------------------------------ */
+  /* Segment 2: the AdLib synthesiser, in the LCD's LUT8 bonus area.     */
+  /* RAM_EMU is guest frames; the bonus area is the video arena, which   */
+  /* only EGA/Mode Y titles fill. emu8950's code, tables and state and   */
+  /* x86_opl.c go here (~23 KB), so every title gets those frames back.  */
+  /* The firmware switches to LUT8 before loading a RAM_UC segment and   */
+  /* lcd_get_bonus_pool() returns what is left after it; bonus_layout()  */
+  /* in src/main.c is computed from that at runtime.                     */
+  /* ------------------------------------------------------------------ */
+  .core_ram_uc __RAM_UC_CORE_START__ : AT(__CORE_CODE_END__ + SIZEOF(.core_itcm))
+  {
+    __CORE_RAM_UC_CODE_START__ = .;
+    *emu8950.o(.text*)
+    *emu8950.o(.rodata*)
+    *x86_opl.o(.text*)
+    *x86_opl.o(.rodata*)
+    *x86_mouse.o(.text*)
+    *x86_mouse.o(.rodata*)
+    *x86_nor.o(.text*)
+    *x86_nor.o(.rodata*)
+    . = ALIGN(4);
+    __CORE_RAM_UC_CODE_END__ = .;
+  } >RAM_UC :ramuc
+
+  .core_ram_uc_bss (NOLOAD) :
+  {
+    *(.ram_uc_bss*)
+    *emu8950.o(.bss* COMMON)
+    *x86_opl.o(.bss* COMMON)
+    *x86_mouse.o(.bss* COMMON)
+    *x86_nor.o(.bss* COMMON)
+    /* End the segment 2 KB short of a page boundary. The bonus pool starts
+       here, bonus_layout() puts the 2 KB palette first and the arena on the
+       next page, so this makes that page the very next byte: the gap is
+       spent HERE (the mouse driver and the NOR snapshot code fill most of it) instead of being lost to the
+       arena's round-up. */
+    . += (ALIGN(ABSOLUTE(.) + 2048, 4096) - 2048) - ABSOLUTE(.);
+    __CORE_RAM_UC_BSS_END__ = .;
+  } >RAM_UC :ramucbss
+
+  ASSERT(__CORE_RAM_UC_BSS_END__ <= __RAM_UC_CORE_END__,
+         "Error: the RAM_UC segment overflows the LUT8 bonus area")
 
   /* Code-only segment: the interpreter's state lives in DTCM (runtime) and
      RAM_EMU (.bss), never in ITCM. */
