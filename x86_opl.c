@@ -166,10 +166,23 @@ void x86_opl_write(uint8_t reg, uint8_t val)
 
     if (reg == 0xBDu) {
         uint8_t want = (uint8_t)((val >> 5) & 1u);
-        if (want && !rhythm_on)
+        if (want && !rhythm_on) {
             x86_opl_rhythm_muted++;   /* asked for drums; see the header */
+            /* The three rhythm channels go quiet: key them off now. */
+            for (unsigned c = 6u; c < 9u; c++)
+                OPL_writeReg(opl, 0xB0u + c, opl->reg[0xB0u + c] & 0xDFu);
+        }
         rhythm_on = want;
+        /* emu8950 is built with EMU8950_NO_PERCUSSION_MODE, and that build
+           ASSERTS that bit 5 is clear -- a fatal exception on the console
+           (measured in the XTulator core with Ironman on AdLib). Only the
+           AM/vibrato depth bits go through. */
+        val &= 0xC0u;
     }
+    /* While the guest is in rhythm mode, channels 6-8 are drums we do not
+       play: never key them on as melodic voices. */
+    if (rhythm_on && reg >= 0xB6u && reg <= 0xB8u)
+        val &= 0xDFu;
 
     if ((reg & 0xF0u) == 0xB0u && (reg & 0x0Fu) < 9u) {
         unsigned ci = reg & 0x0Fu;
