@@ -1136,6 +1136,21 @@ uint32_t x86_pager_fault(uint32_t lin, int write)
 {
     uint32_t page = lin >> X86_PG_SHIFT;
 
+    /* A20 MASKED: the sixteen pages at 1 MB are the ALIAS of the bottom of
+       memory, and fold_install() keeps that alias only while the low page is
+       RESIDENT. A wrapped access to a low page that is not resident lands
+       here with its 1 MB address -- outside every window -- and used to be
+       refused as unmapped. Fault the page it aliases instead; fold_install()
+       then writes both entries. Measured: Rick Dangerous' loader walks DS
+       through FF26h after reading RICK.EGA, the 8088 wrap it was written for,
+       and died there with x86_pg_unmapped 1 whenever the page underneath had
+       not been touched yet. */
+    if (!x86_io.a20_open && page >= X86_HMA_FIRST_PAGE
+        && page < X86_HMA_FIRST_PAGE + X86_HMA_PAGES) {
+        page -= X86_HMA_FIRST_PAGE;
+        lin  -= (uint32_t)X86_HMA_FIRST_PAGE << X86_PG_SHIFT;
+    }
+
     if (!owns(page)) {
         /* Not a page fault at all -- a genuinely unmapped address. The caller
            takes X86_EXIT_MEM_FAULT, which is the honest answer and the one

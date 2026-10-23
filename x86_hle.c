@@ -236,7 +236,7 @@ int x86_bios_rom_install(void)
  * X86_EXIT_HLE_INT; exit_info carries the vector number.
  */
 uint32_t x86_hle_unhandled_vector;
-uint32_t x86_hle_log[32];
+uint32_t x86_hle_log[16];
 uint32_t x86_hle_log_idx;
 uint32_t x86_hle_unhandled_func;
 
@@ -272,7 +272,7 @@ int x86_hle_dispatch(uint8_t vector)
        bit 16 set once the handler reports it did not know the function. One
        counter per vector was not enough -- what a program does when a probe
        goes unanswered only makes sense against the whole conversation. */
-    x86_hle_log[x86_hle_log_idx & 31] = ((uint32_t)vector << 8) | AH;
+    x86_hle_log[x86_hle_log_idx & 15] = ((uint32_t)vector << 8) | AH;
     x86_hle_log_idx++;
 
     switch (vector) {
@@ -338,7 +338,7 @@ uint32_t x86_hle_calls;
 int x86_hle_service(void)
 {
     uint8_t vector = (uint8_t)cpu_state_ptr->exit_info;
-    unsigned slot = x86_hle_log_idx & 31;
+    unsigned slot = x86_hle_log_idx & 15;
 #if X86_PROBE
     /* Captured BEFORE dispatch: a handler is free to overwrite AX, and AH is
        the key. The unhandled-marker snapshot is what lets the probe report

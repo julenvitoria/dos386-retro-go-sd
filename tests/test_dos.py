@@ -952,8 +952,8 @@ def exec2_test(b, syms):
     # is always "what did the guest ask for next", and one counter cannot say.
     if "x86_hle_log" in syms and "x86_hle_log_idx" in syms:
         idx = b.read_uint32(syms["x86_hle_log_idx"])
-        raw = [b.read_uint32(syms["x86_hle_log"] + 4 * i) for i in range(32)]
-        seq = [raw[i & 31] for i in range(max(0, idx - 32), idx)]
+        raw = [b.read_uint32(syms["x86_hle_log"] + 4 * i) for i in range(16)]
+        seq = [raw[i & 15] for i in range(max(0, idx - 16), idx)]
         print("  services: " + " ".join(
             f"{(v >> 8) & 0xFF:02X}/{v & 0xFF:02X}{'!' if v & 0x10000 else ''}"
             for v in seq))
