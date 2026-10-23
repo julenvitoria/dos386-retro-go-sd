@@ -411,7 +411,7 @@ def parse_guest(spec):
         spec, label = spec.split("=", 1)
     addr_s, _, len_s = spec.partition(":")
     addr = int(addr_s, 0)
-    return addr, int(len_s or 64, 0), (label or f"guest:{addr:#x}")
+    return addr, int(len_s or "64", 0), (label or f"guest:{addr:#x}")
 
 
 def guest_read(backend, syms, lin, nbytes):

@@ -162,6 +162,13 @@ is exactly how the palette stream was cleared of a channel rotation.
 `--bytes-save SYM[:N]:FILE` writes the range out for a byte compare against a
 reference. **For GUEST memory use `--guest`, never `--bytes`.**
 
+`--guest-watch LINADDR[=LABEL]` reads a uint32 of guest LINEAR memory at
+every sample, next to the `--watch` globals: a game's own counters become a
+rate. Ironman keeps a frame counter at 05F7:06B7 (`--guest-watch
+0x6627=FRAMES`), and dividing its growth by `pit_now`'s (1.193182 MHz) gave
+its vertical-retrace syncs per guest second -- ~650 with the old 0x3DA beam,
+70 with the current one.
+
 `--set-at SECONDS` delays the `--set` writes by that many seconds instead of
 applying them at once. Its use is re-arming a SATURATING log just before the
 event you care about: `--set x86_dos_file_log_idx=0 --set-at 40` records the
