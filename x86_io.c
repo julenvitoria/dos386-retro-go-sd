@@ -357,7 +357,7 @@ static uint32_t pic_read_irr(void)
 /* The last 32 writes that can move the tone, as (port << 24) | value, so a
    guest whose beeps come out at the wrong pitch can be read rather than
    guessed at. scripts/probe.py --dump x86_spk_log:8x4 (32 -> 8, 2026-10-22: RAM_EMU) */
-volatile uint32_t x86_spk_log[8];
+X86_UC_BSS(x86_spk_log) volatile uint32_t x86_spk_log[8];
 volatile uint32_t x86_spk_log_idx = 0;
 
 /*
