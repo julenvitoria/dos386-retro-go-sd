@@ -682,7 +682,7 @@ extern char x86_dos_last_path[32];
    bytes for guest frames (overlays' dos_core.ld) can route `.bss.__uc.*` to
    the LUT8 bonus area, where uncached is fine for a log nobody reads hot. */
 #define X86_UC_BSS(name) __attribute__((section(".bss.__uc." #name)))
-extern uint32_t x86_dos_file_log[20 * 4];   /* DOS_FILE_LOG_SLOTS * 4, x86_dos.c */
+extern uint32_t x86_dos_file_log[16 * 4];   /* DOS_FILE_LOG_SLOTS * 4, x86_dos.c */
 extern uint32_t x86_dos_file_log_idx;
 extern uint32_t x86_dos_file_calls;
 extern volatile uint32_t x86_io_log[64];
@@ -706,6 +706,7 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size);
    millisecond of host time owes -- see the three-clock block in src/main.c. */
 uint32_t x86_pit0_divisor(void);
 extern volatile uint32_t x86_pit0_writes;
+extern volatile uint32_t x86_pit0_restarts;   /* channel 0 counts loaded */
 /* The PIT's free-running counter, in 1.193182 MHz ticks of GUEST time. See the
    block comment in x86_io.c: guest time is instructions at x86_pit_kips. */
 extern uint32_t x86_pit_kips;         /* main.c publishes guest_kips here */
@@ -731,7 +732,7 @@ extern volatile uint32_t x86_kb_pushes;
 extern volatile uint32_t x86_kb_pops;
 extern volatile uint32_t x86_kb_peek_hits;
 extern volatile uint32_t x86_kbd_port60_reads;
-extern volatile uint32_t x86_kbd_read_log[32];
+extern volatile uint8_t x86_kbd_read_log[32];
 extern volatile uint32_t x86_kbd_read_log_idx;
 /* SOUND. Detection (OPL2 timers, the DSP reset handshake) AND DIGITISED
    PLAYBACK: an 8237 pair, IRQ 5 through the 8259, the CT1745 mixer and the

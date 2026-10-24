@@ -102,7 +102,13 @@ void x86_pit_sync(void)
     if (d > 1000000u)
         d = 1000000u;
 
-    uint32_t kips = x86_pit_kips ? x86_pit_kips : PIT_NOMINAL_KIPS;
+    /* Never SLOWER than the nominal: Max publishes its measured rate, which
+       makes guest time real time on a title that runs below 5,500 k
+       (Ironman), and keeps the old, faster-than-real guest time on one that
+       runs above it (Keen 4 drew far more slowly at its true retrace rate). */
+    uint32_t kips = x86_pit_kips;
+    if (!kips || kips > PIT_NOMINAL_KIPS)
+        kips = PIT_NOMINAL_KIPS;
     if (kips < 100u)     kips = 100u;
     if (kips > 100000u)  kips = 100000u;
 
@@ -351,7 +357,7 @@ static uint32_t pic_read_irr(void)
 /* The last 32 writes that can move the tone, as (port << 24) | value, so a
    guest whose beeps come out at the wrong pitch can be read rather than
    guessed at. scripts/probe.py --dump x86_spk_log:8x4 (32 -> 8, 2026-10-22: RAM_EMU) */
-volatile uint32_t x86_spk_log[8];
+X86_UC_BSS(x86_spk_log) volatile uint32_t x86_spk_log[8];
 volatile uint32_t x86_spk_log_idx = 0;
 
 /*
@@ -593,7 +599,6 @@ static void pit_write_control(uint8_t v)
 /* Channel 0's data port. Same three access modes as channel 2 and for the same
    reasons; the divisor it leaves behind is read by the frame loop, which is
    where the guest's tick rate actually comes from. */
-static uint32_t x86_pit0_divisor_planned = 65536u;
 static void pit_write_ch0(uint8_t v)
 {
     int loaded = 1;                  /* the count is complete after this byte */
@@ -616,16 +621,16 @@ static void pit_write_ch0(uint8_t v)
         break;
     }
     if (loaded) {
-        uint32_t before = x86_pit0_divisor_planned;
         pit_ch_loaded(0);
-        /* A NEW system-timer rate ends the sub-slice at the next boundary, so
-           the frame loop can re-plan the rest of the frame's ticks at it
-           (src/main.c, guest_tick_replans). Waiting for the next frame left
-           up to a frame of instructions before the first fast tick. */
-        if (x86_pit0_divisor() != before) {
-            x86_pit0_divisor_planned = x86_pit0_divisor();
-            x86_pit_counter_forced(1);
-        }
+        /* A loaded count RESTARTS the period -- even the same divisor -- and
+           ends the sub-slice so the frame loop can re-plan the rest of the
+           frame's ticks from here (src/main.c, guest_tick_replans). Waiting
+           for the next frame left up to a frame of instructions before the
+           first fast tick; ignoring a same-value reload broke Ironman, whose
+           INT 08h reloads the count at each vertical retrace so that the next
+           tick lands just before the next one. */
+        x86_pit0_restarts++;
+        x86_pit_counter_forced(1);
     }
     x86_pit0_writes++;
 }
@@ -636,6 +641,7 @@ static void pit_write_ch0(uint8_t v)
  * touches channel 0 gets exactly the 18.2065 Hz it always got.
  */
 volatile uint32_t x86_pit0_writes = 0;
+volatile uint32_t x86_pit0_restarts = 0;
 
 uint32_t x86_pit0_divisor(void)
 {
@@ -861,7 +867,7 @@ static uint8_t  kbd_obf;          /* output buffer holds a byte not yet read */
 static uint16_t kbd_isr_stuck;    /* raise attempts refused by an un-EOI'd IRQ 1 */
 
 volatile uint32_t x86_kbd_port60_reads = 0;
-volatile uint32_t x86_kbd_read_log[32];
+volatile uint8_t x86_kbd_read_log[32];   /* bytes: a scancode is one (2026-10-24, -96 B RAM_EMU) */
 volatile uint32_t x86_kbd_read_log_idx = 0;
 
 /* Move the next queued code into the output buffer. The log records what the
@@ -923,7 +929,7 @@ int x86_kbd_raise_irq(X86CPUState *cpu)
  * log is the last 32 bytes handed out, newest at (idx-1) & 31.
  *
  *   python3 scripts/probe.py --retrogo --wait-magic \
- *       --watch x86_kbd_port60_reads --dump x86_kbd_read_log:32x8
+ *       --watch x86_kbd_port60_reads --bytes x86_kbd_read_log:32
  */
 /*
  * PORT 0x60 HOLDS ITS BYTE. Reading it does not advance the queue: on the
