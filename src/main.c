@@ -2225,9 +2225,23 @@ static int find_startup_program(char *out, unsigned max,
  */
 static int16_t chain_off = -1;
 static void resolve_program_ext(char *full, size_t cap);
+/* Run one program: relative to the CWD unless rooted, with COMMAND.COM's
+   .COM/.EXE search. The first program is entered outright, like any root; the
+   rest from inside the previous one's terminating INT 21h. */
+static int exec_program(const char *cmd, const char *tail, int first)
+{
+    char full[96];
+    int rooted = 0;
+    for (const char *c = cmd; *c; c++)
+        if (*c == '/' || *c == '\\') rooted = 1;
+    path_join(full, sizeof(full), rooted ? "" : x86_dos_get_cwd(), cmd);
+    resolve_program_ext(full, sizeof(full));
+    return first ? x86_dos_exec(full, tail) : x86_dos_exec_next(full, tail);
+}
+
 static int launch_chain_next(void)
 {
-    char cmd[X86_SETTINGS_STR_MAX], full[96];
+    char cmd[X86_SETTINGS_STR_MAX];
     const char *src, *tail = "";
     int first = (chain_off == 0);
     /* A program that is not there is SKIPPED, not the end of the chain: a
@@ -2253,14 +2267,7 @@ again:
         tail = x86_settings_str(X86_STR_ARGS);
         chain_off = -1;
     }
-    int rooted = 0;
-    for (const char *c = cmd; *c; c++)
-        if (*c == '/' || *c == '\\') rooted = 1;
-    path_join(full, sizeof(full), rooted ? "" : x86_dos_get_cwd(), cmd);
-    resolve_program_ext(full, sizeof(full));
-    /* The first program is entered outright, like any root; the rest from
-       inside the previous one's terminating INT 21h. */
-    if ((first ? x86_dos_exec(full, tail) : x86_dos_exec_next(full, tail)) == 0)
+    if (exec_program(cmd, tail, first) == 0)
         return 1;
     goto again;
 }
@@ -2690,14 +2697,8 @@ static void guest_reset(void)
             /* The program lives in the CWD the batch file changed to, and
                x86_dos_exec takes a FatFs path rather than a guest one, so the
                prefix is applied here rather than in dos_path_from_guest(). */
-            char full[96];
-            int rooted = 0;
-            for (const char *c = startup; *c; c++)
-                if (*c == '/' || *c == '\\') { rooted = 1; break; }
-            path_join(full, sizeof(full), rooted ? "" : x86_dos_get_cwd(), startup);
-            resolve_program_ext(full, sizeof(full));
-            dsk_exec_rc = (uint32_t)x86_dos_exec(full,
-                                                 guest_use_cmdtail ? cmdtail : "");
+            dsk_exec_rc = (uint32_t)exec_program(startup,
+                                                 guest_use_cmdtail ? cmdtail : "", 1);
         }
     }
     if (dsk_exec_rc != 0) {
@@ -4356,8 +4357,14 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                 kips = 100000u;                /* keeps dt*kips in 32 bits */
             /* The PIT counters convert instructions into 1.193182 MHz
                ticks at exactly this rate, so the machine's clock and the
-               speed it claims to run at are one number. */
-            x86_pit_kips = kips;
+               speed it claims to run at are one number. UNTHROTTLED there is
+               no claimed speed, and the fixed nominal (5,500 k) made guest
+               time crawl whenever a title ran slower than that: Ironman waits
+               on 0x3DA, which is guest time, and ran at a fraction of real
+               speed. So Max takes the rate it MEASURED over the last second:
+               instructions / measured rate = the seconds that really passed,
+               HLT included. 0 until the first measurement (-> the nominal). */
+            x86_pit_kips = kips ? kips : guest_ips_achieved / 1000u;
 
             /*
              * How many instructions FIT in one display period, regulated from
@@ -4528,10 +4535,17 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                 cap = TICK_CATCHUP_MAX;
             if (cap > TICK_IRQ_MAX)
                 cap = TICK_IRQ_MAX;
-            /* Anything last frame could not place (the one-deep slot was held
-               by the keyboard) is time the guest never got. Count it here
-               rather than letting the assignment below swallow it. */
-            guest_ticks_dropped += tick_irqs_owed;
+            /* What last frame could not place (the one-deep slot was held by
+               the keyboard) is CARRIED, up to two ticks: a held button repeats
+               its scancode all the time, and dropping every tick it collided
+               with slowed Rick 2's music and movement by a quarter. Beyond two
+               it is a stall, not a collision -- counted as dropped, so a long
+               CLI does not come back as a burst. */
+            if (tick_irqs_owed > 2u) {
+                guest_ticks_dropped += tick_irqs_owed - 2u;
+                tick_irqs_owed = 2u;
+            }
+            owed += tick_irqs_owed;
             tick_irqs_owed = owed > cap ? cap : owed;
             guest_ticks_dropped += owed - tick_irqs_owed;
         }
