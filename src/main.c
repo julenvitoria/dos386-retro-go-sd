@@ -519,7 +519,7 @@ volatile uint32_t guest_kbd_retries = 0;
 /* Where the guest was when it executed HLT: (CS << 16) | IP, 16 deep, plus the
    last linear EIP. See the capture site for why the LOCATION is the question
    and the count is not. */
-volatile uint32_t x86_hlt_log[4];   /* 16 -> 4, 2026-10-22: RAM_EMU */
+X86_UC_BSS(x86_hlt_log) volatile uint32_t x86_hlt_log[4];   /* 16 -> 4, 2026-10-22: RAM_EMU; UC on overlays */
 volatile uint32_t x86_hlt_log_idx = 0;
 volatile uint32_t x86_hlt_last_eip = 0;
 volatile uint32_t guest_grow_blocked = 0;
