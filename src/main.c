@@ -638,7 +638,35 @@ static uint32_t tick_acc;             /* ms * TICK_NUM, below one IRQ 0      */
 static uint32_t bda_acc;              /* the same, for the 18.2 Hz BDA count */
 static uint32_t tick_irqs_owed;       /* IRQ 0s this frame still has to give */
 static uint32_t tick_last_ms;
-static uint32_t tick_skip_ms, tick_credit, pit_restarts_seen;
+static uint32_t pit_restarts_seen;
+/* PHASE MODE. After the guest loads PIT channel 0 the ticks follow THAT
+   period's phase, in instructions, across frame boundaries, instead of being
+   spread over each frame from the real-time count -- see tick_phase_plan(). It
+   lapses two seconds after the last load. */
+static uint8_t  tick_phase_on;
+static uint8_t  tick_phase_quiet;
+static uint32_t tick_phase_left;      /* instructions from now to the next tick */
+
+/* Plan `left` instructions on the PIT's own phase: the next tick `first`
+   instructions in, then one every `per`. Returns how many fall inside; *tail is
+   the length of the last sub-slice, and tick_phase_left what will remain to
+   the next tick when this plan has run. */
+static uint32_t tick_phase_plan(uint32_t first, uint32_t left, uint32_t per,
+                                uint32_t *tail)
+{
+    uint32_t n = 0;
+    *tail = 0;
+    if (first < left) {
+        n = 1u + (left - first - 1u) / per;
+        if (n > TICK_IRQ_MAX)
+            n = TICK_IRQ_MAX;
+        *tail = left - first - (n - 1u) * per;
+        tick_phase_left = *tail < per ? per - *tail : 1u;
+    } else {
+        tick_phase_left = first - left + 1u;
+    }
+    return n;
+}
 volatile uint32_t guest_ticks = 0;          /* ticks handed to the guest     */
 volatile uint32_t guest_ticks_dropped = 0;  /* owed but refused (see above)  */
 volatile uint32_t guest_tick_irq_lost = 0;  /* tick IRQ the 1-deep slot ate  */
@@ -4358,19 +4386,22 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                 kips = 100000u;                /* keeps dt*kips in 32 bits */
             /* The PIT counters convert instructions into 1.193182 MHz
                ticks at exactly this rate, so the machine's clock and the
-               speed it claims to run at are one number. UNTHROTTLED there is
-               no claimed speed, and the fixed nominal (5,500 k) made guest
-               time crawl whenever a title ran slower than that: Ironman waits
-               on 0x3DA, which is guest time, and ran at a fraction of real
-               speed. So Max takes the rate it MEASURED over the last frame
-               (what ran / how long it took, HLT included), so a frame's guest
-               time is the real time it took; x86_io.c caps it at the nominal,
-               so Max is never slower than it used to be. */
+               speed it claims to run at are one number. Unthrottled there is
+               no claimed speed: the fine clock keeps the 5,500 k nominal and a
+               second, REAL-TIME clock runs at the rate measured over the last
+               frame -- x86_io.c says which reads use which. */
             {
                 static uint32_t pit_insns_last;
-                uint32_t ran = guest_insns_total - pit_insns_last;
-                pit_insns_last = guest_insns_total;
-                x86_pit_kips = kips ? kips : ran / (dt ? dt : 1u);
+                /* EXECUTED, not budgeted: guest_insns_total adds the slice
+                   budget, and a run cut short by a port 0x40 reload or an
+                   IRQ never runs its tail -- Ironman, reloading in every
+                   INT 08h, ran ~45% of its budget and a rate taken from the
+                   budget ran its retrace at 43% of real time. */
+                x86_pit_sync();
+                uint32_t ran = x86_pit_insns - pit_insns_last;
+                pit_insns_last = x86_pit_insns;
+                x86_pit_kips = kips;
+                x86_pit_rt_kips = kips ? kips : ran / (dt ? dt : 1u);
             }
 
             /*
@@ -4530,12 +4561,15 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
             /* After a mid-frame restart (below) the period started THERE:
                the part of the frame before it is not time towards a tick, and
                the ticks already planned after it are paid. */
-            tick_acc += (dt > tick_skip_ms ? dt - tick_skip_ms : 0u) * TICK_NUM;
-            tick_skip_ms = 0;
+            tick_acc += dt * TICK_NUM;
             uint32_t owed = tick_acc / den;
             tick_acc -= owed * den;
-            owed = owed > tick_credit ? owed - tick_credit : 0u;
-            tick_credit = 0;
+            if (tick_phase_on) {          /* the phase plans this frame's ticks */
+                owed = 0;
+                tick_irqs_owed = 0;
+                if (++tick_phase_quiet > 120u)
+                    tick_phase_on = 0;
+            }
             /* Time lost to a stall is still time: count it as dropped rather
                than pretending the target was never away. */
             owed += (stalled_ms * TICK_NUM) / den;
@@ -4579,12 +4613,26 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
          * host cycles and nothing in the interpreter (delivery itself still
          * happens IN-GUEST, see .handle_pit_or_irq).
          */
-        uint32_t subs = tick_irqs_owed ? tick_irqs_owed : 1u;
-        if (subs > TICK_IRQ_MAX)
-            subs = TICK_IRQ_MAX;
-        uint32_t sub_slice = slice / subs;
-        if (sub_slice == 0)
-            sub_slice = slice;
+        uint32_t subs, sub_slice, sub_left, phase_tail = 0;
+        if (tick_phase_on) {
+            uint32_t per = (slice / plan_ms) * plan_div / 1193u;
+            if (!per)
+                per = 1u;
+            uint32_t first = tick_phase_left ? tick_phase_left : 1u;
+            uint32_t n = tick_phase_plan(first, slice, per, &phase_tail);
+            tick_irqs_owed = n;
+            subs = n + 1u;          /* a tick-less run up to the first tick */
+            sub_slice = per;
+            sub_left = n ? first : slice;
+        } else {
+            subs = tick_irqs_owed ? tick_irqs_owed : 1u;
+            if (subs > TICK_IRQ_MAX)
+                subs = TICK_IRQ_MAX;
+            sub_slice = slice / subs;
+            if (sub_slice == 0)
+                sub_slice = slice;
+            sub_left = sub_slice;
+        }
         /* The PIT clock is charged for everything run under the OLD reload
            before the new one lands, and the emulated CPU's declared speed is
            what converts instructions into 1.193182 MHz ticks. */
@@ -4598,11 +4646,11 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         uint32_t chunk = max_slice / AUDIO_CHUNK_DIV;
         if (chunk < MAX_SLICE_FLOOR)
             chunk = MAX_SLICE_FLOOR;
-        uint32_t sub_left = sub_slice;
         uint32_t run = sub_left < chunk ? sub_left : chunk;
         uint32_t kbd_retries = 0;           /* see KBD_RETRY_RUN */
         cpu_state_ptr->pit_reload = run;
-        arm_tick_irq();
+        if (!tick_phase_on)
+            arm_tick_irq();
         if (cpu_state_ptr->pit_counter != 1u)
             x86_pit_counter_forced(run);
 
@@ -4758,15 +4806,16 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                        links __aeabi_uldivmod into RAM_EMU, which is guest
                        frames. */
                     uint32_t per = (slice / plan_ms) * nd / 1193u;
-                    uint32_t n = per ? left / per : TICK_IRQ_MAX;
-                    if (n > TICK_IRQ_MAX) n = TICK_IRQ_MAX;
+                    if (!per)
+                        per = 1u;
                     plan_div = nd;
                     guest_tick_divisor = nd;
                     guest_tick_replans++;
                     /* THE COUNT WAS LOADED: the period restarts now. A tick
                        armed but not yet taken belongs to the old period and
                        goes; the first new one is a whole period away, then
-                       evenly spaced to the end of the frame. Ironman reloads
+                       one every period, ON THAT PHASE across the following
+                       frames (tick_phase_plan). Ironman reloads
                        the count in its INT 08h at each retrace; ticks on the
                        old phase arrived while it waited for the next retrace,
                        queued, and ran its handler back to back -- music that
@@ -4776,14 +4825,13 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                         x86_pic_eoi_level(0);
                     }
                     tick_acc = 0;
-                    tick_skip_ms = abi->HAL_GetTick() - tick_last_ms;
-                    tick_credit = n;
+                    tick_phase_on = 1;
+                    tick_phase_quiet = 0;
+                    uint32_t n = tick_phase_plan(per, left, per, &phase_tail);
                     tick_irqs_owed = n;
                     subs = n + 1u;      /* a tick-less first sub-slice, then n */
-                    sub_slice = left / subs;
-                    if (sub_slice < MAX_SLICE_FLOOR)
-                        sub_slice = MAX_SLICE_FLOOR;
-                    sub_left = sub_slice;
+                    sub_slice = per;
+                    sub_left = n ? per : left;
                 }
                 /* An audio chunk inside the sub-slice: go straight back in,
                    with no interrupt and no change to the tick plan. */
@@ -4797,7 +4845,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                     break;
                 /* Another sub-slice: arm the next timer interrupt and go back
                    in. Nothing else about the frame changes. */
-                sub_left = sub_slice;
+                sub_left = (subs == 1u && phase_tail) ? phase_tail : sub_slice;
                 run = sub_left < chunk ? sub_left : chunk;
                 cpu_state_ptr->pit_reload = run;
                 arm_tick_irq();

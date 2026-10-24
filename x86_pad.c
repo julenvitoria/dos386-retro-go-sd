@@ -21,6 +21,7 @@ uint8_t x86_pad_mouse_on;
 
 static uint32_t hold_since[X86_PAD_BUTTONS];    /* ms the button went down */
 static uint32_t last_rep[X86_PAD_BUTTONS];      /* ms of the last repeat   */
+static uint8_t  rep_button = 0xFF;               /* the one that repeats    */
 static uint32_t held_prev;
 
 /*
@@ -258,9 +259,12 @@ unsigned x86_pad_repeat(uint32_t held, uint32_t now_ms, void (*emit)(uint8_t sc)
         if (!(held_prev & m)) {                     /* went down this frame */
             hold_since[i] = now_ms;
             last_rep[i] = now_ms;
+            rep_button = (uint8_t)i;
             continue;
         }
-        if (!x86_pad_repeat_on)
+        /* A keyboard repeats only the LAST key pressed: holding RIGHT and
+           tapping jump must not leave both streaming codes into the guest. */
+        if (!x86_pad_repeat_on || i != rep_button)
             continue;
         if (now_ms - hold_since[i] < X86_PAD_REPEAT_DELAY_MS
             || now_ms - last_rep[i] < X86_PAD_REPEAT_RATE_MS)

@@ -1661,16 +1661,12 @@ void x86_video_policy_tick(void)
         return;                         /* the mode cannot address more */
     if (x86_pager_policy_headroom() < X86_ARENA_PAGE + X86_ARENA_PAGE)
         return;
-    /* A SHORT second piece is re-fitted, not kept for the session. A shrink
-       during Keen 4's loading left a 9-frame piece (card 45,056 of 65,536)
-       and the "already lent" test then refused every grow after it, so the
-       world map scrolled its pages into offsets the card did not have and
-       went black a third of the time. Its frames plus the headroom fund the
-       whole card now; the piece's contents go (the guest redraws them), the
-       arena's piece is untouched. */
-    if (x86_vga_ega_planes2())
-        ega_card_trim();
-    else if (x86_pg_donated)
+    /* ONE second piece per session stays: re-fitting a short one bigger was
+       tried (Keen 4's map card 45,056 -> 60,416 offsets, the black frames
+       gone) and it cost the guest the frames its working set needed --
+       pagefile evictions on every scroll and a game that crawled on the
+       device. Picture quality is not worth that trade. */
+    if (x86_vga_ega_planes2() || x86_pg_donated)
         return;
     (void)ega_card_extend();
 }

@@ -49,9 +49,8 @@ X86IOState x86_io;
  * declared speed -- guest_kips, the same knob the pacing loop uses (main.c
  * "TWO PACING MODES"). In a paced profile that is exact by construction: the
  * machine claims to be a 386DX-33 and its PIT agrees. Unthrottled there is no
- * declared speed, so main.c publishes the rate it MEASURED over the last second
- * (instructions / measured rate = the real seconds that passed); the fixed
- * nominal below is only the stand-in until that first measurement.
+ * declared speed, so a fixed nominal stands in; see below. The vertical
+ * retrace alone runs on a second, real-time clock (x86_pit_sync).
  *
  * The alternative -- driving the counter off HOST wall-clock time -- was
  * rejected. The Zen Timer overflows past 54.9 ms and reports a sentinel, and
@@ -66,6 +65,10 @@ X86IOState x86_io;
 uint32_t x86_pit_kips = 0;      /* published by main.c from guest_kips      */
 
 static uint64_t pit_frac;           /* insns*PIT_HZ not yet worth a tick    */
+static uint32_t pit_rt_frac;        /* the same, for the real-time clock    */
+static uint32_t pit_rt;             /* real-time clock, PIT ticks           */
+uint32_t x86_pit_rt_kips = 0;       /* measured rate at Max, else = kips    */
+uint32_t x86_pit_insns;             /* instructions executed, as counted here */
 static uint32_t pit_now;            /* free-running 1.193182 MHz tick count */
 static uint32_t pit_last_counter;   /* pit_counter at the last accounting   */
 
@@ -101,14 +104,9 @@ void x86_pit_sync(void)
        stale reload of 0xFFFFFFFF at reset banking an hour of guest time. */
     if (d > 1000000u)
         d = 1000000u;
+    x86_pit_insns += d;             /* what really ran: main.c's real-time rate */
 
-    /* Never SLOWER than the nominal: Max publishes its measured rate, which
-       makes guest time real time on a title that runs below 5,500 k
-       (Ironman), and keeps the old, faster-than-real guest time on one that
-       runs above it (Keen 4 drew far more slowly at its true retrace rate). */
-    uint32_t kips = x86_pit_kips;
-    if (!kips || kips > PIT_NOMINAL_KIPS)
-        kips = PIT_NOMINAL_KIPS;
+    uint32_t kips = x86_pit_kips ? x86_pit_kips : PIT_NOMINAL_KIPS;
     if (kips < 100u)     kips = 100u;
     if (kips > 100000u)  kips = 100000u;
 
@@ -116,6 +114,30 @@ void x86_pit_sync(void)
     uint64_t den = (uint64_t)kips * 1000u;
     pit_now += (uint32_t)(pit_frac / den);
     pit_frac %= den;
+
+    /* THE REAL-TIME CLOCK: the vertical retrace (0x3DA bit 3) and the PIT
+       counters. Paced it is the same clock; at Max it runs at the rate
+       MEASURED over the last frame, so a 70 Hz retrace is 70 Hz of the
+       panel's time whatever the title costs us, and the IRQ 0 the frame loop
+       delivers in real time agrees with the counter a guest reads. Ironman
+       times its game and music off the retrace (it crawled on the nominal
+       clock) and CALIBRATES its timer reload by reading the PIT counter across
+       a frame -- with the counter on the nominal clock it computed a reload a
+       quarter of the real one and its IRQ came 1 ms after each retrace.
+       Horizontal blanking (bit 0) and the OPL timers stay on the nominal
+       clock: Keen 4 times five or ten 0x3DA reads against one 5 us blank, and
+       on the slower real-time clock each read cost more than the blank lasts,
+       so its wait timed out every frame with interrupts off. */
+    /* 32-bit on purpose (d <= 1e6, so d * 1193 fits): 1,193 counts per ms. */
+    /* Below 1,000 k the measurement is not believed: it counts what this
+       function saw, and a guest taking IRQs faster than it is synced (Keen
+       4's 560 Hz) reloads the counter twice between syncs and reads as a
+       few k. Such a title keeps the nominal clock, as before. */
+    if (x86_pit_rt_kips >= 1000u)
+        kips = x86_pit_rt_kips;
+    pit_rt_frac += d * 1193u;
+    pit_rt += pit_rt_frac / kips;
+    pit_rt_frac %= kips;
 }
 
 void x86_pit_counter_forced(uint32_t v)
@@ -138,7 +160,11 @@ void x86_pit_advance_us(uint32_t us)
     if (us > 1000000u)
         us = 1000000u;                /* a second; nobody waits longer here */
     x86_pit_sync();
-    pit_now += (uint32_t)(((uint64_t)us * PIT_HZ) / 1000000u);
+    {
+        uint32_t t = (uint32_t)(((uint64_t)us * PIT_HZ) / 1000000u);
+        pit_now += t;
+        pit_rt += t;
+    }
 }
 
 uint32_t x86_pit_ticks(void)
@@ -197,7 +223,7 @@ volatile uint32_t x86_gameport_writes = 0;
 
 /* Per-channel counter state. Channel 1 (DRAM refresh) is carried so the array
    indexes by channel number and nothing has to remember that 2 is really 1. */
-static uint32_t pit_ch_start[3];    /* pit_now when the count was loaded   */
+static uint32_t pit_ch_start[3];    /* pit_rt when the count was loaded    */
 static uint16_t pit_ch_latch[3];    /* the frozen count from OUT 43h,xx00b */
 static uint8_t  pit_ch_latched[3];  /* a latch is pending                  */
 static uint8_t  pit_ch_rdphase[3];  /* lo/hi READ phase (its own, not the
@@ -248,7 +274,7 @@ static uint16_t pit_count(unsigned ch)
     if (!pit_ch_running[ch])
         return pit_ch_frozen[ch];
 
-    uint32_t el = pit_now - pit_ch_start[ch];
+    uint32_t el = pit_rt - pit_ch_start[ch];
     if (pit_ch_mode[ch] == 0 || pit_ch_mode[ch] == 1) {
         if (el >= R - 1u)
             return 0;                /* terminal count, and it stays there */
@@ -261,7 +287,7 @@ static uint16_t pit_count(unsigned ch)
 static void pit_ch_loaded(unsigned ch)
 {
     x86_pit_sync();
-    pit_ch_start[ch] = pit_now;
+    pit_ch_start[ch] = pit_rt;
     pit_ch_frozen[ch] = (uint16_t)((pit_ch_reload(ch) - 1u) & 0xFFFFu);
     pit_ch_running[ch] = (ch == 2) ? (uint8_t)(x86_io.port61 & 1u) : 1u;
 }
@@ -299,7 +325,7 @@ static void pit_ch2_gate(unsigned on)
         return;
     x86_pit_sync();
     if (on) {
-        pit_ch_start[2] = pit_now;
+        pit_ch_start[2] = pit_rt;
         pit_ch_running[2] = 1;
     } else {
         pit_ch_frozen[2] = pit_count(2);
@@ -374,7 +400,7 @@ volatile uint32_t x86_spk_log_idx = 0;
  *
  * scripts/probe.py --io-log
  */
-#define X86_IO_LOG_SLOTS 32
+#define X86_IO_LOG_SLOTS 16   /* 32 -> 16 (2026-10-24): RAM_EMU for the PIT phase */
 volatile uint32_t x86_io_log[X86_IO_LOG_SLOTS * 2];
 volatile uint32_t x86_io_log_idx = 0;
 volatile uint32_t x86_io_log_total = 0;
@@ -2461,8 +2487,8 @@ static uint32_t port_read_inner(uint32_t port)
          * so the retrace now comes when a real card's would.
          */
         if (cpu_state_ptr->pit_reload) {
-            uint32_t t = x86_pit_ticks();
-            if (t % VGA_FRAME_TICKS >= VGA_FRAME_TICKS - VGA_VRETRACE_TICKS)
+            uint32_t t = x86_pit_ticks();       /* also syncs pit_rt */
+            if (pit_rt % VGA_FRAME_TICKS >= VGA_FRAME_TICKS - VGA_VRETRACE_TICKS)
                 return 0x08u | 0x01u;           /* vertical retrace */
             if (t % VGA_LINE_TICKS >= VGA_LINE_TICKS - VGA_HBLANK_TICKS)
                 v |= 0x01u;                     /* horizontal retrace */
