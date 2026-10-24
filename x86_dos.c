@@ -2181,10 +2181,11 @@ static void fail(uint16_t code) { x86_set_ax(code); x86_hle_set_cf(1); }
  * guest pager frames, and the full-size EGA card for Keen 4 needed them more.
  * The saturating prologue is what gets read (Monkey Island's whole startup
  * conversation fitted in its first nine entries); re-arm for a later phase.
- * 20, not 48 (2026-10-24): the [autoexec] program chain (`x86_dos_exec_next`,
- * AH=31h, INT 27h) cost one more pager frame, and 448 B of debug log buys it back.
+ * 16, not 48 (2026-10-24): the [autoexec] program chain (`x86_dos_exec_next`,
+ * AH=31h, INT 27h) and the PIT period restart cost pager frames; 512 B of debug log
+ * buys them back.
  */
-#define DOS_FILE_LOG_SLOTS 20
+#define DOS_FILE_LOG_SLOTS 16
 X86_UC_BSS(x86_dos_file_log) uint32_t x86_dos_file_log[DOS_FILE_LOG_SLOTS * 4];
 uint32_t x86_dos_file_log_idx;
 uint32_t x86_dos_file_calls;

@@ -120,7 +120,7 @@ def check_game_opens_osk(runner, syms, out=print):
 
     def read_log():
         base = syms["x86_kbd_read_log"]
-        return [b.read_uint32(base + 4 * i) for i in range(32)]
+        return list(b.read_memory(base, 32))   # uint8_t[32]
 
     def fresh_since(idx0):
         idx1 = b.read_uint32(syms["x86_kbd_read_log_idx"])

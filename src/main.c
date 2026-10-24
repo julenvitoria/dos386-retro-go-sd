@@ -638,6 +638,7 @@ static uint32_t tick_acc;             /* ms * TICK_NUM, below one IRQ 0      */
 static uint32_t bda_acc;              /* the same, for the 18.2 Hz BDA count */
 static uint32_t tick_irqs_owed;       /* IRQ 0s this frame still has to give */
 static uint32_t tick_last_ms;
+static uint32_t tick_skip_ms, tick_credit, pit_restarts_seen;
 volatile uint32_t guest_ticks = 0;          /* ticks handed to the guest     */
 volatile uint32_t guest_ticks_dropped = 0;  /* owed but refused (see above)  */
 volatile uint32_t guest_tick_irq_lost = 0;  /* tick IRQ the 1-deep slot ate  */
@@ -4361,10 +4362,16 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                no claimed speed, and the fixed nominal (5,500 k) made guest
                time crawl whenever a title ran slower than that: Ironman waits
                on 0x3DA, which is guest time, and ran at a fraction of real
-               speed. So Max takes the rate it MEASURED over the last second:
-               instructions / measured rate = the seconds that really passed,
-               HLT included. 0 until the first measurement (-> the nominal). */
-            x86_pit_kips = kips ? kips : guest_ips_achieved / 1000u;
+               speed. So Max takes the rate it MEASURED over the last frame
+               (what ran / how long it took, HLT included), so a frame's guest
+               time is the real time it took; x86_io.c caps it at the nominal,
+               so Max is never slower than it used to be. */
+            {
+                static uint32_t pit_insns_last;
+                uint32_t ran = guest_insns_total - pit_insns_last;
+                pit_insns_last = guest_insns_total;
+                x86_pit_kips = kips ? kips : ran / (dt ? dt : 1u);
+            }
 
             /*
              * How many instructions FIT in one display period, regulated from
@@ -4520,9 +4527,15 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                 x86_bios_tick();
 
             uint32_t den = div * 1000u;         /* <= 65,536,000: fits */
-            tick_acc += dt * TICK_NUM;
+            /* After a mid-frame restart (below) the period started THERE:
+               the part of the frame before it is not time towards a tick, and
+               the ticks already planned after it are paid. */
+            tick_acc += (dt > tick_skip_ms ? dt - tick_skip_ms : 0u) * TICK_NUM;
+            tick_skip_ms = 0;
             uint32_t owed = tick_acc / den;
             tick_acc -= owed * den;
+            owed = owed > tick_credit ? owed - tick_credit : 0u;
+            tick_credit = 0;
             /* Time lost to a stall is still time: count it as dropped rather
                than pretending the target was never away. */
             owed += (stalled_ms * TICK_NUM) / den;
@@ -4734,30 +4747,43 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                  * half its boots, depending only on where in the frame its
                  * `OUT 40h` landed.
                  */
-                {
+                if (x86_pit0_restarts != pit_restarts_seen) {
                     uint32_t nd = x86_pit0_divisor();
-                    if (nd != plan_div) {
-                        /* what is left of this sub-slice, and the rest */
-                        uint32_t left = sub_left + sub_slice * (subs - 1u);
-                        /* instructions per tick at the new rate: this
-                           frame's instructions per ms, times the divisor, over
-                           the 1,193 PIT counts in a ms. 32-bit on purpose --
-                           a 64-bit divide links __aeabi_uldivmod into RAM_EMU,
-                           which is guest frames. */
-                        uint32_t per = (slice / plan_ms) * nd / 1193u;
-                        uint32_t n = per ? left / per : TICK_IRQ_MAX;
-                        if (n < 1u) n = 1u;
-                        if (n > TICK_IRQ_MAX) n = TICK_IRQ_MAX;
-                        plan_div = nd;
-                        guest_tick_divisor = nd;
-                        guest_tick_replans++;
-                        tick_irqs_owed = n;
-                        subs = n + 1u;              /* the -- below eats one */
-                        sub_slice = left / n;
-                        if (sub_slice < MAX_SLICE_FLOOR)
-                            sub_slice = MAX_SLICE_FLOOR;
-                        sub_left = 0;   /* start the re-planned sub-slices */
+                    pit_restarts_seen = x86_pit0_restarts;
+                    /* what is left of this sub-slice, and the rest */
+                    uint32_t left = sub_left + sub_slice * (subs - 1u);
+                    /* instructions per tick at this rate: this frame's
+                       instructions per ms, times the divisor, over the 1,193
+                       PIT counts in a ms. 32-bit on purpose -- a 64-bit divide
+                       links __aeabi_uldivmod into RAM_EMU, which is guest
+                       frames. */
+                    uint32_t per = (slice / plan_ms) * nd / 1193u;
+                    uint32_t n = per ? left / per : TICK_IRQ_MAX;
+                    if (n > TICK_IRQ_MAX) n = TICK_IRQ_MAX;
+                    plan_div = nd;
+                    guest_tick_divisor = nd;
+                    guest_tick_replans++;
+                    /* THE COUNT WAS LOADED: the period restarts now. A tick
+                       armed but not yet taken belongs to the old period and
+                       goes; the first new one is a whole period away, then
+                       evenly spaced to the end of the frame. Ironman reloads
+                       the count in its INT 08h at each retrace; ticks on the
+                       old phase arrived while it waited for the next retrace,
+                       queued, and ran its handler back to back -- music that
+                       sped up and slowed down, and no time left for the game. */
+                    if (cpu_state_ptr->hard_int_pending == 0x08u) {
+                        cpu_state_ptr->hard_int_pending = 0;
+                        x86_pic_eoi_level(0);
                     }
+                    tick_acc = 0;
+                    tick_skip_ms = abi->HAL_GetTick() - tick_last_ms;
+                    tick_credit = n;
+                    tick_irqs_owed = n;
+                    subs = n + 1u;      /* a tick-less first sub-slice, then n */
+                    sub_slice = left / subs;
+                    if (sub_slice < MAX_SLICE_FLOOR)
+                        sub_slice = MAX_SLICE_FLOOR;
+                    sub_left = sub_slice;
                 }
                 /* An audio chunk inside the sub-slice: go straight back in,
                    with no interrupt and no change to the tick plan. */

@@ -1029,14 +1029,17 @@ static void blit_ega16(uint8_t *dst, uint32_t stride)
 
     /* One extra group per row so the pel-panning shift has 8 more pixels to
        pull from. */
-    for (unsigned y = 0; y < EGA_ROWS; y++, dst += stride, addr += pitch) {
+    for (unsigned y = 0; y < EGA_ROWS; y++, dst += stride, addr = (addr + pitch) & 0xFFFFu) {
         uint8_t line[EGA_WIDTH + 8];
         unsigned a = addr;
         uint8_t *out = line;
 
-        for (unsigned g = 0; g < EGA_ROWBYTES + 1u; g++, a++) {
+        for (unsigned g = 0; g < EGA_ROWBYTES + 1u; g++, a = (a + 1u) & 0xFFFFu) {
             uint32_t p0, p1, p2, p3;
 
+            /* The CRTC counts in 16 bits: a page that starts near the top of
+               the 64 KB plane WRAPS to its bottom (Keen 4 scrolls its pages
+               round the whole plane), it does not run off into nothing. */
             if (a < vram) {
                 /* One 32-bit load, four planes. Bit 7 is the leftmost pixel. */
                 uint32_t q;
@@ -1654,11 +1657,20 @@ void x86_video_policy_tick(void)
     }
     /* GROW is permission, not an instruction: only when the headroom funds at
        least one arena page of second piece. */
-    if (x86_vga_ega_planes2() || x86_pg_donated)
-        return;
     if (x86_vga_ega_card_offsets >= X86_EGA_PLANE_MAX)
         return;                         /* the mode cannot address more */
     if (x86_pager_policy_headroom() < X86_ARENA_PAGE + X86_ARENA_PAGE)
+        return;
+    /* A SHORT second piece is re-fitted, not kept for the session. A shrink
+       during Keen 4's loading left a 9-frame piece (card 45,056 of 65,536)
+       and the "already lent" test then refused every grow after it, so the
+       world map scrolled its pages into offsets the card did not have and
+       went black a third of the time. Its frames plus the headroom fund the
+       whole card now; the piece's contents go (the guest redraws them), the
+       arena's piece is untouched. */
+    if (x86_vga_ega_planes2())
+        ega_card_trim();
+    else if (x86_pg_donated)
         return;
     (void)ega_card_extend();
 }
