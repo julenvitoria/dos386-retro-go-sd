@@ -2189,7 +2189,7 @@ static void fail(uint16_t code) { x86_set_ax(code); x86_hle_set_cf(1); }
 X86_UC_BSS(x86_dos_file_log) uint32_t x86_dos_file_log[DOS_FILE_LOG_SLOTS * 4];
 uint32_t x86_dos_file_log_idx;
 uint32_t x86_dos_file_calls;
-char x86_dos_path_log[8][32];   /* 16 -> 8 (2026-10-17): RAM_EMU for INT 10h AH=13h */
+char x86_dos_path_log[4][32];   /* 16 -> 8 (2026-10-17), -> 4 (2026-10-24): RAM_EMU */
 static uint32_t dos_path_log_idx;
 
 /* The MEMORY calls are traced too, but they are not FILE calls: they get a
@@ -2222,7 +2222,7 @@ static int dos_func_is_file(uint8_t f)
 
 static void dos_log_path(const char *p)
 {
-    unsigned slot = dos_path_log_idx & 7;
+    unsigned slot = dos_path_log_idx & 3;
     strncpy(x86_dos_path_log[slot], p, sizeof(x86_dos_path_log[0]) - 1);
     x86_dos_path_log[slot][sizeof(x86_dos_path_log[0]) - 1] = 0;
     dos_path_log_idx++;

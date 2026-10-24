@@ -685,10 +685,10 @@ extern char x86_dos_last_path[32];
 extern uint32_t x86_dos_file_log[16 * 4];   /* DOS_FILE_LOG_SLOTS * 4, x86_dos.c */
 extern uint32_t x86_dos_file_log_idx;
 extern uint32_t x86_dos_file_calls;
-extern volatile uint32_t x86_io_log[64];
+extern volatile uint32_t x86_io_log[32];
 extern volatile uint32_t x86_io_log_idx;
 extern volatile uint32_t x86_io_log_total;
-extern char x86_dos_path_log[8][32];
+extern char x86_dos_path_log[4][32];
 uint16_t *x86_hle_flags_on_stack(void);
 uint16_t dos_test_alloc(uint16_t paras, uint16_t *largest);
 uint16_t dos_test_free(uint16_t seg);
@@ -710,6 +710,8 @@ extern volatile uint32_t x86_pit0_restarts;   /* channel 0 counts loaded */
 /* The PIT's free-running counter, in 1.193182 MHz ticks of GUEST time. See the
    block comment in x86_io.c: guest time is instructions at x86_pit_kips. */
 extern uint32_t x86_pit_kips;         /* main.c publishes guest_kips here */
+extern uint32_t x86_pit_rt_kips;      /* ...and the real-time clock's rate */
+extern uint32_t x86_pit_insns;        /* instructions executed (x86_pit_sync) */
 void     x86_pit_sync(void);          /* accrue what the guest has just run */
 void     x86_pit_counter_forced(uint32_t v);  /* host write to pit_counter  */
 void     x86_pit_advance_us(uint32_t us); /* INT 15h AH=86h: the wait passes */
