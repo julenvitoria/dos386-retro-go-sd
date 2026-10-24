@@ -61,19 +61,29 @@ profile for those.
 
 ### `[autoexec]`
 
-Which program starts. It is not a full `.bat` file: the core carries its own
-DOS and launches **one** program, so it takes two things from this section:
+Which programs start. It is not a full `.bat` file: the core carries its own
+DOS, so it takes two things from this section:
 
 - `cd <folder>` (or `cd\folder`): the working directory.
-- Any other line is the program to run, with its parameters. If there are
-  several, the last one counts.
+- Any other line is a program to run, with its parameters. The last one is the
+  game; the earlier ones run first, in order, each starting when the previous
+  one exits or stays resident (a missing one is
+  skipped). Use it to load a resident driver before the
+  game, for example the AdLib `SOUND.COM` that Rick Dangerous II needs:
+
+  ```ini
+  [autoexec]
+  sound
+  rick2
+  ```
 - `mount`, `imgmount`, `echo`, `cls`, `pause`, `exit`, `set`, `keyb`, `c:`…
   are ignored without an error, so a DOSBox `[autoexec]` can be pasted in.
 
 Without `[autoexec]`, the `.dsk`'s `AUTOEXEC.BAT` decides.
 
 The same can be written with separate keys, in any section: `entry` (the
-program), `args` (its parameters), `cwd` (the folder) and `use_cmdtail`
+program), `args` (its parameters), `cwd` (the folder), `pre` (with `entry`:
+programs to run first, separated by `;`, e.g. `pre = sound`) and `use_cmdtail`
 (`true`/`false`: whether the parameters in the game's `AUTOEXEC.BAT` are passed
 when the `.cfg` gives none).
 

@@ -131,6 +131,7 @@ static const x86_cfg_key_t x86_cfg_keys[] = {
     { "entry",        NULL,   X86_STR_ENTRY,       X86_CFG_T_STR  },
     { "args",         NULL,   X86_STR_ARGS,        X86_CFG_T_STR  },
     { "cwd",          NULL,   X86_STR_CWD,         X86_CFG_T_STR  },
+    { "pre",          NULL,   X86_STR_PRE,         X86_CFG_T_STR  },
     { "use_cmdtail",  NULL,   X86_SET_USE_CMDTAIL, X86_CFG_T_BOOL },
 };
 #define X86_CFG_KEY_COUNT ((int)(sizeof x86_cfg_keys / sizeof x86_cfg_keys[0]))
@@ -336,9 +337,12 @@ static int cfg_val_memkb(const unsigned char *v, const unsigned char *v_end,
  *                    an error: a config copied wholesale from a desktop DOSBox
  *                    will be full of them and none of them is a mistake, it is
  *                    just work this core does elsewhere.
- *   anything else    the program to run, and the rest of the line is its
- *                    arguments. LAST ONE WINS, which is what a batch file's own
- *                    semantics amount to when only one program can start.
+ *   anything else    a program to run, and the rest of the line is its
+ *                    arguments. The LAST one is the game (`entry`/`args`);
+ *                    earlier ones go to `pre` and run first, one after the
+ *                    other, each starting when the one before it ends or stays
+ *                    resident (AH=31h) -- which is what a driver like
+ *                    SOUND.COM does.
  *
  * The honest limit, stated rather than hidden: a line this core ignores is
  * ignored SILENTLY. `x86_cfg_report()` says how many commands the section
@@ -510,6 +514,26 @@ x86_cfg_status_t x86_cfg_parse(const unsigned char *buf, unsigned long len,
                         r.applied++;
                     }
                     continue;
+                }
+            }
+            /* A SECOND program line: the one before it is not lost any more
+               but moved to `pre`, to run first (a resident driver, typically).
+               Only lines of THIS section move -- an `entry = ` key elsewhere
+               is still simply replaced. */
+            if (r.commands && x86_settings_str_is_set(X86_STR_ENTRY)) {
+                char line[X86_SETTINGS_STR_MAX];
+                const char *pre = x86_settings_str_is_set(X86_STR_PRE)
+                                  ? x86_settings_str(X86_STR_PRE) : "";
+                const char *a = x86_settings_str(X86_STR_ARGS);
+                int n = snprintf(line, sizeof line, "%s%s%s%s%s", pre,
+                                 *pre ? ";" : "", x86_settings_str(X86_STR_ENTRY),
+                                 *a ? " " : "", a);
+                if (n < 0 || n >= (int)sizeof line
+                    || !x86_settings_str_set(X86_STR_PRE, line,
+                                             (unsigned long)n)) {
+                    if (r.bad_value == 0)
+                        cfg_keep(r.first_bad, buf + ls, buf + le);
+                    r.bad_value++;
                 }
             }
             if (cfg_autoexec_command(buf + ls, buf + le)) {

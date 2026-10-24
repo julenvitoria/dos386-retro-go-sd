@@ -321,6 +321,8 @@ int x86_hle_dispatch(uint8_t vector)
         return x86_xms_control();
     case 0x20:
         return x86_dos_terminate();
+    case 0x27:
+        return x86_dos_int27();
     default:
         /* Loud, not silent. A service we never implemented that returns as
            though it worked is indistinguishable from one that does, and the

@@ -188,6 +188,11 @@ typedef enum {
        `cwd = ` written out. Empty means the image root, which is what
        find_startup_program() starts from today. */
     X86_STR_CWD   = 2,
+    /* Programs to run BEFORE the entry, as command lines separated by ';' --
+       the earlier lines of an `[autoexec]` section, or `pre = ` written out.
+       What they are for is a driver that stays resident (AH=31h) for the
+       game: Rick Dangerous II's AdLib is `SOUND.COM`. */
+    X86_STR_PRE   = 3,
     X86_STR_COUNT
 } x86_setting_str_id_t;
 

@@ -61,19 +61,30 @@ para esos, un perfil lento.
 
 ### `[autoexec]`
 
-Qué programa se arranca. No es un archivo `.bat` completo: el núcleo trae su
-propio DOS y lanza **un** programa, así que de esta sección toma dos cosas:
+Qué programas se arrancan. No es un archivo `.bat` completo: el núcleo trae
+su propio DOS, así que de esta sección toma dos cosas:
 
 - `cd <carpeta>` (o `cd\carpeta`): el directorio de trabajo.
-- Cualquier otra línea es el programa a ejecutar, con sus parámetros. Si hay
-  varias, cuenta la última.
+- Cualquier otra línea es un programa a ejecutar, con sus parámetros. La
+  última es el juego; las anteriores se ejecutan antes, en orden, y cada una
+  empieza cuando la anterior termina o se queda residente (si una no existe, se
+  salta). Sirve para cargar un
+  driver residente antes del juego, por ejemplo el `SOUND.COM` de AdLib que
+  pide Rick Dangerous II:
+
+  ```ini
+  [autoexec]
+  sound
+  rick2
+  ```
 - `mount`, `imgmount`, `echo`, `cls`, `pause`, `exit`, `set`, `keyb`, `c:`…
   se ignoran sin dar error, para poder pegar un `[autoexec]` de DOSBox.
 
 Sin `[autoexec]` manda el `AUTOEXEC.BAT` del `.dsk`.
 
 Lo mismo se puede escribir con claves sueltas, en cualquier sección:
-`entry` (el programa), `args` (sus parámetros), `cwd` (la carpeta) y
+`entry` (el programa), `args` (sus parámetros), `cwd` (la carpeta), `pre`
+(con `entry`: programas a ejecutar antes, separados por `;`, p. ej. `pre = sound`) y
 `use_cmdtail` (`true`/`false`: si se pasan los parámetros que traiga el
 `AUTOEXEC.BAT` del juego cuando el `.cfg` no pone ninguno).
 

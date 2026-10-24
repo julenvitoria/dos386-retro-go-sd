@@ -101,7 +101,7 @@ static const x86_setting_desc_t x86_setting_desc[X86_SET_COUNT] = {
 /* String rows. Separate from the table above because they are .cfg-only and
    have no wire representation at all (x86_settings.h says why). */
 static const char *const x86_setting_str_name_tbl[X86_STR_COUNT] = {
-    "entry", "args", "cwd",
+    "entry", "args", "cwd", "pre",
 };
 
 /*
