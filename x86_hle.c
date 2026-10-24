@@ -236,7 +236,7 @@ int x86_bios_rom_install(void)
  * X86_EXIT_HLE_INT; exit_info carries the vector number.
  */
 uint32_t x86_hle_unhandled_vector;
-uint32_t x86_hle_log[16];
+X86_UC_BSS(x86_hle_log) uint32_t x86_hle_log[16];
 uint32_t x86_hle_log_idx;
 uint32_t x86_hle_unhandled_func;
 

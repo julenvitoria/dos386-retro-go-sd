@@ -2185,7 +2185,7 @@ static void fail(uint16_t code) { x86_set_ax(code); x86_hle_set_cf(1); }
  * AH=31h, INT 27h) cost one more pager frame, and 448 B of debug log buys it back.
  */
 #define DOS_FILE_LOG_SLOTS 20
-uint32_t x86_dos_file_log[DOS_FILE_LOG_SLOTS * 4];
+X86_UC_BSS(x86_dos_file_log) uint32_t x86_dos_file_log[DOS_FILE_LOG_SLOTS * 4];
 uint32_t x86_dos_file_log_idx;
 uint32_t x86_dos_file_calls;
 char x86_dos_path_log[8][32];   /* 16 -> 8 (2026-10-17): RAM_EMU for INT 10h AH=13h */

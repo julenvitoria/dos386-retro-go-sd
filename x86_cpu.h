@@ -676,6 +676,12 @@ extern char x86_dos_last_path[32];
  * -- plus the path of the last four opens, so "which call, on which name, with
  * what answer" is one dump instead of a rebuild.
  */
+/* A cold debug buffer that may live OUTSIDE RAM_EMU. The name keeps it a
+   `.bss.*` section, so a linker script that says nothing about it (main's
+   dos_core.ld, TEST.ld) files it with the rest of .bss; one that wants the
+   bytes for guest frames (overlays' dos_core.ld) can route `.bss.__uc.*` to
+   the LUT8 bonus area, where uncached is fine for a log nobody reads hot. */
+#define X86_UC_BSS(name) __attribute__((section(".bss.__uc." #name)))
 extern uint32_t x86_dos_file_log[20 * 4];   /* DOS_FILE_LOG_SLOTS * 4, x86_dos.c */
 extern uint32_t x86_dos_file_log_idx;
 extern uint32_t x86_dos_file_calls;
