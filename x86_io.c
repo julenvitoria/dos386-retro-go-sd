@@ -48,8 +48,10 @@ X86IOState x86_io;
  * instruction. So guest time is instructions converted at the emulated CPU's
  * declared speed -- guest_kips, the same knob the pacing loop uses (main.c
  * "TWO PACING MODES"). In a paced profile that is exact by construction: the
- * machine claims to be a 386DX-33 and its PIT agrees. Unthrottled (kips == 0)
- * there is no declared speed, so a fixed nominal stands in; see below.
+ * machine claims to be a 386DX-33 and its PIT agrees. Unthrottled there is no
+ * declared speed, so main.c publishes the rate it MEASURED over the last second
+ * (instructions / measured rate = the real seconds that passed); the fixed
+ * nominal below is only the stand-in until that first measurement.
  *
  * The alternative -- driving the counter off HOST wall-clock time -- was
  * rejected. The Zen Timer overflows past 54.9 ms and reports a sentinel, and
