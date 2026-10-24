@@ -2217,6 +2217,54 @@ static int find_startup_program(char *out, unsigned max,
     return parse_batch("AUTOEXEC.BAT", out, max, tail, tail_max, 0);
 }
 
+/*
+ * The [autoexec] chain: the ';'-separated command lines of `pre`, then the
+ * game (`entry`/`args`). chain_off is how far through `pre` the machine is.
+ * Consumed by launch_chain_next(), which the DOS layer also calls each time
+ * the root program ends (x86_dos_set_chain()).
+ */
+static int16_t chain_off = -1;
+static void resolve_program_ext(char *full, size_t cap);
+static int launch_chain_next(void)
+{
+    char cmd[X86_SETTINGS_STR_MAX], full[96];
+    const char *src, *tail = "";
+    int first = (chain_off == 0);
+    /* A program that is not there is SKIPPED, not the end of the chain: a
+       missing driver must not cost the game its launch. */
+again:
+    if (chain_off < 0)
+        return 0;
+    tail = "";
+    src = x86_settings_str(X86_STR_PRE) + chain_off;
+    while (*src == ' ' || *src == ';')
+        src++;
+    if (*src) {
+        unsigned n = 0;
+        while (src[n] && src[n] != ';' && n < sizeof(cmd) - 1)
+            n++;
+        memcpy(cmd, src, n);
+        cmd[n] = 0;
+        chain_off = (int16_t)(src + n - x86_settings_str(X86_STR_PRE));
+        char *t = strchr(cmd, ' ');
+        if (t) { *t = 0; tail = t + 1; }
+    } else {                            /* `pre` is done: the game, last */
+        snprintf(cmd, sizeof(cmd), "%s", x86_settings_str(X86_STR_ENTRY));
+        tail = x86_settings_str(X86_STR_ARGS);
+        chain_off = -1;
+    }
+    int rooted = 0;
+    for (const char *c = cmd; *c; c++)
+        if (*c == '/' || *c == '\\') rooted = 1;
+    path_join(full, sizeof(full), rooted ? "" : x86_dos_get_cwd(), cmd);
+    resolve_program_ext(full, sizeof(full));
+    /* The first program is entered outright, like any root; the rest from
+       inside the previous one's terminating INT 21h. */
+    if ((first ? x86_dos_exec(full, tail) : x86_dos_exec_next(full, tail)) == 0)
+        return 1;
+    goto again;
+}
+
 static FATFS dsk_fs;
 
 /*
@@ -2503,6 +2551,8 @@ static void guest_reset(void)
     static const uint8_t hle_vectors[] = {
         0x08, 0x09, 0x10, 0x11, 0x12, 0x15, 0x16, 0x1A, 0x20, 0x21, 0x2F,
         0x33,   /* answers only under `mouse = on` -- x86_mouse.h */
+        0x27,   /* .COM TSR exit (Rick 2's SOUND.COM): a bare IRET ran on
+                   into the bytes after it */
     };
     x86_hle_install(hle_vectors, sizeof(hle_vectors));
 
@@ -2618,17 +2668,37 @@ static void guest_reset(void)
            TOPBENCH.dsk asks for "-l", its continuous scoring loop. Clear
            guest_use_cmdtail (over the debug backend, or here) to launch the
            program bare, which for TOPBENCH is its interactive menu UI. */
-        /* The program lives in the CWD the batch file changed to, and
-           x86_dos_exec takes a FatFs path rather than a guest one, so the
-           prefix is applied here rather than in dos_path_from_guest(). */
-        char full[96];
-        int rooted = 0;
-        for (const char *c = startup; *c; c++)
-            if (*c == '/' || *c == '\\') { rooted = 1; break; }
-        path_join(full, sizeof(full), rooted ? "" : x86_dos_get_cwd(), startup);
-        resolve_program_ext(full, sizeof(full));
-        dsk_exec_rc = (uint32_t)x86_dos_exec(full,
-                                             guest_use_cmdtail ? cmdtail : "");
+    }
+    if (dsk_startup_ok) {
+        /*
+         * THE [autoexec] LAUNCH NEVER RAN. This exec used to sit inside the
+         * AUTOEXEC.BAT branch alone, so a .cfg that named its program -- the
+         * documented way -- set everything up and then exec'd nothing: rc
+         * stayed -1 and the built-in demo pattern came up instead. It is
+         * reached from both branches now.
+         *
+         * `pre` (the earlier [autoexec] lines) runs FIRST, one program after
+         * another, and the game last: x86_dos.c asks launch_chain_next() for
+         * the next one whenever the root program exits or stays resident.
+         */
+        if (dsk_mounted && x86_settings_str_is_set(X86_STR_PRE)
+            && x86_settings_str_is_set(X86_STR_ENTRY)) {
+            chain_off = 0;
+            x86_dos_set_chain(launch_chain_next);
+            dsk_exec_rc = launch_chain_next() ? 0u : 0xFFFFFFFFu;
+        } else {
+            /* The program lives in the CWD the batch file changed to, and
+               x86_dos_exec takes a FatFs path rather than a guest one, so the
+               prefix is applied here rather than in dos_path_from_guest(). */
+            char full[96];
+            int rooted = 0;
+            for (const char *c = startup; *c; c++)
+                if (*c == '/' || *c == '\\') { rooted = 1; break; }
+            path_join(full, sizeof(full), rooted ? "" : x86_dos_get_cwd(), startup);
+            resolve_program_ext(full, sizeof(full));
+            dsk_exec_rc = (uint32_t)x86_dos_exec(full,
+                                                 guest_use_cmdtail ? cmdtail : "");
+        }
     }
     if (dsk_exec_rc != 0) {
         /*

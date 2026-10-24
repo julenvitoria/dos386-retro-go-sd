@@ -236,7 +236,7 @@ int x86_bios_rom_install(void)
  * X86_EXIT_HLE_INT; exit_info carries the vector number.
  */
 uint32_t x86_hle_unhandled_vector;
-uint32_t x86_hle_log[16];
+X86_UC_BSS(x86_hle_log) uint32_t x86_hle_log[16];
 uint32_t x86_hle_log_idx;
 uint32_t x86_hle_unhandled_func;
 
@@ -321,6 +321,8 @@ int x86_hle_dispatch(uint8_t vector)
         return x86_xms_control();
     case 0x20:
         return x86_dos_terminate();
+    case 0x27:
+        return x86_dos_int27();
     default:
         /* Loud, not silent. A service we never implemented that returns as
            though it worked is indistinguishable from one that does, and the

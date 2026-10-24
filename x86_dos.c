@@ -1324,7 +1324,22 @@ static void dos_close_all(void)
         }
 }
 
-int x86_dos_terminate_code(uint16_t code)
+/*
+ * THE [autoexec] CHAIN. A title whose sound needs a driver resident first --
+ * Rick Dangerous II's AdLib is SOUND.COM, a TSR -- has a launch of two
+ * programs, and this DOS starts one. src/main.c owns the list (it resolves
+ * paths against the CWD and COMMAND.COM's extension order); when the ROOT
+ * program ends, by AH=4Ch or by staying resident with AH=31h, this asks it for
+ * the next one instead of stopping the machine. NULL = no chain.
+ */
+static int (*dos_chain_next)(void);
+void x86_dos_set_chain(int (*fn)(void)) { dos_chain_next = fn; }
+volatile uint32_t x86_dos_tsrs;          /* AH=31h calls honoured */
+
+static int dos_terminate(uint16_t code, int keep);
+int x86_dos_terminate_code(uint16_t code) { return dos_terminate(code, 0); }
+
+static int dos_terminate(uint16_t code, int keep)
 {
     if (dos_exec_depth) {
         /* A CHILD is exiting. Give the parent its machine back. */
@@ -1343,7 +1358,8 @@ int x86_dos_terminate_code(uint16_t code)
         /* ONE call frees both: the child's program block and the environment
            block are both OWNED by the child's PSP, which is the only reason
            freeing by owner works at all. */
-        mcb_free_owner(fr->child_psp);
+        if (!keep)                      /* a TSR keeps its blocks */
+            mcb_free_owner(fr->child_psp);
 
         for (int i = 0; i < 8; i++)
             cpu_state_ptr->regs[i] = fr->regs[i];
@@ -1377,8 +1393,42 @@ int x86_dos_terminate_code(uint16_t code)
        is still sitting in the filesystem window until something flushes it. */
     dos_close_all();
     dos_ret_code = code;
+    if (dos_chain_next) {
+        /* The next [autoexec] program runs in this one's place. A plain exit
+           gives its memory back first; a TSR keeps what AH=31h left it. */
+        if (!keep)
+            mcb_free_owner(psp_seg);
+        if (dos_chain_next())
+            return 1;
+    }
     cpu_state_ptr->exit_reason = X86_EXIT_TERMINATE;
     return 1;
+}
+
+/* The next ROOT program of an [autoexec] chain, started from inside the
+   previous one's terminating INT 21h. Entered exactly as an EXEC'd child is --
+   through the stub's IRET, off a frame on its own stack -- because there is an
+   interrupt in flight; but with no parent to return to, like x86_dos_exec(). */
+int x86_dos_exec_next(const char *path, const char *cmdline)
+{
+    dos_prog_t p;
+    x86_dos_env_seg = dos_env_build(path, MCB_OWNER_DOS);
+    if (dos_load_mz(path, cmdline, (unsigned)strlen(cmdline), 0,
+                    (uint16_t)x86_dos_env_seg, NULL, &p) != 0)
+        return -1;
+    uint8_t *q = x86_guest_ptr(SEG(p.psp) + 0x16u, 2);
+    if (q) { q[0] = (uint8_t)p.psp; q[1] = (uint8_t)(p.psp >> 8); }
+    uint16_t sp = (uint16_t)(p.sp - 6u);
+    uint8_t frame[6] = {
+        (uint8_t)p.ip, (uint8_t)(p.ip >> 8),
+        (uint8_t)p.cs, (uint8_t)(p.cs >> 8),
+        0x00, 0x02,
+    };
+    if (x86_guest_copy_in(SEG(p.ss) + sp, frame, 6) != 6)
+        return -1;
+    dos_prog_enter_data(&p);
+    cpu_state_ptr->regs[4] = sp;
+    return 0;
 }
 
 int x86_dos_terminate(void) { return x86_dos_terminate_code(0); }
@@ -2131,9 +2181,11 @@ static void fail(uint16_t code) { x86_set_ax(code); x86_hle_set_cf(1); }
  * guest pager frames, and the full-size EGA card for Keen 4 needed them more.
  * The saturating prologue is what gets read (Monkey Island's whole startup
  * conversation fitted in its first nine entries); re-arm for a later phase.
+ * 20, not 48 (2026-10-24): the [autoexec] program chain (`x86_dos_exec_next`,
+ * AH=31h, INT 27h) cost one more pager frame, and 448 B of debug log buys it back.
  */
-#define DOS_FILE_LOG_SLOTS 48
-uint32_t x86_dos_file_log[DOS_FILE_LOG_SLOTS * 4];
+#define DOS_FILE_LOG_SLOTS 20
+X86_UC_BSS(x86_dos_file_log) uint32_t x86_dos_file_log[DOS_FILE_LOG_SLOTS * 4];
 uint32_t x86_dos_file_log_idx;
 uint32_t x86_dos_file_calls;
 char x86_dos_path_log[8][32];   /* 16 -> 8 (2026-10-17): RAM_EMU for INT 10h AH=13h */
@@ -2233,6 +2285,24 @@ int x86_dos_int21(uint8_t func)
     return rc;
 }
 
+/* Terminate and stay resident: PARAS paragraphs of the program's block stay
+   allocated (DOS clamps it to at least the 6 of the PSP); everything else ends
+   as AH=4Ch, and the [autoexec] chain moves on to its next program. */
+static int dos_tsr(uint16_t paras, uint8_t code)
+{
+    uint16_t largest = 0;
+    (void)mcb_resize(psp_seg, paras < 6u ? 6u : paras, &largest);
+    x86_dos_tsrs++;
+    return dos_terminate((uint16_t)(0x0300u | code), 1);
+}
+
+/* INT 27h, the .COM form: DX is a BYTE count from the PSP (CS of a .COM). */
+int x86_dos_int27(void)
+{
+    uint32_t bytes = (cpu_state_ptr->regs[2] & 0xFFFFu) + 15u;
+    return dos_tsr((uint16_t)(bytes >> 4), 0);
+}
+
 static int dos_int21_dispatch(uint8_t func)
 {
     uint32_t *r = cpu_state_ptr->regs;
@@ -2251,6 +2321,9 @@ static int dos_int21_dispatch(uint8_t func)
 
     case 0x4B:                                  /* EXEC */
         return dos_exec_child();
+
+    case 0x31:                                  /* terminate and stay resident */
+        return dos_tsr(dx, (uint8_t)r[0]);
 
 #if X86_DOS_EXEC
     case 0x4D:                                  /* get child return code */

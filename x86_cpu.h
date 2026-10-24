@@ -567,6 +567,7 @@ int x86_dos_terminate(void);
 /* Terminate with a return code, which AH=4Dh reports to the parent. Plain
    x86_dos_terminate() is this with code 0 -- what INT 20h and AH=00h mean. */
 int x86_dos_terminate_code(uint16_t code);
+int x86_dos_int27(void);   /* .COM terminate-and-stay-resident */
 /* EXEC (AH=4Bh) counters. "Did the EXEC happen at all" is the first question
    asked of any run that gets this far, and it must be answerable from the host
    without a trace. x86_dos_exec_last_err carries the DOS error of the last
@@ -650,6 +651,11 @@ extern volatile uint32_t x86_disk_cache_evictions;
 extern volatile uint32_t x86_disk_cache_bypass;
 extern volatile uint32_t x86_disk_cache_invalidates;
 int x86_dos_exec(const char *path, const char *cmdline);
+/* The [autoexec] chain (x86_dos.c): main.c registers the "start the next
+   program" hook, which calls x86_dos_exec_next() from inside the previous
+   program's terminating INT 21h. */
+void x86_dos_set_chain(int (*fn)(void));
+int x86_dos_exec_next(const char *path, const char *cmdline);
 /* The guest's current directory, as a FatFs-shaped prefix ("DF", no trailing
    separator). FF_FS_RPATH is 0, so FatFs cannot hold this for us; every
    relative path the guest opens is resolved against it in x86_dos.c. */
@@ -670,7 +676,13 @@ extern char x86_dos_last_path[32];
  * -- plus the path of the last four opens, so "which call, on which name, with
  * what answer" is one dump instead of a rebuild.
  */
-extern uint32_t x86_dos_file_log[48 * 4];   /* DOS_FILE_LOG_SLOTS * 4, x86_dos.c */
+/* A cold debug buffer that may live OUTSIDE RAM_EMU. The name keeps it a
+   `.bss.*` section, so a linker script that says nothing about it (main's
+   dos_core.ld, TEST.ld) files it with the rest of .bss; one that wants the
+   bytes for guest frames (overlays' dos_core.ld) can route `.bss.__uc.*` to
+   the LUT8 bonus area, where uncached is fine for a log nobody reads hot. */
+#define X86_UC_BSS(name) __attribute__((section(".bss.__uc." #name)))
+extern uint32_t x86_dos_file_log[20 * 4];   /* DOS_FILE_LOG_SLOTS * 4, x86_dos.c */
 extern uint32_t x86_dos_file_log_idx;
 extern uint32_t x86_dos_file_calls;
 extern volatile uint32_t x86_io_log[64];

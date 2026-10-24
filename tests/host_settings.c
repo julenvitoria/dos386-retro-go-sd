@@ -549,6 +549,14 @@ static void test_autoexec(void)
     ck_str(x86_settings_str(X86_STR_ENTRY), "SECOND.EXE", "last command wins");
     ck_str(x86_settings_str(X86_STR_ARGS), "-b", "with its own arguments");
     ck_eq((int)r.commands, 2, "and both were counted");
+    /* ...and the EARLIER lines are not lost: they go to `pre`, run first and
+       in order (a TSR such as Rick 2's SOUND.COM before the game). */
+    ck_str(x86_settings_str(X86_STR_PRE), "FIRST.EXE -a", "the earlier line went to pre");
+    cfg("[autoexec]\nsound\nmouse /q\nrick2\n", &r);
+    ck_str(x86_settings_str(X86_STR_PRE), "sound;mouse /q", "several, ';'-joined in order");
+    ck_str(x86_settings_str(X86_STR_ENTRY), "rick2", "the last is still the entry");
+    cfg("[autoexec]\nCAT.EXE\n", &r);
+    ck_eq(x86_settings_str_is_set(X86_STR_PRE), 0, "one command sets no pre");
 
     /* A section with NOTHING this core can run reports zero commands, which is
        the reading that tells a user their launch line was skipped. */

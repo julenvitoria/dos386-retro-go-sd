@@ -81,7 +81,15 @@ SECTIONS
   .bss (NOLOAD) :
   {
     . = ALIGN(8);
-    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o) .bss*)
+    /* `.bss.__uc.*` (X86_UC_BSS, x86_cpu.h) is NOT matched here: those cold
+       debug logs go to the RAM_UC segment below. `[!_]` keeps the pattern
+       from claiming them while still taking every ordinary `.bss.<name>`. */
+    /* EXCLUDE_FILE binds to the ONE pattern after it, hence one line each. */
+    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o) .bss)
+    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o) .bss.[!_]*)
+    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o) .bss._[!_]*)
+    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o) .bss.__[!u]*)
+    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o) .bss.__u[!c]*)
     *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o) COMMON)
     . = ALIGN(8);
 
@@ -152,6 +160,7 @@ SECTIONS
   .core_ram_uc_bss (NOLOAD) :
   {
     *(.ram_uc_bss*)
+    *(.bss.__uc.*)
     *emu8950.o(.bss* COMMON)
     *x86_opl.o(.bss* COMMON)
     *x86_mouse.o(.bss* COMMON)
