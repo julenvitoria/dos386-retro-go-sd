@@ -4769,7 +4769,13 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
             }
             /* Bank the slice's guest time while pit_counter still holds what
                the guest left it at -- every host store to it below is a
-               forced one and would otherwise be charged as elapsed time. */
+               forced one and would otherwise be charged as elapsed time.
+               A TIMER exit means the count RAN OUT: the interpreter has put
+               pit_reload back in it on the way out, which x86_pit_sync()
+               would read as "nothing ran since the last sync" and drop the
+               whole run -- guest time only advanced between port reads. */
+            if (cpu_state_ptr->exit_reason == X86_EXIT_TIMER)
+                cpu_state_ptr->pit_counter = 0;
             x86_pit_sync();
             uint32_t reason = cpu_state_ptr->exit_reason;
             last_slice_halted = (reason == X86_EXIT_HALT);
@@ -4823,6 +4829,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
                     if (cpu_state_ptr->hard_int_pending == 0x08u) {
                         cpu_state_ptr->hard_int_pending = 0;
                         x86_pic_eoi_level(0);
+                        x86_pit_irq_withdrawn();   /* not taken: no reload */
                     }
                     tick_acc = 0;
                     tick_phase_on = 1;

@@ -36,6 +36,7 @@ unsigned       x86_vga_crtc_start(void);    /* display start, plane offsets   */
 unsigned       x86_vga_row_pitch(void);     /* 2 x CRTC Offset                */
 unsigned       x86_vga_pel_panning(void);   /* ATC index 0x13, low 3 bits     */
 const uint8_t *x86_vga_attr_palette(void);  /* ATC 0x00-0x0F, 16 entries      */
+uint8_t *x86_vga_attr_regs(void);           /* the same, writable (INT 10h)    */
 
 /* Plant the CRTC geometry a real VGA BIOS writes for `mode`. Chained 13h does
    not need it; a title that unchains without programming the Offset itself
