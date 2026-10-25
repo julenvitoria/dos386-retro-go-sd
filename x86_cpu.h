@@ -297,6 +297,7 @@ typedef struct {
      * generator ever saw it -- see x86_audio_wave.h. 0 means "gated off";
      * a guest reload of 0 is carried as 65536, so this cannot be uint16_t. */
 #define X86_SPK_EVENTS 32u
+#define X86_SPK_CLICK  0xFFFFFFFFu   /* "divisor" of a gate-off data-bit pulse */
     uint32_t spk_ev_ms[X86_SPK_EVENTS];
     uint32_t spk_ev_div[X86_SPK_EVENTS];
     uint8_t  spk_ev_head, spk_ev_tail;
@@ -304,6 +305,7 @@ typedef struct {
     uint32_t spk_render_div;  /* divisor the renderer left off at            */
     uint32_t spk_window_ms;   /* clock value the next render's window starts at */
     uint8_t  spk_was_on;      /* last rendered run was audible -> edge detect */
+    int16_t  spk_click_lvl;   /* the decaying swing of the last data-bit click */
     uint8_t  cga_mode;        /* 0x3D8 mode control */
     uint8_t  cga_color_select;/* 0x3D9 background + palette + intensity */
     uint16_t cga_beam;        /* 0..0xFFFF through the frame, set by the core */
