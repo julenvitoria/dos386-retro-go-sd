@@ -721,6 +721,14 @@ static void pit_write_ch2(uint8_t v)
  */
 uint32_t x86_speaker_divisor(void)
 {
+    /* GATE LOW, DATA HIGH: OUT2 of a stopped channel 2 sits high, so the cone
+       follows the data bit alone. Pulsing it is the "direct speaker" click,
+       and Rick Dangerous's footsteps are exactly that (bit 1 toggled with the
+       gate off, 42 pulses a few seconds into a walk); a gate-off write used to
+       be silence. Marked rather than rendered as a tone: see
+       x86_speaker_render. */
+    if ((x86_io.port61 & 3) == 2)
+        return X86_SPK_CLICK;
     if ((x86_io.port61 & 3) != 3)
         return 0;                    /* gate or data line off: silence */
     /* A reload of 0 means the full 16-bit period, i.e. 65536 -- not 0, which
@@ -732,12 +740,14 @@ uint32_t x86_speaker_divisor(void)
    path; see x86_audio_wave.h. */
 uint32_t x86_speaker_hz(void)
 {
-    return x86_spkr_freq_hz(x86_speaker_divisor());
+    uint32_t d = x86_speaker_divisor();
+    return d == X86_SPK_CLICK ? 0 : x86_spkr_freq_hz(d);
 }
 
 uint32_t (*x86_io_time_ms)(void);
 volatile uint32_t x86_spk_events = 0;
 volatile uint32_t x86_spk_events_dropped = 0;
+volatile uint32_t x86_spk_clicks = 0;    /* data-bit clicks actually rendered */
 
 /*
  * Log a change in the audible frequency, stamped with the host clock.
@@ -788,7 +798,8 @@ static void spk_run(int16_t *dst, unsigned n, uint32_t divisor,
 {
     if (!n)
         return;
-    uint32_t inc = x86_spkr_phase_inc(divisor, sample_rate);
+    uint32_t inc = divisor == X86_SPK_CLICK
+                 ? 0u : x86_spkr_phase_inc(divisor, sample_rate);
     if (inc == 0) {
         memset(dst, 0, n * sizeof(*dst));
         x86_io.spk_was_on = 0;
@@ -822,7 +833,8 @@ void x86_speaker_render(int16_t *dst, unsigned frames, unsigned sample_rate,
     x86_io.spk_window_ms = t1;
     uint32_t span = t1 - t0;
 
-    unsigned pos = 0;
+    unsigned pos = 0, nclick = 0;
+    uint16_t click_at[8];
     while (x86_io.spk_ev_head != x86_io.spk_ev_tail) {
         uint32_t ev_ms = x86_io.spk_ev_ms[x86_io.spk_ev_head];
         uint32_t div   = x86_io.spk_ev_div[x86_io.spk_ev_head];
@@ -843,10 +855,34 @@ void x86_speaker_render(int16_t *dst, unsigned frames, unsigned sample_rate,
         spk_run(dst + pos, idx - pos, x86_io.spk_render_div,
                 sample_rate, amplitude);
         pos = idx;
+        if (div == X86_SPK_CLICK && nclick < 8u)
+            click_at[nclick++] = (uint16_t)idx;
         x86_io.spk_render_div = div;
     }
     spk_run(dst + pos, frames - pos, x86_io.spk_render_div,
             sample_rate, amplitude);
+
+    /* THE CLICKS. A pulse of the data bit is often shorter than a sample, so
+       it is not a segment but an EDGE: a step the cone answers with a short
+       decaying swing. Each one restarts the swing at its sample; it decays
+       over ~4 ms (1.3 ms time constant at 48 kHz) and carries into the next buffer. */
+    {
+        int32_t lvl = x86_io.spk_click_lvl;
+        unsigned c = 0;
+        for (unsigned i = 0; i < frames; i++) {
+            while (c < nclick && click_at[c] <= i) {
+                lvl = amplitude;
+                c++;
+                x86_spk_clicks++;
+            }
+            if (!lvl)
+                continue;
+            int32_t o = dst[i] + lvl;
+            dst[i] = (int16_t)(o > 32767 ? 32767 : o < -32768 ? -32768 : o);
+            lvl -= (lvl >> 6) + (lvl > 0);
+        }
+        x86_io.spk_click_lvl = (int16_t)lvl;
+    }
 }
 
 /* ---------------------------------------------------------------------------
