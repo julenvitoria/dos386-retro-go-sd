@@ -712,6 +712,7 @@ extern volatile uint32_t x86_pit0_restarts;   /* channel 0 counts loaded */
 extern uint32_t x86_pit_kips;         /* main.c publishes guest_kips here */
 extern uint32_t x86_pit_rt_kips;      /* ...and the real-time clock's rate */
 extern uint32_t x86_pit_insns;        /* instructions executed (x86_pit_sync) */
+void x86_pit_irq_withdrawn(void);
 void     x86_pit_sync(void);          /* accrue what the guest has just run */
 void     x86_pit_counter_forced(uint32_t v);  /* host write to pit_counter  */
 void     x86_pit_advance_us(uint32_t us); /* INT 15h AH=86h: the wait passes */

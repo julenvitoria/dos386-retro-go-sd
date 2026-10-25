@@ -1005,14 +1005,66 @@ static void ega_sync_palette(void)
     cga_clut_dirty = 1;
 }
 
-static void blit_ega16(uint8_t *dst, uint32_t stride)
+/*
+ * PLANES TO PIXELS, A NIBBLE AT A TIME. Each plane byte is 8 pixels' worth of
+ * one colour bit; a pixel is the four planes' bits for it, plane 0 in bit 0.
+ * This used to be done one pixel at a time -- four shift/mask/or pairs per
+ * pixel, 64,000 pixels a frame -- which is the EGA-only cost Rick Dangerous
+ * and Ironman (VGA = 16-colour planar here) paid on top of the planar stores,
+ * and why their CGA modes ran smoothly. Now a 16-entry table spreads a nibble
+ * into four pixel bytes, and four planes are four ORs per four pixels. Both
+ * the table and the loop live in ITCM, beside the planar store path.
+ */
+#define EGA16_HOT __attribute__((section(".itcram_hot.ega16")))
+__attribute__((section(".itcram_hot.ega16tab"), aligned(4)))
+static const uint32_t ega_nib[16] = {
+    /* byte k of entry n = bit (3 - k) of n: bit 3 is the leftmost pixel */
+    0x00000000u, 0x01000000u, 0x00010000u, 0x01010000u,
+    0x00000100u, 0x01000100u, 0x00010100u, 0x01010100u,
+    0x00000001u, 0x01000001u, 0x00010001u, 0x01010001u,
+    0x00000101u, 0x01000101u, 0x00010101u, 0x01010101u,
+};
+
+/* One row: `groups` plane offsets from `a` (wrapping at 64 KB) into `out`,
+   8 pixels each. */
+EGA16_HOT __attribute__((noinline)) static void ega16_row(uint32_t *out, unsigned a, unsigned groups,
+                                const uint8_t *planes, uint32_t split,
+                                const uint8_t *planes2, uint32_t vram)
+{
+    for (unsigned g = 0; g < groups; g++, a = (a + 1u) & 0xFFFFu, out += 2) {
+        uint32_t q;
+
+        /* The CRTC counts in 16 bits: a page that starts near the top of the
+           64 KB plane WRAPS to its bottom (Keen 4 scrolls its pages round the
+           whole plane). Past the card that is fitted reads as ZERO, as the
+           store path discards writes there. */
+        if (a < split)
+            q = *(const uint32_t *)(planes + 4u * a);
+        else if (a < vram)
+            q = *(const uint32_t *)(planes2 + 4u * (a - split));
+        else
+            q = 0;
+        if (!q) {
+            out[0] = out[1] = 0;
+            continue;
+        }
+        uint32_t p0 = q & 0xFFu, p1 = (q >> 8) & 0xFFu;
+        uint32_t p2 = (q >> 16) & 0xFFu, p3 = q >> 24;
+        out[0] = ega_nib[p0 >> 4] | (ega_nib[p1 >> 4] << 1)
+               | (ega_nib[p2 >> 4] << 2) | (ega_nib[p3 >> 4] << 3);
+        out[1] = ega_nib[p0 & 15u] | (ega_nib[p1 & 15u] << 1)
+               | (ega_nib[p2 & 15u] << 2) | (ega_nib[p3 & 15u] << 3);
+    }
+}
+
+EGA16_HOT static void blit_ega16(uint8_t *dst, uint32_t stride)
 {
     const uint8_t *planes = x86_vga_ega_planes();
     const uint32_t vram   = x86_vga_ega_plane_offsets();
     /* Offsets from `split` on live in the card's second piece (frames lent
        by the pager); see x86_video_planar.c. */
     const uint8_t *planes2 = x86_vga_ega_planes2();
-    const uint32_t split   = x86_vga_ega_split();
+    const uint32_t split   = planes2 ? x86_vga_ega_split() : vram;
     /* The display is a WINDOW onto plane memory, not the bottom of it. A game
        that scrolls moves the CRTC start address and widens the row pitch; both
        have to be honoured or the picture is a sheared crop. */
@@ -1030,37 +1082,9 @@ static void blit_ega16(uint8_t *dst, uint32_t stride)
     /* One extra group per row so the pel-panning shift has 8 more pixels to
        pull from. */
     for (unsigned y = 0; y < EGA_ROWS; y++, dst += stride, addr = (addr + pitch) & 0xFFFFu) {
-        uint8_t line[EGA_WIDTH + 8];
-        unsigned a = addr;
-        uint8_t *out = line;
-
-        for (unsigned g = 0; g < EGA_ROWBYTES + 1u; g++, a = (a + 1u) & 0xFFFFu) {
-            uint32_t p0, p1, p2, p3;
-
-            /* The CRTC counts in 16 bits: a page that starts near the top of
-               the 64 KB plane WRAPS to its bottom (Keen 4 scrolls its pages
-               round the whole plane), it does not run off into nothing. */
-            if (a < vram) {
-                /* One 32-bit load, four planes. Bit 7 is the leftmost pixel. */
-                uint32_t q;
-                memcpy(&q, a < split ? planes + 4u * a
-                                     : planes2 + 4u * (a - split), 4);
-                p0 = q & 0xFFu;         p1 = (q >> 8) & 0xFFu;
-                p2 = (q >> 16) & 0xFFu; p3 = (q >> 24) & 0xFFu;
-            } else {
-                /* Past the memory this card has fitted: reads as ZERO, exactly
-                   as the store path discards writes there. The card-size
-                   boundary is then visible in the picture rather than being an
-                   internal detail. */
-                p0 = p1 = p2 = p3 = 0;
-            }
-            for (int bit = 7; bit >= 0; bit--)
-                *out++ = (uint8_t)(((p0 >> bit) & 1u)
-                                 | (((p1 >> bit) & 1u) << 1)
-                                 | (((p2 >> bit) & 1u) << 2)
-                                 | (((p3 >> bit) & 1u) << 3));
-        }
-        memcpy(dst, line + pan, EGA_WIDTH);
+        uint32_t line[(EGA_WIDTH + 8u) / 4u];
+        ega16_row(line, addr, EGA_ROWBYTES + 1u, planes, split, planes2, vram);
+        memcpy(dst, (const uint8_t *)line + pan, EGA_WIDTH);
     }
 }
 

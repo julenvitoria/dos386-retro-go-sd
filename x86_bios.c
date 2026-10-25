@@ -12,6 +12,7 @@
 
 #include "cutils.h"
 #include "x86_cpu.h"
+#include "x86_video_planar.h"
 
 #define BDA          0x400u
 #define BDA_KB_HEAD  (BDA + 0x1A)
@@ -529,12 +530,44 @@ int x86_bios_video(uint8_t func)
             }
             return 1;
         }
-        /* AL=00/01/02/03 are the EGA 16-colour palette-register calls. Mode
-           13h indexes the DAC directly and does not go through them, and we
-           have no attribute controller, so they are accepted and ignored
-           rather than left unanswered -- an unanswered call in the middle of a
-           sequence is indistinguishable, to the guest, from broken hardware.
-           That is the TOPBENCH AH=43h shape, and it cost a session. */
+        /* AL=00-03 / 07-09: the EGA 16-colour PALETTE REGISTERS, i.e. the
+           attribute controller the EGA/16-colour renderer reads. They were
+           accepted and ignored on the belief that there was no attribute
+           controller; there is one (x86_io.c), and Rick Dangerous installs its
+           whole EGA palette with AL=02 -- ignored, its grey stone came out
+           pink, colour for colour the default 16. */
+        {
+            uint8_t *attr = x86_vga_attr_regs();
+            unsigned bl = cpu_state_ptr->regs[3] & 0xFF;
+            unsigned bh = (cpu_state_ptr->regs[3] >> 8) & 0xFF;
+            uint32_t lin = cpu_state_ptr->segs[0].base
+                         + (cpu_state_ptr->regs[2] & 0xFFFF);
+            uint8_t t[17];
+            switch (al) {
+            case 0x00: attr[bl & 0x1F] = (uint8_t)bh; break;   /* one register */
+            case 0x01: attr[0x11] = (uint8_t)bh; break;        /* overscan */
+            case 0x02:                                          /* all 16 + overscan */
+                if (x86_guest_copy_out(t, lin, 17) == 17) {
+                    memcpy(attr, t, 16);
+                    attr[0x11] = t[16];
+                }
+                break;
+            case 0x03:                                          /* blink / intensity */
+                attr[0x10] = (uint8_t)((attr[0x10] & ~0x08u) | ((bl & 1u) << 3));
+                break;
+            case 0x07:                                          /* read one */
+            case 0x08:                                          /* read overscan */
+                bh = attr[al == 0x07 ? (bl & 0x1F) : 0x11];
+                cpu_state_ptr->regs[3] = (cpu_state_ptr->regs[3] & 0xFFFF00FFu)
+                                       | (bh << 8);
+                break;
+            case 0x09:                                          /* read all */
+                memcpy(t, attr, 16);
+                t[16] = attr[0x11];
+                (void)x86_guest_copy_in(lin, t, 17);
+                break;
+            }
+        }
         return 1;
     }
     /*

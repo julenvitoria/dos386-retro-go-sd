@@ -71,6 +71,7 @@ uint32_t x86_pit_rt_kips = 0;       /* measured rate at Max, else = kips    */
 uint32_t x86_pit_insns;             /* instructions executed, as counted here */
 static uint32_t pit_now;            /* free-running 1.193182 MHz tick count */
 static uint32_t pit_last_counter;   /* pit_counter at the last accounting   */
+static uint8_t  pit_irq_armed;      /* forced to 1 with an IRQ waiting      */
 
 /*
  * Fold everything the guest has executed since the last call into `pit_now`.
@@ -91,7 +92,15 @@ void x86_pit_sync(void)
     uint32_t reload = cpu_state_ptr->pit_reload;
     uint32_t d;
 
-    if (cur <= pit_last_counter)
+    /* AN IRQ ARMED BY A FORCED COUNT OF 1 AND SINCE TAKEN means the guest
+       reloaded pit_counter from pit_reload once in between: a wrap, even when
+       the counter has come back down below where it was forced (it was
+       charging 1 instruction for a whole run). */
+    int wrapped = cur > pit_last_counter
+               || (pit_irq_armed && !cpu_state_ptr->hard_int_pending);
+    if (!cpu_state_ptr->hard_int_pending)
+        pit_irq_armed = 0;
+    if (!wrapped)
         d = pit_last_counter - cur;
     else if (reload >= cur)
         d = pit_last_counter + (reload - cur);
@@ -129,22 +138,23 @@ void x86_pit_sync(void)
        on the slower real-time clock each read cost more than the blank lasts,
        so its wait timed out every frame with interrupts off. */
     /* 32-bit on purpose (d <= 1e6, so d * 1193 fits): 1,193 counts per ms. */
-    /* Below 1,000 k the measurement is not believed: it counts what this
-       function saw, and a guest taking IRQs faster than it is synced (Keen
-       4's 560 Hz) reloads the counter twice between syncs and reads as a
-       few k. Such a title keeps the nominal clock, as before. */
-    if (x86_pit_rt_kips >= 1000u)
-        kips = x86_pit_rt_kips;
+    if (x86_pit_rt_kips)
+        kips = x86_pit_rt_kips < 100u ? 100u : x86_pit_rt_kips;
     pit_rt_frac += d * 1193u;
     pit_rt += pit_rt_frac / kips;
     pit_rt_frac %= kips;
 }
+
+/* A tick the host armed and then took back (a PIT reload restarted the
+   period): it was never taken, so the guest never reloaded the counter. */
+void x86_pit_irq_withdrawn(void) { pit_irq_armed = 0; }
 
 void x86_pit_counter_forced(uint32_t v)
 {
     x86_pit_sync();
     cpu_state_ptr->pit_counter = v;
     pit_last_counter = v;
+    pit_irq_armed = (v == 1u && cpu_state_ptr->hard_int_pending) ? 1u : 0u;
 }
 
 /*
@@ -535,6 +545,8 @@ unsigned x86_vga_pel_panning(void) { return vga_regs.attr[0x13] & 7u; }
 
 /* ATC palette registers 0x00-0x0F: pixel value -> DAC entry. */
 const uint8_t *x86_vga_attr_palette(void) { return vga_regs.attr; }
+/* The attribute controller as INT 10h AH=10h AL=00-03/07-09 drives it. */
+uint8_t *x86_vga_attr_regs(void) { return vga_regs.attr; }
 
 /*
  * Plant the CRTC geometry a real VGA BIOS writes for `mode`.
