@@ -1083,40 +1083,43 @@ static void egafit_test_run(void)
 /*
  * THE VIRTUAL EGA CARD (x86_video_planar.c, at ega_ptab). On the harness's
  * 8-page arena the card is 8,192 offsets = 32 pages, mapped as the identity.
- * Every number below is a consequence of the rules, in order:
+ * Pages 1..31 get one 0x77 each and page 0 a 0x11, so NO page is all zero
+ * until the arm makes one. Every number below follows from the rules:
  *
  *   [0]  card offsets                                  8192
- *   [1]  a store to page 0x90 BEFORE anything ages:     discarded (lost +1)
- *   [2]  ...and page 0x90 is still unmapped             1
- *   [3]  30 frames displayed at 0x4000 (unmapped, so pages 0..31 all age 30),
- *        then a store to 0x9000:                        remaps +1
+ *   [1]  a store to page 0x90 with nothing zero and nothing stale:
+ *        discarded (lost +1)                           1
+ *   [2]  ...and page 0x90 is still unmapped            1
+ *   [12] a store of ZERO to unmapped page 0xD0: no storage claimed, nothing
+ *        counted as lost (an unmapped page already reads zero)   1
+ *   [13] page 5's only non-zero byte zeroed, one frame on, a store to 0xE000:
+ *        page 5 is recycled at once although it is fresh -- it is all
+ *        zero, so dropping it is lossless             1
+ *   [3]  30 frames displayed at 0x4000 (unmapped), then a store to 0x9000:
+ *        remaps +1                                     1
  *   [4]  ...page 0x90 now holds the byte (plane 0)      0x5A
- *   [5]  ...the victim was page 0, the first of the
- *        equally stale ones, and it is unmapped now     1
- *   [6]  ...page 0's shadow byte reads as a cell of
- *        zeros, not the 0x11 that was stored there      0
+ *   [5]  ...the victim was page 0, the stalest          1
+ *   [6]  ...page 0's shadow byte reads as zeros, not 0x11   0
  *   [7]  page 1 written NOW, then a store to 0xA000:
- *        the victim skips page 1 (fresh) -> page 2      1 (ptab[2] NULL, ptab[1] kept)
+ *        the victim skips page 1 (fresh) -> page 2      1
  *   [8]  pages 3..11 written now; one frame displayed from 0x0C00 (pages
  *        12..43); 29 more from 0x4000; then a store to 0xB000. Pages 12..31
- *        were last WRITTEN 59 frames ago -- the stalest by writes -- but the
- *        panel showed them 29 frames ago, so they are not stale at all and
- *        the victim is one of the age-30 pages instead     1 (12..31 all kept)
- *   [9]  the blit sees the remapped byte: a 0Dh row read through the table
- *        at 0x9000 is not black                        1
- *   [10] recycles in all                               3
+ *        were last WRITTEN ~60 frames ago but the panel showed them 29 frames
+ *        ago, so they must all survive                 1
+ *   [9]  the blit's table sees the remapped page        1
+ *   [10] recycles in all: [13], [3], [7], [8]           4
  *   [11] a guest READ of A000:9000 -- far above the old 16 KB shadow --
- *        returns the byte (read mode 0, map 0)         0x5A
+ *        returns the byte (read mode 0, map 0)          0x5A
  */
 volatile uint32_t run_vcard_flag = 0;
-volatile uint32_t vcard_r[12];
+volatile uint32_t vcard_r[16];
 
 static void vcard_test_run(void)
 {
     uint8_t *const *pt;
     uint32_t lost0, remap0;
 
-    for (unsigned i = 0; i < 12; i++)
+    for (unsigned i = 0; i < 16; i++)
         vcard_r[i] = 0;
     planar_test_init();
     x86_video_set_mode(0x03);
@@ -1128,16 +1131,27 @@ static void vcard_test_run(void)
         return;
 
     x86_vga_planar_store(0x0000, 0x11, 1);      /* page 0, in the shadow */
+    for (uint32_t pg = 1; pg < 32; pg++)
+        x86_vga_planar_store(pg << 8, 0x77, 1);
     lost0 = x86_vga_planar_lost;
     remap0 = x86_vga_ega_remaps;
     x86_vga_planar_store(0x9000, 0x5A, 1);
     vcard_r[1] = x86_vga_planar_lost - lost0;
     vcard_r[2] = pt[0x90] == NULL;
 
+    lost0 = x86_vga_planar_lost;
+    x86_vga_planar_store(0xD000, 0x00, 1);
+    vcard_r[12] = pt[0xD0] == NULL && x86_vga_planar_lost == lost0;
+
+    x86_vga_planar_store(0x0500, 0x00, 1);      /* page 5 is all zero now */
+    x86_vga_ega_frame(0x4000, 40, 200);
+    x86_vga_planar_store(0xE000, 0x66, 1);
+    vcard_r[13] = pt[5] == NULL && pt[0xE0] != NULL;
+
     for (unsigned f = 0; f < 30; f++)
         x86_vga_ega_frame(0x4000, 40, 200);
     x86_vga_planar_store(0x9000, 0x5A, 1);
-    vcard_r[3] = x86_vga_ega_remaps - remap0;
+    vcard_r[3] = pt[0x90] != NULL;
     vcard_r[4] = pt[0x90] ? pt[0x90][0] : 0xFFu;
     vcard_r[5] = pt[0] == NULL;
     vcard_r[6] = vga_test_aperture[0];
@@ -1147,7 +1161,8 @@ static void vcard_test_run(void)
     vcard_r[7] = pt[2] == NULL && pt[1] != NULL && pt[0xA0] != NULL;
 
     for (uint32_t pg = 3; pg <= 11; pg++)
-        x86_vga_planar_store(pg << 8, 0x55, 1);
+        if (pg != 5)                            /* recycled in [13] */
+            x86_vga_planar_store(pg << 8, 0x55, 1);
     x86_vga_ega_frame(0x0C00, 40, 200);
     for (unsigned f = 0; f < 29; f++)
         x86_vga_ega_frame(0x4000, 40, 200);
@@ -1163,7 +1178,7 @@ static void vcard_test_run(void)
         uint32_t q = pt[0x90] ? *(const uint32_t *)pt[0x90] : 0u;
         vcard_r[9] = q != 0u;
     }
-    vcard_r[10] = x86_vga_ega_remaps - remap0;  /* 3 */
+    vcard_r[10] = x86_vga_ega_remaps - remap0;  /* 4 */
     vcard_r[11] = vga_test_aperture[0x9000];    /* 0x5A: read above 16 KB */
 
     x86_video_set_mode(0x03);

@@ -2222,7 +2222,7 @@ python3 tests/test_video.py              # CGA mode 4 blitter, pixel-exact, plus
                                          # recycled; written and DISPLAYED
                                          # pages are kept; the read shadow
                                          # answers above 16 KB
-python3 scripts/run_planar_controls.py   # grades those arms: TEN negative
+python3 scripts/run_planar_controls.py   # grades those arms: ELEVEN negative
                                          # controls that must FAIL (chain-4
                                          # inert, a 40-offset blit stride, four
                                          # FLAT planes, the fixed 16 KB page
@@ -2237,8 +2237,9 @@ python3 scripts/run_planar_controls.py   # grades those arms: TEN negative
                                          # virtual-card mutations,
                                          # -DX86_EGA_VCARD_NEGCTL=1 the blit
                                          # not marking the displayed window,
-                                         # =2 no staleness threshold, graded
-                                         # by --vcard-only) and one
+                                         # =2 no staleness threshold, =3 no
+                                         # lossless reuse of an all-zero page,
+                                         # graded by --vcard-only) and one
                                          # POSITIVE control --
                                          # -DX86_MODEY_PAGE0=16384 must still
                                          # produce the same 64,000 pixels,

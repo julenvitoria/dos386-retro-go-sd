@@ -1521,20 +1521,27 @@ def vcard_checks(b, syms):
     b.write_uint32(syms["run_vcard_flag"], 1)
     if not wait_flag(b, syms["run_vcard_flag"], 0, "virtual card arm hung"):
         return False
-    r = [b.read_uint32(syms["vcard_r"] + 4 * i) for i in range(12)]
+    r = [b.read_uint32(syms["vcard_r"] + 4 * i) for i in range(16)]
     print(f"  card={r[0]} early_lost={r[1]} still_unmapped={r[2]} remap={r[3]} "
           f"byte={r[4]:#04x} victim0={r[5]} shadow0={r[6]:#04x} fresh_kept={r[7]} "
-          f"display_kept={r[8]} blit_sees={r[9]} remaps={r[10]}")
+          f"display_kept={r[8]} blit_sees={r[9]} remaps={r[10]} "
+          f"zero_store={r[12]} zero_reuse={r[13]}")
     want = [(0, 8192, "the harness card is 8,192 offsets"),
-            (1, 1, "a store to an unmapped page before anything has aged must "
-                   "be DISCARDED -- recycling a page the guest is still using "
-                   "inside the same frame is how a picture gets torn"),
+            (1, 1, "with no page all zero and none stale, a store to an "
+                   "unmapped page must be DISCARDED -- recycling a page the "
+                   "guest is still using inside the same frame is how a "
+                   "picture gets torn"),
+            (12, 1, "a store of ZERO to an unmapped page must claim nothing "
+                    "and lose nothing: the page already reads zero, and Keen "
+                    "4 clears the whole 64 KB plane at every load"),
+            (13, 1, "an ALL-ZERO page must be recycled at once, fresh or not: "
+                    "dropping it is lossless, and a clear-then-draw inside one "
+                    "frame is otherwise discarded (Keen 4's black world map)"),
             (2, 1, "...and the page must stay unmapped"),
             (3, 1, "after 30 frames every page is stale, so the same store "
                    "must recycle exactly one page"),
             (4, 0x5A, "the recycled page must hold the byte just stored"),
-            (5, 1, "the victim must be page 0, the first of the equally "
-                   "stalest pages"),
+            (5, 1, "the victim must be page 0, the stalest page"),
             (6, 0, "page 0's READ SHADOW byte must stop showing the 0x11 that "
                    "was stored there once the page is recycled"),
             (7, 1, "a page written this frame must not be the victim (page 2 "
@@ -1543,7 +1550,7 @@ def vcard_checks(b, syms):
                    "(pages 12..31 were displayed 29 frames ago and must all "
                    "stay, though they are the oldest by writes)"),
             (9, 1, "the blit's table must see the recycled page"),
-            (10, 3, "three recycles in all"),
+            (10, 4, "four recycles in all ([13], [3], [7], [8])"),
             (11, 0x5A, "a guest READ of A000:9000 must return the plane byte: "
                        "the shadow covers the window up to the table at "
                        "0xFA00, and reading zero above 16 KB is what drew "

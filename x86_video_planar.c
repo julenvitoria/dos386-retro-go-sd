@@ -294,12 +294,16 @@ static uint32_t  ega_size1;
  */
 #define EGA_VPAGES        256u
 #define EGA_VPAGE_BYTES   1024u           /* 256 cells of 4 plane bytes   */
+#ifndef EGA_STALE_FRAMES
 #define EGA_STALE_FRAMES  30u
+#endif
 /* Graded by scripts/run_planar_controls.py through tests/test_video.py
    --vcard-only, which must FAIL with each compiled in:
      1  the blit does not mark the displayed window, so a page the panel is
         showing can be recycled under it
-     2  no staleness threshold, so a page still in use this frame is recycled */
+     2  no staleness threshold, so a page still in use this frame is recycled
+     3  no lossless reuse of an all-zero page, so a clear-then-draw inside one
+        frame is discarded (Keen 4's black map) */
 #ifndef X86_EGA_VCARD_NEGCTL
 #define X86_EGA_VCARD_NEGCTL 0
 #endif
@@ -318,7 +322,9 @@ static uint32_t  ega_size1;
 static uint8_t  **ega_ptab;         /* NULL unless the card is mapped       */
 static uint16_t  *ega_vstamp;       /* ega_epoch at a page's last use       */
 static uint16_t   ega_epoch;        /* presented frames, mod 65,536         */
-static uint16_t   ega_nofault_until;/* no page can be stale before this     */
+static uint16_t   ega_nofault_until;/* no fault is worth scanning before    */
+static uint8_t    ega_zscan;        /* where the zero-page search resumes   */
+volatile uint32_t x86_vga_ega_zero_reuse;  /* all-zero pages recycled losslessly */
 static uint32_t   ega_shadow_zero;  /* what unmapped shadow pages hold; 0x100
                                        = unknown, so the next rebuild fills */
 volatile uint32_t x86_vga_ega_remaps;
@@ -823,7 +829,19 @@ PLANAR_HOT static void ega_vpage_drop(uint32_t vp)
  * title hammering unmapped offsets inside one frame pays one scan, not one
  * per byte.
  */
-PLANAR_HOT __attribute__((noinline)) static uint8_t *ega_page_fault(uint32_t a)
+/* Is this physical page all zero? Then dropping it loses nothing: a page
+   with no storage reads as zeros too. */
+static int ega_page_is_zero(const uint8_t *pg)
+{
+    const uint32_t *w = (const uint32_t *)(const void *)pg;
+    uint32_t acc = 0;
+
+    for (uint32_t i = 0; i < EGA_VPAGE_BYTES / 4u; i++)
+        acc |= w[i];
+    return acc == 0u;
+}
+
+__attribute__((noinline)) static uint8_t *ega_page_fault(uint32_t a)
 {
     uint32_t vp = (a >> 8) & 0xFFu, best = EGA_VPAGES;
     int32_t best_age = -1;
@@ -832,20 +850,44 @@ PLANAR_HOT __attribute__((noinline)) static uint8_t *ega_page_fault(uint32_t a)
     if (!ega_ptab || x86_vga_modey_armed
         || (int16_t)(ega_epoch - ega_nofault_until) < 0)
         return 0;
-    for (uint32_t v = 0; v < EGA_VPAGES; v++) {
-        int32_t age;
-        if (!ega_ptab[v])
-            continue;
-        age = (uint16_t)(ega_epoch - ega_vstamp[v]);
-        if (age > best_age) {           /* ties keep the lowest page */
-            best_age = age;
+    /* FIRST CHOICE: a page that holds nothing but zeros, however recently it
+       was touched -- recycling it is lossless. A title that clears video
+       memory and then draws (Keen 4 at every map and level load, inside one
+       frame on the device) leaves exactly those, and the staleness rule alone
+       could not use them: everything it had just cleared was fresh, so the
+       draw was discarded and the map came up black. The scan resumes where
+       the last one stopped, so a run of faults does not re-read the same
+       non-zero pages. */
+    for (uint32_t n = 0; n < EGA_VPAGES; n++) {
+        uint32_t v = (ega_zscan + n) & (EGA_VPAGES - 1u);
+        if (X86_EGA_VCARD_NEGCTL == 3)
+            break;
+        if (v != vp && ega_ptab[v] && ega_page_is_zero(ega_ptab[v])) {
+            ega_zscan = (uint8_t)(v + 1u);
             best = v;
+            best_age = (int32_t)EGA_STALE_FRAMES;  /* passes the test below */
+            x86_vga_ega_zero_reuse++;
+            break;
+        }
+    }
+    /* SECOND CHOICE: the stalest page, if it is stale enough. */
+    if (best == EGA_VPAGES) {
+        for (uint32_t v = 0; v < EGA_VPAGES; v++) {
+            int32_t age;
+            if (!ega_ptab[v])
+                continue;
+            age = (uint16_t)(ega_epoch - ega_vstamp[v]);
+            if (age > best_age) {       /* ties keep the lowest page */
+                best_age = age;
+                best = v;
+            }
         }
     }
     if (best == EGA_VPAGES
         || (X86_EGA_VCARD_NEGCTL != 2 && best_age < (int32_t)EGA_STALE_FRAMES)) {
-        ega_nofault_until = (uint16_t)(ega_epoch + EGA_STALE_FRAMES
-                                       - (best_age > 0 ? best_age : 0));
+        /* Nothing until the next presented frame: a zero page can appear
+           any time (more zero stores), a stale one only as frames pass. */
+        ega_nofault_until = (uint16_t)(ega_epoch + 1u);
         return 0;
     }
     pg = ega_ptab[best];
@@ -857,12 +899,26 @@ PLANAR_HOT __attribute__((noinline)) static uint8_t *ega_page_fault(uint32_t a)
     return pg + 4u * (a & 0xFFu);
 }
 
-/* vga_cell() for a STORE: a miss in 0Dh may recycle a page. */
-__attribute__((always_inline)) static inline uint8_t *vga_cell_w(uint32_t a)
+/*
+ * vga_cell() for a STORE: a miss in 0Dh may recycle a page.
+ *
+ * `zero` says the store leaves the cell all zero. A page with no storage
+ * already READS as zeros, so such a store to one is a no-op and must not cost
+ * a page: it gets a scratch cell to write into instead. That is what keeps
+ * Keen 4's `rep stosw` over the whole 64 KB plane at every map and level load
+ * from claiming storage for 64 KB of nothing.
+ */
+static uint8_t ega_null_cell[4] __attribute__((aligned(4)));
+
+__attribute__((always_inline)) static inline uint8_t *vga_cell_w(uint32_t a, int zero)
 {
     uint8_t *p = vga_cell(a);
 
-    return p ? p : ega_page_fault(a);
+    if (p)
+        return p;
+    if (zero && !x86_vga_modey_armed)
+        return ega_null_cell;
+    return ega_page_fault(a);
 }
 
 /*
@@ -1192,14 +1248,9 @@ static void modey_lost(uint32_t a)
    been reloaded for this instruction. */
 static void planar_byte(uint32_t a, uint8_t v)
 {
-    uint8_t *p = vga_cell_w(a);
-    uint8_t out[4], rot, bitmask;
+    uint8_t *p;
+    uint8_t out[4], rot, bitmask, any;
     int i;
-
-    if (!p) {
-        modey_lost(a);
-        return;                         /* card has no memory there */
-    }
 
     switch (GC_MODE & 3u) {
     case 1:
@@ -1247,6 +1298,18 @@ static void planar_byte(uint32_t a, uint8_t v)
             out[i] = (uint8_t)((src & bitmask) | (latch[i] & (uint8_t)~bitmask));
         }
         break;
+    }
+
+    /* The cell is looked up only now: whether the write leaves it all zero
+       decides whether an unmapped page needs storage at all (vga_cell_w). */
+    any = 0;
+    for (i = 0; i < 4; i++)
+        if (map_mask & (1u << i))
+            any |= out[i];
+    p = vga_cell_w(a, any == 0u);
+    if (!p) {
+        modey_lost(a);
+        return;                         /* card has no memory there */
     }
 
     /* Map Mask decides which planes the write actually reaches. */
@@ -1314,7 +1377,7 @@ PLANAR_HOT static void planar_store_body(uint32_t off, uint32_t val, uint32_t si
            planar stores and every one of them was paying the full chain. */
         for (i = 0; i < size; i++) {
             uint32_t a = (off + i) & (X86_VGA_APERTURE_BYTES - 1u);
-            uint8_t *p = vga_cell_w(a);
+            uint8_t *p = vga_cell_w(a, ((val >> (8u * i)) & 0xFFu) == 0u);
             uint32_t q;
             x86_vga_planar_cls_plane++;
             if (!p) {
@@ -1376,7 +1439,7 @@ PLANAR_HOT static void planar_store_body(uint32_t off, uint32_t val, uint32_t si
            address, not from each destination byte in turn. */
         for (i = 0; i < size; i++) {
             uint32_t a = (off + i) & (X86_VGA_APERTURE_BYTES - 1u);
-            uint8_t *p = vga_cell_w(a);
+            uint8_t *p = vga_cell_w(a, (latch[0] | latch[1] | latch[2] | latch[3]) == 0u);
             x86_vga_planar_cls_copy++;
             if (!p) {
                 modey_lost(a);

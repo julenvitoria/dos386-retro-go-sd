@@ -98,6 +98,11 @@ anything.
                                         still using it. --vcard-only's [1]
                                         requires that store to be discarded.
 
+  VCZERO   -DX86_EGA_VCARD_NEGCTL=3     no lossless reuse of an all-zero page:
+                                        a clear-then-draw inside one frame is
+                                        discarded -- Keen 4's black world map
+                                        on the device. --vcard-only's [13].
+
   LEARN    -DX86_MODEY_PAGE0=16384      the POSITIVE control. The same 64,000
                                         pixels must still come out from a WRONG
                                         default, because the core is supposed to
@@ -126,6 +131,7 @@ ARMS = [
     ("EGAMODE","-DX86_EGA_SIG_NEGCTL=2",     False, "--ega-only"),
     ("VCDISP", "-DX86_EGA_VCARD_NEGCTL=1",   False, "--vcard-only"),
     ("VCSTALE","-DX86_EGA_VCARD_NEGCTL=2",   False, "--vcard-only"),
+    ("VCZERO", "-DX86_EGA_VCARD_NEGCTL=3",   False, "--vcard-only"),
     ("LEARN",  "-DX86_MODEY_PAGE0=16384",     True,  "--modey-only"),
 ]
 
@@ -164,7 +170,7 @@ def main():
     if fail:
         print("PLANAR CONTROLS FAIL")
         return 1
-    print("PLANAR CONTROLS PASS (10/10 negative controls caught, stride learning "
+    print("PLANAR CONTROLS PASS (11/11 negative controls caught, stride learning "
           "proven from a wrong default)")
     return 0
 
