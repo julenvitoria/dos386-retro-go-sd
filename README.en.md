@@ -91,9 +91,14 @@ More detail: [`docs/input/03-onscreen-keyboard.md`](docs/input/03-onscreen-keybo
 
 ## Branches
 
-- **`main`**: the version to use, the one built and shipped as `dos386.bin`.
-- **`overlays`**: memory experiments (parts of the core loaded into the screen's spare memory to
-  give the game more pages). Moves to `main` once it is tested on the console.
+- **`main`**: the version to use, the one built and shipped as `dos386.bin`. Since
+  2026-10-26 it is the former `overlays`: the AdLib chip, the mouse, the NOR snapshot and the
+  pagefile live in the memory the screen leaves free in palette (LUT8) mode, and the game gets
+  158 pages of 160. It needs a retro-go firmware that loads that part of the core (this
+  project's does).
+- **`normal`**: the previous build, without that extra memory (152 pages), for firmwares that
+  do not load it. No longer developed.
+- Any other branch is a test: it moves to `main` once it is tested on the console.
 
 ## For developers
 
