@@ -2993,6 +2993,12 @@ volatile uint32_t sound_opl_bytes = 0;    /* bytes the FM chip was given, 0 = no
 
 static void sound_cards_claim(const gw_firmware_abi_t *abi)
 {
+#if !X86_OPL_DYNAMIC
+    /* The chip's memory is static here (the overlays build keeps it in RAM_UC,
+       where it costs the guest nothing), so there is nothing to decide before
+       the pool: sound_cards_apply() does it all from settings_load(). */
+    (void)abi;
+#else
     int opl_on = 1, sb_on = 1;
 
     if (ACTIVE_FILE && ACTIVE_FILE->path[0]) {
@@ -3030,6 +3036,17 @@ static void sound_cards_claim(const gw_firmware_abi_t *abi)
     printf("DOS: sound: FM %s (%u B), Sound Blaster %s\n",
            sound_opl_bytes ? "on" : "off", (unsigned)sound_opl_bytes,
            sb_on ? "on" : "off");
+#endif
+}
+
+/* The same two keys, applied from settings_load() once the .cfg is parsed for
+   real. On the dynamic build this only confirms what sound_cards_claim()
+   already did; on the static one it is the whole job. */
+static void sound_cards_apply(void)
+{
+    x86_sb_enabled = (uint8_t)(x86_settings_get(X86_SET_SB) != 0);
+    if (!x86_settings_get(X86_SET_OPL))
+        x86_opl_set_mem(NULL);
 }
 
 /* Instrumentation. The whole point of a settings layer is that it is invisible
@@ -3140,6 +3157,7 @@ static void settings_load(void)
            common case, not an event worth a line in a wrapping log ring. */
         settings_dset_status = (uint32_t)x86_settings_load(dbuf, (unsigned long)n);
     }
+    sound_cards_apply();
 }
 
 /*
