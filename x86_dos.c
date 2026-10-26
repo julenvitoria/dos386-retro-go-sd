@@ -1483,8 +1483,13 @@ static uint16_t dos_env_build(const char *path, uint16_t owner)
     unsigned n = 0;
     static const char base[] =
         "PATH=\0COMSPEC=C:\\COMMAND.COM\0" DOS_ENV_BLASTER "\0";
-    memcpy(env, base, sizeof(base) - 1);
-    n = sizeof(base) - 1;
+    /* No BLASTER when the .cfg said `sbtype = none`: the string ends the
+       table, so leaving it off is a shorter copy. A driver that reads BLASTER
+       believes it, and advertising a card that is not there is the one thing
+       that is worse than advertising nothing (see DOS_ENV_BLASTER). */
+    n = x86_sb_enabled ? sizeof(base) - 1
+                       : sizeof(base) - 1 - (sizeof(DOS_ENV_BLASTER) - 1) - 1;
+    memcpy(env, base, n);
     env[n++] = 0;                       /* end of the strings */
     env[n++] = 1; env[n++] = 0;         /* one trailing item follows */
     env[n++] = 'C'; env[n++] = ':'; env[n++] = '\\';

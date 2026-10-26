@@ -96,6 +96,10 @@ static const x86_setting_desc_t x86_setting_desc[X86_SET_COUNT] = {
        the fastest rung rather than be refused as a bad value, and the consumer
        clamps to its own table's top when it picks the nearest rung. */
     { "cpu_cycles",   0, 0, 200000 },
+
+    /* oplmode / sbtype: 1 = present (today's machine), 0 = `none`. */
+    { "oplmode",      1, 0, 1 },
+    { "sbtype",       1, 0, 1 },
 };
 
 /* String rows. Separate from the table above because they are .cfg-only and

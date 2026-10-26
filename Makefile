@@ -34,7 +34,9 @@ CFLAGS += -DIS_LITTLE_ENDIAN -Ilib/FatFs
 CFLAGS += -Ilib/emu8950 -fms-extensions \
   -DUSE_EMU8950_OPL=1 -DDOOMX=1 -DEMU8950_LINEAR=1 -DEMU8950_LINEAR_SKIP=1 \
   -DEMU8950_NO_RATECONV=1 -DEMU8950_NO_TLL=1 -DEMU8950_NO_TIMER=1 \
-  -DEMU8950_NO_TEST_FLAG=1 -DEMU8950_NO_PERCUSSION_MODE=1
+  -DEMU8950_NO_TEST_FLAG=1 -DEMU8950_NO_PERCUSSION_MODE=1 \
+  -DEMU8950_NO_WAVE_TABLE_MAP=1 -DSLOT_RENDER_PORTABLE=1 \
+  -DEMU8950_EXT_MEM=1 -DEMU8950_SAMPLE_BUF=256
 # The pagefile slot ring, small. This harness's .bss is 176 bytes from
 # overflowing RAM_EMU, and the ring's logic is size-independent -- a 32-slot
 # ring wraps in tests/main.c's pgfile arm sooner, which is if anything better

@@ -25,7 +25,10 @@
 #define DOOMX_DTCM_BSS
 #endif
 
-#define SAMPLE_BUF_SIZE 1024
+#define SAMPLE_BUF_SIZE EMU8950_SAMPLE_BUF
+#if EMU8950_EXT_MEM
+void *emu8950_ext_mem;
+#endif
 
 #ifndef INLINE
 #if defined(_MSC_VER)
@@ -975,8 +978,10 @@ static INLINE int16_t to_linear_tll(uint16_t h, OPL_SLOT *slot, uint16_t tll, in
 #define LOGSIN_MASK (PG_WIDTH/4 - 1)
 #define LOGSIN_MASK2 (PG_WIDTH/2 - 1)
 
-//static INLINE uint16_t get_wave_table(OPL_SLOT *slot, uint32_t index) {
-static uint16_t get_wave_table(OPL_SLOT *slot, uint32_t index) {
+/* INLINE, and that matters under EMU8950_NO_WAVE_TABLE_MAP (TinyEMU,
+   2026-10-26): the computed form is two loads and an OR, which GCC no longer
+   inlines on its own -- it emitted an out-of-line call per operator sample. */
+static INLINE __attribute__((always_inline)) uint16_t get_wave_table(OPL_SLOT *slot, uint32_t index) {
 #if !EMU8950_NO_WAVE_TABLE_MAP
     return slot->wave_table[index];
 #else
@@ -1011,7 +1016,9 @@ static uint16_t get_wave_table(OPL_SLOT *slot, uint32_t index) {
 #endif
 }
 
-static INLINE uint16_t get_wave_table_wrap(OPL_SLOT *slot, uint32_t index) {
+/* Forced for the same reason as get_wave_table(): GCC kept it out of line
+   (get_wave_table_wrap.isra.0 showed up in PC samples of OPL music). */
+static INLINE __attribute__((always_inline)) uint16_t get_wave_table_wrap(OPL_SLOT *slot, uint32_t index) {
 #if !EMU8950_NO_WAVE_TABLE_MAP
     return get_wave_table(slot, index & (PG_WIDTH - 1));
 #else
@@ -1264,7 +1271,12 @@ OPL *OPL_new(uint32_t clk, uint32_t rate) {
         initializeTables();
     }
 
-#if DOOMX
+#if DOOMX && EMU8950_EXT_MEM
+    if (!emu8950_ext_mem)
+        return NULL;                    /* the host configured no FM chip */
+    opl = (OPL *) emu8950_ext_mem;
+    memset(opl, 0, sizeof(*opl));
+#elif DOOMX
     // Single static instance in zero-wait DTCM (touched every sample);
     // .dtcm_bss is zeroed at boot, matching the calloc semantics.
     static DOOMX_DTCM_BSS OPL the_opl;
@@ -1832,14 +1844,22 @@ void __not_in_flash_func(OPL_calc_buffer_linear)(OPL *opl, int32_t *buffer, uint
     static uint8_t lfo_am_buffer_lsl3[SAMPLE_BUF_SIZE];
     assert(nsamples <= sizeof(lfo_am_buffer_lsl3));
     opl->lfo_am_buffer_lsl3 = lfo_am_buffer_lsl3;
+#elif EMU8950_EXT_MEM
+    /* After the OPL struct: the int16 buffer first, so it stays 2-aligned. */
+    assert(nsamples <= SAMPLE_BUF_SIZE);
+    opl->mod_buffer = (int16_t *) ((uint8_t *) emu8950_ext_mem + EMU8950_OPL_BYTES);
+    opl->lfo_am_buffer = (uint8_t *) emu8950_ext_mem + EMU8950_OPL_BYTES
+                         + 2u * SAMPLE_BUF_SIZE;
 #else
     static DOOMX_DTCM_BSS uint8_t lfo_am_buffer[SAMPLE_BUF_SIZE];
     assert(nsamples <= sizeof(lfo_am_buffer));
     opl->lfo_am_buffer = lfo_am_buffer;
 #endif
+#if !EMU8950_EXT_MEM || EMU8950_SLOT_RENDER
     static DOOMX_DTCM_BSS int16_t mod_buffer[SAMPLE_BUF_SIZE];
 
     opl->mod_buffer = mod_buffer;
+#endif
     opl->buffer = buffer;
 
     // todo achievable by memcpy
@@ -1854,7 +1874,7 @@ void __not_in_flash_func(OPL_calc_buffer_linear)(OPL *opl, int32_t *buffer, uint
         // note <<3 still fits within 8 bits
         lfo_am_buffer_lsl3[s] = (am_table[opl->am_phase_index] >> (opl->am_mode ? 0 : 2)) << 3;
 #else
-        lfo_am_buffer[s] = (am_table[opl->am_phase_index] >> (opl->am_mode ? 0 : 2));
+        opl->lfo_am_buffer[s] = (am_table[opl->am_phase_index] >> (opl->am_mode ? 0 : 2));
 #endif
         buffer[s]=0;
     }

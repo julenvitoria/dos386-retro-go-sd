@@ -63,3 +63,15 @@ frame boundaries, in `x86_opl.c`. The first version of this core used a
 zero-order hold -- i.e. exactly the scheme that buzzes -- because the Sound
 Blaster path next door uses one. The SB path is resampling a 6-11 kHz sample
 stream and gets away with it; a held FM note does not.
+
+## TinyEMU additions (2026-10-26)
+
+- `EMU8950_NO_WAVE_TABLE_MAP=1` + `SLOT_RENDER_PORTABLE=1`: the waveforms are
+  computed per sample from `logsin_table` and `wav_or_table_lookup` instead of
+  an 8 KB map. Bit-exact with the map (host check: 2,048,000 samples of random
+  register traffic hash identically). `get_wave_table` and
+  `get_wave_table_wrap` are forced inline.
+- `EMU8950_EXT_MEM=1` + `EMU8950_SAMPLE_BUF=256`: the single DOOMX instance and
+  its two scratch buffers live in `emu8950_ext_mem` (EMU8950_EXT_MEM_BYTES),
+  handed over by the host; NULL makes `OPL_new()` return NULL. x86_opl.c owns
+  the block (static, or from src/main.c's RAM pool under X86_OPL_DYNAMIC).

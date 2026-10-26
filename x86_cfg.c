@@ -36,6 +36,8 @@ typedef enum {
     X86_CFG_T_ONOFFKB,    /* DOSBox's `xms = true` / `ems = false`: a bool
                              that lands in a KB setting                      */
     X86_CFG_T_CYCLES,     /* DOSBox's `cycles`: `max`/`auto`, or a number    */
+    X86_CFG_T_NONE,       /* DOSBox's `oplmode`/`sbtype`: `none` (or a false
+                             bool) is 0, any model name is 1                 */
     X86_CFG_T_STR         /* free text, stored in x86_settings.c's fixed
                              storage. `.cfg`-only -- see x86_settings.h      */
 } x86_cfg_type_t;
@@ -115,6 +117,18 @@ static const x86_cfg_key_t x86_cfg_keys[] = {
     { "ems",          "dos",  X86_SET_EMS_KB,      X86_CFG_T_ONOFFKB },
     { "xms_kb",       "dos",  X86_SET_XMS_KB,      X86_CFG_T_MEMKB   },
     { "ems_kb",       "dos",  X86_SET_EMS_KB,      X86_CFG_T_MEMKB   },
+
+    /* ---- [sblaster] --------------------------------------------------------
+     *
+     * DOSBox's own two keys, so a dosbox.conf line means here what it means
+     * there: `oplmode = none` is no FM chip (no AdLib, and no FM half of the
+     * Sound Blaster), `sbtype = none` is no Sound Blaster DSP. Any model name
+     * DOSBox accepts -- auto, opl2, dualopl2, opl3, sb16, sbpro2... -- is
+     * simply "present"; this core has one of each. `oplmode = none` is also
+     * the one that buys memory: src/main.c then never allocates the chip, and
+     * on the main build those bytes go to the guest's frame pool. */
+    { "oplmode",      "sblaster", X86_SET_OPL,      X86_CFG_T_NONE    },
+    { "sbtype",       "sblaster", X86_SET_SB,       X86_CFG_T_NONE    },
 
     /* ---- launch parameters, written out ------------------------------------
      *
@@ -649,6 +663,19 @@ x86_cfg_status_t x86_cfg_parse(const unsigned char *buf, unsigned long len,
                 break;
             case X86_CFG_T_MEMKB:
                 parsed = cfg_val_memkb(v, v_end, x86_cfg_gran_kb(id), &val);
+                break;
+            case X86_CFG_T_NONE:
+                /* `none` is absent; a bool is taken at its word; any other
+                   non-empty word is a model name, i.e. present. */
+                if (cfg_eq(v, v_end, "none")) {
+                    val = 0;
+                    parsed = 1;
+                } else if (!cfg_val_bool(v, v_end, &val)) {
+                    val = 1;
+                    parsed = v < v_end;
+                } else {
+                    parsed = 1;
+                }
                 break;
             case X86_CFG_T_CYCLES:
                 /* `max` and `auto` are DOSBox's own words for "as fast as it

@@ -147,6 +147,21 @@ typedef struct __OPL {
 
 } OPL;
 
+/* TinyEMU (2026-10-26): EMU8950_EXT_MEM puts the single DOOMX instance and its
+   two per-call scratch buffers in memory the HOST hands over, instead of
+   static .bss -- so a title configured with no FM chip (`oplmode = none`)
+   never pays for them. emu8950_ext_mem must point at EMU8950_EXT_MEM_BYTES,
+   4-byte aligned, before OPL_new(); NULL makes OPL_new() return NULL. The
+   render is then limited to EMU8950_SAMPLE_BUF samples per call. */
+#ifndef EMU8950_SAMPLE_BUF
+#define EMU8950_SAMPLE_BUF 1024
+#endif
+#if EMU8950_EXT_MEM
+#define EMU8950_OPL_BYTES     ((sizeof(OPL) + 3u) & ~3u)
+#define EMU8950_EXT_MEM_BYTES (EMU8950_OPL_BYTES + 3u * EMU8950_SAMPLE_BUF)
+extern void *emu8950_ext_mem;
+#endif
+
 #if !EMU8950_NO_TEST_FLAG
 #define opl_test_flag(opl) opl->test_flag
 #else
