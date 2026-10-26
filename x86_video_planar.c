@@ -617,23 +617,70 @@ int x86_vga_modey_row_at(uint32_t a, const uint8_t **base, uint32_t *off)
  * stay exact, and latch copies are the idiom that matters; a title that reads
  * pixels back for collision detection would not be served.
  */
+/*
+ * WHAT A READ RETURNS, FROM A CELL ALREADY IN HAND -- three words of state
+ * derived from the four read-affecting registers, so neither the shadow
+ * rebuild nor the per-store shadow update re-decodes them per byte.
+ *
+ * Read mode 1 is the same AND over the planes that Colour Don't Care selects,
+ * done on all four plane bytes of the 32-bit cell at once:
+ *   x = (cell ^ rd_xor) | rd_or
+ * where rd_xor inverts the planes whose Colour Compare bit is 0 and rd_or
+ * forces the planes Don't Care deselects to 0xFF (they drop out of the AND).
+ * The four bytes of x are then ANDed together. In read mode 0 the answer is
+ * one plane byte, plane rd_plane.
+ *
+ * MEASURED, gwemu tier 2, KEEN4 gameplay: ~4.4 read-affecting changes per
+ * guest frame, every one a full 16 KB shadow rebuild, and the rebuild called
+ * ega_read_byte() -- in AXI, through a veneer into ITCM for vga_cell() -- once
+ * per byte. One rebuild was measured on silicon at 846,000 cycles (docs/13).
+ * A PC sample of KEEN4 gameplay landed in ega_read_byte / vga_cell / the
+ * veneer in 13 of its 19 non-idle samples.
+ *
+ * Set by ega_read_prep() wherever ega_shadow_sig is assigned: the three are a
+ * pure function of the signature, so they cannot disagree with it.
+ */
+static uint32_t rd_mode1, rd_plane, rd_xor, rd_or;
+
+PLANAR_HOT static void ega_read_prep(void)
+{
+    uint32_t i;
+
+    rd_mode1 = (GC_MODE & 8u) != 0u;
+    rd_plane = GC_READ_MAP & 3u;
+    rd_xor = rd_or = 0;
+    for (i = 0; i < 4; i++) {
+        if (!(GC_COLOR_CMP & (1u << i)))
+            rd_xor |= 0xFFu << (8u * i);
+        if (!(GC_COLOR_DC & (1u << i)))
+            rd_or |= 0xFFu << (8u * i);
+    }
+}
+
+static inline uint8_t cell_read_w(uint32_t w)
+{
+    if (rd_mode1) {
+        uint32_t x = (w ^ rd_xor) | rd_or;
+        x &= x >> 16;
+        x &= x >> 8;
+        return (uint8_t)x;
+    }
+    return (uint8_t)(w >> (8u * rd_plane));
+}
+
+static inline uint8_t cell_read(const uint8_t *p)
+{
+    uint32_t w;
+
+    memcpy(&w, p, 4);                   /* cells are 4-byte aligned */
+    return cell_read_w(w);
+}
+
 static uint8_t ega_read_byte(uint32_t a)
 {
-    static const uint8_t nocell[4] = { 0, 0, 0, 0 };
     const uint8_t *p = vga_cell(a);
 
-    if (!p)
-        p = nocell;
-    if (GC_MODE & 8u) {
-        /* Read mode 1: each returned bit is 1 where every plane selected by
-           Colour Don't Care matches the corresponding bit of Colour Compare. */
-        uint8_t r = 0xFF;
-        for (int i = 0; i < 4; i++)
-            if (GC_COLOR_DC & (1u << i))
-                r &= (GC_COLOR_CMP & (1u << i)) ? p[i] : (uint8_t)~p[i];
-        return r;
-    }
-    return p[GC_READ_MAP & 3u];
+    return p ? cell_read(p) : cell_read_w(0);    /* no cell reads as zeros */
 }
 
 /*
@@ -764,7 +811,7 @@ static uint32_t ega_read_sig(void)
 /* The signature the shadow currently HOLDS. Set wherever the shadow is built. */
 static uint32_t ega_shadow_sig;
 
-static void ega_shadow_rebuild(void)
+PLANAR_HOT static void ega_shadow_rebuild(void)
 {
     uint8_t *sh = x86_vga_planar_aperture;
     uint32_t a;
@@ -774,7 +821,36 @@ static void ega_shadow_rebuild(void)
     if (!sh || x86_vga_modey_armed || !x86_vga_ega_armed)
         return;
     SHPROF_BEGIN();
-    for (a = 0; a < ega_plane_size && a < EGA_SHADOW_OFFSETS; a++)
+    /* Four cells into one aligned word of shadow per step, straight off the
+       first piece -- which holds the whole shadow on every layout that ships
+       (ega_size1 >= 0x4000); the tail loop covers a first piece that does not. */
+    {
+        uint32_t n = ega_size1 < ega_plane_size ? ega_size1 : ega_plane_size;
+        const uint32_t *c = (const uint32_t *)(const void *)ega_planes;
+
+        if (n > EGA_SHADOW_OFFSETS)
+            n = EGA_SHADOW_OFFSETS;
+        n &= ~3u;
+        if (rd_mode1) {
+            for (a = 0; a < n; a += 4) {
+                uint32_t v = (uint32_t)cell_read_w(c[a])
+                           | (uint32_t)cell_read_w(c[a + 1]) << 8
+                           | (uint32_t)cell_read_w(c[a + 2]) << 16
+                           | (uint32_t)cell_read_w(c[a + 3]) << 24;
+                memcpy(sh + a, &v, 4);
+            }
+        } else {
+            const uint32_t sft = 8u * rd_plane;
+            for (a = 0; a < n; a += 4) {
+                uint32_t v = ((c[a] >> sft) & 0xFFu)
+                           | ((c[a + 1] >> sft) & 0xFFu) << 8
+                           | ((c[a + 2] >> sft) & 0xFFu) << 16
+                           | ((c[a + 3] >> sft) & 0xFFu) << 24;
+                memcpy(sh + a, &v, 4);
+            }
+        }
+    }
+    for (; a < ega_plane_size && a < EGA_SHADOW_OFFSETS; a++)
         sh[a] = ega_read_byte(a);
     /* Offsets past the modelled planes read as zero rather than as stale bytes
        from whatever mode ran before. */
@@ -819,6 +895,7 @@ void x86_vga_ega_reseat(const void *old, uint32_t old_offsets)
         memset(ega_planes + 4u * keep, 0, 4u * (ega_size1 - keep));
     if (x86_vga_ega_armed) {
         ega_shadow_sig = ega_read_sig();
+        ega_read_prep();
         ega_shadow_rebuild();
     }
 }
@@ -975,7 +1052,7 @@ static void planar_byte(uint32_t a, uint8_t v)
        the aperture is plane a&3 at plane offset a>>2 -- so this would scribble
        a decoded byte over a pixel four stores younger than itself. */
     if (!x86_vga_modey_armed && a < EGA_SHADOW_OFFSETS)
-        x86_vga_planar_aperture[a] = ega_read_byte(a);
+        x86_vga_planar_aperture[a] = cell_read(p);
 }
 
 /* The measured body. x86_vga_planar_store() below is the bracket; with
@@ -1069,7 +1146,7 @@ PLANAR_HOT static void planar_store_body(uint32_t off, uint32_t val, uint32_t si
             }
             X86_VPROF_END(cl, cell);
             if (!x86_vga_modey_armed && a < EGA_SHADOW_OFFSETS)
-                ap[a] = ega_read_byte(a);
+                ap[a] = cell_read(p);
         }
         return;
     }
@@ -1095,7 +1172,7 @@ PLANAR_HOT static void planar_store_body(uint32_t off, uint32_t val, uint32_t si
             p[0] = latch[0]; p[1] = latch[1];
             p[2] = latch[2]; p[3] = latch[3];
             if (!x86_vga_modey_armed && a < EGA_SHADOW_OFFSETS)
-                ap[a] = ega_read_byte(a);
+                ap[a] = cell_read(p);
         }
         return;
     }
@@ -1322,6 +1399,7 @@ int x86_vga_planar_arm(int on)
 
     x86_vga_ega_armed = 1;
     ega_shadow_sig = ega_read_sig();
+    ega_read_prep();
     ega_shadow_rebuild();
     hook_set(1);
     return 1;
@@ -1371,6 +1449,7 @@ void x86_vga_planar_gc_write(unsigned idx, uint8_t val)
         if (sig == ega_shadow_sig)
             return;
         ega_shadow_sig = sig;
+        ega_read_prep();
         ega_shadow_rebuild();
     }
 }
