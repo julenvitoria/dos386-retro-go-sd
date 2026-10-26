@@ -261,6 +261,67 @@ static uint32_t  ega_plane_size;    /* plane OFFSETS the card has fitted, total 
    pieces need only what the arena is short of (~29). */
 static uint8_t  *ega_planes2;
 static uint32_t  ega_size1;
+
+/*
+ * THE VIRTUAL CARD. A real EGA has 64 KB per plane; this card has whatever the
+ * arena (plus a pager loan) could fit, ~46 K offsets on the shipping layouts.
+ * A title that scrolls its pages round the whole plane -- the Galaxy engine,
+ * Keen 4 -- therefore lost every store past the fitted size: measured at tier
+ * 2, 30% of KEEN4's planar stores, seen as a white world map and a black top
+ * half in the levels whenever the display start wandered up there.
+ *
+ * But it never USES 64 KB at once. Sampled at tier 2 in KEEN4's first level,
+ * the pages (256 offsets) it touched in the last 4 s came to 92 -- 23.5 K
+ * offsets -- in three windows that slide with the scroll. So the card is now
+ * addressed through a page table: plane offset a lives in the 1 KB physical
+ * page ega_ptab[a >> 8], or nowhere.
+ *
+ *   - It starts as the IDENTITY of the old layout: offsets below the card
+ *     size map exactly where they always did, so a title whose footprint fits
+ *     sees no change at all.
+ *   - A store to an unmapped page RECYCLES the stalest mapped page -- one not
+ *     written, latch-read or displayed for EGA_STALE_FRAMES presented frames.
+ *     If none is that stale the store is discarded, as before. Within one
+ *     frame nothing ages, which is why the harness's card-bound arm (a whole
+ *     program run before the first blit) still sees its discards.
+ *   - Recycled data is lost the way past-the-card data always was: it reads
+ *     back as zero.
+ *
+ * The table (256 pointers) and the page stamps (256 x 16 bit) are 1.5 KB that
+ * live in the TOP of the aperture, which 0Dh does not otherwise use: guest
+ * reads above the 16 KB shadow already return nothing meaningful (zero), and
+ * now return table bytes in that last 1.5 KB. Nothing in RAM_EMU pays for it.
+ */
+#define EGA_VPAGES        256u
+#define EGA_VPAGE_BYTES   1024u           /* 256 cells of 4 plane bytes   */
+#define EGA_STALE_FRAMES  30u
+/* Graded by scripts/run_planar_controls.py through tests/test_video.py
+   --vcard-only, which must FAIL with each compiled in:
+     1  the blit does not mark the displayed window, so a page the panel is
+        showing can be recycled under it
+     2  no staleness threshold, so a page still in use this frame is recycled */
+#ifndef X86_EGA_VCARD_NEGCTL
+#define X86_EGA_VCARD_NEGCTL 0
+#endif
+#define EGA_VT_BYTES      (EGA_VPAGES * 4u + EGA_VPAGES * 2u)
+/*
+ * THE READ SHADOW COVERS THE WHOLE WINDOW BUT THE TABLE: 0..0xF9FF. It was the
+ * bottom 16 KB only, and every guest read above that returned zero -- which is
+ * where Keen 4's black boxes round its sprites came from: the Galaxy engine
+ * draws a masked sprite by READING each plane of the background (`mov al,
+ * es:[di] / and al,mask / or al,shape`), and up there the background read as
+ * black. A full rebuild used to cost a byte computation per offset; it is now
+ * a word per four offsets over the MAPPED pages only (see ega_shadow_rebuild),
+ * so the cost follows the card, not the window.
+ */
+#define EGA_SHADOW_OFFSETS ((0x10000u - EGA_VT_BYTES) & ~0xFFu)   /* 0xFA00 */
+static uint8_t  **ega_ptab;         /* NULL unless the card is mapped       */
+static uint16_t  *ega_vstamp;       /* ega_epoch at a page's last use       */
+static uint16_t   ega_epoch;        /* presented frames, mod 65,536         */
+static uint16_t   ega_nofault_until;/* no page can be stale before this     */
+static uint32_t   ega_shadow_zero;  /* what unmapped shadow pages hold; 0x100
+                                       = unknown, so the next rebuild fills */
+volatile uint32_t x86_vga_ega_remaps;
 static uint8_t  *modey_cache;       /* Mode Y off-screen store (arena)       */
 static uint32_t  modey_cache_offs;  /* plane offsets it holds                */
 /* Real storage for Mode Y display pages 1 and 2. Page 0 is always the aperture.
@@ -389,12 +450,18 @@ uint32_t       x86_vga_ega_plane_offsets(void) { return ega_plane_size; }
    came back holding cache bytes cannot pass by being incidentally zero. */
 const uint8_t *x86_vga_modey_cache_ptr(void) { return modey_cache; }
 
+static void ega_vmap_identity(void);
+static void ega_vmap_add(uint8_t *base, uint32_t pages);
+static void ega_vpage_drop(uint32_t vp);
+
 void x86_vga_ega_set_planes(void *p, uint32_t plane_offsets)
 {
     ega_planes = (uint8_t *)p;
     ega_plane_size = p ? plane_offsets : 0u;
     ega_size1 = ega_plane_size;
     ega_planes2 = NULL;                 /* a new first piece drops the second */
+    if (x86_vga_ega_armed)
+        ega_vmap_identity();            /* the table must never outlive a piece */
 }
 
 /* Append the second piece (or drop it with p == NULL). Its bytes are ZEROED:
@@ -407,7 +474,16 @@ void x86_vga_ega_set_planes2(void *p, uint32_t plane_offsets)
         ega_planes2 = (uint8_t *)p;
         memset(ega_planes2, 0, 4u * plane_offsets);
         ega_plane_size = ega_size1 + plane_offsets;
+        if (ega_ptab)                   /* armed: hand the pages out now */
+            ega_vmap_add(ega_planes2, plane_offsets >> 8);
     } else {
+        if (ega_ptab && ega_planes2) {
+            const uint8_t *lo = ega_planes2;
+            const uint8_t *hi = lo + 4u * (ega_plane_size - ega_size1);
+            for (uint32_t v = 0; v < EGA_VPAGES; v++)
+                if (ega_ptab[v] >= lo && ega_ptab[v] < hi)
+                    ega_vpage_drop(v);
+        }
         ega_planes2 = NULL;
         ega_plane_size = ega_size1;
     }
@@ -528,11 +604,14 @@ PLANAR_HOT static uint8_t *vga_cell(uint32_t a)
     uint32_t pg, off;
 
     if (!x86_vga_modey_armed) {
-        if (a < ega_size1)
-            return ega_planes + 4u * a;
-        if (a < ega_plane_size)         /* the second piece, if any */
-            return ega_planes2 + 4u * (a - ega_size1);
-        return 0;                       /* past the fitted card: discarded */
+        /* Through the virtual card's page table; `a` is a 16-bit plane
+           offset. An unmapped page has no storage: reads see nothing, and a
+           store goes to ega_page_fault(). */
+        uint8_t *pg;
+        if (!ega_ptab)
+            return 0;
+        pg = ega_ptab[(a >> 8) & 0xFFu];
+        return pg ? pg + 4u * (a & 0xFFu) : 0;
     }
 
 #if X86_MODEY_PAGE_NEGCTL
@@ -683,9 +762,134 @@ static uint8_t ega_read_byte(uint32_t a)
     return p ? cell_read(p) : cell_read_w(0);    /* no cell reads as zeros */
 }
 
+/* ---- the virtual card's page management (see the block at ega_ptab) ---- */
+
+#define EGA_SHADOW_PAGES  (EGA_SHADOW_OFFSETS >> 8)
+/* Page management runs on a miss, a mode set or a card re-fit -- never per
+   store -- and RAM_EMU is the budget it competes with, so it is built small. */
+#define EGA_COLD __attribute__((cold, noinline, optimize("Os")))
+
+/* Give `pages` physical pages from `base` to the lowest unmapped offsets.
+   They hold no data yet, so nothing is displaced. */
+EGA_COLD static void ega_vmap_add(uint8_t *base, uint32_t pages)
+{
+    uint32_t vp = 0;
+
+    for (; pages; pages--, base += EGA_VPAGE_BYTES) {
+        while (vp < EGA_VPAGES && ega_ptab[vp])
+            vp++;
+        if (vp >= EGA_VPAGES)
+            return;
+        ega_ptab[vp] = base;
+        ega_vstamp[vp] = ega_epoch;
+    }
+}
+
+/* Build the table at the top of the aperture as the IDENTITY of the old
+   layout: the first piece from offset 0, the second piece after it. */
+EGA_COLD static void ega_vmap_identity(void)
+{
+    uint8_t *top;
+
+    ega_ptab = NULL;
+    if (!x86_vga_planar_aperture || !ega_planes)
+        return;
+    top = x86_vga_planar_aperture + X86_VGA_APERTURE_BYTES - EGA_VT_BYTES;
+    ega_ptab = (uint8_t **)(void *)top;
+    ega_vstamp = (uint16_t *)(void *)(top + EGA_VPAGES * 4u);
+    memset(ega_ptab, 0, EGA_VPAGES * 4u);
+    ega_vmap_add(ega_planes, ega_size1 >> 8);
+    if (ega_planes2)
+        ega_vmap_add(ega_planes2, (ega_plane_size - ega_size1) >> 8);
+    ega_nofault_until = ega_epoch;
+}
+
+/* Unmap a page. What it held is gone; its shadow bytes become what a read of
+   a page with no storage returns. */
+PLANAR_HOT static void ega_vpage_drop(uint32_t vp)
+{
+    ega_ptab[vp] = NULL;
+    if (vp < EGA_SHADOW_PAGES && x86_vga_planar_aperture)
+        memset(x86_vga_planar_aperture + (vp << 8), cell_read_w(0), 256u);
+}
+
 /*
- * Rebuild the whole read shadow -- the bottom 16 KB of the aperture, which is
- * what a guest read of A000:xxxx lands on.
+ * A STORE to a page with no storage: recycle the stalest page, or refuse.
+ * Returns the cell for `a`, or NULL (the store is discarded and counted by the
+ * caller exactly as a past-the-card store always was).
+ *
+ * The scan is 256 entries and runs only on a miss. When it finds nothing
+ * stale it records the earliest frame at which something could be, so a
+ * title hammering unmapped offsets inside one frame pays one scan, not one
+ * per byte.
+ */
+PLANAR_HOT __attribute__((noinline)) static uint8_t *ega_page_fault(uint32_t a)
+{
+    uint32_t vp = (a >> 8) & 0xFFu, best = EGA_VPAGES;
+    int32_t best_age = -1;
+    uint8_t *pg;
+
+    if (!ega_ptab || x86_vga_modey_armed
+        || (int16_t)(ega_epoch - ega_nofault_until) < 0)
+        return 0;
+    for (uint32_t v = 0; v < EGA_VPAGES; v++) {
+        int32_t age;
+        if (!ega_ptab[v])
+            continue;
+        age = (uint16_t)(ega_epoch - ega_vstamp[v]);
+        if (age > best_age) {           /* ties keep the lowest page */
+            best_age = age;
+            best = v;
+        }
+    }
+    if (best == EGA_VPAGES
+        || (X86_EGA_VCARD_NEGCTL != 2 && best_age < (int32_t)EGA_STALE_FRAMES)) {
+        ega_nofault_until = (uint16_t)(ega_epoch + EGA_STALE_FRAMES
+                                       - (best_age > 0 ? best_age : 0));
+        return 0;
+    }
+    pg = ega_ptab[best];
+    ega_vpage_drop(best);
+    memset(pg, 0, EGA_VPAGE_BYTES);
+    ega_ptab[vp] = pg;
+    ega_vstamp[vp] = ega_epoch;
+    x86_vga_ega_remaps++;
+    return pg + 4u * (a & 0xFFu);
+}
+
+/* vga_cell() for a STORE: a miss in 0Dh may recycle a page. */
+__attribute__((always_inline)) static inline uint8_t *vga_cell_w(uint32_t a)
+{
+    uint8_t *p = vga_cell(a);
+
+    return p ? p : ega_page_fault(a);
+}
+
+/*
+ * Once per presented frame, from the blit: age everything by one and mark the
+ * pages the panel is showing as used now, so a displayed page is never the
+ * stalest. The window is `rows` rows of `pitch` from `start`, plus the one
+ * extra group the pel pan reads; it wraps at 64 KB like the CRTC.
+ */
+PLANAR_HOT void x86_vga_ega_frame(uint32_t start, uint32_t pitch, uint32_t rows)
+{
+    uint32_t n, v;
+
+    ega_epoch++;
+    if (!ega_ptab || X86_EGA_VCARD_NEGCTL == 1)
+        return;
+    n = ((start & 0xFFu) + pitch * rows + 41u + 255u) >> 8;
+    if (n > EGA_VPAGES)
+        n = EGA_VPAGES;
+    for (v = (start >> 8) & 0xFFu; n--; v = (v + 1u) & 0xFFu)
+        ega_vstamp[v] = ega_epoch;
+}
+
+uint8_t *const *x86_vga_ega_ptab(void) { return ega_ptab; }
+
+/*
+ * Rebuild the whole read shadow -- the aperture below the virtual card's
+ * table, which is what a guest read of A000:xxxx lands on.
  *
  * THE SHADOW IS AT THE BOTTOM OF THE APERTURE AND THAT IS LOAD-BEARING. A guest
  * access to the window has to reach it with NO change to the address fold, on
@@ -699,7 +903,6 @@ static uint8_t ega_read_byte(uint32_t a)
  * loop. On the reference this went unnoticed at 8 KB and then wedged a device
  * run at 64 KB.
  */
-#define EGA_SHADOW_OFFSETS  0x4000u     /* 16 KB, the CPU-visible window */
 
 /* ---------------------------------------------------------------------------
  * X86_EGA_SHPROF=1 -- the EGA read-shadow rebuild instrument. OFF by default.
@@ -821,41 +1024,43 @@ PLANAR_HOT static void ega_shadow_rebuild(void)
     if (!sh || x86_vga_modey_armed || !x86_vga_ega_armed)
         return;
     SHPROF_BEGIN();
-    /* Four cells into one aligned word of shadow per step, straight off the
-       first piece -- which holds the whole shadow on every layout that ships
-       (ega_size1 >= 0x4000); the tail loop covers a first piece that does not. */
+    /* Page by page through the table, four cells into one aligned shadow
+       word per step. A page with no storage reads as a cell of zeros, and its
+       shadow already says so unless that value itself changed (read mode 1
+       can make it 0xFF): ega_vpage_drop() writes it whenever a page goes. */
     {
-        uint32_t n = ega_size1 < ega_plane_size ? ega_size1 : ega_plane_size;
-        const uint32_t *c = (const uint32_t *)(const void *)ega_planes;
+    const uint32_t z = cell_read_w(0);
+    const int zchanged = z != ega_shadow_zero;
+    ega_shadow_zero = z;
+    for (uint32_t vp = 0; vp < EGA_SHADOW_PAGES; vp++) {
+        const uint32_t *c = ega_ptab ? (const uint32_t *)(const void *)ega_ptab[vp] : NULL;
+        uint8_t *d = sh + (vp << 8);
 
-        if (n > EGA_SHADOW_OFFSETS)
-            n = EGA_SHADOW_OFFSETS;
-        n &= ~3u;
+        if (!c) {
+            if (zchanged)
+                memset(d, (int)z, 256u);
+            continue;
+        }
         if (rd_mode1) {
-            for (a = 0; a < n; a += 4) {
+            for (a = 0; a < 256u; a += 4) {
                 uint32_t v = (uint32_t)cell_read_w(c[a])
                            | (uint32_t)cell_read_w(c[a + 1]) << 8
                            | (uint32_t)cell_read_w(c[a + 2]) << 16
                            | (uint32_t)cell_read_w(c[a + 3]) << 24;
-                memcpy(sh + a, &v, 4);
+                memcpy(d + a, &v, 4);
             }
         } else {
             const uint32_t sft = 8u * rd_plane;
-            for (a = 0; a < n; a += 4) {
+            for (a = 0; a < 256u; a += 4) {
                 uint32_t v = ((c[a] >> sft) & 0xFFu)
                            | ((c[a + 1] >> sft) & 0xFFu) << 8
                            | ((c[a + 2] >> sft) & 0xFFu) << 16
                            | ((c[a + 3] >> sft) & 0xFFu) << 24;
-                memcpy(sh + a, &v, 4);
+                memcpy(d + a, &v, 4);
             }
         }
     }
-    for (; a < ega_plane_size && a < EGA_SHADOW_OFFSETS; a++)
-        sh[a] = ega_read_byte(a);
-    /* Offsets past the modelled planes read as zero rather than as stale bytes
-       from whatever mode ran before. */
-    for (; a < EGA_SHADOW_OFFSETS; a++)
-        sh[a] = 0;
+    }
     SHPROF_END();
 }
 
@@ -931,6 +1136,8 @@ static void latch_reload(void)
             return;
         }
         p = vga_cell(off);
+        if (p && !x86_vga_modey_armed)
+            ega_vstamp[off >> 8] = ega_epoch;   /* a latch source is in use */
     }
     if (p) {
         latch[0] = p[0]; latch[1] = p[1];
@@ -985,7 +1192,7 @@ static void modey_lost(uint32_t a)
    been reloaded for this instruction. */
 static void planar_byte(uint32_t a, uint8_t v)
 {
-    uint8_t *p = vga_cell(a);
+    uint8_t *p = vga_cell_w(a);
     uint8_t out[4], rot, bitmask;
     int i;
 
@@ -1051,8 +1258,11 @@ static void planar_byte(uint32_t a, uint8_t v)
        NOT IN MODE Y: there the shadow address IS plane storage -- byte `a` of
        the aperture is plane a&3 at plane offset a>>2 -- so this would scribble
        a decoded byte over a pixel four stores younger than itself. */
-    if (!x86_vga_modey_armed && a < EGA_SHADOW_OFFSETS)
-        x86_vga_planar_aperture[a] = cell_read(p);
+    if (!x86_vga_modey_armed) {
+        ega_vstamp[a >> 8] = ega_epoch;
+        if (a < EGA_SHADOW_OFFSETS)
+            x86_vga_planar_aperture[a] = cell_read(p);
+    }
 }
 
 /* The measured body. x86_vga_planar_store() below is the bracket; with
@@ -1104,7 +1314,7 @@ PLANAR_HOT static void planar_store_body(uint32_t off, uint32_t val, uint32_t si
            planar stores and every one of them was paying the full chain. */
         for (i = 0; i < size; i++) {
             uint32_t a = (off + i) & (X86_VGA_APERTURE_BYTES - 1u);
-            uint8_t *p = vga_cell(a);
+            uint8_t *p = vga_cell_w(a);
             uint32_t q;
             x86_vga_planar_cls_plane++;
             if (!p) {
@@ -1145,8 +1355,11 @@ PLANAR_HOT static void planar_store_body(uint32_t off, uint32_t val, uint32_t si
                     x86_vga_planar_cls_plane1++;
             }
             X86_VPROF_END(cl, cell);
-            if (!x86_vga_modey_armed && a < EGA_SHADOW_OFFSETS)
-                ap[a] = cell_read(p);
+            if (!x86_vga_modey_armed) {
+                ega_vstamp[a >> 8] = ega_epoch;
+                if (a < EGA_SHADOW_OFFSETS)
+                    ap[a] = cell_read(p);
+            }
         }
         return;
     }
@@ -1163,7 +1376,7 @@ PLANAR_HOT static void planar_store_body(uint32_t off, uint32_t val, uint32_t si
            address, not from each destination byte in turn. */
         for (i = 0; i < size; i++) {
             uint32_t a = (off + i) & (X86_VGA_APERTURE_BYTES - 1u);
-            uint8_t *p = vga_cell(a);
+            uint8_t *p = vga_cell_w(a);
             x86_vga_planar_cls_copy++;
             if (!p) {
                 modey_lost(a);
@@ -1171,8 +1384,11 @@ PLANAR_HOT static void planar_store_body(uint32_t off, uint32_t val, uint32_t si
             }
             p[0] = latch[0]; p[1] = latch[1];
             p[2] = latch[2]; p[3] = latch[3];
-            if (!x86_vga_modey_armed && a < EGA_SHADOW_OFFSETS)
-                ap[a] = cell_read(p);
+            if (!x86_vga_modey_armed) {
+                ega_vstamp[a >> 8] = ega_epoch;
+                if (a < EGA_SHADOW_OFFSETS)
+                    ap[a] = cell_read(p);
+            }
         }
         return;
     }
@@ -1366,6 +1582,7 @@ int x86_vga_planar_arm(int on)
         if (!x86_vga_ega_armed)
             return 1;
         x86_vga_ega_armed = 0;
+        ega_ptab = NULL;                /* the table lives in the aperture */
         hook_set(x86_vga_modey_armed);
         return 1;
     }
@@ -1390,12 +1607,15 @@ int x86_vga_planar_arm(int on)
         memset(ega_planes2, 0, 4u * (ega_plane_size - ega_size1));
     /* The WHOLE aperture, not just the shadow. An EGA in a planar mode decodes
        all 64 KB at A000:0000 and software uses it -- Keen 4's first act after
-       the mode set is a `rep stosw` with CX=8000h over the lot. Only the bottom
-       16 KB is the shadow; the rest must read back as ZERO, because a write up
-       there reaches a plane offset this card has not fitted and is discarded.
+       the mode set is a `rep stosw` with CX=8000h over the lot. The shadow
+       covers 0..0xF9FF (the top 1.5 KB holds the virtual card's table); an
+       offset with no page must read back as ZERO, because a write there was
+       discarded.
        Leaving stale bytes would have the guest read back data it never stored,
        which is exactly the `z`-marker failure tega2.asm exists to catch. */
     memset(x86_vga_planar_aperture, 0, X86_VGA_APERTURE_BYTES);
+    ega_shadow_zero = 0x100u;           /* the next rebuild fills every page */
+    ega_vmap_identity();
 
     x86_vga_ega_armed = 1;
     ega_shadow_sig = ega_read_sig();

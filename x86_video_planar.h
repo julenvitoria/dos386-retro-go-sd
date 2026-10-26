@@ -103,6 +103,13 @@ uint32_t       x86_vga_ega_plane_offsets(void);
 void           x86_vga_ega_set_planes2(void *planes, uint32_t plane_offsets);
 const uint8_t *x86_vga_ega_planes2(void);
 uint32_t       x86_vga_ega_split(void);
+/* THE VIRTUAL CARD (x86_video_planar.c, at ega_ptab): plane offset a lives at
+   ptab[a >> 8] + 4 * (a & 255), or nowhere when that entry is NULL. NULL table
+   while 0Dh is not armed. x86_vga_ega_frame() is the blit's once-per-frame
+   call: it ages every page and marks the displayed window as in use. */
+uint8_t *const *x86_vga_ega_ptab(void);
+void           x86_vga_ega_frame(uint32_t start, uint32_t pitch, uint32_t rows);
+extern volatile uint32_t x86_vga_ega_remaps;  /* pages recycled to a new offset */
 
 /* ---- the blit's half of the address model -------------------------------
  *
