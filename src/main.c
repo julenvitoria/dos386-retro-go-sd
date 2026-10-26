@@ -4239,8 +4239,21 @@ static void audio_pump(const gw_firmware_abi_t *abi, int frame_end)
     }
     int16_t *abuf = abi->audio_get_active_buffer();
     if (abuf && audio_frames) {
+        /*
+         * THE OUTPUT LEVEL (2026-10-26). The firmware's volume is 0..255
+         * (volume_tbl, porting/common.c), and `>> 10` made the top of the
+         * dial a QUARTER of full scale: a full-scale Sound Blaster sample
+         * peaked at ~8,000 and a nine-voice FM chord at ~2,000, against cores
+         * like gw that reach full scale -- "AdLib and Sound Blaster are quiet
+         * at full volume" on the device. `amp` is now full scale at the top
+         * of the dial and feeds the two CARDS; the PC speaker, a full-swing
+         * square wave and far louder per unit than either, gets half of it --
+         * twice what it had, but still under the cards. Everything clamps in
+         * the mix, as before.
+         */
         int16_t amp = (int16_t)(((int32_t)abi->common_emu_sound_get_volume()
-                                 * INT16_MAX) >> 10);
+                                 * INT16_MAX) >> 8);
+        int16_t amp_spk = (int16_t)(amp >> 1);
 #if X86_AUDIO_TONE
         /* THE PARTITION TEST. Every emulated source is bypassed: a 440 Hz
            square at the launcher's own volume, written straight into the
@@ -4256,7 +4269,7 @@ static void audio_pump(const gw_firmware_abi_t *abi, int frame_end)
             }
         }
 #else
-        x86_speaker_render(abuf, audio_frames, SAMPLE_RATE, amp);
+        x86_speaker_render(abuf, audio_frames, SAMPLE_RATE, amp_spk);
         /* THE SOUND BLASTER IS MIXED ON TOP, AND THIS CALL IS ALSO WHAT
            ADVANCES THE DMA TRANSFER -- there is no per-instruction engine
            anywhere (x86_io.c's engine block says why). It pulls exactly the
