@@ -256,6 +256,22 @@ X86_OPL_BENCH ?= 0
 # not optional and it is not a taste: OPL_SLOT embeds `struct SLOT_RENDER`
 # ANONYMOUSLY, which is an MS/plan9 extension and a hard error in plain C11.
 # Enabling it changes nothing for any other file in the build.
+#
+# EMU8950_NO_WAVE_TABLE_MAP is OURS, not the Doom port's (2026-10-26): the four
+# OPL2 waveforms are computed per sample from the 512-entry logsin table and a
+# 4x4 OR table instead of read from an 8 KB precomputed map. Verified BIT-EXACT
+# on the host: 2,048,000 samples of random register traffic (all four waveform
+# selects enabled) hashed identically with and without it. 8 KB of RAM_EMU is
+# two pager frames. SLOT_RENDER_PORTABLE must ride along for EVERY translation
+# unit -- it is what puts the per-slot OR-table pointer into OPL_SLOT, and a
+# per-file mismatch silently changes the struct layout.
+#
+# EMU8950_EXT_MEM / EMU8950_SAMPLE_BUF / X86_OPL_DYNAMIC (also ours): the OPL
+# instance and its scratch come from src/main.c out of the RAM pool BEFORE the
+# guest's frames are claimed, and only when the title's .cfg did not say
+# `oplmode = none` -- so a title with no FM chip gives them to the guest. The
+# scratch is sized to x86_opl.c's 256-sample chunk, not emu8950's 1,024. The
+# overlays build sets X86_OPL_DYNAMIC=0: its OPL .bss is in RAM_UC already.
 EMU8950_DEFS := \
 -fms-extensions \
 -DUSE_EMU8950_OPL=1 \
@@ -266,7 +282,12 @@ EMU8950_DEFS := \
 -DEMU8950_NO_TLL=1 \
 -DEMU8950_NO_TIMER=1 \
 -DEMU8950_NO_TEST_FLAG=1 \
--DEMU8950_NO_PERCUSSION_MODE=1
+-DEMU8950_NO_PERCUSSION_MODE=1 \
+-DEMU8950_NO_WAVE_TABLE_MAP=1 \
+-DSLOT_RENDER_PORTABLE=1 \
+-DEMU8950_EXT_MEM=1 \
+-DEMU8950_SAMPLE_BUF=256 \
+-DX86_OPL_DYNAMIC=0
 
 CORE_C_DEFS := \
 -DX86_CORE_BUILD=1 \

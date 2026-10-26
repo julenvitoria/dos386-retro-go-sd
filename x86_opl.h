@@ -33,6 +33,15 @@
 /* Power-on state. Safe to call at any time; kills every voice. */
 void x86_opl_reset(void);
 
+/* The chip's memory (x86_opl.c, at X86_OPL_MEM_BYTES): how big, the static
+   block when this build has one (NULL under X86_OPL_DYNAMIC), and the call
+   that installs a block -- or NULL for NO FM CHIP, which x86_opl_present()
+   then reports and x86_io.c turns into open-bus AdLib ports. */
+uint32_t x86_opl_mem_bytes(void);
+void    *x86_opl_static_mem(void);
+void     x86_opl_set_mem(void *p);
+int      x86_opl_present(void);
+
 /* One accepted register write. `reg` is the index latch, `val` the data byte.
    Cheap: this is on the guest's OUT path and does no synthesis. */
 void x86_opl_write(uint8_t reg, uint8_t val);

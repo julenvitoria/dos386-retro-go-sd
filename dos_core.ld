@@ -57,8 +57,8 @@ SECTIONS
     KEEP(*(.gw_core_bridge_probe))
 
     . = ALIGN(4);
-    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o) .text*)
-    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o) .rodata*)
+    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o *x86_pgfile.o) .text*)
+    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o *x86_pgfile.o) .rodata*)
     *(.glue_7)
     *(.glue_7t)
 
@@ -85,12 +85,12 @@ SECTIONS
        debug logs go to the RAM_UC segment below. `[!_]` keeps the pattern
        from claiming them while still taking every ordinary `.bss.<name>`. */
     /* EXCLUDE_FILE binds to the ONE pattern after it, hence one line each. */
-    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o) .bss)
-    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o) .bss.[!_]*)
-    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o) .bss._[!_]*)
-    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o) .bss.__[!u]*)
-    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o) .bss.__u[!c]*)
-    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o) COMMON)
+    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o *x86_pgfile.o) .bss)
+    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o *x86_pgfile.o) .bss.[!_]*)
+    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o *x86_pgfile.o) .bss._[!_]*)
+    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o *x86_pgfile.o) .bss.__[!u]*)
+    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o *x86_pgfile.o) .bss.__u[!c]*)
+    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o *x86_pgfile.o) COMMON)
     . = ALIGN(8);
 
     /* `.dtcm_bss` is a TEST.ld section name: in the bare-metal harness it
@@ -153,6 +153,12 @@ SECTIONS
     *x86_mouse.o(.rodata*)
     *x86_nor.o(.text*)
     *x86_nor.o(.rodata*)
+    /* The pagefile layer (2026-10-26): cold -- an SD write-back path -- and
+       1.5 KB that fits in the page-alignment gap this segment ends with
+       anyway, so moving it here costs the arena nothing and paid for the
+       [sblaster] .cfg keys in RAM_EMU. */
+    *x86_pgfile.o(.text*)
+    *x86_pgfile.o(.rodata*)
     . = ALIGN(4);
     __CORE_RAM_UC_CODE_END__ = .;
   } >RAM_UC :ramuc
@@ -165,6 +171,7 @@ SECTIONS
     *x86_opl.o(.bss* COMMON)
     *x86_mouse.o(.bss* COMMON)
     *x86_nor.o(.bss* COMMON)
+    *x86_pgfile.o(.bss* COMMON)
     /* End the segment 2 KB short of a page boundary. The bonus pool starts
        here, bonus_layout() puts the 2 KB palette first and the arena on the
        next page, so this makes that page the very next byte: the gap is

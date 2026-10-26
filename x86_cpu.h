@@ -415,6 +415,7 @@ void x86_video_init(void *vram, void *lut8_palette);
 void x86_video_refresh_palette(void);
 extern uint32_t cga_clut_dirty;   /* frame loop re-pushes the CLUT when set */
 extern uint8_t x86_video_mode_byte;   /* current BIOS video mode */
+extern uint8_t x86_sb_enabled;        /* .cfg `sbtype`: 0 = no Sound Blaster */
 void x86_video_set_beam(uint32_t frac);
 void x86_video_set_mode(uint8_t mode);
 uint8_t x86_video_mode(void);

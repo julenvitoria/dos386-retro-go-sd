@@ -1085,6 +1085,8 @@ static void run_benchmark(void)
     benchmark_insns = 2u * (500000u - cpu_state_ptr->regs[0]) + 1u;
 }
 
+static void sound_cards_claim(const gw_firmware_abi_t *abi);
+
 void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
 {
     (void)load_state; (void)start_paused; (void)save_slot;
@@ -1223,6 +1225,7 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
        the pool this claim comes from, so it is answerable here (unlike DTCM).
        A zero answer from an older firmware falls through to asking for the
        full size -- i.e. precisely the old behaviour. */
+    sound_cards_claim(abi);
     {
         uint8_t *probe = (uint8_t *)abi->mem_ctl(GW_MEM_OP_ALLOC,
                                                  GW_MEM_RAM, 1, 1);
@@ -2965,6 +2968,87 @@ static int settings_path(char *out, size_t cap, const char *suffix)
     return 0;
 }
 
+/*
+ * THE SOUND CARDS THE TITLE HAS -- decided BEFORE the guest's frame pool is
+ * claimed, because one of them is memory the pool can have instead.
+ *
+ * The FM chip (emu8950's OPL instance, its scratch and x86_opl.c's chunk) is
+ * not .bss any more on the main build (X86_OPL_DYNAMIC, Makefile.core): it is
+ * allocated here, from the same firmware RAM pool the frames come out of, and
+ * ONLY if the title's .cfg did not say `[sblaster] oplmode = none`. So a title
+ * that runs on the PC speaker gives those bytes to the guest. `sbtype = none`
+ * costs nothing either way; it is read here only so both keys are applied in
+ * one place.
+ *
+ * This is a PEEK: it parses the .cfg into the settings base and reads the two
+ * values back, and settings_load() parses it again, for real, after the disk
+ * is mounted. Parsing twice is harmless -- x86_cfg_parse(NULL, ...) clears the
+ * base first -- and the alternative, moving settings_load() above the pool,
+ * would drag the pad, the mouse and the .dosset with it.
+ *
+ * With no .cfg, or one that does not say, both cards are present: today's
+ * machine.
+ */
+volatile uint32_t sound_opl_bytes = 0;    /* bytes the FM chip was given, 0 = none */
+
+static void sound_cards_claim(const gw_firmware_abi_t *abi)
+{
+#if !X86_OPL_DYNAMIC
+    /* The chip's memory is static here (the overlays build keeps it in RAM_UC,
+       where it costs the guest nothing), so there is nothing to decide before
+       the pool: sound_cards_apply() does it all from settings_load(). */
+    (void)abi;
+#else
+    int opl_on = 1, sb_on = 1;
+
+    if (ACTIVE_FILE && ACTIVE_FILE->path[0]) {
+        char path[sizeof(dsk_path) + 8];
+        unsigned char cfgbuf[X86_CFG_MAX_BYTES + 1];   /* stack: see settings_load */
+        x86_cfg_result_t res;
+
+        strncpy(dsk_path, ACTIVE_FILE->path, sizeof(dsk_path) - 1);
+        x86_cfg_parse(NULL, 0, &res);
+        if (settings_path(path, sizeof(path), ".cfg") == 0) {
+            size_t n = settings_slurp(path, cfgbuf, sizeof(cfgbuf));
+            if (n && x86_cfg_parse(cfgbuf, (unsigned long)n, &res) == X86_CFG_OK) {
+                if (x86_settings_base_is_set(X86_SET_OPL)
+                    || x86_settings_base_is_set(X86_SET_SB)) {
+                    x86_settings_reset();
+                    opl_on = x86_settings_get(X86_SET_OPL) != 0;
+                    sb_on = x86_settings_get(X86_SET_SB) != 0;
+                }
+            }
+        }
+        x86_cfg_parse(NULL, 0, &res);   /* settings_load() does it for real */
+    }
+
+    x86_sb_enabled = (uint8_t)sb_on;
+    if (opl_on) {
+        void *m = x86_opl_static_mem();
+        if (!m)
+            m = (void *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_RAM, 1,
+                                     x86_opl_mem_bytes());
+        x86_opl_set_mem(m);             /* NULL here = no room = no chip */
+        sound_opl_bytes = m ? x86_opl_mem_bytes() : 0;
+    } else {
+        x86_opl_set_mem(NULL);
+    }
+    printf("DOS: sound: FM %s (%u B), Sound Blaster %s\n",
+           sound_opl_bytes ? "on" : "off", (unsigned)sound_opl_bytes,
+           sb_on ? "on" : "off");
+#endif
+}
+
+/* The same two keys, applied from settings_load() once the .cfg is parsed for
+   real. On the dynamic build this only confirms what sound_cards_claim()
+   already did; on the static one it is the whole job. */
+static void sound_cards_apply(void)
+{
+    x86_sb_enabled = (uint8_t)(x86_settings_get(X86_SET_SB) != 0);
+    if (!x86_settings_get(X86_SET_OPL))
+        x86_opl_set_mem(NULL);
+}
+
 /* Instrumentation. The whole point of a settings layer is that it is invisible
    when it works, which is exactly what makes a broken one indistinguishable
    from a working one -- so what it did is readable over the probe. */
@@ -3073,6 +3157,7 @@ static void settings_load(void)
            common case, not an event worth a line in a wrapping log ring. */
         settings_dset_status = (uint32_t)x86_settings_load(dbuf, (unsigned long)n);
     }
+    sound_cards_apply();
 }
 
 /*

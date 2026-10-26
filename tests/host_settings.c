@@ -404,6 +404,26 @@ static void test_cfg_text(void)
     ck_eq((int)cfg("[dos]\n", &r), X86_CFG_OK, "an empty section parses");
     ck_eq(x86_settings_base_is_set(X86_SET_XMS_KB), 0, "saying nothing is different");
 
+    /* [sblaster]: DOSBox's oplmode / sbtype. `none` is absent, a model name is
+       present, a bool is taken at its word, and saying nothing leaves today's
+       machine (both present) -- src/main.c reads these BEFORE the frame pool
+       is claimed, so a misparse here is memory given away or a missing chip. */
+    ck_eq((int)cfg("[sblaster]\noplmode = none\nsbtype = none\n", &r), X86_CFG_OK,
+          "oplmode/sbtype = none parse");
+    ck_eq((int)r.applied, 2, "both applied");
+    ck_eq(x86_settings_default(X86_SET_OPL), 0, "oplmode = none is no FM chip");
+    ck_eq(x86_settings_default(X86_SET_SB), 0, "sbtype = none is no Sound Blaster");
+    ck_eq((int)cfg("[sblaster]\noplmode = opl2\nsbtype = sb16\n", &r), X86_CFG_OK,
+          "model names parse");
+    ck_eq(x86_settings_default(X86_SET_OPL), 1, "opl2 is present");
+    ck_eq(x86_settings_default(X86_SET_SB), 1, "sb16 is present");
+    ck_eq((int)cfg("[sblaster]\noplmode = false\n", &r), X86_CFG_OK, "a bool parses");
+    ck_eq(x86_settings_default(X86_SET_OPL), 0, "false is absent");
+    ck_eq((int)cfg("[sblaster]\n", &r), X86_CFG_OK, "saying nothing");
+    ck_eq(x86_settings_base_is_set(X86_SET_OPL), 0, "leaves oplmode unspecified");
+    ck_eq(x86_settings_default(X86_SET_OPL), 1, "and the default is present");
+    ck_eq(x86_settings_default(X86_SET_SB), 1, "for both cards");
+
     /* SECTIONS ARE NOT REQUIRED -- the .cfg files on the card are flat. */
     ck_eq((int)cfg("cycles = 3000\nxms_kb = 512\n", &r), X86_CFG_OK, "a flat file");
     ck_eq((int)r.applied, 2, "both keys applied with no section header");

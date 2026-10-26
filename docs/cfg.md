@@ -59,6 +59,23 @@ para esos, un perfil lento.
 | `xms_kb` | KB | XMS con un tamaño concreto. |
 | `ems_kb` | KB, múltiplo de 16 | EMS con un tamaño concreto. |
 
+### `[sblaster]`
+
+| Clave | Valores | Qué hace |
+|---|---|---|
+| `oplmode` | `none`, o cualquier modelo (`auto`, `opl2`, `opl3`…) | `none` = sin chip FM: ni AdLib ni la música FM de la Sound Blaster. |
+| `sbtype` | `none`, o cualquier modelo (`sb16`, `sbpro2`…) | `none` = sin Sound Blaster (tampoco se anuncia `BLASTER`). |
+
+Son las mismas claves de DOSBox. Sin ellas está todo: AdLib y Sound Blaster.
+Una tarjeta quitada no responde, como una ranura vacía, y el juego pasa a la
+siguiente que conozca (normalmente el altavoz del PC).
+
+`oplmode = none` además **da memoria al juego** en `dos386.bin` (la versión
+normal): los ~3,6 KB del chip FM pasan a la memoria del juego, que gana una
+página (de 154 a 155 de 160). Úsalo en juegos que van con el altavoz del PC
+(Rick Dangerous, Alley Cat…). En `dos386_overlays.bin` el chip ya vive en la
+memoria extra y no cambia nada.
+
 ### `[autoexec]`
 
 Qué programas se arrancan. No es un archivo `.bat` completo: el núcleo trae

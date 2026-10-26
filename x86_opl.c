@@ -87,6 +87,7 @@ volatile uint32_t x86_opl_frame_cycles;
    allocates nothing -- see lib/emu8950/README-tinyemu.md, and note that this
    core has no malloc to give it if that flag ever comes off. */
 static OPL *opl;
+static uint8_t inited;
 
 /* Chip samples are pulled one chunk at a time rather than one at a time:
    OPL_calc_buffer_linear() amortises its per-call setup over the chunk, which
@@ -99,12 +100,70 @@ static OPL *opl;
    sample, which is what s0/s1 are -- they carry across the refill boundary so
    the chunking is inaudible. */
 #define OPL_CHUNK 256u
+#if EMU8950_EXT_MEM
+/*
+ * THE CHIP'S MEMORY IS HANDED OVER, NOT STATIC (2026-10-26). One block holds
+ * emu8950's OPL instance, its two per-call buffers (sized to OPL_CHUNK through
+ * EMU8950_SAMPLE_BUF) and this file's chunk. Who provides it:
+ *
+ *   X86_OPL_DYNAMIC=1  src/main.c allocates it from the firmware's RAM pool
+ *                      BEFORE the guest's frame pool is claimed -- and only if
+ *                      the title's .cfg did not say `oplmode = none`. That is
+ *                      the point: a title with no FM chip gives those bytes to
+ *                      the guest instead (the main build, where this .bss is
+ *                      RAM_EMU).
+ *   X86_OPL_DYNAMIC=0  the static block below. The overlays build places this
+ *                      file's .bss in the RAM_UC bonus area, so it costs the
+ *                      guest nothing there, and the bare-metal harness needs no
+ *                      host to call anything.
+ *
+ * NULL means NO CHIP: x86_opl_present() answers 0 and x86_io.c makes the AdLib
+ * ports open bus, so a title probes, finds nothing and falls back.
+ */
+#ifndef X86_OPL_DYNAMIC
+#define X86_OPL_DYNAMIC 0
+#endif
+#define X86_OPL_MEM_BYTES (EMU8950_EXT_MEM_BYTES + OPL_CHUNK * 4u)
+static int32_t *chunk;
+static uint8_t  mem_decided;
+#if !X86_OPL_DYNAMIC
+static uint32_t opl_static_mem[X86_OPL_MEM_BYTES / 4u];
+#endif
+
+uint32_t x86_opl_mem_bytes(void) { return X86_OPL_MEM_BYTES; }
+
+void *x86_opl_static_mem(void)
+{
+#if X86_OPL_DYNAMIC
+    return 0;
+#else
+    return opl_static_mem;
+#endif
+}
+
+void x86_opl_set_mem(void *p)
+{
+    emu8950_ext_mem = p;
+    chunk = p ? (int32_t *)(void *)((uint8_t *)p + EMU8950_EXT_MEM_BYTES) : 0;
+    opl = 0;                            /* OPL_new() again, in this block */
+    inited = 0;
+    mem_decided = 1;
+}
+
+int x86_opl_present(void)
+{
+    if (!mem_decided)
+        return X86_OPL_DYNAMIC ? 0 : 1; /* static: present until told not */
+    return emu8950_ext_mem != 0;
+}
+#else
 static int32_t chunk[OPL_CHUNK];
+int x86_opl_present(void) { return 1; }
+#endif
 static unsigned chunk_len, chunk_pos;
 
 static uint32_t frac;          /* the 16.16 resampler accumulator */
 static int16_t  s0, s1;        /* the two chip samples it interpolates between */
-static uint8_t  inited;
 static uint8_t  rhythm_on;
 
 /* EG_MAX is emu8950's "this operator contributes nothing"; a slot at or above
@@ -117,6 +176,10 @@ static uint8_t  rhythm_on;
 
 void x86_opl_reset(void)
 {
+#if EMU8950_EXT_MEM && !X86_OPL_DYNAMIC
+    if (!mem_decided)
+        x86_opl_set_mem(opl_static_mem);
+#endif
     if (!opl)
         opl = OPL_new(X86_OPL_CLOCK_HZ * 72u, X86_OPL_CLOCK_HZ);
     if (opl)

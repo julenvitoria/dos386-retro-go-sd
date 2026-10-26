@@ -159,6 +159,16 @@ typedef enum {
      */
     X86_SET_CPU_CYCLES = 4,
 
+    /*
+     * DOSBox's `[sblaster] oplmode` and `sbtype`, reduced to present/absent:
+     * this core has exactly one FM chip and one DSP. Default 1 = present, which
+     * is today's machine. `oplmode = none` is also read EARLY, before the
+     * guest's frame pool is claimed (src/main.c, sound_cfg_peek), because an
+     * absent chip is memory the pool can have instead.
+     */
+    X86_SET_OPL = 5,
+    X86_SET_SB  = 6,
+
     X86_SET_COUNT
 } x86_setting_id_t;
 

@@ -2281,6 +2281,23 @@ static void dsp_write_reset(uint8_t v)
     x86_sb_resets++;
 }
 
+/*
+ * THE CARDS A TITLE'S .cfg SAID IT HAS (`[sblaster] oplmode` / `sbtype`, read
+ * by src/main.c). An absent card is OPEN BUS -- every read 0xFF, every write
+ * dropped -- because that is what a game's probe expects to find in an empty
+ * slot, and it then falls back to the next device it knows. The FM chip at
+ * 0x388 is present exactly when x86_opl.c was given memory for it; the FM
+ * aliases at the SB base need both the chip and the card.
+ */
+uint8_t x86_sb_enabled = 1;
+
+static int sound_port_on(uint32_t p)
+{
+    if (!x86_opl_present())
+        return 0;
+    return p == 0x388u || p == 0x389u || x86_sb_enabled;
+}
+
 /* 0x388/0x389 is the AdLib pair; 0x2x0/0x2x1 and 0x2x8/0x2x9 are its aliases
    at the SB base, which is why POP probes 0x220, 0x221, 0x228 and 0x229. */
 static int opl_port(uint32_t p)
@@ -2482,16 +2499,22 @@ static uint32_t port_read_inner(uint32_t port)
      */
     /* ---- sound: see the block above. -------------------------------- */
     case 0x388: case 0x220: case 0x228:
+        if (!sound_port_on(port))
+            return 0xFFu;            /* no such card: open bus */
         return opl_read_status();
     case 0x389: case 0x221: case 0x229:
         return 0xFFu;                /* FM data is WRITE-ONLY on a YM3812 */
     case SB_BASE + 5:                /* mixer data                        */
+        if (!x86_sb_enabled) return 0xFFu;
         return mixer_read();
     case SB_BASE + 0xA:              /* DSP read data                     */
+        if (!x86_sb_enabled) return 0xFFu;
         return dsp_read_data();
     case SB_BASE + 0xC:              /* write-buffer status: b7=0 = ready */
+        if (!x86_sb_enabled) return 0xFFu;
         return 0x7Fu;
     case SB_BASE + 0xE:
+        if (!x86_sb_enabled) return 0xFFu;
         /*
          * Read-buffer status AND THE 8-BIT DMA INTERRUPT ACKNOWLEDGE. The two
          * live on the same port on the real part, and the acknowledge is the
@@ -2507,6 +2530,7 @@ static uint32_t port_read_inner(uint32_t port)
         }
         return (dsp.out_head != dsp.out_tail) ? 0xFFu : 0x7Fu;
     case SB_BASE + 0xF:              /* 16-bit DMA interrupt acknowledge  */
+        if (!x86_sb_enabled) return 0xFFu;
         if (sb_irq_kind & 0x02u) {
             sb_irq_kind &= (uint8_t)~0x02u;
             if (!sb_irq_kind)
@@ -2761,19 +2785,20 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
     /* ---- sound: see the block above. -------------------------------- */
     case 0x388: case 0x389:
     case 0x220: case 0x221: case 0x228: case 0x229:
-        opl_write(port, (uint8_t)value);
+        if (sound_port_on(port))
+            opl_write(port, (uint8_t)value);
         break;
     case SB_BASE + 4:                /* mixer index                       */
-        mixer_idx = (uint8_t)value;
+        if (x86_sb_enabled) mixer_idx = (uint8_t)value;
         break;
     case SB_BASE + 5:                /* mixer data                        */
-        mixer_write((uint8_t)value);
+        if (x86_sb_enabled) mixer_write((uint8_t)value);
         break;
     case SB_BASE + 6:                /* DSP reset: 1 then 0 -> 0xAA       */
-        dsp_write_reset((uint8_t)value);
+        if (x86_sb_enabled) dsp_write_reset((uint8_t)value);
         break;
     case SB_BASE + 0xC:              /* DSP command / data                */
-        dsp_write_cmd((uint8_t)value);
+        if (x86_sb_enabled) dsp_write_cmd((uint8_t)value);
         break;
 
     case 0x3B4:
