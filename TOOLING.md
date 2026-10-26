@@ -2215,7 +2215,14 @@ python3 tests/test_video.py              # CGA mode 4 blitter, pixel-exact, plus
                                          # which is the case the device hits
                                          # and the 20-frame model missed.
                                          # --present-only runs just that arm
-python3 scripts/run_planar_controls.py   # grades those arms: EIGHT negative
+                                         # --vcard-only runs just the VIRTUAL
+                                         # EGA CARD arm: an unmapped store is
+                                         # discarded until a page is 30 frames
+                                         # stale, then the stalest page is
+                                         # recycled; written and DISPLAYED
+                                         # pages are kept; the read shadow
+                                         # answers above 16 KB
+python3 scripts/run_planar_controls.py   # grades those arms: TEN negative
                                          # controls that must FAIL (chain-4
                                          # inert, a 40-offset blit stride, four
                                          # FLAT planes, the fixed 16 KB page
@@ -2226,7 +2233,12 @@ python3 scripts/run_planar_controls.py   # grades those arms: EIGHT negative
                                          # -DX86_EGA_SIG_NEGCTL=1 a CONSTANT
                                          # signature, =2 the read-MODE bit
                                          # dropped -- graded by the 0Dh arm's
-                                         # six read-path probes) and one
+                                         # six read-path probes; the two
+                                         # virtual-card mutations,
+                                         # -DX86_EGA_VCARD_NEGCTL=1 the blit
+                                         # not marking the displayed window,
+                                         # =2 no staleness threshold, graded
+                                         # by --vcard-only) and one
                                          # POSITIVE control --
                                          # -DX86_MODEY_PAGE0=16384 must still
                                          # produce the same 64,000 pixels,

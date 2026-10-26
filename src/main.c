@@ -3330,7 +3330,9 @@ volatile uint32_t nor_snap_addr     = 0;  /* XIP address the firmware chose   */
 #define NOR_SNAP_ATTACH        9
 #define NOR_SNAP_ALREADY      10
 
-static char nor_snap_path[sizeof(dsk_path) + 32];
+/* nor_snap_path is a LOCAL of nor_snapshot_run() now: it is built, used and
+   removed inside that one call, and 288 B of RAM_EMU bss bought the EGA
+   virtual card's page management (2026-10-26). */
 
 /*
  * The watchdog heartbeat for the whole snapshot, and the instrument that says
@@ -3432,6 +3434,7 @@ static int nor_snap_make_placeholder(const gw_firmware_abi_t *abi,
 static void nor_snapshot_run(void)
 {
     const gw_firmware_abi_t *abi = gw_firmware_abi();
+    char nor_snap_path[sizeof(dsk_path) + 32];
     uint32_t t0 = abi->HAL_GetTick();
 
     nor_snap_wdog_gap_ms = 0;

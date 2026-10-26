@@ -1505,6 +1505,59 @@ def modeypage_checks(b, syms):
     return True
 
 
+def vcard_checks(b, syms):
+    """THE VIRTUAL EGA CARD: page recycling, staleness, and display protection.
+
+    Keen 4 scrolls its pages round the whole 64 KB plane and a ~46 K-offset
+    card lost 30% of its stores. The card is now addressed through a page
+    table, and a store to an unmapped page recycles the stalest page -- one not
+    used for EGA_STALE_FRAMES presented frames. See vcard_test_run() in
+    tests/main.c for what each number is and why it must be exactly that.
+    """
+    for n in ("run_vcard_flag", "vcard_r"):
+        if n not in syms:
+            print(f"missing symbol {n}")
+            return False
+    b.write_uint32(syms["run_vcard_flag"], 1)
+    if not wait_flag(b, syms["run_vcard_flag"], 0, "virtual card arm hung"):
+        return False
+    r = [b.read_uint32(syms["vcard_r"] + 4 * i) for i in range(12)]
+    print(f"  card={r[0]} early_lost={r[1]} still_unmapped={r[2]} remap={r[3]} "
+          f"byte={r[4]:#04x} victim0={r[5]} shadow0={r[6]:#04x} fresh_kept={r[7]} "
+          f"display_kept={r[8]} blit_sees={r[9]} remaps={r[10]}")
+    want = [(0, 8192, "the harness card is 8,192 offsets"),
+            (1, 1, "a store to an unmapped page before anything has aged must "
+                   "be DISCARDED -- recycling a page the guest is still using "
+                   "inside the same frame is how a picture gets torn"),
+            (2, 1, "...and the page must stay unmapped"),
+            (3, 1, "after 30 frames every page is stale, so the same store "
+                   "must recycle exactly one page"),
+            (4, 0x5A, "the recycled page must hold the byte just stored"),
+            (5, 1, "the victim must be page 0, the first of the equally "
+                   "stalest pages"),
+            (6, 0, "page 0's READ SHADOW byte must stop showing the 0x11 that "
+                   "was stored there once the page is recycled"),
+            (7, 1, "a page written this frame must not be the victim (page 2 "
+                   "goes, page 1 stays)"),
+            (8, 1, "a page the panel displayed recently must not be the victim "
+                   "(pages 12..31 were displayed 29 frames ago and must all "
+                   "stay, though they are the oldest by writes)"),
+            (9, 1, "the blit's table must see the recycled page"),
+            (10, 3, "three recycles in all"),
+            (11, 0x5A, "a guest READ of A000:9000 must return the plane byte: "
+                       "the shadow covers the window up to the table at "
+                       "0xFA00, and reading zero above 16 KB is what drew "
+                       "black boxes round Keen 4's sprites")]
+    for i, w, why in want:
+        if r[i] != w:
+            print(f"FAIL: virtual card [{i}] got {r[i]:#x} want {w:#x} -- {why}")
+            return False
+    print("PASS: virtual EGA card (unmapped store discarded until a page is "
+          "stale, then the stalest page recycled; fresh and displayed pages "
+          "kept; shadow and blit follow the table)")
+    return True
+
+
 def egafit_checks(b, syms):
     """The ENLARGED EGA card: the CGA loan, the compaction, and the refusal.
 
@@ -1743,6 +1796,11 @@ def main(args):
             # and its own video buffers, so nothing has to run before it.
             time.sleep(0.5)
             return modeyfit_checks(b, syms)
+        if getattr(args, "vcard_only", False):
+            # The virtual-card arm alone, for the VCARD controls in
+            # scripts/run_planar_controls.py. It sets up its own arena and mode.
+            time.sleep(0.5)
+            return vcard_checks(b, syms)
         if getattr(args, "ega_only", False):
             # The 0Dh arm alone, for the EGASIG/EGAMODE controls in
             # scripts/run_planar_controls.py. It arms its own mode and draws
@@ -1822,6 +1880,8 @@ def main(args):
             return False
         if not ega_checks(b, syms):
             return False
+        if not vcard_checks(b, syms):
+            return False
         # LAST: it re-points the video layer at arena blocks of its own and
         # rebuilds the arena around them, so nothing may run after it that
         # expects the harness's standard buffers still to be claimed.
@@ -1838,6 +1898,8 @@ if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser(description=__doc__)
     add_runner_args(p)
+    p.add_argument("--vcard-only", action="store_true",
+                   help="only the virtual EGA card arm (the VCARD controls)")
     p.add_argument("--ega-only", action="store_true",
                    help="only the EGA 0Dh arm (the read-shadow-guard controls)")
     p.add_argument("--modey-only", action="store_true",

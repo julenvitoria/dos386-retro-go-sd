@@ -939,16 +939,13 @@ static void vga13_blit(uint8_t *dst, uint32_t stride)
  * planes of one 8-pixel group are a single aligned 32-bit load. That layout is
  * tiny386's / QEMU's; the idea is theirs.
  *
- * KEEN 4'S LEVEL BACKGROUNDS ARE STILL NOT FULLY REACHABLE HERE, AND THAT IS
- * ARITHMETIC. The Galaxy engine caches its tile art in off-screen video memory
- * and blits it out with latch copies; measured on the reference, 97.2% of those
- * copies source from beyond an 8 KB plane and its write high-water is plane
- * offset 65,536 -- a 256 KB card. The card is sized from the arena now (see
- * planar_storage_follow), which reaches 19,456 offsets on the shipping layout
- * instead of 8,192: the whole 200-row frame is addressable at Keen's 64-byte
- * pitch where it used to cut off at row 128, and the off-screen tiles that do
- * not fit still draw as nothing. A complete frame with wrong tiles, not a
- * pixel-correct one.
+ * THE CARD IS VIRTUAL (x86_video_planar.c, at ega_ptab). Keen 4 scrolls its
+ * pages round the whole 64 KB plane, which no card we can fit holds; but it
+ * only USES ~23 K offsets at a time, so plane memory is a page table over the
+ * fitted storage and a store to an unmapped page recycles the stalest one.
+ * The blit reads through that table (ega16_row) and, once a frame, marks the
+ * pages it displays as in use (x86_vga_ega_frame), so the panel's own window
+ * is never what gets recycled.
  *
  * KNOWN LIMIT OF THE LOAN: while 0Dh is up the guest's 0xB8000 mapping still
  * points at the pages the planes now hold. Our own writers stand down
@@ -1028,22 +1025,17 @@ static const uint32_t ega_nib[16] = {
 /* One row: `groups` plane offsets from `a` (wrapping at 64 KB) into `out`,
    8 pixels each. */
 EGA16_HOT __attribute__((noinline)) static void ega16_row(uint32_t *out, unsigned a, unsigned groups,
-                                const uint8_t *planes, uint32_t split,
-                                const uint8_t *planes2, uint32_t vram)
+                                uint8_t *const *ptab)
 {
     for (unsigned g = 0; g < groups; g++, a = (a + 1u) & 0xFFFFu, out += 2) {
         uint32_t q;
 
         /* The CRTC counts in 16 bits: a page that starts near the top of the
            64 KB plane WRAPS to its bottom (Keen 4 scrolls its pages round the
-           whole plane). Past the card that is fitted reads as ZERO, as the
-           store path discards writes there. */
-        if (a < split)
-            q = *(const uint32_t *)(planes + 4u * a);
-        else if (a < vram)
-            q = *(const uint32_t *)(planes2 + 4u * (a - split));
-        else
-            q = 0;
+           whole plane). The card is VIRTUAL: a page with no storage reads
+           as ZERO, as the store path discards writes there. */
+        const uint8_t *pg = ptab[a >> 8];
+        q = pg ? *(const uint32_t *)(pg + 4u * (a & 0xFFu)) : 0u;
         if (!q) {
             out[0] = out[1] = 0;
             continue;
@@ -1059,12 +1051,8 @@ EGA16_HOT __attribute__((noinline)) static void ega16_row(uint32_t *out, unsigne
 
 EGA16_HOT static void blit_ega16(uint8_t *dst, uint32_t stride)
 {
-    const uint8_t *planes = x86_vga_ega_planes();
-    const uint32_t vram   = x86_vga_ega_plane_offsets();
-    /* Offsets from `split` on live in the card's second piece (frames lent
-       by the pager); see x86_video_planar.c. */
-    const uint8_t *planes2 = x86_vga_ega_planes2();
-    const uint32_t split   = planes2 ? x86_vga_ega_split() : vram;
+    /* The card's page table (x86_video_planar.c, the virtual card). */
+    uint8_t *const *ptab = x86_vga_ega_ptab();
     /* The display is a WINDOW onto plane memory, not the bottom of it. A game
        that scrolls moves the CRTC start address and widens the row pitch; both
        have to be honoured or the picture is a sheared crop. */
@@ -1073,7 +1061,8 @@ EGA16_HOT static void blit_ega16(uint8_t *dst, uint32_t stride)
     unsigned addr = x86_vga_crtc_start();
 
     ega_sync_palette();
-    if (!planes) {
+    x86_vga_ega_frame(addr, pitch, EGA_ROWS);
+    if (!ptab) {
         for (unsigned y = 0; y < EGA_ROWS; y++)
             memset(dst + y * stride, 0, EGA_WIDTH);
         return;
@@ -1083,7 +1072,7 @@ EGA16_HOT static void blit_ega16(uint8_t *dst, uint32_t stride)
        pull from. */
     for (unsigned y = 0; y < EGA_ROWS; y++, dst += stride, addr = (addr + pitch) & 0xFFFFu) {
         uint32_t line[(EGA_WIDTH + 8u) / 4u];
-        ega16_row(line, addr, EGA_ROWBYTES + 1u, planes, split, planes2, vram);
+        ega16_row(line, addr, EGA_ROWBYTES + 1u, ptab);
         memcpy(dst, (const uint8_t *)line + pan, EGA_WIDTH);
     }
 }
