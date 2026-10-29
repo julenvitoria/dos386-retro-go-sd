@@ -103,6 +103,11 @@ anything.
                                         discarded -- Keen 4's black world map
                                         on the device. --vcard-only's [13].
 
+  VCEVAC   -DX86_EGA_VCARD_NEGCTL=4     a second piece the pager takes back is
+                                        dropped wholesale instead of evacuated
+                                        into free first-piece pages.
+                                        --vcard-only's [14].
+
   LEARN    -DX86_MODEY_PAGE0=16384      the POSITIVE control. The same 64,000
                                         pixels must still come out from a WRONG
                                         default, because the core is supposed to
@@ -132,6 +137,7 @@ ARMS = [
     ("VCDISP", "-DX86_EGA_VCARD_NEGCTL=1",   False, "--vcard-only"),
     ("VCSTALE","-DX86_EGA_VCARD_NEGCTL=2",   False, "--vcard-only"),
     ("VCZERO", "-DX86_EGA_VCARD_NEGCTL=3",   False, "--vcard-only"),
+    ("VCEVAC", "-DX86_EGA_VCARD_NEGCTL=4",   False, "--vcard-only"),
     ("LEARN",  "-DX86_MODEY_PAGE0=16384",     True,  "--modey-only"),
 ]
 
@@ -170,7 +176,7 @@ def main():
     if fail:
         print("PLANAR CONTROLS FAIL")
         return 1
-    print("PLANAR CONTROLS PASS (11/11 negative controls caught, stride learning "
+    print("PLANAR CONTROLS PASS (12/12 negative controls caught, stride learning "
           "proven from a wrong default)")
     return 0
 

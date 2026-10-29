@@ -1666,6 +1666,15 @@ void x86_video_policy_tick(void)
         if (!x86_pg_donated || !x86_vga_ega_planes2())
             return;                     /* nothing lent: nothing to give back */
         ega_card_trim();
+        /* AND TAKE BACK WHAT THE GUEST CAN STILL SPARE, AT ONCE. The shrink
+           returns the whole second piece -- the arena drops a lent region all
+           or nothing -- but the pressure that caused it has just raised the
+           policy's reserve to the working set it measured, so a new loan
+           sized to THAT reserve does not re-create the pressure. Waiting for
+           the quiet second before growing left Keen 4 a card of 31,744
+           offsets for ~1.5 s while it loaded, and a quick keypress drew the
+           world map into it: a black band top and bottom on the device. */
+        (void)ega_card_extend();
         return;
     }
     /* GROW is permission, not an instruction: only when the headroom funds at

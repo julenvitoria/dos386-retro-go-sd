@@ -303,7 +303,8 @@ static uint32_t  ega_size1;
         showing can be recycled under it
      2  no staleness threshold, so a page still in use this frame is recycled
      3  no lossless reuse of an all-zero page, so a clear-then-draw inside one
-        frame is discarded (Keen 4's black map) */
+        frame is discarded (Keen 4's black map)
+     4  a returned second piece is dropped wholesale, not evacuated */
 #ifndef X86_EGA_VCARD_NEGCTL
 #define X86_EGA_VCARD_NEGCTL 0
 #endif
@@ -325,6 +326,7 @@ static uint16_t   ega_epoch;        /* presented frames, mod 65,536         */
 static uint16_t   ega_nofault_until;/* no fault is worth scanning before    */
 static uint8_t    ega_zscan;        /* where the zero-page search resumes   */
 volatile uint32_t x86_vga_ega_zero_reuse;  /* all-zero pages recycled losslessly */
+volatile uint32_t x86_vga_ega_evacuated;   /* pages saved from a returned piece   */
 static uint32_t   ega_shadow_zero;  /* what unmapped shadow pages hold; 0x100
                                        = unknown, so the next rebuild fills */
 volatile uint32_t x86_vga_ega_remaps;
@@ -459,6 +461,7 @@ const uint8_t *x86_vga_modey_cache_ptr(void) { return modey_cache; }
 static void ega_vmap_identity(void);
 static void ega_vmap_add(uint8_t *base, uint32_t pages);
 static void ega_vpage_drop(uint32_t vp);
+static void ega_piece2_evacuate(void);
 
 void x86_vga_ega_set_planes(void *p, uint32_t plane_offsets)
 {
@@ -483,13 +486,8 @@ void x86_vga_ega_set_planes2(void *p, uint32_t plane_offsets)
         if (ega_ptab)                   /* armed: hand the pages out now */
             ega_vmap_add(ega_planes2, plane_offsets >> 8);
     } else {
-        if (ega_ptab && ega_planes2) {
-            const uint8_t *lo = ega_planes2;
-            const uint8_t *hi = lo + 4u * (ega_plane_size - ega_size1);
-            for (uint32_t v = 0; v < EGA_VPAGES; v++)
-                if (ega_ptab[v] >= lo && ega_ptab[v] < hi)
-                    ega_vpage_drop(v);
-        }
+        if (ega_ptab && ega_planes2)
+            ega_piece2_evacuate();
         ega_planes2 = NULL;
         ega_plane_size = ega_size1;
     }
@@ -839,6 +837,91 @@ static int ega_page_is_zero(const uint8_t *pg)
     for (uint32_t i = 0; i < EGA_VPAGE_BYTES / 4u; i++)
         acc |= w[i];
     return acc == 0u;
+}
+
+/*
+ * THE SECOND PIECE IS GOING BACK TO THE PAGER: keep what it holds that matters.
+ *
+ * MEASURED, gwemu tier 2, KEEN4: the card is lent its second piece at the
+ * first 0Dh mode set (65,536 offsets), the pager's policy takes it back about a
+ * second later while the game is still loading (31,744), and lends a smaller
+ * one again ~1.5 s after that (48,128). Everything in the second piece used to
+ * be dropped on the spot. Now its pages are moved, MOST RECENTLY USED FIRST,
+ * into first-piece storage that is worth less: an all-zero page (free), or one
+ * older than the page being saved. A page that is all zero itself, or that
+ * nothing older can make room for, is dropped as before. One copy per page,
+ * at the policy tick -- a safe point between guest slices.
+ */
+__attribute__((cold, noinline)) static void ega_piece2_evacuate(void)
+{
+    const uint8_t *lo = ega_planes2;
+    const uint8_t *hi = lo + 4u * (ega_plane_size - ega_size1);
+    uint32_t zero1[EGA_VPAGES / 32u], done[EGA_VPAGES / 32u];
+    uint32_t v, u;
+
+    for (v = 0; v < EGA_VPAGES / 32u; v++)
+        zero1[v] = done[v] = 0;
+    /* Which first-piece pages are free to take (all zero), computed once. */
+    for (u = 0; u < EGA_VPAGES; u++) {
+        const uint8_t *pg = ega_ptab[u];
+        if (pg && !(pg >= lo && pg < hi) && ega_page_is_zero(pg))
+            zero1[u >> 5] |= 1u << (u & 31u);
+    }
+    for (;;) {
+        int32_t vbest = -1, vage = 0x7FFFFFFF;
+        int32_t victim = -1, uage = -1;
+
+        /* The freshest second-piece page not yet handled. */
+        for (v = 0; v < EGA_VPAGES; v++) {
+            const uint8_t *pg = ega_ptab[v];
+            int32_t age;
+            if (!pg || !(pg >= lo && pg < hi) || (done[v >> 5] & (1u << (v & 31u))))
+                continue;
+            age = (uint16_t)(ega_epoch - ega_vstamp[v]);
+            if (age < vage) {
+                vage = age;
+                vbest = (int32_t)v;
+            }
+        }
+        if (vbest < 0)
+            break;
+        v = (uint32_t)vbest;
+        done[v >> 5] |= 1u << (v & 31u);
+        if (X86_EGA_VCARD_NEGCTL == 4 || ega_page_is_zero(ega_ptab[v])) {
+            ega_vpage_drop(v);          /* nothing to keep */
+            continue;
+        }
+        /* Somewhere worth less to put it: a free page, else the stalest
+           first-piece page that is older than this one. */
+        for (u = 0; u < EGA_VPAGES; u++) {
+            const uint8_t *pg = ega_ptab[u];
+            int32_t age;
+            if (!pg || (pg >= lo && pg < hi))
+                continue;
+            if (zero1[u >> 5] & (1u << (u & 31u))) {
+                victim = (int32_t)u;
+                break;
+            }
+            age = (uint16_t)(ega_epoch - ega_vstamp[u]);
+            if (age > vage && age > uage) {
+                uage = age;
+                victim = (int32_t)u;
+            }
+        }
+        if (victim < 0) {
+            ega_vpage_drop(v);
+            continue;
+        }
+        u = (uint32_t)victim;
+        {
+            uint8_t *dst = ega_ptab[u];
+            zero1[u >> 5] &= ~(1u << (u & 31u));
+            ega_vpage_drop(u);
+            memcpy(dst, ega_ptab[v], EGA_VPAGE_BYTES);
+            ega_ptab[v] = dst;          /* same data, same shadow, same stamp */
+            x86_vga_ega_evacuated++;
+        }
+    }
 }
 
 __attribute__((noinline)) static uint8_t *ega_page_fault(uint32_t a)

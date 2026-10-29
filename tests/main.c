@@ -1110,6 +1110,8 @@ static void egafit_test_run(void)
  *   [10] recycles in all: [13], [3], [7], [8]           4
  *   [11] a guest READ of A000:9000 -- far above the old 16 KB shadow --
  *        returns the byte (read mode 0, map 0)          0x5A
+ *   [14] a second piece taken back moves its written page into a free
+ *        first-piece page instead of dropping it       1
  */
 volatile uint32_t run_vcard_flag = 0;
 volatile uint32_t vcard_r[16];
@@ -1180,6 +1182,28 @@ static void vcard_test_run(void)
     }
     vcard_r[10] = x86_vga_ega_remaps - remap0;  /* 4 */
     vcard_r[11] = vga_test_aperture[0x9000];    /* 0x5A: read above 16 KB */
+
+    /* [14] A RETURNED SECOND PIECE KEEPS WHAT MATTERS. A fresh card; one
+       first-piece page (7) left all zero, the rest written; a 4-page second
+       piece lent from a scratch corner of test_ram, mapped onto pages 32..35;
+       page 33 written. Taking the piece back must MOVE page 33 into page 7's
+       storage -- the free one -- with its byte intact, rather than drop it. */
+    x86_video_set_mode(0x03);
+    x86_video_set_mode(0x0D);
+    x86_vga_planar_seq_write(2, 0x0F);
+    pt = x86_vga_ega_ptab();
+    if (pt) {
+        uint8_t *p7;
+        for (uint32_t pg = 0; pg < 32; pg++)
+            if (pg != 7)
+                x86_vga_planar_store(pg << 8, 0x77, 1);
+        p7 = pt[7];
+        x86_vga_ega_set_planes2(test_ram + 0xA0000u, 1024u);
+        x86_vga_planar_store(0x2100, 0x5A, 1);  /* page 33, second piece */
+        x86_vga_ega_set_planes2(NULL, 0);
+        vcard_r[14] = pt[33] == p7 && pt[33] && pt[33][0] == 0x5A
+                      && pt[7] == NULL && pt[32] == NULL && pt[34] == NULL;
+    }
 
     x86_video_set_mode(0x03);
     x86_arena_reset();

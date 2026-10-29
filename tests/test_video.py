@@ -1551,6 +1551,10 @@ def vcard_checks(b, syms):
                    "stay, though they are the oldest by writes)"),
             (9, 1, "the blit's table must see the recycled page"),
             (10, 4, "four recycles in all ([13], [3], [7], [8])"),
+            (14, 1, "when the pager takes the second piece back, a page it holds "
+                    "that was written must MOVE into a free first-piece page, "
+                    "not be dropped (Keen 4 loses its card's second piece "
+                    "about a second into loading)"),
             (11, 0x5A, "a guest READ of A000:9000 must return the plane byte: "
                        "the shadow covers the window up to the table at "
                        "0xFA00, and reading zero above 16 KB is what drew "
