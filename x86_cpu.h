@@ -688,7 +688,7 @@ extern char x86_dos_last_path[32];
 extern uint32_t x86_dos_file_log[16 * 4];   /* DOS_FILE_LOG_SLOTS * 4, x86_dos.c */
 extern uint32_t x86_dos_file_log_idx;
 extern uint32_t x86_dos_file_calls;
-extern volatile uint32_t x86_io_log[32];
+extern volatile uint32_t x86_io_log[];    /* X86_IO_LOG_SLOTS * 2, x86_io.c */
 extern volatile uint32_t x86_io_log_idx;
 extern volatile uint32_t x86_io_log_total;
 extern char x86_dos_path_log[4][32];

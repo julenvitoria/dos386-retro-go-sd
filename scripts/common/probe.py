@@ -380,7 +380,10 @@ def dump_io_log(target, syms, out=print):
     n = b.read_uint32(syms["x86_io_log_idx"])
     total = b.read_uint32(syms["x86_io_log_total"])
     base = syms["x86_io_log"]
-    slots = 16   # X86_IO_LOG_SLOTS (x86_io.c)
+    # X86_IO_LOG_SLOTS (x86_io.c): read from the build when it publishes it,
+    # so a diagnostic build with a longer ring decodes all of it.
+    slots = (b.read_uint32(syms["x86_io_log_slots"])
+             if "x86_io_log_slots" in syms else 16)
     out(f"  port accesses: {total} total, last {min(n, slots)} runs "
         f"(oldest first)")
     first = max(0, n - slots)
