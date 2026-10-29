@@ -1981,7 +1981,7 @@ static void sound_test_run(void)
 #define SBD_RATE    48000u
 
 volatile uint32_t run_sbdma_flag = 0;
-volatile uint32_t sbd_r[28];
+volatile uint32_t sbd_r[29];
 /* The first 64 rendered samples, PACKED TWO PER WORD. This harness has a few
    hundred bytes of RAM_EMU and an int32 per sample overflows the region -- see
    TEST.ld. Low half is the even sample. */
@@ -2194,6 +2194,17 @@ static void sbdma_test_run(void)
     sbd_r[21] = (uint32_t)guard;
     sbd_r[22] = captured;
     sbd_r[23] = reason;
+    /* The write-status port must read BUSY some of the time: Prince of
+       Persia's sound driver waits to SEE bit 7 set before it halts a playing
+       sound, and a port that is never busy froze it for the rest of each
+       sound. Thirty-two reads; some must be busy and some ready. */
+    {
+        uint32_t busy = 0;
+        for (unsigned i = 0; i < 32; i++)
+            if (x86_port_read(0x22C, 1) & 0x80u)
+                busy++;
+        sbd_r[28] = busy;
+    }
 }
 
 

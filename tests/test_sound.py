@@ -88,7 +88,15 @@ def playback(args, runner):
         print("FAIL: the playback arm never completed")
         return False
 
-    r = [b.read_uint32(syms["sbd_r"] + 4 * i) for i in range(28)]
+    r = [b.read_uint32(syms["sbd_r"] + 4 * i) for i in range(29)]
+    wbusy = r[28]
+    if not (0 < wbusy < 32):
+        print(f"FAIL: the DSP write-status port (0x22C) read busy {wbusy} times in "
+              f"32. A real DSP's bit 7 comes and goes; Prince of Persia waits to "
+              f"SEE it busy before halting a playing sound, and a port that never "
+              f"reads busy froze the game for the rest of each sound.")
+        return False
+    print(f"PASS: 0x22C reads busy {wbusy}/32 times (bit 7 comes and goes)")
     (aa, major, minor, polls_left, isr_count, dma_status, dsp_stat,
      mix82, mix80, mix81, starts, blocks, dma_bytes, samples, irqs,
      delivered, acked, eois, underruns, rate, maps, guard, captured,

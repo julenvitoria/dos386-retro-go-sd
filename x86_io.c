@@ -410,8 +410,13 @@ volatile uint32_t x86_spk_log_idx = 0;
  *
  * scripts/probe.py --io-log
  */
+#ifndef X86_IO_LOG_SLOTS
 #define X86_IO_LOG_SLOTS 16   /* 32 -> 16 (2026-10-24): RAM_EMU for the PIT phase */
+#endif
 volatile uint32_t x86_io_log[X86_IO_LOG_SLOTS * 2];
+/* The ring's length, published so the decoder follows a diagnostic build
+   (EXTRA_CFLAGS=-DX86_IO_LOG_SLOTS=512) instead of assuming 16. */
+const uint32_t x86_io_log_slots = X86_IO_LOG_SLOTS;
 volatile uint32_t x86_io_log_idx = 0;
 volatile uint32_t x86_io_log_total = 0;
 
@@ -1439,6 +1444,7 @@ static struct {
 } sbp = { .dma8 = 1, .dma16 = 5 };
 
 static uint8_t sb_irq_line;       /* the DSP's interrupt output            */
+static uint8_t sb_wstat_reads;    /* 0x22C reads: drives the busy bit      */
 static uint8_t sb_irq_kind;       /* mixer 0x82: b0 = 8-bit, b1 = 16-bit   */
 
 
@@ -2512,7 +2518,23 @@ static uint32_t port_read_inner(uint32_t port)
         return dsp_read_data();
     case SB_BASE + 0xC:              /* write-buffer status: b7=0 = ready */
         if (!x86_sb_enabled) return 0xFFu;
-        return 0x7Fu;
+        /*
+         * BUSY SOME OF THE TIME, NOT NEVER. A real DSP's write buffer reads
+         * busy (bit 7 set) for a while after each byte it takes, so polling
+         * this port sees bit 7 come and go. It used to read ready for ever,
+         * and that froze Prince of Persia: to cut off a playing sound before
+         * starting the next (a jump while running), its driver loops until it
+         * sees the port go BUSY, then waits for ready and sends 0xD0 -- and
+         * the only other way out of that loop is the end-of-sound interrupt.
+         * Measured at tier 2: the guest spent 5-7 s at a time in that loop
+         * (CS:0151-015C, polling 0x22C with interrupts on between reads), and
+         * the whole game stood still for the rest of each sound. `sbtype =
+         * none` made it go away on the device, which is what pointed here.
+         *
+         * Eight reads busy, eight ready, in turn: a driver waiting for ready
+         * waits at most eight reads, one waiting for busy at most eight.
+         */
+        return (++sb_wstat_reads & 8u) ? 0xFFu : 0x7Fu;
     case SB_BASE + 0xE:
         if (!x86_sb_enabled) return 0xFFu;
         /*
