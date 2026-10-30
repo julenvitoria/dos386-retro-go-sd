@@ -353,6 +353,9 @@ GNW_CORE_SDK ?= sdk
 BUILD_DIR ?= build/$(PROJECT_KIND)
 
 PACKED_BIN  := $(CORE_NAME).bin
+# Both logos are WHITE ON BLACK (the owner's style, 2026-10-30): white is
+# what the launcher draws in the theme colour. pack_core's default is the
+# other way round (dark = drawn), hence --logo-invert below.
 PAD_LOGO    := src/assets/pad.png
 HEADER_LOGO := src/assets/header.png
 
@@ -392,4 +395,5 @@ pack: $(TARGET_BIN) $(PAD_LOGO) $(HEADER_LOGO)
 		--version 0.1.0 \
 		--pad-logo $(PAD_LOGO) \
 		--header-logo $(HEADER_LOGO) \
+		--logo-invert \
 		--out $(PACKED_BIN)
