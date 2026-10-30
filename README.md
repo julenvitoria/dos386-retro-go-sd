@@ -92,7 +92,7 @@ Más detalle: [`docs/input/03-onscreen-keyboard.md`](docs/input/03-onscreen-keyb
 ## Ramas
 
 - **`main`**: la versión de uso, la que se compila y se reparte como `dos386.bin`. Desde el
-  26-10-2026 es la antigua `overlays`: el chip AdLib, el ratón, la memoria flash y el archivo
+  30-10-2026 es la antigua `overlays`: el chip AdLib, el ratón, la memoria flash y el archivo
   de intercambio van en la memoria que la pantalla deja libre en modo paleta (LUT8), y el
   juego tiene 158 páginas de 160. Necesita un firmware retro-go que cargue esa parte del
   núcleo (el de este proyecto lo hace).
