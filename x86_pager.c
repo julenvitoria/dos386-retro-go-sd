@@ -249,6 +249,14 @@ void x86_pager_own(uint32_t first_page, uint32_t count)
     own_count = count;
 }
 
+/* Is `page` in a frame right now? For XMS: a move through a LOCKED block goes
+   to the pagefile slots its alias shares, which is only coherent while no
+   alias page is resident (and possibly dirty) in a frame. */
+int x86_pager_resident(uint32_t page)
+{
+    return page < X86_PG_PAGES && pg_frame && pg_frame[page] != PG_NO_FRAME;
+}
+
 void x86_pager_own_aux(uint32_t first_page, uint32_t count)
 {
     if (!count) {

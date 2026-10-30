@@ -117,9 +117,10 @@ def main(args):
             ("ROUND TRIP BYTE-EXACT across a granule",  r[33], 1),
             ("nothing outside the block was written",   r[44], 1),
             ("bytes moved up",                          r[37], PAT),
-            ("bytes moved down (two down-moves)",       r[38], 2 * PAT),
-            ("successful moves",                        r[36], 3),
-            ("one store open per move, not per page",   r[41], 3),
+            # the third down-move is the one through a LOCKED handle (below)
+            ("bytes moved down (three down-moves)",     r[38], 3 * PAT),
+            ("successful moves",                        r[36], 4),
+            ("one store open per move, not per page",   r[41], 4),
             ("no store I/O errors",                     r[39], 0),
             ("no unreachable guest page",               r[40], 0),
 
@@ -147,8 +148,13 @@ def main(args):
             ("  ... alias is in the 8 MB window",       r[49], 0x0080),
             ("  ... alias starts at allocated bytes",   r[50], 0),
             ("AH=0Eh reports one lock",                 r[51], 0x010F),
-            ("AH=0Bh refuses moves of locked handles", r[52], 0),
-            ("  ... BL=ABh locked",                    r[53] & 0xFF, 0xAB),
+            # A lock pins the block's ADDRESS; it does not forbid moves (Dune II
+            # locks its block for the linear base and then moves through it).
+            # The move is still refused if the alias page is resident in a
+            # frame -- the store would be stale -- which a real-mode guest
+            # cannot cause, as this one cannot.
+            ("AH=0Bh moves a locked handle",           r[52], 1),
+            ("  ... BL=00h",                           r[53] & 0xFF, 0x00),
             ("AH=0Dh unlock succeeds",                 r[54], 1),
             ("AH=0Ch can relock after unlock",          r[55], 1),
             ("more memory than exists is refused",      r[30], 0),

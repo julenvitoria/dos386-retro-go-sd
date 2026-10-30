@@ -176,6 +176,7 @@ void x86_pager_own(uint32_t first_page, uint32_t count);
  * guest pages, filled on fault and evictable like any other.
  */
 void x86_pager_own_aux(uint32_t first_page, uint32_t count);
+int x86_pager_resident(uint32_t page);
 
 /*
  * Re-install one page's fold entry from the pager's own record: the frame's

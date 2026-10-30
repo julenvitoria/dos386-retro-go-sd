@@ -1772,6 +1772,57 @@ static int sb_next_sample(void)
     return 1;
 }
 
+/* ---------------------------------------------------------------------------
+ * DIRECT DAC (DSP command 10h): one sample per command, no DMA.
+ *
+ * Another World plays all of its digitised sound this way: a timer interrupt
+ * at the sample rate writes 10h and a byte, thousands of times a second. There
+ * is no transfer and no rate register, so the rate is whatever the guest's own
+ * clock makes it -- and the frame loop already renders each audio buffer for
+ * the GUEST time that has passed since the last one (x86_speaker_render, same
+ * clock). So the samples written during a window are simply spread evenly over
+ * that window's output: N queued bytes become `frames` output samples, each
+ * held (zero-order) until the next. A timer-driven stream is evenly spaced, so
+ * that recovers its rate to within one window and costs no timestamps.
+ *
+ * The FIFO comes from the host's allocator (x86_io_alloc, the AHB heap in the
+ * core) on the FIRST 10h, so titles that never use the DAC pay nothing. With
+ * no allocator (the bare-metal harness) the byte is counted and dropped, which
+ * is the old behaviour.
+ *
+ * A window with no samples adds nothing: the DAC is taken as back at centre.
+ * x86_sb_dac_writes counts every sample; a full FIFO keeps the newest.
+ */
+#define SB_DAC_FIFO 4096u               /* power of two: ~0.37 s at 11 kHz */
+void *(*x86_io_alloc)(uint32_t bytes);
+volatile uint32_t x86_sb_dac_writes;    /* 10h samples accepted (free-running) */
+static uint8_t *sb_dac_buf;
+static uint32_t sb_dac_read;            /* render position, same counter base */
+
+static void sb_dac_put(uint8_t v)
+{
+    if (!sb_dac_buf && x86_io_alloc)
+        sb_dac_buf = (uint8_t *)x86_io_alloc(SB_DAC_FIFO);
+    if (sb_dac_buf)
+        sb_dac_buf[x86_sb_dac_writes++ & (SB_DAC_FIFO - 1u)] = v;
+}
+
+static void sb_dac_render(int16_t *dst, unsigned frames, int16_t amplitude)
+{
+    uint32_t n = x86_sb_dac_writes - sb_dac_read;
+    if (!n)
+        return;
+    if (n > SB_DAC_FIFO)                /* overrun: keep the newest FIFO's worth */
+        sb_dac_read = x86_sb_dac_writes - (n = SB_DAC_FIFO);
+    uint32_t step = (n << 16) / frames, pos = 0;
+    for (unsigned i = 0; i < frames; i++, pos += step) {
+        int32_t o = dst[i] + ((((int32_t)sb_dac_buf[(sb_dac_read + (pos >> 16))
+                                & (SB_DAC_FIFO - 1u)] - 128) * amplitude) >> 7);
+        dst[i] = (int16_t)(o > 32767 ? 32767 : (o < -32768 ? -32768 : o));
+    }
+    sb_dac_read += n;
+}
+
 /*
  * Render one frame's worth of SB output on top of whatever is already in the
  * buffer, and BY DOING SO advance the transfer. There is no other clock.
@@ -1791,6 +1842,7 @@ static int sb_next_sample(void)
 unsigned x86_sb_render_mix(int16_t *dst, unsigned frames, unsigned sample_rate,
                            int16_t amplitude)
 {
+    sb_dac_render(dst, frames, amplitude);
     if (!sbp.active || sbp.paused || !sbp.rate || !sample_rate || !frames)
         return 0;
 
@@ -2221,12 +2273,9 @@ static void dsp_exec(uint8_t c)
         break;
 
     case 0x10:                        /* direct DAC: a single sample, no DMA */
-        /* One sample written straight to the DAC. Held until the next one,
-           which is what a direct-DAC guest is doing anyway: it writes at its
-           own pace from a delay loop. It advances no transfer, so it is not a
-           start -- and with no DMA behind it, it is the one path here that is
-           still not audible. Counted, not faked. */
-        x86_sb_dma_refused++;
+        /* One sample written straight to the DAC, at the guest's own pace
+           (a timer interrupt or a delay loop). Queued for sb_dac_render(). */
+        sb_dac_put(dsp.args[0]);
         break;
     case 0x24:                        /* 8-bit DMA INPUT: nothing to record */
         x86_sb_dma_refused++;

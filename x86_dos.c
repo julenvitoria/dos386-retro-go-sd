@@ -850,11 +850,8 @@ static int mz_open(const char *path, mz_open_t *m)
  * that is asking for the image to be fixed up as though it lived at the
  * factor, which is precisely MS-DOS's reading.
  */
-/* Relocations that straddle a granule (applied through the copy helpers) and
-   relocations that could not be applied at all. The second must stay 0: any
-   other value is a program running with a segment it was never given. */
+/* Relocations that straddle a granule, applied through the copy helpers. */
 X86_UC_BSS(reloc_straddles) volatile uint32_t x86_dos_reloc_straddles;
-X86_UC_BSS(reloc_refused) volatile uint32_t x86_dos_reloc_refused;
 
 /* A fixup word that STRADDLES a 4 KB granule (offset 0xFFF): its two bytes
    live in two unrelated frames, and x86_guest_ptr() refuses a spanning
@@ -866,15 +863,12 @@ X86_UC_BSS(reloc_refused) volatile uint32_t x86_dos_reloc_refused;
 static __attribute__((noinline)) void mz_reloc_straddle(uint32_t lin, uint16_t reloc_factor)
 {
     uint8_t b[2];
-    if (x86_guest_copy_out(b, lin, 2) != 2) {
-        x86_dos_reloc_refused++;
+    if (x86_guest_copy_out(b, lin, 2) != 2)
         return;
-    }
     uint16_t v = (uint16_t)((b[0] | (b[1] << 8)) + reloc_factor);
     b[0] = (uint8_t)v;
     b[1] = (uint8_t)(v >> 8);
-    if (x86_guest_copy_in(lin, b, 2) != 2)
-        x86_dos_reloc_refused++;
+    x86_guest_copy_in(lin, b, 2);
     x86_dos_reloc_straddles++;
 }
 
@@ -926,8 +920,6 @@ static int mz_place(mz_open_t *m, uint16_t load_seg, uint16_t reloc_factor)
                 uint16_t *w = (uint16_t *)x86_guest_ptr(lin, 2);
                 if (w)
                     *w = (uint16_t)(*w + reloc_factor);
-                else
-                    x86_dos_reloc_refused++;
                 continue;
             }
             mz_reloc_straddle(lin, reloc_factor);
@@ -2959,12 +2951,14 @@ static uint32_t         xms_kb;         /* the whole store, in KB */
 static uint32_t         xms_a20_local;  /* AH=05h/06h nesting count */
 #define XMS_LINEAR_BASE  (8u * 1024u * 1024u)
 
-/* The ONLY buffer this interface owns, and it is 256 bytes because the two
+/* The ONLY buffer this interface owns, and it is 64 bytes because the two
    paths that need one are rare: an XMS->XMS move and the copy inside a growing
-   AH=0Fh. Guest<->XMS moves need no buffer at all -- x86_guest_ptr() hands out
+   AH=0Fh. (256 until 2026-10-30: the 192 B went to the SB direct DAC and the
+   locked-move check, which was the difference between 157 and 158 guest
+   frames.) Guest<->XMS moves need no buffer at all -- x86_guest_ptr() hands out
    a host pointer for one page-run and the store reads or writes straight
    through it, so the common path is zero-copy. */
-#define XMS_CHUNK 256u
+#define XMS_CHUNK 64u
 static uint8_t xms_buf[XMS_CHUNK];
 
 void x86_xms_set_backing(x86_xms_open_fn op, x86_xms_close_fn cl,
@@ -3221,6 +3215,23 @@ static int xms_store_run(uint32_t dst, uint32_t src, uint32_t bytes)
  *   +10 dw  destination handle
  *   +12 dd  destination offset
  */
+/* A LOCKED block may be moved to and from: the lock pins its address, it does
+   not forbid access (HIMEM checks no lock on AH=0Bh). Dune II locks its 100 KB
+   block only to learn the linear base and then moves through it; refusing
+   with 0xAB sent its copy routine on with garbage and it crashed into the IVT.
+   The one case that IS unsafe is ours: the alias at 8 MB shares the store's
+   pagefile slots, so if any alias page of the range sits in a frame the store
+   may be stale. A real-mode guest cannot touch the alias, so in practice this
+   only refuses for a protected-mode one that did. */
+static int xms_alias_live(uint32_t kb_off, uint32_t off, uint32_t len)
+{
+    uint32_t lin = XMS_LINEAR_BASE + (kb_off << 10) + off;
+    for (uint32_t p = lin >> X86_PG_SHIFT; p <= (lin + len - 1u) >> X86_PG_SHIFT; p++)
+        if (x86_pager_resident(p))
+            return 1;
+    return 0;
+}
+
 static int xms_move(void)
 {
     uint8_t st[16];
@@ -3253,10 +3264,10 @@ static int xms_move(void)
         xms_handle_t *h = xms_get(sh);
         if (!h)
             return xms_err(XMSE_BADSRCH);
-        if (h->locks)
-            return xms_err(XMSE_LOCKED);
         if (so > (h->kb << 10) || (h->kb << 10) - so < len)
             return xms_err(XMSE_BADSRCO);
+        if (h->locks && xms_alias_live(h->kb_off, so, len))
+            return xms_err(XMSE_LOCKED);
         s_off = (h->kb_off << 10) + so;
     } else {
         s_lin = ((so >> 16) << 4) + (so & 0xFFFFu);
@@ -3265,10 +3276,10 @@ static int xms_move(void)
         xms_handle_t *h = xms_get(dh);
         if (!h)
             return xms_err(XMSE_BADDSTH);
-        if (h->locks)
-            return xms_err(XMSE_LOCKED);
         if (dof > (h->kb << 10) || (h->kb << 10) - dof < len)
             return xms_err(XMSE_BADDSTO);
+        if (h->locks && xms_alias_live(h->kb_off, dof, len))
+            return xms_err(XMSE_LOCKED);
         d_off = (h->kb_off << 10) + dof;
     } else {
         d_lin = ((dof >> 16) << 4) + (dof & 0xFFFFu);

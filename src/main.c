@@ -632,7 +632,7 @@ static uint32_t   rate_window_frames;
    60 fps, so every slower frame threw ticks away -- measured as ~351 of 473
    per second, with guest_ticks_dropped climbing ~100/s. 24 covers 473 Hz
    down to 20 fps and 560 Hz down to 24. */
-#define TICK_IRQ_MAX           24u
+#define TICK_IRQ_MAX          256u
 #define TICK_STALL_MS        1000u    /* longer than this is a stall, not lag */
 static uint32_t tick_acc;             /* ms * TICK_NUM, below one IRQ 0      */
 static uint32_t bda_acc;              /* the same, for the 18.2 Hz BDA count */
@@ -2424,6 +2424,14 @@ static int dsk_walk(int want, FILINFO *out)
     }
     abi->f_closedir(&dir);
     return want >= 0 ? rc : seen;
+}
+
+/* Host buffers for the I/O layer (the SB direct-DAC FIFO): the AHB heap, like
+   the disk cache and the OSK's disk table -- never RAM_EMU, which is guest
+   frames. Asked for lazily, so a title that never needs one costs nothing. */
+static void *io_alloc_ahb(uint32_t bytes)
+{
+    return (void *)gw_firmware_abi()->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_AHB, 1, bytes);
 }
 
 int x86_osk_disk_scan(void)
@@ -4351,6 +4359,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
        speed (owner's videos, 2026-10-17). In guest time a note lasts what the
        guest timed it to last, whatever the burst looked like on the host. */
     x86_io_time_ms = x86_pit_ticks;
+    x86_io_alloc = io_alloc_ahb;
 
     cpu_profile_init(abi);
 
