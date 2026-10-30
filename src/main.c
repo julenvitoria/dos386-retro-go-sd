@@ -2358,6 +2358,8 @@ static int mount_guest_disk(void)
     x86_disk_set_writer(sd_sector_write);
     if (f_mount(&dsk_fs, "", 1) != FR_OK)
         return -1;
+    /* A partitioned image is a hard disk: the guest runs from C:. */
+    x86_dos_cur_drive = dsk_fs.volbase ? 2 : 0;
     dsk_mounted = 1;
     return 0;
 }
@@ -2470,6 +2472,7 @@ int x86_osk_disk_insert(int i)
     dsk_cur_path = p;
     x86_disk_set_reader(sd_sector_read, p, (uint32_t)fi.fsize);
     if (f_mount(&dsk_fs, "", 1) == FR_OK) {
+        x86_dos_cur_drive = dsk_fs.volbase ? 2 : 0;
         dsk_menu_cur = (int8_t)i;
         dsk_swaps++;
         return 0;

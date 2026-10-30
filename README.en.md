@@ -30,7 +30,10 @@ Both live on the same card.
 
 A `.dsk` is an ordinary FAT disk image: a floppy (360 KB … 2.88 MB) or a hard
 disk with its partition table. A floppy `.img` only needs renaming. The core
-mounts that image as the game's drive (`A:` and `C:` are the same disk).
+mounts that image as the game's drive (`A:` and `C:` are the same disk). A game
+that asks which drive it runs from is told `A:` for a floppy image and `C:` for
+a hard-disk one: some games (Risky Woods) refuse to run from a floppy. To build
+a `.dsk` from a folder: `scripts/make_dsk.py` (see `TOOLING.md`).
 
 Which program starts, in order:
 

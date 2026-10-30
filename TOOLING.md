@@ -1661,6 +1661,22 @@ byte. The tree used to carry Hepper's 128 ASCII glyphs only, which forced a
 `& 0x7F` in `text_render` and turned every box-drawing rule and shading block of
 a full-screen UI into an unrelated letter.
 
+### `make_dsk.py` — a game folder to a `.dsk`
+
+```bash
+python3 scripts/make_dsk.py --src build/run/games/rw/RISKY --out RISKY.dsk \
+    --autoexec RISKY --size-mb 3          # hard disk: the guest sees C:
+python3 scripts/make_dsk.py --src build/run/games/aw/ANOTHER --out ANOTHER.dsk \
+    --autoexec ANOTHER                    # fits a floppy: 1.44 MB, the guest sees A:
+```
+
+Up to 2.88 MB it writes a plain floppy; larger (or with `--size-mb`) a hard
+disk shaped like MS-DOS 5 left one: an MBR with one partition at LBA 63,
+FAT12/FAT16 as mformat picks, the partition type read back from the boot
+sector. `--autoexec` writes a one-line `AUTOEXEC.BAT`. The guest is told `C:`
+for a hard-disk image and `A:` for a floppy (INT 21h AH=19h), so a title that
+refuses to run from floppy (Risky Woods) needs `--size-mb`. Needs mtools.
+
 ### `sdcard.py` — compose the SD card
 
 `create_image()` formats the partition with plain `mformat -F` and, only if that

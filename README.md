@@ -31,7 +31,10 @@ Los dos conviven en la misma tarjeta.
 Un `.dsk` es una imagen de disco FAT normal: un disquete (360 KB … 2,88 MB) o un
 disco duro con su tabla de particiones. Una `.img` de disquete basta con
 renombrarla. El núcleo monta esa imagen como la unidad del juego (`A:` y `C:`
-son el mismo disco).
+son el mismo disco). Al juego que pregunta en qué unidad está se le dice `A:`
+si la imagen es un disquete y `C:` si es un disco duro: hay juegos (Risky
+Woods) que no arrancan desde disquete. Para crear un `.dsk` desde una carpeta:
+`scripts/make_dsk.py` (ver `TOOLING.md`).
 
 Qué programa se arranca, por orden:
 

@@ -360,9 +360,12 @@ int x86_bios_video(uint8_t func)
         x86_set_dx(x86_video_get_cursor());
         return 1;
     case 0x06:                      /* scroll up */
-        x86_video_scroll((uint8_t)((cpu_state_ptr->regs[0]) & 0xFF),
-                         (uint8_t)((cpu_state_ptr->regs[3] >> 8) & 0xFF));
-        return 1;
+    case 0x07:                      /* scroll down */
+        if (x86_video_int10_scroll(func))
+            return 1;
+        x86_hle_unhandled_vector = 0x10;    /* AH=07h in graphics */
+        x86_hle_unhandled_func = func;
+        return 0;
     case 0x11:                      /* character generator */
         /* AL=30h: return a pointer to a font. A CGA BIOS has no AH=11h at all,
            so leaving it unanswered left ES:BP holding the caller's own garbage

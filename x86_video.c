@@ -1983,6 +1983,66 @@ void x86_video_scroll(uint8_t lines, uint8_t attr)
         c[i] = (uint16_t)(0x20 | (attr << 8));
 }
 
+/*
+ * INT 10h AH=06h (up) / AH=07h (down), registers straight from the guest: AL
+ * lines (0 = clear), BH the fill attribute, CH,CL top-left and DH,DL
+ * bottom-right. Returns 0 only for AH=07h in a graphics mode, which has no
+ * implementation; graphics AH=06h keeps the whole-screen path it always had.
+ *
+ * In TEXT modes the rectangle is the point of the call. The old path ignored
+ * it and acted on the whole screen, which is right for DOS's own scrolling but
+ * wrong for every windowing text UI: Borland conio clears a window with AH=06h
+ * AL=0 over just that window, so each new window wiped the entire screen to
+ * its background colour. Dune II's SETUP showed a bare blue screen with only
+ * the bottom prompt, drawn after the last clear. Cold: it lives in RAM_UC.
+ */
+X86_UC_TEXT(int10_scroll)
+int x86_video_int10_scroll(uint8_t func)
+{
+    uint8_t lines = (uint8_t)(cpu_state_ptr->regs[0] & 0xFF);
+    uint8_t attr = (uint8_t)((cpu_state_ptr->regs[3] >> 8) & 0xFF);
+    uint16_t cx = (uint16_t)cpu_state_ptr->regs[1];
+    uint16_t dx = (uint16_t)cpu_state_ptr->regs[2];
+    unsigned top = cx >> 8, left = cx & 0xFF, bottom = dx >> 8, right = dx & 0xFF;
+    unsigned cols = cur_desc->cols;
+    int down = (func == 0x07);
+
+    if (!x86_video_is_text()) {
+        if (down)
+            return 0;
+        x86_video_scroll(lines, attr);
+        return 1;
+    }
+    if (!cga_storage_ok())
+        return 1;
+    if (bottom >= TEXT_ROWS)
+        bottom = TEXT_ROWS - 1;
+    if (right >= cols)
+        right = cols - 1;
+    if (top > bottom || left > right)
+        return 1;
+    unsigned h = bottom - top + 1u;
+    unsigned w = right - left + 1u;
+    uint16_t blank = (uint16_t)(0x20 | (attr << 8));
+    if (lines == 0 || lines >= h)
+        lines = (uint8_t)h;
+    for (unsigned i = 0; i < h; i++) {
+        /* Up: row r takes row r+lines, walking top to bottom. Down: the
+           mirror, walking bottom to top, so neither overwrites a source row
+           before it is read. */
+        unsigned r = down ? bottom - i : top + i;
+        uint16_t *dst = text_cell(r, left);
+        int src = down ? (int)r - lines : (int)(r + lines);
+        if (src < (int)top || src > (int)bottom) {
+            for (unsigned c = 0; c < w; c++)
+                dst[c] = blank;
+        } else {
+            memmove(dst, text_cell((unsigned)src, left), w * 2u);
+        }
+    }
+    return 1;
+}
+
 void x86_video_putc_attr(uint8_t ch, uint8_t attr, uint16_t count)
 {
     if (count == 0) count = 1;

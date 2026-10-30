@@ -57,7 +57,13 @@ SECTIONS
     KEEP(*(.gw_core_bridge_probe))
 
     . = ALIGN(4);
-    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o *x86_pgfile.o) .text*)
+    /* `.text.__uc.*` (X86_UC_TEXT, x86_cpu.h) is NOT matched here: cold code
+       that goes to the RAM_UC segment below, as .bss.__uc.* does. */
+    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o *x86_pgfile.o) .text)
+    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o *x86_pgfile.o) .text.[!_]*)
+    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o *x86_pgfile.o) .text._[!_]*)
+    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o *x86_pgfile.o) .text.__[!u]*)
+    *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o *x86_pgfile.o) .text.__u[!c]*)
     *(EXCLUDE_FILE(*emu8950.o *x86_opl.o *x86_mouse.o *x86_nor.o *x86_pgfile.o) .rodata*)
     *(.glue_7)
     *(.glue_7t)
@@ -159,6 +165,8 @@ SECTIONS
        [sblaster] .cfg keys in RAM_EMU. */
     *x86_pgfile.o(.text*)
     *x86_pgfile.o(.rodata*)
+    /* Cold functions marked X86_UC_TEXT: rare BIOS/DOS paths. */
+    *(.text.__uc.*)
     . = ALIGN(4);
     __CORE_RAM_UC_CODE_END__ = .;
   } >RAM_UC :ramuc

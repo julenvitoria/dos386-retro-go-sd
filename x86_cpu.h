@@ -445,6 +445,7 @@ void x86_video_set_cursor(uint8_t col, uint8_t row);
 uint16_t x86_video_get_cursor(void);
 uint16_t x86_video_read_cell(void);
 void x86_video_scroll(uint8_t lines, uint8_t attr);
+int x86_video_int10_scroll(uint8_t func);
 void x86_video_putc_attr(uint8_t ch, uint8_t attr, uint16_t count);
 void x86_video_teletype(uint8_t ch);
 void x86_video_putpixel(uint16_t x, uint16_t y, uint8_t colour);
@@ -575,6 +576,7 @@ int x86_dos_int27(void);   /* .COM terminate-and-stay-resident */
    asked of any run that gets this far, and it must be answerable from the host
    without a trace. x86_dos_exec_last_err carries the DOS error of the last
    refusal, or 0x1xx for an unimplemented SUBfunction (AL). */
+extern uint8_t x86_dos_cur_drive;   /* 0 = A: (floppy image), 2 = C: (hard disk) */
 extern volatile uint32_t x86_dos_execs;
 /* The ROOT program's environment segment. It was always 0 -- dos_env_build()
    was reachable only from EXEC and every shipped title is the root -- which is
@@ -685,6 +687,11 @@ extern char x86_dos_last_path[32];
    bytes for guest frames (overlays' dos_core.ld) can route `.bss.__uc.*` to
    the LUT8 bonus area, where uncached is fine for a log nobody reads hot. */
 #define X86_UC_BSS(name) __attribute__((section(".bss.__uc." #name)))
+/* The same for COLD CODE: a function only rare guest paths reach (a BIOS
+   window scroll, a relocation that straddles a granule). A `.text.*` section,
+   so TEST.ld files it with .text; overlays' dos_core.ld puts it in RAM_UC so
+   it costs no guest frame. noinline, or the attribute is lost in the caller. */
+#define X86_UC_TEXT(name) __attribute__((section(".text.__uc." #name), noinline))
 extern uint32_t x86_dos_file_log[16 * 4];   /* DOS_FILE_LOG_SLOTS * 4, x86_dos.c */
 extern uint32_t x86_dos_file_log_idx;
 extern uint32_t x86_dos_file_calls;

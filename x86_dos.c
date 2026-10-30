@@ -333,6 +333,7 @@ uint16_t dos_test_walk(void)
 /* --------------------------------------------------------------------------
  * Program Segment Prefix.
  */
+uint8_t x86_dos_cur_drive;     /* INT 21h AH=19h: 0 = A:, 2 = C: */
 static uint16_t psp_seg;
 static uint32_t dta_lin;            /* disk transfer area, default PSP:0080 */
 
@@ -849,6 +850,34 @@ static int mz_open(const char *path, mz_open_t *m)
  * that is asking for the image to be fixed up as though it lived at the
  * factor, which is precisely MS-DOS's reading.
  */
+/* Relocations that straddle a granule (applied through the copy helpers) and
+   relocations that could not be applied at all. The second must stay 0: any
+   other value is a program running with a segment it was never given. */
+X86_UC_BSS(reloc_straddles) volatile uint32_t x86_dos_reloc_straddles;
+X86_UC_BSS(reloc_refused) volatile uint32_t x86_dos_reloc_refused;
+
+/* A fixup word that STRADDLES a 4 KB granule (offset 0xFFF): its two bytes
+   live in two unrelated frames, and x86_guest_ptr() refuses a spanning
+   request -- which used to skip the fixup SILENTLY, so one relocation in 4,096
+   was never applied. Dune II's SETUP has its `CALL FAR` to the sscanf code
+   with the segment word at linear 0x9FFF: it called the UNRELOCATED segment
+   and ran its data as code (exit 0F 3C). Byte by byte through the copy
+   helpers, which split at the seam. Out of line: one fixup in 4,096. */
+static __attribute__((noinline)) void mz_reloc_straddle(uint32_t lin, uint16_t reloc_factor)
+{
+    uint8_t b[2];
+    if (x86_guest_copy_out(b, lin, 2) != 2) {
+        x86_dos_reloc_refused++;
+        return;
+    }
+    uint16_t v = (uint16_t)((b[0] | (b[1] << 8)) + reloc_factor);
+    b[0] = (uint8_t)v;
+    b[1] = (uint8_t)(v >> 8);
+    if (x86_guest_copy_in(lin, b, 2) != 2)
+        x86_dos_reloc_refused++;
+    x86_dos_reloc_straddles++;
+}
+
 static int mz_place(mz_open_t *m, uint16_t load_seg, uint16_t reloc_factor)
 {
     /* Copy the image in, a page at a time so it can cross granules.
@@ -893,9 +922,15 @@ static int mz_place(mz_open_t *m, uint16_t load_seg, uint16_t reloc_factor)
             if (f_read(&m->f, ro, 4, &n) != FR_OK || n != 4)
                 break;
             uint32_t lin = SEG((uint16_t)(reloc_factor + ro[1])) + ro[0];
-            uint16_t *w = (uint16_t *)x86_guest_ptr(lin, 2);
-            if (w)
-                *w = (uint16_t)(*w + reloc_factor);
+            if ((lin & (X86_PG_SIZE - 1u)) != X86_PG_SIZE - 1u) {
+                uint16_t *w = (uint16_t *)x86_guest_ptr(lin, 2);
+                if (w)
+                    *w = (uint16_t)(*w + reloc_factor);
+                else
+                    x86_dos_reloc_refused++;
+                continue;
+            }
+            mz_reloc_straddle(lin, reloc_factor);
         }
     }
     f_close(&m->f);
@@ -2444,6 +2479,14 @@ static int dos_int21_dispatch(uint8_t func)
     case 0x29:                                  /* parse filename into FCB */
         return dos_parse_filename();
 
+    case 0x51:                                  /* get PSP (undocumented) */
+    case 0x62:                                  /* get PSP */
+        /* The running program's PSP segment in BX. Unanswered, this was the
+           invalid-function path: Risky Woods asks it right after "comenzar a
+           Jugar", got AX=1 back as a PSP and went straight to its exit text. */
+        x86_set_bx(psp_seg);
+        return 1;
+
     case 0x30:                                  /* DOS version 5.00 */
         x86_set_ax(0x0005);
         x86_set_bx(0);
@@ -2784,10 +2827,15 @@ static int dos_int21_dispatch(uint8_t func)
     }
 
     case 0x19:                                  /* current drive */
-        x86_set_al(0);                          /* A: -- the only one there is */
+        /* A: for a floppy image, C: for a hard-disk one (main.c sets it from
+           the mount). Every letter still means the one mounted disk -- paths
+           strip it -- but a program that asks is told the truth about what
+           KIND of drive it runs from: Risky Woods disables "comenzar a Jugar"
+           when the current drive is A: or B: (it will not run from floppy). */
+        x86_set_al(x86_dos_cur_drive);
         return 1;
     case 0x0E:                                  /* select drive */
-        x86_set_al(1);                          /* one drive in the system */
+        x86_set_al((uint8_t)(x86_dos_cur_drive + 1u));  /* LASTDRIVE */
         return 1;
     case 0x47: {                                /* get current directory */
         /*
@@ -3258,7 +3306,6 @@ int x86_xms_control(void)
     uint8_t func = (uint8_t)(cpu_state_ptr->regs[0] >> 8);
     uint16_t dx = (uint16_t)cpu_state_ptr->regs[2];
     uint16_t bx = (uint16_t)cpu_state_ptr->regs[3];
-
     x86_xms_calls++;
     switch (func) {
     case 0x00:                                  /* get version */
