@@ -1692,7 +1692,7 @@ python3 scripts/sdcard.py --probe                      # device, over the probe
 
 Same content, three destinations. Lays down `sd_content` (fonts/lang/bios),
 `/cores/<name>.bin`, `/roms/<dir>/<rom>.dsk` + sidecars (a title's `.cfg` goes
-to `/roms/<dir>/dos386cfg/`, where the core reads it), and a `/CONFIG` that
+to `/cores/dos386/`, where the core reads it), and a `/CONFIG` that
 preselects the ROM and disables idle standby.
 
 ### `verify_placement.py` — check the target matches the build

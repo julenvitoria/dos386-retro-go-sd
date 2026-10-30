@@ -2938,8 +2938,8 @@ static size_t settings_slurp(const char *path, unsigned char *buf, size_t cap)
 }
 
 /*
- * `<TITLE>.dsk` -> `<TITLE><suffix>`, in the same directory (a .cfg in its
- * dos386cfg/ subfolder: /roms/dos/dos386cfg/KEEN4.cfg). The extension is
+ * `<TITLE>.dsk` -> `<TITLE><suffix>`, in the same directory (a .cfg in the
+ * core's folder instead: /cores/dos386/KEEN4.cfg). The extension is
  * REPLACED, not appended, which is the derivation the prior port used and the
  * one the sidecars already on the card were named by: "KEEN4.dsk" -> "KEEN4.cfg".
  * Deliberately the same, so the files a title can have have names a user can
@@ -2954,8 +2954,8 @@ static size_t settings_slurp(const char *path, unsigned char *buf, size_t cap)
  * The cost of the choice, stated honestly: rename a .dsk and the settings do
  * not follow it. That is what its savestates and its cover art already do.
  */
-#ifndef X86_CFG_SUBDIR
-#define X86_CFG_SUBDIR "dos386cfg"
+#ifndef X86_CFG_DIR
+#define X86_CFG_DIR "/cores/dos386"
 #endif
 static int settings_path(char *out, size_t cap, const char *suffix)
 {
@@ -2971,22 +2971,20 @@ static int settings_path(char *out, size_t cap, const char *suffix)
         if (dsk_path[i - 1] == '.' && cut == n) cut = i - 1;
     }
     {
-        /* The .cfg lives in its own folder beside the images, dos386cfg/, so
-           the XTulator core (dos.bin, doscfg/) and this one can each keep a
-           .cfg for the same .dsk without reading each other's. The .dosset
-           the menu writes stays beside the image. */
-        const char *sub = (suffix[1] == 'c') ? X86_CFG_SUBDIR "/" : "";
-        size_t sl = 0, dl = 0;
+        /* The .cfg lives beside the CORE, in /cores/dos386/, where the game
+           menu does not list it, and apart from the XTulator core's
+           /cores/dos/ so each core keeps its own .cfg for the same image.
+           The .dosset the menu writes stays beside the image. */
+        const char *pre = (suffix[1] == 'c') ? X86_CFG_DIR "/" : dsk_path;
+        size_t pl = (suffix[1] == 'c') ? sizeof(X86_CFG_DIR) : dir;
+        size_t sl = 0;
         while (suffix[sl])
             sl++;
-        while (sub[dl])
-            dl++;
-        if (cut + dl + sl + 1 > cap)
+        if (pl + (cut - dir) + sl + 1 > cap)
             return -1;
-        memcpy(out, dsk_path, dir);
-        memcpy(out + dir, sub, dl);
-        memcpy(out + dir + dl, dsk_path + dir, cut - dir);
-        memcpy(out + dl + cut, suffix, sl + 1);
+        memcpy(out, pre, pl);
+        memcpy(out + pl, dsk_path + dir, cut - dir);
+        memcpy(out + pl + (cut - dir), suffix, sl + 1);
     }
     return 0;
 }

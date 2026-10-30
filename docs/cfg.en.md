@@ -8,9 +8,9 @@
 ## Where it goes
 
 Next to the image, with the same name: `/roms/dos/MONKEY.dsk` →
-`/roms/dos/dos386cfg/MONKEY.cfg`, in the `dos386cfg` folder beside the images,
-so the other core (`dos.bin`, which reads `/roms/dos/doscfg/`) can keep its own
-`.cfg` for the same game. A `.cfg` loose next to the image is no longer read. All of it is optional: with no `.cfg` the game starts
+`/cores/dos386/MONKEY.cfg`, in the core's folder, so it does not show up in the
+game menu and the other core (`dos.bin`, which reads `/cores/dos/`) can keep
+its own `.cfg` for the same game. A `.cfg` next to the image is no longer read. All of it is optional: with no `.cfg` the game starts
 with whatever its `.dsk`'s `AUTOEXEC.BAT` says, and with the default buttons.
 
 ## Format

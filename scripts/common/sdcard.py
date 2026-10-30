@@ -156,8 +156,8 @@ def push_tree(manager, local_dir):
             manager.push_file(os.path.join(root, name), remote)
 
 
-# Where dos386 looks for a title's .cfg: X86_CFG_SUBDIR in src/main.c.
-CFG_SUBDIR = "dos386cfg"
+# Where dos386 looks for a title's .cfg: X86_CFG_DIR in src/main.c.
+CFG_DIR = "cores/dos386"
 
 
 def compose(manager, core_bin=None, core_name="dos", rom=None, rom_dir="dos",
@@ -168,7 +168,7 @@ def compose(manager, core_bin=None, core_name="dos", rom=None, rom_dir="dos",
                  fonts the launcher renders empty frames and nothing else.
     core_bin     packed core -> /cores/<core_name>.bin (creates the system tab)
     rom          guest .dsk -> /roms/<rom_dir>/, with .dosmeta/.jpg sidecars;
-                 its .cfg -> /roms/<rom_dir>/dos386cfg/
+                 its .cfg -> /cores/dos386/
     config       /CONFIG -- preselects the ROM and disables idle standby
     """
     if content_dir:
@@ -176,7 +176,7 @@ def compose(manager, core_bin=None, core_name="dos", rom=None, rom_dir="dos",
 
     # cores/ and roms/ are build products in sd_content; a clean firmware build
     # removes them, so create rather than assume.
-    for d in ("cores", "roms", f"roms/{rom_dir}", f"roms/{rom_dir}/{CFG_SUBDIR}"):
+    for d in ("cores", CFG_DIR, "roms", f"roms/{rom_dir}"):
         manager.mkdir(d)
 
     if core_bin:
@@ -191,11 +191,10 @@ def compose(manager, core_bin=None, core_name="dos", rom=None, rom_dir="dos",
         if sidecars:
             for ext in (".cfg", ".dosmeta", ".jpg"):
                 if os.path.exists(base + ext):
-                    # the core reads a title's .cfg from <rom dir>/dos386cfg/
-                    sub = f"{CFG_SUBDIR}/" if ext == ".cfg" else ""
+                    # the core reads a title's .cfg from /cores/dos386/
+                    where = CFG_DIR if ext == ".cfg" else f"roms/{rom_dir}"
                     manager.push_file(base + ext,
-                                      f"roms/{rom_dir}/{sub}"
-                                      f"{os.path.basename(base)}{ext}")
+                                      f"{where}/{os.path.basename(base)}{ext}")
 
     if config:
         manager.push_file(config, "CONFIG")

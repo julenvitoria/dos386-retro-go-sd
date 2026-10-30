@@ -23,8 +23,8 @@ Both live on the same card.
 1. Copy the core to `/cores/`. It is built as `dos.bin`; if you also use
    XTulator (which has the same name), rename it, for example to `dos386.bin`.
 2. Copy the games to `/roms/dos/` as **`.dsk`** images.
-3. Each game can have a `.cfg` with the same name in `/roms/dos/dos386cfg/`
-   (`MONKEY.dsk` → `dos386cfg/MONKEY.cfg`). See below.
+3. Each game can have a `.cfg` with the same name in `/cores/dos386/`
+   (`MONKEY.dsk` → `/cores/dos386/MONKEY.cfg`). See below.
 
 ### `.dsk` images
 
@@ -46,8 +46,8 @@ with the executable's name (for example `MONKEY`).
 
 ## Per-game configuration (`.cfg`)
 
-Each game can have a `.cfg` with the same name in `/roms/dos/dos386cfg/`
-(`MONKEY.dsk` → `dos386cfg/MONKEY.cfg`), in DOSBox format. An example:
+Each game can have a `.cfg` with the same name in `/cores/dos386/`
+(`MONKEY.dsk` → `/cores/dos386/MONKEY.cfg`), in DOSBox format. An example:
 
 ```ini
 [cpu]
