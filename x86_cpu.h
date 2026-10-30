@@ -445,6 +445,8 @@ void x86_video_set_cursor(uint8_t col, uint8_t row);
 uint16_t x86_video_get_cursor(void);
 uint16_t x86_video_read_cell(void);
 void x86_video_scroll(uint8_t lines, uint8_t attr);
+extern uint32_t *x86_cga_expand;
+void x86_mouse_events(void);           /* INT 33h AX=000Ch handlers, per frame */      /* 256 entries; X86_CGA_EXPAND_EXTERN builds */
 int x86_video_int10_scroll(uint8_t func);
 void x86_video_putc_attr(uint8_t ch, uint8_t attr, uint16_t count);
 void x86_video_teletype(uint8_t ch);

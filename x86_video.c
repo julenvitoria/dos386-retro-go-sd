@@ -212,7 +212,15 @@ static void text_alloc_palette(void);
 #endif
 /* 2bpp -> four palette bytes. In DTCM: the blitter hits it once per source
    byte, and DTCM's second port keeps that off the AXI path the source is on. */
+#if X86_CGA_EXPAND_EXTERN
+/* The core's .dtcm_bss lands in RAM_EMU (it has no DTCM load segment), so
+   there the 1 KB table cost a quarter of a guest frame AND missed DTCM. The
+   core allocates it from the firmware's DTCM pool instead (src/main.c,
+   x86_cga_expand) before the first x86_video_init(). */
+#define cga_expand x86_cga_expand
+#else
 static uint32_t cga_expand[256] __attribute__((section(".dtcm_bss.cga_expand")));
+#endif
 /* Mode 6, nibble-indexed: two OR-ed output pixels per entry. 64 bytes. */
 static uint32_t cga1_expand[16];
 
@@ -416,7 +424,7 @@ void x86_video_init(void *vram, void *lut8_palette)
        built so a little-endian word store lands them left to right, and every
        entry carries the graphics block base so the blitter's output indexes the
        CLUT directly. */
-    for (unsigned b = 0; b < 256; b++) {
+    for (unsigned b = 0; cga_expand && b < 256; b++) {
         cga_expand[b] = (X86_GFX_CLUT_BASE * 0x01010101u)
                       + (((b >> 6) & 3)
                       | (((b >> 4) & 3) << 8)

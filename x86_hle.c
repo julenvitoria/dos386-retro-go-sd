@@ -146,6 +146,93 @@ _Static_assert(X86_EMS_HDR_LIN + 0x12u <= X86_EMS_ENTRY_LIN,
 #define BIOS_DATE_OFF 0xFF5u         /* F000:FFF5, "MM/DD/YY" */
 #define BIOS_MODEL_OFF 0xFFEu        /* F000:FFFE, model byte */
 
+/* --------------------------------------------------------------------------
+ * INT 33h EVENT HANDLERS (AX=000Ch): the driver calls the program.
+ *
+ * Dune II never polls: it installs a handler with AX=000Ch and waits for the
+ * driver to call it on every move and click. Accepting the call and never
+ * calling back (what x86_mouse.c did) left its menu dead to every button.
+ *
+ * A real driver calls the handler from its IRQ 12 service routine, so this
+ * does exactly that: on an event the frame loop raises INT 74h (IRQ 12's
+ * vector), whose IVT entry points at a stub in the HLE block:
+ *
+ *   0x670  dd   the handler, ES:DX from AX=000Ch
+ *   0x674  pusha / push ds / push es
+ *          0F 0B FA     MOUSE_SEL_EV: AX = event bits, BX/CX/DX = AX=0003h
+ *          call far [cs:0070h]
+ *          0F 0B F9     MOUSE_SEL_DONE: the next event may be raised
+ *          pop es / pop ds / popa / iret
+ *
+ * One event at a time (ms_busy), raised only when the interrupt slot is free;
+ * an event that cannot go out this frame goes out the next. Delivery needs IF
+ * set, like any interrupt. No PIC involvement: nothing to EOI.
+ */
+#define MOUSE_SEL_EV    0xFAu
+#define MOUSE_SEL_DONE  0xF9u
+#define MOUSE_VEC       0x74u
+#define MOUSE_PTR_OFF   0x0070u
+#define MOUSE_STUB_OFF  0x0074u
+static uint16_t ms_mask, ms_pend;
+X86_UC_BSS(ms_raised) volatile uint32_t x86_mouse_ev_raised;   /* INT 74h raised */
+X86_UC_BSS(ms_done) volatile uint32_t x86_mouse_ev_done;       /* handler returned */
+static uint8_t  ms_busy, ms_last_b;
+static uint16_t ms_last_x, ms_last_y;
+_Static_assert(MOUSE_STUB_OFF + 18u <= X86_XMS_ENTRY_OFF,
+               "the mouse event stub must end before the XMS entry");
+
+static void mouse_handler_call(uint16_t ax)
+{
+    if (ax == 0x0000u || ax == 0x0021u) {       /* a reset drops the handler */
+        ms_mask = 0;
+        ms_busy = 0;
+        return;
+    }
+    if (ax != 0x000Cu)
+        return;
+    uint8_t *p = (uint8_t *)x86_guest_ptr(((uint32_t)STUB_SEG << 4) + MOUSE_PTR_OFF, 4);
+    uint8_t *ivt = (uint8_t *)x86_guest_ptr(MOUSE_VEC * 4u, 4);
+    uint16_t off = (uint16_t)cpu_state_ptr->regs[2], seg = cpu_state_ptr->segs[0].sel;
+    ms_mask = (off | seg) ? (uint16_t)cpu_state_ptr->regs[1] : 0u;
+    ms_busy = 0;
+    if (!p || !ivt)
+        return;
+    p[0] = (uint8_t)off; p[1] = (uint8_t)(off >> 8);
+    p[2] = (uint8_t)seg; p[3] = (uint8_t)(seg >> 8);
+    ivt[0] = (uint8_t)MOUSE_STUB_OFF; ivt[1] = 0;
+    ivt[2] = (uint8_t)STUB_SEG; ivt[3] = (uint8_t)(STUB_SEG >> 8);
+}
+
+/* Once per frame, after input: raise INT 74h if the pointer moved or a button
+   changed and the program's mask wants it. The state is read through the
+   driver's own AX=0003h, with the guest's registers put back. */
+void x86_mouse_events(void)
+{
+    if (!ms_mask || ms_busy || !x86_mouse_enabled)
+        return;
+    uint32_t save[4];
+    for (int i = 0; i < 4; i++) save[i] = cpu_state_ptr->regs[i];
+    cpu_state_ptr->regs[0] = 3u;
+    x86_mouse_int33();
+    x86_mouse_calls--;                       /* ours, not the guest's */
+    uint16_t b = (uint16_t)cpu_state_ptr->regs[3], x = (uint16_t)cpu_state_ptr->regs[1],
+             y = (uint16_t)cpu_state_ptr->regs[2];
+    for (int i = 0; i < 4; i++) cpu_state_ptr->regs[i] = save[i];
+    uint16_t ev = (x != ms_last_x || y != ms_last_y) ? 1u : 0u;
+    uint8_t ch = (uint8_t)(b ^ ms_last_b);
+    if (ch & 1u) ev |= (b & 1u) ? 0x02u : 0x04u;
+    if (ch & 2u) ev |= (b & 2u) ? 0x08u : 0x10u;
+    ev &= ms_mask;
+    if (!ev || cpu_state_ptr->hard_int_pending)
+        return;              /* nothing wanted yet, or the slot is taken */
+    ms_last_x = x; ms_last_y = y; ms_last_b = (uint8_t)b;
+    ms_pend = ev;
+    ms_busy = 1;
+    x86_mouse_ev_raised++;
+    cpu_state_ptr->hard_int_pending = MOUSE_VEC;
+    x86_pit_counter_forced(1);
+}
+
 int x86_hle_install(const uint8_t *vectors, unsigned count)
 {
     uint32_t base = (uint32_t)STUB_SEG << 4;
@@ -194,6 +281,18 @@ int x86_hle_install(const uint8_t *vectors, unsigned count)
         x[1] = 0x0B;
         x[2] = X86_HLE_SEL_XMS;
         x[3] = 0xCB;                 /* RETF -- entered by CALL FAR */
+    }
+    {
+        static const uint8_t ms[18] = {
+            0x60, 0x1E, 0x06,                       /* pusha, push ds, es */
+            0x0F, 0x0B, MOUSE_SEL_EV,
+            0x2E, 0xFF, 0x1E, (uint8_t)MOUSE_PTR_OFF, 0x00, /* call far [cs:70] */
+            0x0F, 0x0B, MOUSE_SEL_DONE,
+            0x07, 0x1F, 0x61, 0xCF                  /* pop es, ds, popa, iret */
+        };
+        memcpy(stubs + MOUSE_STUB_OFF, ms, sizeof(ms));
+        ms_mask = 0;
+        ms_busy = 0;
     }
     cpu_state_ptr->hle_enabled = 1;
     return 0;
@@ -308,7 +407,22 @@ int x86_hle_dispatch(uint8_t vector)
         /* The mouse driver (x86_mouse.h). Opt-in per title: with the .cfg not
            asking, it returns without touching a register -- the bare IRET this
            stub replaced, so "no driver" reads exactly as it always did. */
+        if (x86_mouse_enabled)
+            mouse_handler_call((uint16_t)cpu_state_ptr->regs[0]);
         return x86_mouse_int33();
+    case MOUSE_SEL_EV:
+        /* Inside the event stub: the handler's registers. AX=0003h through
+           the driver itself fills BX buttons, CX x, DX y. */
+        cpu_state_ptr->regs[0] = (cpu_state_ptr->regs[0] & 0xFFFF0000u) | 3u;
+        x86_mouse_int33();
+        x86_set_ax(ms_pend);
+        cpu_state_ptr->regs[6] &= 0xFFFF0000u;          /* SI, DI: mickeys */
+        cpu_state_ptr->regs[7] &= 0xFFFF0000u;
+        return 1;
+    case MOUSE_SEL_DONE:
+        ms_busy = 0;
+        x86_mouse_ev_done++;
+        return 1;
     case 0x67:
         /* Expanded memory. Reached through the stub at 0064:0020, which the
            IVT points at only while EMS has backing -- so this arm is not

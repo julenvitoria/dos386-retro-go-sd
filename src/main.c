@@ -674,6 +674,7 @@ volatile uint32_t guest_tick_divisor = 65536; /* PIT ch0 divisor in force    */
 volatile uint32_t guest_tick_replans = 0;   /* mid-frame divisor re-plans   */
 volatile uint32_t guest_uptime_ms = 0;      /* host ms since the loop started */
 
+uint32_t *x86_cga_expand;   /* x86_video.c's CGA table, from DTCM */
 volatile uint32_t guest_exit_reason = 0;
 volatile uint32_t guest_halted = 0;
 volatile uint32_t fb_addr = 0;        /* the buffer the blit was handed */
@@ -1013,6 +1014,15 @@ static bool dtcm_state_init(void)
             x86_vga_aperture_dtcm_fail = 1;
         }
     }
+
+    /* The CGA 2bpp expansion table (1 KB): DTCM, which is where x86_video.c
+       always meant it to be -- the blitter reads it once per source byte --
+       and out of RAM_EMU, where its .dtcm_bss section actually landed. After
+       the aperture, so it can never be the reason the aperture misses; the
+       AHB heap if DTCM is out. */
+    x86_cga_expand = (uint32_t *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_DTC, 256, 4);
+    if (!x86_cga_expand)
+        x86_cga_expand = (uint32_t *)abi->mem_ctl(GW_MEM_OP_ALLOC, GW_MEM_AHB, 256, 4);
 
     /*
      * A WITNESS FOR DTCM, because there is not one anywhere else.
@@ -4475,6 +4485,7 @@ static void emulator_loop(const gw_firmware_abi_t *abi)
         FRAME_PHASE(X86_PHASE_INPUT);
         X86_ZONE_ENTER(X86_ZONE_INPUT);             /* ZONES */
         poll_input(abi);
+        x86_mouse_events();
         X86_ZONE_EXIT();                            /* ZONES */
 
         /*

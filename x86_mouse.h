@@ -24,10 +24,10 @@
  * guest sets with AX=0007h/0008h. Movement arrives in the OSK's 640x200 units
  * and y is scaled to the mode's height.
  *
- * WHAT IS NOT DONE, stated rather than faked: event handlers (AX=000Ch/0014h/
- * 0018h) are accepted and never called -- calling into the guest from an HLE
- * service needs a far-call frame this dispatcher does not build. Every title
- * tested polls (AX=0003h/0005h/0006h/000Bh). The driver never draws a cursor
+ * EVENT HANDLERS: AX=000Ch IS CALLED (x86_hle.c, x86_mouse_events()): the
+ * frame loop raises INT 74h on a move or button change the mask wants, and a
+ * stub in the HLE block calls the handler with AX/BX/CX/DX set -- Dune II
+ * never polls. AX=0014h/0018h are still accepted and never called. The driver never draws a cursor
  * into video memory; the OSK paints its own arrow over the frame while the
  * guest has asked for the driver's cursor (AX=0001h) to be shown.
  */
