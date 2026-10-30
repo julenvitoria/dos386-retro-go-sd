@@ -156,6 +156,10 @@ def push_tree(manager, local_dir):
             manager.push_file(os.path.join(root, name), remote)
 
 
+# Where dos386 looks for a title's .cfg: X86_CFG_SUBDIR in src/main.c.
+CFG_SUBDIR = "dos386cfg"
+
+
 def compose(manager, core_bin=None, core_name="dos", rom=None, rom_dir="dos",
             config=None, content_dir=None, sidecars=True):
     """Lay out everything the firmware needs, onto any destination.
@@ -163,7 +167,8 @@ def compose(manager, core_bin=None, core_name="dos", rom=None, rom_dir="dos",
     content_dir  the firmware's sd_content tree (fonts, lang, bios). Without
                  fonts the launcher renders empty frames and nothing else.
     core_bin     packed core -> /cores/<core_name>.bin (creates the system tab)
-    rom          guest .dsk -> /roms/<rom_dir>/, with .cfg/.dosmeta sidecars
+    rom          guest .dsk -> /roms/<rom_dir>/, with .dosmeta/.jpg sidecars;
+                 its .cfg -> /roms/<rom_dir>/dos386cfg/
     config       /CONFIG -- preselects the ROM and disables idle standby
     """
     if content_dir:
@@ -171,7 +176,7 @@ def compose(manager, core_bin=None, core_name="dos", rom=None, rom_dir="dos",
 
     # cores/ and roms/ are build products in sd_content; a clean firmware build
     # removes them, so create rather than assume.
-    for d in ("cores", "roms", f"roms/{rom_dir}"):
+    for d in ("cores", "roms", f"roms/{rom_dir}", f"roms/{rom_dir}/{CFG_SUBDIR}"):
         manager.mkdir(d)
 
     if core_bin:
@@ -186,8 +191,10 @@ def compose(manager, core_bin=None, core_name="dos", rom=None, rom_dir="dos",
         if sidecars:
             for ext in (".cfg", ".dosmeta", ".jpg"):
                 if os.path.exists(base + ext):
+                    # the core reads a title's .cfg from <rom dir>/dos386cfg/
+                    sub = f"{CFG_SUBDIR}/" if ext == ".cfg" else ""
                     manager.push_file(base + ext,
-                                      f"roms/{rom_dir}/"
+                                      f"roms/{rom_dir}/{sub}"
                                       f"{os.path.basename(base)}{ext}")
 
     if config:

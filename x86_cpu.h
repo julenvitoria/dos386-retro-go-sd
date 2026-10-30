@@ -698,7 +698,7 @@ extern uint32_t x86_dos_file_calls;
 extern volatile uint32_t x86_io_log[];    /* X86_IO_LOG_SLOTS * 2, x86_io.c */
 extern volatile uint32_t x86_io_log_idx;
 extern volatile uint32_t x86_io_log_total;
-extern char x86_dos_path_log[4][32];
+extern char x86_dos_path_log[4][20];
 uint16_t *x86_hle_flags_on_stack(void);
 uint16_t dos_test_alloc(uint16_t paras, uint16_t *largest);
 uint16_t dos_test_free(uint16_t seg);

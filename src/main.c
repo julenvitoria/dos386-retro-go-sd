@@ -632,7 +632,7 @@ static uint32_t   rate_window_frames;
    60 fps, so every slower frame threw ticks away -- measured as ~351 of 473
    per second, with guest_ticks_dropped climbing ~100/s. 24 covers 473 Hz
    down to 20 fps and 560 Hz down to 24. */
-#define TICK_IRQ_MAX          256u
+#define TICK_IRQ_MAX          512u
 #define TICK_STALL_MS        1000u    /* longer than this is a stall, not lag */
 static uint32_t tick_acc;             /* ms * TICK_NUM, below one IRQ 0      */
 static uint32_t bda_acc;              /* the same, for the 18.2 Hz BDA count */
@@ -2938,7 +2938,8 @@ static size_t settings_slurp(const char *path, unsigned char *buf, size_t cap)
 }
 
 /*
- * `<TITLE>.dsk` -> `<TITLE><suffix>`, in the same directory. The extension is
+ * `<TITLE>.dsk` -> `<TITLE><suffix>`, in the same directory (a .cfg in its
+ * dos386cfg/ subfolder: /roms/dos/dos386cfg/KEEN4.cfg). The extension is
  * REPLACED, not appended, which is the derivation the prior port used and the
  * one the sidecars already on the card were named by: "KEEN4.dsk" -> "KEEN4.cfg".
  * Deliberately the same, so the files a title can have have names a user can
@@ -2953,9 +2954,12 @@ static size_t settings_slurp(const char *path, unsigned char *buf, size_t cap)
  * The cost of the choice, stated honestly: rename a .dsk and the settings do
  * not follow it. That is what its savestates and its cover art already do.
  */
+#ifndef X86_CFG_SUBDIR
+#define X86_CFG_SUBDIR "dos386cfg"
+#endif
 static int settings_path(char *out, size_t cap, const char *suffix)
 {
-    size_t n = 0, cut;
+    size_t n = 0, cut, dir = 0;
 
     if (!dsk_path[0])
         return -1;
@@ -2963,18 +2967,26 @@ static int settings_path(char *out, size_t cap, const char *suffix)
         n++;
     cut = n;
     for (size_t i = n; i > 0; i--) {
-        if (dsk_path[i - 1] == '/')
-            break;
-        if (dsk_path[i - 1] == '.') { cut = i - 1; break; }
+        if (dsk_path[i - 1] == '/') { dir = i; break; }
+        if (dsk_path[i - 1] == '.' && cut == n) cut = i - 1;
     }
     {
-        size_t sl = 0;
+        /* The .cfg lives in its own folder beside the images, dos386cfg/, so
+           the XTulator core (dos.bin, doscfg/) and this one can each keep a
+           .cfg for the same .dsk without reading each other's. The .dosset
+           the menu writes stays beside the image. */
+        const char *sub = (suffix[1] == 'c') ? X86_CFG_SUBDIR "/" : "";
+        size_t sl = 0, dl = 0;
         while (suffix[sl])
             sl++;
-        if (cut + sl + 1 > cap)
+        while (sub[dl])
+            dl++;
+        if (cut + dl + sl + 1 > cap)
             return -1;
-        memcpy(out, dsk_path, cut);
-        memcpy(out + cut, suffix, sl + 1);
+        memcpy(out, dsk_path, dir);
+        memcpy(out + dir, sub, dl);
+        memcpy(out + dir + dl, dsk_path + dir, cut - dir);
+        memcpy(out + dl + cut, suffix, sl + 1);
     }
     return 0;
 }
@@ -3013,7 +3025,7 @@ static void sound_cards_claim(const gw_firmware_abi_t *abi)
     int opl_on = 1, sb_on = 1;
 
     if (ACTIVE_FILE && ACTIVE_FILE->path[0]) {
-        char path[sizeof(dsk_path) + 8];
+        char path[sizeof(dsk_path) + 24];
         unsigned char cfgbuf[X86_CFG_MAX_BYTES + 1];   /* stack: see settings_load */
         x86_cfg_result_t res;
 
@@ -3098,7 +3110,7 @@ static void settings_load(void)
        headroom is the tightest budget in this core (STATUS.md's Budgets), and
        2 KB that lives for the length of one cold call has no business being
        static. */
-    char path[sizeof(dsk_path) + 8];
+    char path[sizeof(dsk_path) + 24];
     x86_cfg_result_t res;
     x86_cfg_status_t st = X86_CFG_EABSENT;
 
@@ -3184,7 +3196,7 @@ static void settings_load(void)
 static void settings_save(void)
 {
     const gw_firmware_abi_t *abi = gw_firmware_abi();
-    char path[sizeof(dsk_path) + 8];
+    char path[sizeof(dsk_path) + 24];
     unsigned char buf[X86_SETTINGS_MAX_BYTES];
     unsigned long n;
     FILE *f;

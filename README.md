@@ -23,8 +23,8 @@ Los dos conviven en la misma tarjeta.
 1. Copia el núcleo a `/cores/`. Al compilarse sale como `dos.bin`; si también
    usas XTulator (que se llama igual), renómbralo, por ejemplo a `dos386.bin`.
 2. Copia los juegos a `/roms/dos/` como imágenes **`.dsk`**.
-3. Al lado de cada juego puede ir su `.cfg` con el mismo nombre
-   (`MONKEY.dsk` → `MONKEY.cfg`). Ver más abajo.
+3. Cada juego puede tener su `.cfg` con el mismo nombre en la carpeta
+   `/roms/dos/dos386cfg/` (`MONKEY.dsk` → `dos386cfg/MONKEY.cfg`). Ver más abajo.
 
 ### Las imágenes `.dsk`
 
@@ -47,8 +47,8 @@ con el nombre del ejecutable (por ejemplo `MONKEY`).
 
 ## Configuración por juego (`.cfg`)
 
-Al lado de cada juego puede ir un `.cfg` con su mismo nombre (`MONKEY.dsk` →
-`MONKEY.cfg`), en el formato de DOSBox. Un ejemplo:
+Cada juego puede tener un `.cfg` con su mismo nombre en `/roms/dos/dos386cfg/`
+(`MONKEY.dsk` → `dos386cfg/MONKEY.cfg`), en el formato de DOSBox. Un ejemplo:
 
 ```ini
 [cpu]

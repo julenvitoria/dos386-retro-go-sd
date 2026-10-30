@@ -2221,7 +2221,7 @@ static void fail(uint16_t code) { x86_set_ax(code); x86_hle_set_cf(1); }
 X86_UC_BSS(x86_dos_file_log) uint32_t x86_dos_file_log[DOS_FILE_LOG_SLOTS * 4];
 uint32_t x86_dos_file_log_idx;
 uint32_t x86_dos_file_calls;
-char x86_dos_path_log[4][32];   /* 16 -> 8 (2026-10-17), -> 4 (2026-10-24): RAM_EMU */
+char x86_dos_path_log[4][20];   /* 16 -> 8 (2026-10-17), -> 4 (2026-10-24), 32 -> 20 chars (2026-10-30): RAM_EMU */
 static uint32_t dos_path_log_idx;
 
 /* The MEMORY calls are traced too, but they are not FILE calls: they get a
@@ -2951,14 +2951,14 @@ static uint32_t         xms_kb;         /* the whole store, in KB */
 static uint32_t         xms_a20_local;  /* AH=05h/06h nesting count */
 #define XMS_LINEAR_BASE  (8u * 1024u * 1024u)
 
-/* The ONLY buffer this interface owns, and it is 64 bytes because the two
+/* The ONLY buffer this interface owns, and it is 32 bytes because the two
    paths that need one are rare: an XMS->XMS move and the copy inside a growing
-   AH=0Fh. (256 until 2026-10-30: the 192 B went to the SB direct DAC and the
-   locked-move check, which was the difference between 157 and 158 guest
-   frames.) Guest<->XMS moves need no buffer at all -- x86_guest_ptr() hands out
+   AH=0Fh. (256 until 2026-10-30: the 224 B went to the SB direct DAC, the
+   locked-move check and the dos386cfg/ path, which was the difference between
+   157 and 158 guest frames.) Guest<->XMS moves need no buffer at all -- x86_guest_ptr() hands out
    a host pointer for one page-run and the store reads or writes straight
    through it, so the common path is zero-copy. */
-#define XMS_CHUNK 64u
+#define XMS_CHUNK 32u
 static uint8_t xms_buf[XMS_CHUNK];
 
 void x86_xms_set_backing(x86_xms_open_fn op, x86_xms_close_fn cl,

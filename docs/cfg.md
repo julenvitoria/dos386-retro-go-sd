@@ -7,8 +7,11 @@
 
 ## Dónde va
 
-Junto a la imagen y con el mismo nombre: `/roms/dos/MONKEY.dsk` →
-`/roms/dos/MONKEY.cfg`. Todo es opcional: sin `.cfg` el juego arranca con lo
+En la carpeta `dos386cfg` que hay junto a las imágenes, con el mismo nombre
+que la imagen: `/roms/dos/MONKEY.dsk` → `/roms/dos/dos386cfg/MONKEY.cfg`. Así el
+otro núcleo (`dos.bin`, que lee `/roms/dos/doscfg/`) puede tener su propio `.cfg`
+para el mismo juego sin que se mezclen. Un `.cfg` suelto junto a la imagen ya
+no se lee. Todo es opcional: sin `.cfg` el juego arranca con lo
 que diga el `AUTOEXEC.BAT` de su `.dsk` y con los botones por defecto.
 
 ## Formato

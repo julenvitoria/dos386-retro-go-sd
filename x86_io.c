@@ -2582,6 +2582,14 @@ static uint32_t port_read_inner(uint32_t port)
          *
          * Eight reads busy, eight ready, in turn: a driver waiting for ready
          * waits at most eight reads, one waiting for busy at most eight.
+         *
+         * THE COUNT RESTARTS ON EVERY WRITE, so the first seven reads after a
+         * byte say ready. A driver that writes, polls ready, writes again --
+         * every direct-DAC sample, two bytes each -- now passes on its first
+         * read; with a free-running count half of those polls landed in the
+         * busy half and spun up to eight more reads. Another World does that
+         * 10,000 times a second. A driver that polls WITHOUT writing (Prince's
+         * wait for busy) still sees busy within eight reads.
          */
         return (++sb_wstat_reads & 8u) ? 0xFFu : 0x7Fu;
     case SB_BASE + 0xE:
@@ -2870,6 +2878,7 @@ void x86_port_write(uint32_t port, uint32_t value, uint32_t size)
         break;
     case SB_BASE + 0xC:              /* DSP command / data                */
         if (x86_sb_enabled) dsp_write_cmd((uint8_t)value);
+        sb_wstat_reads = 0;          /* the next 7 status reads say ready */
         break;
 
     case 0x3B4:
