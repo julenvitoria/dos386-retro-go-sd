@@ -2485,10 +2485,19 @@ static int dos_int21_dispatch(uint8_t func)
         x86_set_cx(0);
         return 1;
 
-    case 0x2C:                                  /* get time */
-        x86_set_cx(0x0C00);
-        x86_set_dx(0);
+    case 0x2C: {                                /* get time */
+        /* From the BIOS tick count, which the frame loop advances in guest
+           time, plus noon so a game sees a plausible clock. It used to be a
+           constant 12:00:00.00, so a program that waits for the seconds or
+           hundredths to change -- a common DOS delay and benchmark idiom --
+           would wait for ever. 1099/200 = 5.495 cs a tick. */
+        const uint8_t *t = (const uint8_t *)x86_guest_ptr(0x46C, 4);
+        uint32_t cs = t ? (uint32_t)(t[0] | (t[1] << 8) | (t[2] << 16)) * 1099u / 200u : 0;
+        cs += 12u * 360000u;
+        x86_set_cx((uint16_t)((((cs / 360000u) % 24u) << 8) | ((cs / 6000u) % 60u)));
+        x86_set_dx((uint16_t)((((cs / 100u) % 60u) << 8) | (cs % 100u)));
         return 1;
+    }
     case 0x2A:                                  /* get date */
         x86_set_cx(1990);
         x86_set_dx(0x0101);
